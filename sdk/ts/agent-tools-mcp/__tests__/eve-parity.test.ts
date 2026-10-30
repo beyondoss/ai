@@ -2,8 +2,10 @@
  * Eve tools parity — proof, not marketing.
  *
  * Source of truth: https://eve.dev/docs/tools (and vercel/eve docs/tools/overview.mdx).
- * Each `it` is a named Eve claim. Gaps use `it.fails` so the suite stays honest:
- * expected failures = not parity yet. When we implement them, flip to `it`.
+ * Each `it` is a named Eve claim. A claim this package does not implement yet
+ * must be `it.fails`, so `npm run parity` cannot go green by skipping it.
+ * Cancel, the cold-open endsTurn sentence, the endsTurn function, and JSON
+ * Schema `enum` are asserted below and in `__tests__/eve-ctx.test.ts`.
  */
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -15,7 +17,8 @@ import { z } from "zod";
 import { createToolContext } from "../src/context.js";
 import { defineTool } from "../src/define-tool.js";
 import { loadTools } from "../src/load.js";
-import { handleRpc } from "../src/rpc.js";
+import { writeManifest } from "../src/manifest.js";
+import { ENDS_TURN_META_KEY, handleRpc } from "../src/rpc.js";
 import { runTool } from "../src/run-tool.js";
 import { inputSchemaToJsonSchema, validateToolInput } from "../src/schema.js";
 
@@ -240,6 +243,49 @@ describe("Eve parity: defaults, deferred, endsTurn, outputSchema", () => {
     expect(desc).toContain("Calling this tool ends your turn once it succeeds");
     // eve info / authored description unchanged on the def
     expect(tool.description).toBe("React to the current message.");
+
+    const dir = await mkdtemp(path.join(tmpdir(), "eve-menu-"));
+    const manifest = await writeManifest(
+      [{ name: "react", def: tool, sourcePath: "react.ts" }],
+      { name: "tools", out: path.join(dir, ".mcp-tools.json") },
+    );
+    expect(manifest.tools?.[0]?.description).toContain(
+      "Calling this tool ends your turn once it succeeds",
+    );
+  });
+
+  it("endsTurn function sets the host signal only when it returns true", async () => {
+    const stop = defineTool({
+      description: "maybe stop",
+      inputSchema: z.object({ stop: z.boolean() }),
+      endsTurn: (output: { stop: boolean }) => output.stop,
+      execute: ({ stop: shouldStop }) => ({ stop: shouldStop }),
+    });
+    const loaded = [{ name: "stop", def: stop, sourcePath: "stop.ts" }];
+    const yes = await handleRpc(
+      {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: "stop", arguments: { stop: true } },
+      },
+      loaded,
+      rpcBase,
+    );
+    expect(yes?.result).toMatchObject({
+      _meta: { [ENDS_TURN_META_KEY]: true },
+    });
+    const no = await handleRpc(
+      {
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: { name: "stop", arguments: { stop: false } },
+      },
+      loaded,
+      rpcBase,
+    );
+    expect(no?.result).not.toHaveProperty("_meta");
   });
 
   it("outputSchema validates execute return (Eve)", async () => {
@@ -252,6 +298,54 @@ describe("Eve parity: defaults, deferred, endsTurn, outputSchema", () => {
     await expect(runTool(tool, { city: "X" }, ctx())).rejects.toThrow(
       /outputSchema/,
     );
+  });
+
+  it("outputSchema's parsed value is what the model receives", async () => {
+    const tool = defineTool({
+      description: "t",
+      inputSchema: z.object({}),
+      outputSchema: z.object({
+        city: z.string(),
+        unit: z.string().default("F"),
+      }),
+      execute: () => ({ city: "SF", secret: "no" }),
+    });
+    expect(await runTool(tool, {}, ctx())).toEqual({ city: "SF", unit: "F" });
+    const list = await handleRpc(
+      { jsonrpc: "2.0", id: 1, method: "tools/list" },
+      [{ name: "t", def: tool, sourcePath: "t.ts" }],
+      rpcBase,
+    );
+    const listed =
+      (list?.result as { tools: { outputSchema?: { type?: string } }[] })
+        .tools[0];
+    expect(listed?.outputSchema?.type).toBe("object");
+  });
+});
+
+describe("Eve parity: plain JSON Schema keywords this server checks", () => {
+  it("enum rejects a value outside the set", async () => {
+    const schema = {
+      type: "object",
+      properties: { color: { type: "string", enum: ["red", "blue"] } },
+      required: ["color"],
+    };
+    await expect(validateToolInput(schema, { color: "green" })).rejects.toThrow(
+      /enum|expected one of/,
+    );
+    expect(await validateToolInput(schema, { color: "red" })).toEqual({
+      color: "red",
+    });
+  });
+
+  it("anyOf is rejected at defineTool instead of being silently ignored", () => {
+    expect(() =>
+      defineTool({
+        description: "t",
+        inputSchema: { anyOf: [{ type: "string" }, { type: "number" }] },
+        execute: () => ({}),
+      })
+    ).toThrow(/anyOf/);
   });
 });
 

@@ -2,6 +2,8 @@
 dprint = "latest"
 rust = { version = "1.92", components = "rustfmt,clippy,llvm-tools-preview", targets = "aarch64-unknown-linux-gnu,x86_64-unknown-linux-gnu" }
 yamlfmt = "latest"
+# Runs `@beyond.dev/tools` (sdk/ts/agent-tools-mcp) for the agent's agent_tools_mcp tests, and builds its binary.
+bun = "1.4.4"
 cargo-binstall = "latest"
 "cargo:cross" = "latest"
 # nats-server for the e2e harness (real JetStream KV backing slipstream).
@@ -262,7 +264,7 @@ if [ -f target/nextest/verify-isolated/junit.xml ]; then reports="$reports --jun
 cargo run -q -p beyond-verify -- gate $reports
 """
 
-# ---- TypeScript SDK (sdk/ts: npm workspace root; sandbox client + agent-tools-mcp) ----
+# ---- TypeScript SDK (sdk/ts: npm workspace root; sandbox client + @beyond.dev/tools) ----
 
 [tasks."install:ts"]
 description = "Install the TypeScript SDK's dependencies (npm ci in sdk/ts)."
@@ -270,13 +272,13 @@ run = "npm ci"
 dir = "sdk/ts"
 
 [tasks."build:ts"]
-description = "Build the TypeScript SDK (tsdown): sandbox + agent-tools-mcp dist."
+description = "Build the TypeScript SDK (tsdown): sandbox + @beyond.dev/tools dist."
 run = "npm run build"
 dir = "sdk/ts"
 
 [tasks."compile:agent-tools-mcp"]
-description = "AOT+trim+smol binary for in-sandbox tools MCP (bun compile). Build on the guest OS/arch. OUT= overrides bin/tools-mcp."
-run = "npm run compile -w @beyond.dev/agent-tools-mcp"
+description = "Compiled (bun build --compile, minify, smol) binary for in-sandbox tools MCP. Build on the guest OS/arch. OUT= overrides bin/tools-mcp."
+run = "npm run compile -w @beyond.dev/tools"
 dir = "sdk/ts"
 
 [tasks."check:ts"]

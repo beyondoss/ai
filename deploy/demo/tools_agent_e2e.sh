@@ -161,12 +161,12 @@ bun --version
 mkdir -p /home/user/tools-mcp/src /home/user/workspace/tools /home/user/bin
 ' >/dev/null || fail "install bun"
 
-for f in cli.ts context.ts define-tool.ts load.ts manifest.ts rpc.ts run-tool.ts sandbox-handle.ts schema.ts serve-http.ts serve-stdio.ts eve-tools.ts index.ts bun-shim.d.ts; do
+for f in cli.ts context.ts define-tool.ts load.ts manifest.ts rpc.ts run-tool.ts sandbox-handle.ts schema.ts serve-http.ts serve-stdio.ts workspace.ts eve-tools.ts index.ts bun-shim.d.ts; do
   vm_put "/home/user/tools-mcp/src/$f" "$PKG/src/$f"
 done
 # Guest package.json: runtime deps only (host package.json pulls vitest/tsdown via bun install).
 jq -n '{
-  name: "@beyond.dev/agent-tools-mcp",
+  name: "@beyond.dev/tools",
   version: "0.1.0-dev",
   type: "module",
   dependencies: {
@@ -228,7 +228,7 @@ set +e
 export PATH=\"\$HOME/.bun/bin:\$PATH\"
 # Resolve eve/zod from workspace/node_modules (tools/*.ts live under workspace/).
 cd /home/user/workspace
-bun /home/user/tools-mcp/src/cli.ts serve --dir /home/user/workspace/tools --http 127.0.0.1:$BRIDGE_PORT \
+bun /home/user/tools-mcp/src/cli.ts serve --dir /home/user/workspace/tools --workspace /home/user/workspace --http 127.0.0.1:$BRIDGE_PORT \
   >/tmp/tools-mcp.log 2>&1 </dev/null &
 BPID=\$!
 for i in \$(seq 1 100); do

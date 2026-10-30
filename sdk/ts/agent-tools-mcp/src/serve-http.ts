@@ -1,7 +1,40 @@
 import { randomUUID } from "node:crypto";
 
 import type { LoadedTool } from "./load.js";
-import { handleRpc, type RpcContextBase, serializeRpc } from "./rpc.js";
+import {
+  handleRpc,
+  RpcCalls,
+  type RpcContextBase,
+  serializeRpc,
+} from "./rpc.js";
+
+export type SessionDecision =
+  | { ok: true; session: string | null }
+  | { ok: false; status: number; message: string };
+
+/**
+ * Streamable HTTP session rule. `initialize` mints an id when the client did
+ * not send one. Every later POST must carry an id this process issued.
+ */
+export function sessionGate(
+  sessions: Set<string>,
+  input: { isInit: boolean; session: string | null },
+): SessionDecision {
+  let session = input.session;
+  if (input.isInit && !session) {
+    session = randomUUID();
+    sessions.add(session);
+    return { ok: true, session };
+  }
+  if (!input.isInit && !session) {
+    return { ok: false, status: 400, message: "missing Mcp-Session-Id" };
+  }
+  if (session && !sessions.has(session) && !input.isInit) {
+    return { ok: false, status: 404, message: "session not found" };
+  }
+  if (session) sessions.add(session);
+  return { ok: true, session };
+}
 
 export type ServeHttpOptions = {
   tools: LoadedTool[];
@@ -35,6 +68,7 @@ export async function serveHttp(
   const host = opts.host ?? "127.0.0.1";
   const port = opts.port ?? 0;
   const sessions = new Set<string>();
+  const calls = new RpcCalls();
 
   const server = Bun.serve({
     hostname: host,
@@ -85,16 +119,15 @@ export async function serveHttp(
         && typeof body === "object"
         && (body as JsonRpc).method === "initialize";
 
-      let session = incomingSession;
-      if (isInit && !session) {
-        session = randomUUID();
-        sessions.add(session);
-      } else if (session && !sessions.has(session) && !isInit) {
-        // Unknown session → 404 so rmcp re-initializes (SessionExpired).
-        return new Response("session not found", { status: 404 });
-      } else if (session) {
-        sessions.add(session);
+      const decision = sessionGate(sessions, {
+        isInit,
+        session: incomingSession,
+      });
+      if (!decision.ok) {
+        return new Response(decision.message, { status: decision.status });
       }
+      const session = decision.session;
+      const dispatch = { calls, parentSignal: req.signal };
 
       const headers: Record<string, string> = {
         "content-type": "application/json",
@@ -104,13 +137,18 @@ export async function serveHttp(
       if (Array.isArray(body)) {
         const out = [];
         for (const item of body) {
-          const r = await handleRpc(item as never, opts.tools, opts.base);
+          const r = await handleRpc(
+            item as never,
+            opts.tools,
+            opts.base,
+            dispatch,
+          );
           if (r) out.push(r);
         }
         return new Response(serializeRpc(out), { status: 200, headers });
       }
 
-      const r = await handleRpc(body as never, opts.tools, opts.base);
+      const r = await handleRpc(body as never, opts.tools, opts.base, dispatch);
       if (r == null) {
         if (session) {
           return new Response(null, {

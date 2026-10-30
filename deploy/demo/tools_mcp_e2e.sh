@@ -2,15 +2,14 @@
 # End-to-end proof: Eve-shaped tools/*.ts → tools-mcp → E2B → MCP tools/call.
 #
 # Composes:
-#   - sdk/ts/agent-tools-mcp (defineTool, serve, compile AOT→JIT fallback)
+#   - sdk/ts/agent-tools-mcp (defineTool, serve, bun build --compile)
 #   - E2B REST + envd (same style as deploy/demo/mcp-outside-agent/run.sh)
 #   - deploy/demo/agents/tools
 #
-# Host: prove AOT compile (or --jit fallback) + manifest + local call.
+# Host: prove the compiled binary + manifest + local call.
 # E2B: install Bun in guest, run tools-mcp from uploaded sources, MCP round-trip.
 #
 #     ./deploy/demo/tools_mcp_e2e.sh
-#     ./deploy/demo/tools_mcp_e2e.sh --jit
 #     ./deploy/demo/tools_mcp_e2e.sh --local
 set -euo pipefail
 
@@ -29,11 +28,9 @@ if [ -f "$ROOT/.env" ]; then
 fi
 
 MODE=e2b
-FORCE_JIT=0
 for arg in "$@"; do
   case "$arg" in
     --local) MODE=local ;;
-    --jit) FORCE_JIT=1 ;;
     -h|--help) sed -n '2,16p' "$0" | tr -d '#'; exit 0 ;;
     *) echo "unknown arg: $arg" >&2; exit 2 ;;
   esac
@@ -80,16 +77,10 @@ vm_bash() { # script
 
 # --- 1) Host compile ------------------------------------------------------------------------------
 say "compile host tools-mcp"
-rm -f "$PKG/bin/tools-mcp" "$PKG/bin/tools-mcp.mode"
-if [ "$FORCE_JIT" = 1 ]; then
-  FORCE_NO_AOT=1 OUT="$PKG/bin/tools-mcp" bash "$PKG/scripts/compile.sh"
-  [ "$(cat "$PKG/bin/tools-mcp.mode")" = jit ] || fail "expected jit"
-else
-  OUT="$PKG/bin/tools-mcp" bash "$PKG/scripts/compile.sh"
-fi
+rm -f "$PKG/bin/tools-mcp"
+OUT="$PKG/bin/tools-mcp" bash "$PKG/scripts/compile.sh"
 HOST_BIN=$PKG/bin/tools-mcp
-COMPILE_MODE=$(cat "$PKG/bin/tools-mcp.mode")
-pass "host binary mode=$COMPILE_MODE size=$(ls -lh "$HOST_BIN" | awk '{print $5}')"
+pass "host binary size=$(ls -lh "$HOST_BIN" | awk '{print $5}')"
 
 # --- 2) Manifest + local call (real eve/tools + Zod, not a plain-object fake) --------------------
 say "manifest + local call"
@@ -102,7 +93,7 @@ ZOD_DIR=$(cd "$PKG" && node -e "console.log(require('path').dirname(require.reso
 # Walk up from the package entry to its package root (exports often hide package.json).
 SPEC_DIR=$(cd "$PKG" && node -e "let p=require.resolve('@standard-schema/spec');const fs=require('fs');const path=require('path');for(;;){if(fs.existsSync(path.join(p,'package.json'))){console.log(p);break}const n=path.dirname(p);if(n===p)process.exit(1);p=n}")
 mkdir -p "$STAGE/node_modules/@beyond.dev" "$STAGE/node_modules/@standard-schema"
-ln -sfn "$PKG" "$STAGE/node_modules/@beyond.dev/agent-tools-mcp"
+ln -sfn "$PKG" "$STAGE/node_modules/@beyond.dev/tools"
 ln -sfn "$PKG/eve-shim" "$STAGE/node_modules/eve"
 ln -sfn "$ZOD_DIR" "$STAGE/node_modules/zod"
 ln -sfn "$SPEC_DIR" "$STAGE/node_modules/@standard-schema/spec"
@@ -147,11 +138,11 @@ bun --version
 mkdir -p /home/user/tools-mcp/src /home/user/workspace/tools
 ' >/dev/null || fail "install bun"
 
-for f in cli.ts context.ts define-tool.ts load.ts manifest.ts rpc.ts run-tool.ts sandbox-handle.ts schema.ts serve-http.ts serve-stdio.ts eve-tools.ts index.ts bun-shim.d.ts; do
+for f in cli.ts context.ts define-tool.ts load.ts manifest.ts rpc.ts run-tool.ts sandbox-handle.ts schema.ts serve-http.ts serve-stdio.ts workspace.ts eve-tools.ts index.ts bun-shim.d.ts; do
   vm_put "/home/user/tools-mcp/src/$f" "$PKG/src/$f"
 done
 jq -n '{
-  name: "@beyond.dev/agent-tools-mcp",
+  name: "@beyond.dev/tools",
   version: "0.1.0-dev",
   type: "module",
   dependencies: {
@@ -184,7 +175,7 @@ START_OUT=$(vm_bash "
 set -e
 export PATH=\"\$HOME/.bun/bin:\$PATH\"
 cd /home/user/workspace
-setsid nohup bun /home/user/tools-mcp/src/cli.ts serve --dir /home/user/workspace/tools --http 0.0.0.0:$BRIDGE_PORT \
+setsid nohup bun /home/user/tools-mcp/src/cli.ts serve --dir /home/user/workspace/tools --workspace /home/user/workspace --http 0.0.0.0:$BRIDGE_PORT \
   >/tmp/tools-mcp.log 2>&1 </dev/null &
 for i in \$(seq 1 200); do
   curl -sf -m 2 localhost:$BRIDGE_PORT/healthz && echo READY && exit 0
@@ -223,5 +214,5 @@ echo "$CALL" | jq -e '.result.structuredContent.city=="SF" and .result.structure
   || fail "call: $CALL"
 pass "tools/call on E2B"
 
-say "all good (host_compile=$COMPILE_MODE)"
+say "all good"
 echo "OK"

@@ -1165,11 +1165,11 @@ impl Subagent {
         // Read through the gate *now*, not when the ctx was built: `set_mcp_enabled` is a live
         // session command, and a child must see the kit its parent has at this moment. Its skill
         // tools are bound in its own name, so a load it makes asks the user as this child.
-        let mcp_tools = crate::tools::mcp::filter_by_enabled_as(
+        let mcp_tools = crate::tools::mcp::for_subagent(crate::tools::mcp::filter_by_enabled_as(
             &self.ctx.mcp_tools.snapshot(),
             &self.ctx.mcp_enabled,
             origin,
-        );
+        ));
         let mut registry = super::default_registry_with_config(&super::ToolConfig {
             bash_waits_for_exit: false,
             bash_shell_path: self.ctx.tool_cfg.bash_shell_path.as_deref(),

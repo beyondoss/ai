@@ -125,6 +125,7 @@ async fn a_stale_manifest_is_rewritten_once_the_server_starts() {
         remote_name: "ghost".into(),
         description: "Not on the server.".into(),
         input_schema: json!({ "type": "object", "properties": {} }),
+        available_in_subagents: None,
         ui: None,
     });
     mcp_manifest::store(

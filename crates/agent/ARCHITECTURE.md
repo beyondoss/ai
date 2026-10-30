@@ -6234,12 +6234,24 @@ fetch it, `bundle.sha256` what it must hash to). `bundle.rs` does the rest:
   `tests/serve_service_bundle_mcp_tools.rs`.
 - **Agent tools as sandbox MCP.** A folder of Eve-shaped `tools/*.ts` modules (`defineTool` + Zod,
   `import { defineTool } from "eve/tools"`) can run as an MCP server inside the sandbox via
-  `@beyond.dev/agent-tools-mcp` (`tools-mcp` binary). The grant names a `sandbox: true` connector whose
+  `@beyond.dev/tools` (`tools-mcp` binary). The grant names a `sandbox: true` connector whose
   URL is the exec front with `tools=<https URL of the linux binary>`; the front seeds the bundle, starts
   the binary against the seeded `tools/` directory, and bridges MCP. A `.mcp-tools.json` stamped at
-  bundle build (CLI `manifest`) cold-opens the menu without a VM; the first tool call creates the
-  sandbox and dials live. Demo: `deploy/demo/demo.sh tools`, `deploy/demo/tools_agent_e2e.sh`,
-  `tests/agent_tools_mcp.rs` / `tests/agent_tools_e2b.rs`.
+  bundle build (CLI `manifest`, written via temp file and `rename`) cold-opens the menu without a VM;
+  the first tool call creates the sandbox and dials live. `--dir` is only the tool modules.
+  `ctx.workspaceRoot` and `getSandbox()` are the process cwd (the seeded bundle) or `--workspace`.
+  The optional `CachedTool` field `available_in_subagents` rides along so a cold-opened saved menu
+  carries the flag; a missing key means none. `endsTurn: true` is part of the saved description.
+  A successful call on a sandbox connector (`McpConnection::sandbox_connector`, the grant's
+  `sandbox: true`) may set `_meta["beyond.dev/endsTurn"]`, which ends that run; the same key on
+  any other MCP server does not. The gate is the connector, not whether a `.mcp-tools.json` was
+  saved, so a cold-opened menu, a live dial and an MCP Apps session behave the same.
+  `availableInSubagents: false` on a sandbox connector's tool
+  (`_meta["beyond.dev/availableInSubagents"]`) drops it from subagent registries.
+  `notifications/cancelled` aborts that call. HTTP `tools/call` requires the `Mcp-Session-Id`
+  from `initialize`. Demo:
+  `deploy/demo/demo.sh tools`, `deploy/demo/tools_agent_e2e.sh`, `tests/agent_tools_mcp.rs` /
+  `tests/agent_tools_e2b.rs`.
 - **Skill scripts.** When a sandbox does exist, how the bundle's files reach it (so a skill's script
   can run there) is the control plane's job; the replica never copies the bundle into a sandbox. The
   demo's `mint-grant --bundle url=sha256` carries the claim.

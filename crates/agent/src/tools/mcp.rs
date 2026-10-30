@@ -821,16 +821,40 @@ impl Relist {
     }
 }
 
+/// `_meta` on a successful `tools/call`. `@beyond.dev/tools` sets this when `endsTurn`
+/// is true or its function returns true. A failed call does not. Honored only for a
+/// sandbox connector ([`McpConnection::sandbox_connector`]); any other MCP server's
+/// result is just a result.
+const ENDS_TURN_META: &str = "beyond.dev/endsTurn";
+
+/// `tools/list` `_meta` key. `false` hides the tool from subagents. Only honored for a
+/// sandbox connector, and only `false` is stored, so a manifest that omits the field
+/// matches a live list that omitted the key.
+const AVAILABLE_IN_SUBAGENTS_META: &str = "beyond.dev/availableInSubagents";
+
 /// A `tools/list` entry as the manifest records it — and as a re-listing is compared.
 fn cached_tool(t: &rmcp::model::Tool) -> crate::tools::mcp_manifest::CachedTool {
     crate::tools::mcp_manifest::CachedTool {
         remote_name: t.name.to_string(),
         description: t.description.as_deref().unwrap_or_default().to_string(),
         input_schema: t.schema_as_json_value(),
+        available_in_subagents: available_in_subagents_flag(t),
         // Both flavors: a server may send `_meta.ui` whether or not it was negotiated (the official
         // SDK's `registerAppTool` always does), and an app-only tool must stay hidden from the model
         // either way.
         ui: crate::tools::mcp_apps::ToolUi::from_meta(t.meta.as_deref()),
+    }
+}
+
+fn available_in_subagents_flag(t: &rmcp::model::Tool) -> Option<bool> {
+    match t
+        .meta
+        .as_deref()
+        .and_then(|meta| meta.get(AVAILABLE_IN_SUBAGENTS_META))
+        .and_then(serde_json::Value::as_bool)
+    {
+        Some(false) => Some(false),
+        _ => None,
     }
 }
 
@@ -854,14 +878,27 @@ fn mcp_tool(
     } else {
         t.description
     };
+    // Eve's `endsTurn` / `availableInSubagents` ride `_meta` on `@beyond.dev/tools`, which
+    // runs in the sandbox. A sandbox connector is that server. Every other one is plain MCP.
+    let sandbox_connector = conn.sandbox_connector();
     Some(Arc::new(McpTool {
         name,
         description,
         input_schema: t.input_schema,
+        sandbox_connector,
+        subagent_visible: !(sandbox_connector && t.available_in_subagents == Some(false)),
         remote_name: t.remote_name,
         server_name: server.clone(),
         conn: conn.clone(),
     }))
+}
+
+/// Drop tools that opted out of subagents. Every other tool stays.
+pub fn for_subagent(tools: Vec<Arc<dyn Tool>>) -> Vec<Arc<dyn Tool>> {
+    tools
+        .into_iter()
+        .filter(|tool| tool.available_in_subagents())
+        .collect()
 }
 
 /// Session-scoped gate over which configured MCP servers' tools are advertised to the model.
@@ -1115,13 +1152,17 @@ pub fn server_names_from_tools(tools: &[Arc<dyn Tool>]) -> Vec<String> {
     names
 }
 
-/// One MCP-discovered tool. Holds no local behavior at all — `run` forwards straight to the remote
-/// server's `tools/call`; every byte of actual behavior lives on the other end of `client`.
+/// One MCP-discovered tool. `run` forwards to the remote server's `tools/call`.
 struct McpTool {
     /// Registered/advertised name: `mcp__<server>__<tool>` (see [`registered_name`]).
     name: String,
     description: String,
     input_schema: Value,
+    /// This tool's server is a sandbox connector. Only then does `beyond.dev/endsTurn`
+    /// end the run, and `availableInSubagents: false` hide the tool.
+    sandbox_connector: bool,
+    /// `false` when a sandbox connector's tool set `availableInSubagents: false`.
+    subagent_visible: bool,
     /// The bare tool name as the *server* knows it (unprefixed) — what actually goes out over
     /// `tools/call`.
     remote_name: String,
@@ -1323,6 +1364,12 @@ fn register_for_reaping(conn: &Arc<McpConnection>, idle: Duration) {
 }
 
 impl McpConnection {
+    /// Whether this is a sandbox connector ([`crate::grant::McpConnector::sandbox`]): the
+    /// server runs in the sandbox, so it is the bundle's own tools server, not a third party.
+    pub(crate) fn sandbox_connector(&self) -> bool {
+        self.dial.http.as_ref().is_some_and(|h| h.sandbox)
+    }
+
     fn new(
         config: McpServerConfig,
         dial: Dial,
@@ -1448,7 +1495,7 @@ impl McpConnection {
     /// browser page) inside a VM that sleeps for free, so its session lives as long as the agent's.
     async fn reap_if_idle(&self) -> bool {
         let after = self.idle_after;
-        if after.is_zero() || self.dial.http.as_ref().is_some_and(|h| h.sandbox) {
+        if after.is_zero() || self.sandbox_connector() {
             return false;
         }
         let idle =
@@ -1493,6 +1540,10 @@ impl Tool for McpTool {
 
     fn input_schema(&self) -> Value {
         self.input_schema.clone()
+    }
+
+    fn available_in_subagents(&self) -> bool {
+        self.subagent_visible
     }
 
     async fn run(&self, input: Value) -> Result<ToolOutput, ToolError> {
@@ -1545,7 +1596,12 @@ impl McpTool {
         // A call that made its server change its tools (an `enable_toolset`) is answered once the
         // re-listing it set off has landed, so the model's next request already offers them.
         self.conn.dial.relist.settled().await;
-        tool_output_from_result(&self.server_name, &self.remote_name, result?)
+        tool_output_from_result(
+            &self.server_name,
+            &self.remote_name,
+            result?,
+            self.sandbox_connector,
+        )
     }
 }
 
@@ -1610,6 +1666,10 @@ pub(crate) struct McpServerHandle {
 impl McpServerHandle {
     pub(crate) fn name(&self) -> &str {
         &self.name
+    }
+
+    pub(crate) fn sandbox_connector(&self) -> bool {
+        self.conn.sandbox_connector()
     }
 
     pub(crate) async fn call_tool(
@@ -2444,9 +2504,8 @@ impl McpCatalog {
             ResumeError::Unreachable(format!("mcp server `{server}` is not reachable: {e}"))
         })?;
         match await_task(&conn, client, host, record, seed, progress).await {
-            Ok(result) => {
-                tool_output_from_result(&server, &tool, result).map_err(ResumeError::Final)
-            }
+            Ok(result) => tool_output_from_result(&server, &tool, result, conn.sandbox_connector())
+                .map_err(ResumeError::Final),
             Err(TaskFailure::ConnectionLost(why)) => Err(ResumeError::Unreachable(why)),
             Err(TaskFailure::Final(e)) => Err(ResumeError::Final(e)),
         }
@@ -2557,6 +2616,7 @@ pub(crate) fn tool_output_from_result(
     server_name: &str,
     remote_name: &str,
     result: CallToolResult,
+    sandbox_connector: bool,
 ) -> Result<ToolOutput, ToolError> {
     let mut text = String::new();
     let mut images = Vec::new();
@@ -2593,10 +2653,19 @@ pub(crate) fn tool_output_from_result(
             text
         }));
     }
+    // `terminate` ends the run. That is Eve's `endsTurn` for the sandbox's own tools,
+    // and nothing else: a GitHub or Playwright result must not stop the agent because
+    // it happened to set a `_meta` key.
+    let terminate = sandbox_connector
+        && result.meta.as_ref().is_some_and(|meta| {
+            meta.get(ENDS_TURN_META)
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+        });
     Ok(ToolOutput {
         text,
         images,
-        terminate: false,
+        terminate,
     })
 }
 
@@ -4484,7 +4553,9 @@ mod tests {
         use rmcp::model::{AudioContent, EmbeddedResource};
         let run = |block| {
             let result = CallToolResult::success(vec![block]);
-            tool_output_from_result("s", "t", result).unwrap().text
+            tool_output_from_result("s", "t", result, false)
+                .unwrap()
+                .text
         };
 
         let audio = run(ContentBlock::Audio(AudioContent::new(
@@ -4632,5 +4703,91 @@ mod tests {
         assert!(!gate.allows("a"));
         gate.set(None);
         assert!(gate.allows("a"));
+    }
+
+    #[test]
+    fn a_sandbox_connector_ends_the_run_only_when_it_says_so() {
+        use rmcp::model::{CallToolResult, ContentBlock, MetaObject};
+        let ended = || {
+            let mut ended = CallToolResult::success(vec![ContentBlock::text("ok")]);
+            let mut meta = MetaObject::new();
+            meta.insert(ENDS_TURN_META.to_string(), serde_json::Value::Bool(true));
+            ended.meta = Some(meta);
+            ended
+        };
+        let plain = CallToolResult::success(vec![ContentBlock::text("ok")]);
+        assert!(
+            !tool_output_from_result("s", "t", plain, true)
+                .unwrap()
+                .terminate
+        );
+        assert!(
+            !tool_output_from_result("s", "t", ended(), false)
+                .unwrap()
+                .terminate,
+            "a normal MCP server does not end the run"
+        );
+        assert!(
+            tool_output_from_result("s", "t", ended(), true)
+                .unwrap()
+                .terminate
+        );
+
+        let err = CallToolResult::error(vec![ContentBlock::text("no")]);
+        assert!(tool_output_from_result("s", "t", err, true).is_err());
+    }
+
+    struct SubagentShown;
+    struct SubagentHidden;
+
+    #[async_trait::async_trait]
+    impl agent_core::Tool for SubagentShown {
+        fn name(&self) -> &str {
+            "shown"
+        }
+        fn description(&self) -> &str {
+            ""
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        async fn run(
+            &self,
+            _: serde_json::Value,
+        ) -> Result<agent_core::ToolOutput, agent_core::ToolError> {
+            Ok(agent_core::ToolOutput::text(""))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl agent_core::Tool for SubagentHidden {
+        fn name(&self) -> &str {
+            "hidden"
+        }
+        fn description(&self) -> &str {
+            ""
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        async fn run(
+            &self,
+            _: serde_json::Value,
+        ) -> Result<agent_core::ToolOutput, agent_core::ToolError> {
+            Ok(agent_core::ToolOutput::text(""))
+        }
+        fn available_in_subagents(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn for_subagent_drops_tools_that_opt_out() {
+        let kept = for_subagent(vec![
+            std::sync::Arc::new(SubagentShown),
+            std::sync::Arc::new(SubagentHidden),
+        ]);
+        let names: Vec<_> = kept.iter().map(|tool| tool.name().to_string()).collect();
+        assert_eq!(names, ["shown"]);
     }
 }

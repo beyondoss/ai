@@ -320,7 +320,7 @@ $(browser_bridge_script)
 curl -sf -m 2 localhost:$BRIDGE_PORT/healthz" | grep -q ok
 }
 
-# Start @beyond.dev/agent-tools-mcp (AOT linux binary) after the bundle is seeded.
+# Start @beyond.dev/tools (compiled linux binary) after the bundle is seeded.
 # $3 is an https URL of the binary (presigned), or a local path already on the VM.
 vm_tools_start() { # id token tools-mcp-binary-or-url
   local id=$1 tok=$2 src=$3
@@ -343,11 +343,11 @@ TOOLS=\$VM_HOME/workspace/tools
 test -d \"\$TOOLS\" || { echo \"tools dir missing: \$TOOLS\" >&2; exit 1; }
 curl -sf -m 2 localhost:\$BRIDGE_PORT/healthz >/dev/null || (
   cd \$VM_HOME/workspace
-  setsid nohup \"\$BIN\" serve --dir \"\$TOOLS\" --http 0.0.0.0:\$BRIDGE_PORT \
+  setsid nohup \"\$BIN\" serve --dir \"\$TOOLS\" --workspace \"\$VM_HOME/workspace\" --http 0.0.0.0:\$BRIDGE_PORT \
     >/tmp/tools-mcp.log 2>&1 </dev/null &
 )
 for i in \$(seq 1 150); do
-  curl -sf -m 2 localhost:\$BRIDGE_PORT/healthz >/dev/null && exit 0
+  curl -sf -m 2 localhost:\$BRIDGE_PORT/healthz >/dev/null && { echo started; exit 0; }
   sleep 0.1
 done
 echo \"tools-mcp failed to listen; log:\" >&2

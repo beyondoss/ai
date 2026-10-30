@@ -9,7 +9,7 @@ import { z } from "zod";
 
 import { createToolContext } from "../src/context.js";
 import { defineTool } from "../src/define-tool.js";
-import { handleRpc } from "../src/rpc.js";
+import { handleRpc, RpcCalls } from "../src/rpc.js";
 import { runTool } from "../src/run-tool.js";
 
 describe("Eve ctx parity", () => {
@@ -121,6 +121,53 @@ describe("Eve ctx parity", () => {
     });
     expect(await readFile(path.join(dir, "ok.txt"), "utf8")).toBe("1");
   });
+
+  it(
+    "notifications/cancelled aborts the tool and its child process",
+    async () => {
+      const calls = new RpcCalls();
+      const dir = await mkdtemp(path.join(tmpdir(), "eve-cancel-"));
+      let seen: AbortSignal | undefined;
+      const tool = defineTool({
+        description: "sleep",
+        inputSchema: z.object({}),
+        async execute(_input, ctx) {
+          seen = ctx.abortSignal;
+          const sandbox = await ctx.getSandbox();
+          return sandbox.run({ command: "sleep 30" });
+        },
+      });
+      const pending = handleRpc(
+        {
+          jsonrpc: "2.0",
+          id: 7,
+          method: "tools/call",
+          params: { name: "sleep", arguments: {} },
+        },
+        [{ name: "sleep", def: tool, sourcePath: "sleep.ts" }],
+        { workspaceRoot: dir },
+        { calls },
+      );
+      for (let i = 0; i < 50 && !seen; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(seen).toBeInstanceOf(AbortSignal);
+      await handleRpc(
+        {
+          jsonrpc: "2.0",
+          method: "notifications/cancelled",
+          params: { requestId: 7 },
+        },
+        [],
+        { workspaceRoot: dir },
+        { calls },
+      );
+      const result = await pending;
+      expect(seen?.aborted).toBe(true);
+      expect(result?.result).toMatchObject({ isError: true });
+    },
+    8_000,
+  );
 
   it("run nonzero exit does not throw (Eve: check exitCode yourself)", async () => {
     const dir = await mkdtemp(path.join(tmpdir(), "eve-exit-"));

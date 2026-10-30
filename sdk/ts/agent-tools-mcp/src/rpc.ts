@@ -1,6 +1,6 @@
 import { createToolContext, type CreateToolContextInput } from "./context.js";
 import type { LoadedTool } from "./load.js";
-import { runTool } from "./run-tool.js";
+import { executeTool, type RunnableTool } from "./run-tool.js";
 import { ToolInputValidationError } from "./schema.js";
 
 type JsonRpcRequest = {
@@ -38,23 +38,31 @@ export function serializeRpc(
   return serializeOne(message as JsonRpcResponse);
 }
 
+/** MCP `structuredContent` is a JSON object. Arrays and scalars stay in the text block. */
+function structuredObject(
+  value: unknown,
+): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
 function rememberToolWire(
   response: JsonRpcResponse,
   text: string,
   value: unknown,
+  endsTurn: boolean,
 ): void {
   const idJson = JSON.stringify(response.id);
   const encodedText = JSON.stringify(text);
-  // `undefined` is omitted, matching JSON.stringify. A string is escaped once
-  // and reused for both fields. Any other value's canonical JSON is `text`.
-  let structured = "";
-  if (value !== undefined) {
-    const json = typeof value === "string" ? encodedText : text;
-    structured = `,"structuredContent":${json}`;
+  // `text` is the one walk of `value`. Splice it in so writing the envelope
+  // does not call `toJSON` again. Field order matches the result object.
+  let extra = "";
+  if (structuredObject(value)) extra += `,"structuredContent":${text}`;
+  if (endsTurn) {
+    extra += `,"_meta":${JSON.stringify({ [ENDS_TURN_META_KEY]: true })}`;
   }
   wireByResponse.set(
     response,
-    `{"jsonrpc":"2.0","id":${idJson},"result":{"content":[{"type":"text","text":${encodedText}}]${structured}}}`,
+    `{"jsonrpc":"2.0","id":${idJson},"result":{"content":[{"type":"text","text":${encodedText}}]${extra}}}`,
   );
 }
 
@@ -65,21 +73,101 @@ export type RpcContextBase = Omit<
 >;
 
 /**
+ * `_meta` key on a successful `tools/call`. The agent sets `ToolOutput.terminate`
+ * when this is true. A failed call never sets it.
+ */
+export const ENDS_TURN_META_KEY = "beyond.dev/endsTurn";
+
+/**
+ * `tools/list` `_meta` key. `false` means subagents do not inherit the tool.
+ * Omitted means they do.
+ */
+export const AVAILABLE_IN_SUBAGENTS_META_KEY =
+  "beyond.dev/availableInSubagents";
+
+type InFlight = {
+  controller: AbortController;
+  onParent?: () => void;
+  parent?: AbortSignal;
+};
+
+/**
+ * In-flight `tools/call`s for one server. `notifications/cancelled` aborts the
+ * matching JSON-RPC id; an HTTP request abort aborts the call it started.
+ */
+export class RpcCalls {
+  private inflight = new Map<string, InFlight>();
+  private cancelled = new Set<string>();
+
+  begin(id: string, parent?: AbortSignal): AbortSignal {
+    const controller = new AbortController();
+    const onParent = () => controller.abort();
+    if (parent) {
+      if (parent.aborted) controller.abort();
+      else parent.addEventListener("abort", onParent, { once: true });
+    }
+    if (this.cancelled.delete(id)) controller.abort();
+    if (!controller.signal.aborted) {
+      const entry: InFlight = { controller };
+      if (parent) {
+        entry.onParent = onParent;
+        entry.parent = parent;
+      }
+      this.inflight.set(id, entry);
+    } else if (parent) {
+      parent.removeEventListener("abort", onParent);
+    }
+    return controller.signal;
+  }
+
+  end(id: string): void {
+    const entry = this.inflight.get(id);
+    if (entry?.parent && entry.onParent) {
+      entry.parent.removeEventListener("abort", entry.onParent);
+    }
+    this.inflight.delete(id);
+    this.cancelled.delete(id);
+  }
+
+  cancel(id: string): void {
+    const entry = this.inflight.get(id);
+    if (entry) {
+      entry.controller.abort();
+      return;
+    }
+    if (this.cancelled.size > 64) this.cancelled.clear();
+    this.cancelled.add(id);
+  }
+}
+
+export type RpcDispatch = {
+  calls?: RpcCalls;
+  parentSignal?: AbortSignal;
+};
+
+/**
  * Minimal MCP surface: initialize, tools/list, tools/call.
- * Enough for beyond-agent + `.mcp-tools.json` stamp; keep the surface small for AOT+trim.
+ * Enough for beyond-agent + `.mcp-tools.json` stamp; keep the surface small for the compiled binary.
  */
 export async function handleRpc(
   body: JsonRpcRequest,
   tools: LoadedTool[],
   base: RpcContextBase,
+  dispatch?: RpcDispatch,
 ): Promise<JsonRpcResponse | null> {
   const id = body.id ?? null;
   const method = body.method;
+  const calls = dispatch?.calls ?? new RpcCalls();
 
-  if (
-    method === "notifications/initialized"
-    || method === "notifications/cancelled"
-  ) {
+  if (method === "notifications/cancelled") {
+    const requestId = body.params?.requestId;
+    if (typeof requestId === "string" || typeof requestId === "number") {
+      calls.cancel(String(requestId));
+    }
+    return null;
+  }
+
+  if (method === "notifications/initialized") {
     return null;
   }
 
@@ -101,15 +189,24 @@ export async function handleRpc(
       jsonrpc: "2.0",
       id,
       result: {
-        tools: listed.map((t) => ({
-          name: t.name,
-          description: modelFacingDescription(
-            t.def.description,
-            t.def.endsTurn,
-          ),
-          inputSchema: t.def.jsonInputSchema,
-          ...(t.def.annotations ? { annotations: t.def.annotations } : {}),
-        })),
+        tools: listed.map((t) => {
+          const tool: Record<string, unknown> = {
+            name: t.name,
+            description: modelFacingDescription(
+              t.def.description,
+              t.def.endsTurn,
+            ),
+            inputSchema: t.def.jsonInputSchema,
+          };
+          if (t.def.jsonOutputSchema) {
+            tool.outputSchema = t.def.jsonOutputSchema;
+          }
+          if (t.def.annotations) tool.annotations = t.def.annotations;
+          if (t.def.availableInSubagents === false) {
+            tool._meta = { [AVAILABLE_IN_SUBAGENTS_META_KEY]: false };
+          }
+          return tool;
+        }),
       },
     };
   }
@@ -132,29 +229,32 @@ export async function handleRpc(
       };
     }
     const args = body.params?.arguments ?? {};
+    const callKey = id === null || id === undefined ? undefined : String(id);
+    const abortSignal = callKey
+      ? calls.begin(callKey, dispatch?.parentSignal)
+      : dispatch?.parentSignal ?? new AbortController().signal;
     const ctx = createToolContext({
       ...base,
       toolName: tool.name,
-      callId: id === null || id === undefined
-        ? crypto.randomUUID()
-        : String(id),
+      callId: callKey ?? crypto.randomUUID(),
+      abortSignal,
     });
     try {
-      const result = await runTool(tool.def, args, ctx);
-      // One walk of the value. `serializeRpc` reuses it for `structuredContent`
-      // instead of walking the object again when the envelope is written.
-      const text: unknown = typeof result === "string"
-        ? result
-        : JSON.stringify(result ?? null);
-      const response: JsonRpcResponse = {
-        jsonrpc: "2.0",
-        id,
-        result: {
-          content: [{ type: "text", text: text as string }],
-          structuredContent: result,
-        },
+      const run = await executeTool(tool.def, args, ctx);
+      // One walk of the value. `serializeRpc` reuses it instead of walking
+      // `structuredContent` again when the envelope is written.
+      const text: unknown = typeof run.value === "string"
+        ? run.value
+        : JSON.stringify(run.value ?? null);
+      const result: Record<string, unknown> = {
+        content: [{ type: "text", text: text as string }],
       };
-      if (typeof text === "string") rememberToolWire(response, text, result);
+      if (structuredObject(run.value)) result.structuredContent = run.value;
+      if (run.endsTurn) result._meta = { [ENDS_TURN_META_KEY]: true };
+      const response: JsonRpcResponse = { jsonrpc: "2.0", id, result };
+      if (typeof text === "string") {
+        rememberToolWire(response, text, run.value, run.endsTurn);
+      }
       return response;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -170,6 +270,8 @@ export async function handleRpc(
           ...(data ? { _meta: data } : {}),
         },
       };
+    } finally {
+      if (callKey) calls.end(callKey);
     }
   }
 
@@ -187,12 +289,10 @@ export async function handleRpc(
 const ENDS_TURN_SENTENCE =
   "Calling this tool ends your turn once it succeeds: do not write a reply or call other tools in the same step. If it fails, you will see the error and can continue.";
 
-function modelFacingDescription(
+/** Description the model sees. Boolean `endsTurn` only; a function is decided after execute. */
+export function modelFacingDescription(
   description: string,
-  endsTurn:
-    | boolean
-    | ((output: never) => boolean | Promise<boolean>)
-    | undefined,
+  endsTurn: RunnableTool["endsTurn"],
 ): string {
   if (endsTurn === true) {
     return `${description}\n\n${ENDS_TURN_SENTENCE}`;

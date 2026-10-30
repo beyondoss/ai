@@ -71,6 +71,10 @@ pub struct CachedTool {
     pub remote_name: String,
     pub description: String,
     pub input_schema: serde_json::Value,
+    /// `Some(false)` hides a sandbox connector's tool from subagents. `None` means they
+    /// inherit it. Ignored for every other MCP server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_in_subagents: Option<bool>,
     /// The tool's MCP Apps `_meta.ui` (view resource, visibility). Recorded only in the apps
     /// manifest ([`ManifestDir::for_apps`]); absent from every plain one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -449,6 +453,7 @@ mod tests {
             remote_name: name.into(),
             description: String::new(),
             input_schema: serde_json::json!({ "type": "object" }),
+            available_in_subagents: None,
             ui: None,
         };
         let prompt = CachedPrompt {
@@ -695,5 +700,15 @@ mod tests {
             },
         };
         assert_ne!(invocation_key(&s), invocation_key(&h));
+    }
+
+    #[test]
+    fn a_saved_tool_without_the_optional_fields_still_parses() {
+        let tool: CachedTool = serde_json::from_str(
+            r#"{"remote_name":"get_weather","description":"d","input_schema":{"type":"object"}}"#,
+        )
+        .unwrap();
+        assert!(tool.available_in_subagents.is_none());
+        assert!(tool.ui.is_none());
     }
 }

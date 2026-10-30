@@ -69,6 +69,7 @@ export async function loadTools(dir: string): Promise<LoadedTool[]> {
     .sort();
 
   const out: LoadedTool[] = [];
+  const seen = new Set<string>();
   for (const file of files) {
     const sourcePath = path.join(root, file);
     const mod = (await import(pathToFileURL(sourcePath).href)) as {
@@ -79,6 +80,12 @@ export async function loadTools(dir: string): Promise<LoadedTool[]> {
     if (!name) {
       throw new Error(`${sourcePath}: empty tool name`);
     }
+    if (seen.has(name)) {
+      throw new Error(
+        `${sourcePath}: duplicate tool name "${name}" (another file in this directory has the same stem)`,
+      );
+    }
+    seen.add(name);
     out.push({ name, def, sourcePath });
   }
   return out;
