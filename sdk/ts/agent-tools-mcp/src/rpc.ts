@@ -10,12 +10,53 @@ type JsonRpcRequest = {
   params?: Record<string, unknown>;
 };
 
-type JsonRpcResponse = {
+export type JsonRpcResponse = {
   jsonrpc: "2.0";
   id: string | number | null;
   result?: unknown;
   error?: { code: number; message: string; data?: unknown };
 };
+
+/**
+ * Wire bytes for a response whose tool value was already stringified once.
+ * `JSON.stringify` of the envelope would walk `structuredContent` again.
+ */
+const wireByResponse = new WeakMap<JsonRpcResponse, string>();
+
+function serializeOne(message: JsonRpcResponse): string {
+  return wireByResponse.get(message) ?? JSON.stringify(message);
+}
+
+/** JSON-RPC bytes. Tool successes reuse the stringify from `handleRpc`. */
+export function serializeRpc(
+  message: JsonRpcResponse | readonly JsonRpcResponse[],
+): string {
+  if (Array.isArray(message)) {
+    return `[${message.map((item) => serializeOne(item)).join(",")}]`;
+  }
+  // `Array.isArray` does not narrow a readonly array out of this union.
+  return serializeOne(message as JsonRpcResponse);
+}
+
+function rememberToolWire(
+  response: JsonRpcResponse,
+  text: string,
+  value: unknown,
+): void {
+  const idJson = JSON.stringify(response.id);
+  const encodedText = JSON.stringify(text);
+  // `undefined` is omitted, matching JSON.stringify. A string is escaped once
+  // and reused for both fields. Any other value's canonical JSON is `text`.
+  let structured = "";
+  if (value !== undefined) {
+    const json = typeof value === "string" ? encodedText : text;
+    structured = `,"structuredContent":${json}`;
+  }
+  wireByResponse.set(
+    response,
+    `{"jsonrpc":"2.0","id":${idJson},"result":{"content":[{"type":"text","text":${encodedText}}]${structured}}}`,
+  );
+}
 
 /** Session-wide bits; per-call `toolName` / `callId` are filled in on tools/call. */
 export type RpcContextBase = Omit<
@@ -100,17 +141,21 @@ export async function handleRpc(
     });
     try {
       const result = await runTool(tool.def, args, ctx);
-      const text = typeof result === "string"
+      // One walk of the value. `serializeRpc` reuses it for `structuredContent`
+      // instead of walking the object again when the envelope is written.
+      const text: unknown = typeof result === "string"
         ? result
         : JSON.stringify(result ?? null);
-      return {
+      const response: JsonRpcResponse = {
         jsonrpc: "2.0",
         id,
         result: {
-          content: [{ type: "text", text }],
+          content: [{ type: "text", text: text as string }],
           structuredContent: result,
         },
       };
+      if (typeof text === "string") rememberToolWire(response, text, result);
+      return response;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       const data = err instanceof ToolInputValidationError
