@@ -559,6 +559,10 @@ async fn r11_abort_cancels_the_running_tool() {
     let e = env_or_skip!();
     let s = e.session("a");
     let (base, requests) = spawn_model_server(vec![
+        // Warm-up: the first call to a session creates its VM; the abort must land on a call that
+        // is already running in it, not on one still waiting for the VM.
+        turn_tool_use("w1", &tool("get_weather"), r#"{"city":"Oslo"}"#),
+        turn_text("warm"),
         turn_tool_use("t1", &tool("slow"), r#"{"seconds":60}"#),
         // After the abort: a fresh turn reads the marker the tool should have written.
         turn_tool_use("t2", &tool("read_seed"), r#"{"path":"abort-marker.txt"}"#),
@@ -566,6 +570,7 @@ async fn r11_abort_cancels_the_running_tool() {
     ]);
     let (svc, _c) = service(&base).await;
     let mut o = open(&e, &svc, &s, "s1.r11", Menu::Saved, true).await;
+    prompt(&svc, &mut o.ws, "p0", "warm up").await;
     ws_send(
         &mut o.ws,
         json!({"type": "prompt", "id": "p1", "message": "be slow"}),
@@ -615,13 +620,12 @@ async fn r11_abort_cancels_the_running_tool() {
         ),
     );
     assert!(blob(&frames).contains("next turn fine"));
-    // Whether the agent tells the server: dropping an rmcp `tools/call` future sends no
-    // `notifications/cancelled` and leaves the POST stream open, so the tool keeps running until
-    // it finishes. That is the agent's client behavior, not the guest's (see r11b for the guest).
-    // Recorded, not asserted.
-    log(
-        "r11",
-        format!("agent-side propagation of the abort to the running tool: {observed}"),
+    // The agent's MCP client sends `notifications/cancelled` when the running `tools/call` is
+    // dropped by the abort; it crosses the front and the guest cancels the tool.
+    assert!(
+        observed,
+        "the tool never observed the abort: {}",
+        &msgs[msgs.len().saturating_sub(600)..]
     );
 }
 
