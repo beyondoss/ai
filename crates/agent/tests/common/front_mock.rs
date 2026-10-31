@@ -46,6 +46,9 @@ pub enum Fault {
     HealthIsOpen,
     /// A refused token still creates the VM.
     CreatesBeforeAuth,
+    /// A `stream` field it does not understand is answered one-shot, as Beyond's front does, not
+    /// refused: a correct answer whose `stdout` is base64.
+    OneShotStreamAnswers,
 }
 
 #[derive(Default)]
@@ -287,6 +290,7 @@ async fn serve(
     let streams = match req.get("stream") {
         None => false,
         Some(Value::Bool(b)) => *b,
+        Some(_) if fault == Fault::OneShotStreamAnswers => false,
         Some(_) => return refuse_extension(&mut sock, fault).await,
     };
     if let Some(job) = req.get("job") {
@@ -392,8 +396,8 @@ async fn serve(
         )
         .await;
     } else {
-        let body =
-            json!({"exit_code": 0, "stdout": String::from_utf8_lossy(&out.stdout), "stderr": ""});
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&out.stdout);
+        let body = json!({"exit_code": 0, "stdout": b64, "stderr": ""});
         reply(&mut sock, 200, "", "application/json", &body.to_string()).await;
     }
 }

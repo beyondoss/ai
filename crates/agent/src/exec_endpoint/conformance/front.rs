@@ -42,10 +42,20 @@
 
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use serde_json::{Value, json};
 
 use super::{Check, Verdict, fail, pass, skip};
 use crate::exec_endpoint::stream::{Frame, FrameReader, NDJSON};
+
+/// Whether a one-shot answer's `stdout` (standard base64, as every exec answer carries it) decodes
+/// to output with `marker`. Text that is not base64 is not the command's output, so it never matches.
+fn base64_has(stdout: &str, marker: &str) -> bool {
+    STANDARD
+        .decode(stdout)
+        .is_ok_and(|b| String::from_utf8_lossy(&b).contains(marker))
+}
 
 pub const SINGLE_FLIGHT: &str = "concurrent first requests create one VM";
 pub const FAILED_CREATE: &str = "a failed create leaves no VM";
@@ -410,7 +420,7 @@ impl<H: Hooks> Kit<'_, H> {
             return match serde_json::from_slice::<Value>(&bytes) {
                 Ok(v)
                     if v["exit_code"] == 0
-                        && v["stdout"].as_str().is_some_and(|s| s.contains(&marker)) =>
+                        && v["stdout"].as_str().is_some_and(|s| base64_has(s, &marker)) =>
                 {
                     Outcome::Ran {
                         first,

@@ -89,6 +89,19 @@ async fn each_broken_front_fails_its_check_by_name() {
     }
 }
 
+/// A one-shot answer to a malformed `stream` is a run: its `stdout` is base64, and the kit reads
+/// the marker out of the decoded bytes.
+#[tokio::test]
+async fn a_one_shot_answer_with_base64_stdout_is_a_run() {
+    let report = run(Fault::OneShotStreamAnswers).await;
+    assert_eq!(
+        report.check(front::EXTENSIONS).unwrap().verdict,
+        Verdict::Pass,
+        "{}",
+        report.render()
+    );
+}
+
 /// A front that creates a VM for a request it then refuses is caught by the token checks that
 /// refuse a token naming the tenant.
 #[tokio::test]
