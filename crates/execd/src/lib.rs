@@ -102,7 +102,7 @@ pub type RouteAnswer =
 /// A [`RouteHook`]'s verdict on a request.
 #[allow(
     clippy::large_enum_variant,
-    reason = "built once per request and moved straight on; boxing the request would only cost the embedder an allocation"
+    reason = "boxing the request would add an allocation to every request whenever a hook is set"
 )]
 pub enum Route {
     /// The hook handles it: execd sends this answer and does nothing else with the request.
@@ -180,7 +180,8 @@ pub struct Options {
     /// embedder says so itself. The answer's head goes out as soon as the future resolves, so a
     /// handler can reply at once and then stream the body while it reads the request body, full
     /// duplex over HTTP/2 (HTTP/1.1 is half duplex in practice for most clients). The request body
-    /// is not bounded by [`Self::max_request_bytes`]; a claimed handler bounds its own.
+    /// is not bounded by [`Self::max_request_bytes`], which does not apply to a claimed request: the
+    /// handler owns its own body bounds. The reference endpoint claims nothing.
     pub route_hook: Option<RouteHook>,
 }
 
