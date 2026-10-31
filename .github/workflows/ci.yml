@@ -1,4 +1,6 @@
 name: CI
+# Jobs pin ubuntu-24.04, not ubuntu-latest: latest is moving to 26.04, whose uutils coreutils and
+# Node 24 break suites that assume GNU tools and Node 20 line splitting. Move all of it together.
 on:
   pull_request:
     branches: [main]
@@ -50,7 +52,7 @@ jobs:
   # a formatting nit fails fast without waiting behind a compile.
   fmt:
     name: fmt
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
@@ -66,7 +68,7 @@ jobs:
       - run: mise check:module-tables
   clippy:
     name: clippy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
@@ -94,7 +96,7 @@ jobs:
   # shards, and a rerun of a shard inside that day still finds it.
   archive:
     name: build tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
@@ -139,7 +141,7 @@ jobs:
     # run again — as their own shard, so a hang there names itself instead of hiding another's.
     name: test (${{ matrix.name }})
     needs: archive
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     strategy:
       # A failing group must not cancel the others — their logs are the diagnostic.
@@ -408,7 +410,7 @@ jobs:
     # Merge queue and dispatch only. It has failed on 4 PRs in the run history, and costs ~10 minutes
     # of saturated runner on every push; the queue runs it before anything lands on main.
     if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
       STRESS_FILTER: >-
@@ -478,7 +480,7 @@ jobs:
     # on every push. Release-only breakage (a cfg, a feature, a test seam shipping) is caught by the
     # queue before it lands on main.
     if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -503,7 +505,7 @@ jobs:
   # advisory published since main last changed. A dispatched run (a bot PR) compares with main.
   changes:
     name: changes
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       deps: ${{ steps.diff.outputs.deps }}
@@ -581,7 +583,7 @@ jobs:
     name: sandbox clients (matrix)
     needs: changes
     if: needs.changes.outputs.clients == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
@@ -615,7 +617,7 @@ jobs:
   # loopback execd built here. Needs no Rust beyond that one small crate.
   sdk-ts:
     name: sdk-ts
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
@@ -635,7 +637,7 @@ jobs:
   # against a real execd built here.
   sdk-python:
     name: sdk-python
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
@@ -651,7 +653,7 @@ jobs:
     name: advisories
     needs: changes
     if: needs.changes.outputs.deps == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
@@ -668,7 +670,7 @@ jobs:
   # reaches main passed them). Cheap (no build), and keeps the required-check name stable.
   Check:
     name: Check
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [fmt, clippy, archive, test, gateway-stress, build, changes, advisories, execd-arm64, clients, sdk-ts, sdk-python]
     if: always()
     steps:
