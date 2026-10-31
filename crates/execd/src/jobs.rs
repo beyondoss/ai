@@ -35,10 +35,9 @@ use bytes::Bytes;
 use nix::sys::signal::Signal;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::io::AsyncReadExt as _;
 use tokio::sync::{mpsc, watch};
 
-use crate::exec::{self, Cut, PIPE_GRACE, Sink};
+use crate::exec::{self, AfterExit, Cut, PIPE_GRACE, Sink};
 use crate::frame::{self, FRAME_MAX};
 use crate::http::{self, Line, Request, Resp};
 use crate::notify::{self, Notifier, NotifyTarget};
@@ -659,15 +658,20 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
     // Both pipes into one ring, in arrival order. `progress` counts what the pumps have read, so
     // the supervisor can tell when they have gone quiet.
     let progress = Arc::new(AtomicUsize::new(0));
+    let (exited, _) = tokio::sync::watch::channel(false);
     let mut pipes = Vec::new();
     let mut cap = 0;
     if let Some(p) = proc.stdout.take() {
-        cap += proc::pipe_capacity(&p);
-        pipes.push(pump(ctx.clone(), cell.clone(), p, progress.clone()));
+        let n = proc::pipe_capacity(&p);
+        cap += n;
+        let after = AfterExit::new(&exited);
+        pipes.push(pump(ctx.clone(), cell.clone(), p, progress.clone(), after));
     }
     if let Some(p) = proc.stderr.take() {
-        cap += proc::pipe_capacity(&p);
-        pipes.push(pump(ctx.clone(), cell.clone(), p, progress.clone()));
+        let n = proc::pipe_capacity(&p);
+        cap += n;
+        let after = AfterExit::new(&exited);
+        pipes.push(pump(ctx.clone(), cell.clone(), p, progress.clone(), after));
     }
     tokio::spawn(supervise(
         ctx.clone(),
@@ -677,6 +681,7 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
         pipes,
         progress,
         cap,
+        exited,
     ));
 
     if job.hold {
@@ -705,18 +710,16 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
 }
 
 /// Read `pipe` into the job's ring until it closes or the job is removed.
-fn pump<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
+fn pump<R: tokio::io::AsyncRead + std::os::fd::AsFd + Unpin + Send + 'static>(
     ctx: Arc<Ctx>,
     cell: JobCell,
     mut pipe: R,
     progress: Arc<AtomicUsize>,
+    mut after: AfterExit,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut buf = vec![0u8; frame::READ_BUF];
-        while let Ok(n) = pipe.read(&mut buf).await {
-            if n == 0 {
-                break;
-            }
+        while let Some(n) = after.read(&mut pipe, &mut buf).await {
             {
                 let mut j = locked(&cell);
                 if j.removed {
@@ -763,6 +766,7 @@ async fn drain_pumps(
 
 /// The job's life: wait for the shell, report `shell_exit` if its group lives on, wait for the
 /// group to empty, record the end. Each is a state change notify calls back about.
+#[allow(clippy::too_many_arguments)] // the job's parts, each used once
 async fn supervise(
     ctx: Arc<Ctx>,
     cell: JobCell,
@@ -771,6 +775,7 @@ async fn supervise(
     mut pipes: Vec<tokio::task::JoinHandle<()>>,
     progress: Arc<AtomicUsize>,
     cap: usize,
+    exited: tokio::sync::watch::Sender<bool>,
 ) {
     let pgid = proc.pgid;
     let status = proc.wait().await;
@@ -784,9 +789,10 @@ async fn supervise(
             }
         }
     });
-    drain_pumps(&mut pipes, &progress, cap).await;
     let mut exits = proc::ChildEvents::new();
     if !proc::group_gone(pgid, false).await {
+        // What the shell printed goes before `shell_exit`; the pumps read on, the group lives.
+        drain_pumps(&mut pipes, &progress, cap).await;
         // The moment a held stream would send `shell_exit`: notify calls back.
         {
             let mut j = locked(&cell);
@@ -801,10 +807,15 @@ async fn supervise(
                 break;
             }
         }
-        drain_pumps(&mut pipes, &progress, cap).await;
     }
-    for p in &pipes {
-        p.abort();
+    // The group is empty: the pumps take what the pipes still hold and end when a pipe closes or
+    // goes quiet (`AfterExit`), so nothing is aborted with output unread.
+    exited.send_replace(true);
+    for p in &mut pipes {
+        // One that finished was awaited by `drain_pumps`; a join handle must not be polled again.
+        if !p.is_finished() {
+            let _ = p.await;
+        }
     }
     // The end is observable from here on: notify calls back.
     {

@@ -502,6 +502,7 @@ dependencies = [
  "nix",
  "openssl-probe 0.1.6",
  "reqwest",
+ "rustix",
  "rustls",
  "serde",
  "serde_json",
