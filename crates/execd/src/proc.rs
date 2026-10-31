@@ -559,15 +559,17 @@ mod tests {
     #[test]
     fn a_comm_that_is_not_text_is_still_a_live_member() {
         use std::os::unix::ffi::OsStringExt as _;
-        let sleep = ["/bin/sleep", "/usr/bin/sleep"]
-            .into_iter()
-            .find(|p| std::path::Path::new(p).exists())
-            .unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        // A script named by the raw byte. The kernel takes `comm` from the file name, and the shell
+        // stays alive as the process: it runs `sleep` as a child rather than in its place. Copying
+        // `/bin/sleep` would not do: a multi-call binary (busybox, uutils) picks its applet from
+        // this name and exits.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(std::ffi::OsString::from_vec(vec![0xff]));
-        std::fs::copy(sleep, &path).unwrap();
+        std::fs::write(&path, "#!/bin/sh\nsleep 30\nexit 0\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut cmd = std::process::Command::new(&path);
-        cmd.arg("30").process_group(0);
+        cmd.process_group(0);
         let mut child = cmd.spawn().unwrap();
         let pid = child.id();
         let kill = KillOnDrop(&mut child);
@@ -592,12 +594,13 @@ mod tests {
         drop(kill);
     }
 
-    /// Kill and wait, including when the assertion above fails.
+    /// Kill the group and wait, including when the assertion above fails.
     struct KillOnDrop<'a>(&'a mut std::process::Child);
 
     impl Drop for KillOnDrop<'_> {
         fn drop(&mut self) {
-            let _ = self.0.kill();
+            // The group, not only the child: the script's `sleep` is still running in it.
+            kill_group(self.0.id() as i32);
             let _ = self.0.wait();
         }
     }
