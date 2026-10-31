@@ -129,4 +129,4 @@ What the binary does beyond `serve()`, and what an embedder should call:
 
 An `Observer` set on `Options` is told of every request, stream and callback attempt; unset it costs one branch.
 `examples/embed.rs` is the minimal correct `main()`. See [ARCHITECTURE.md](ARCHITECTURE.md#embedding) for auth,
-idle timeout, activity, and `job_op_hook`.
+idle timeout, activity, `job_op_hook`, and `route_hook` (claim a path before execd reads it; uncounted as activity).

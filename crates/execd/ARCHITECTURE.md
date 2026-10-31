@@ -47,6 +47,8 @@ accept ──► hyper (HTTP/1.1, or prior-knowledge HTTP/2 on the same port)
               │
    /livez ◄───┤ GET or HEAD only (also /healthz): 200, no auth
               ▼
+   (route_hook set: authorize, then the hook may claim the request, uncounted; see Embedding)
+              ▼
    not POST ──► 405
               ▼
    POST ──► bearer check (one header, constant time), or `Options::authorizer` ──► 401
@@ -704,6 +706,18 @@ fn main() -> ExitCode {
 per request, before the body is read, inline on the connection's task, so it must be quick. Setting it together with `bearer` makes
 `serve()` return `InvalidInput`. It counts as authentication for the fail-closed rule, so a non-loopback listener needs no bearer
 with it. The binary cannot supply a closure and is unchanged.
+
+**Route hook.** `Options::route_hook` is `Arc<dyn Fn(HttpRequest) -> Route + Send + Sync>`, where `Route` is `Claimed(future of a
+Response<RouteBody>)` or `Declined(HttpRequest)` (the request handed back untouched). It sees every request except `/livez` and `/healthz`
+after the authorizer or bearer has accepted it, and before any of the body is read. A refused request gets `401` and the hook never sees
+it (so with a hook set a refused non-`POST` is a `401` rather than the unchecked `405`; without one nothing changes). A declined request
+goes on exactly as without a hook, the authorizer not run a second time. A claimed request is **not counted**: `service_fn` in
+`http.rs` returns before `InFlight::enter`, so it adds to neither `Activity::in_flight` nor the connection's idle timer, and a stream
+that handler holds open for hours keeps neither the server nor a sandbox awake. An embedder whose claimed work must keep the host up
+says so itself. The future resolves to the response head, which is sent at once; the body then streams while the handler reads the
+request body, so the exchange is full duplex over HTTP/2. The request body is not bounded by `max_request_bytes`; the handler bounds
+its own. The hook is generic: execd knows nothing of what it serves. The exec protocol's "every `POST` is exec" holds for the
+reference endpoint, which claims nothing; an embedder that claims a path owns it, and the agent never sends one.
 
 **Idle connections.** `Options::idle_timeout` (`EXECD_IDLE_TIMEOUT_MS` for the binary; unset or 0 is off) closes a connection with
 no request in flight for that long: HTTP/1.1 is closed, h2 gets a GOAWAY. A request is in flight from the moment hyper hands it to

@@ -28,7 +28,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use crate::Ctx;
+use crate::{Ctx, Route, RouteBody};
 
 /// A response body: one buffer, or a stream of frames fed through a bounded channel.
 pub(crate) enum Body {
@@ -236,17 +236,35 @@ async fn connection(sock: tokio::net::TcpStream, ctx: Arc<Ctx>, stop: Cancellati
     let activity = Arc::new(ConnActivity::new());
     let tracked = activity.clone();
     let ctx_for_svc = ctx.clone();
-    let svc = hyper::service::service_fn(move |req| {
-        // The health paths are not work: they neither count nor keep a connection awake.
-        let guard = (!is_health(&req)).then(|| InFlight::enter(&tracked, &ctx_for_svc));
+    let svc = hyper::service::service_fn(move |mut req: HttpRequest<Incoming>| {
         let ctx = ctx_for_svc.clone();
+        let tracked = tracked.clone();
         async move {
-            let resp = route(ctx, req).await;
+            // The embedder's route hook sees a request after the authorizer and before anything
+            // reads it. A claimed request is not execd's work and is never counted, so a stream
+            // it holds open keeps neither the server nor its connection awake. A declined one is
+            // counted and handled as ever, with the authorizer's verdict already in hand.
+            let mut checked = false;
+            if let Some(hook) = ctx.opts.route_hook.as_ref().filter(|_| !is_health(&req)) {
+                if !authorized(&ctx, req.headers()) {
+                    crate::log_info!("request kind=auth status=401");
+                    let guard = InFlight::enter(&tracked, &ctx);
+                    let resp = error_response(401, "unauthorized");
+                    return Ok::<_, Infallible>(resp.map(|b| Tracked::own(b, Some(guard))));
+                }
+                match hook(req) {
+                    Route::Claimed(answer) => {
+                        return Ok(answer.await.map(Tracked::claimed));
+                    }
+                    Route::Declined(r) => req = r,
+                }
+                checked = true;
+            }
+            // The health paths are not work: they neither count nor keep a connection awake.
+            let guard = (!is_health(&req)).then(|| InFlight::enter(&tracked, &ctx));
+            let resp = route(ctx, req, checked).await;
             // The guard rides the body: a stream is in flight until its last frame is written.
-            Ok::<_, Infallible>(resp.map(|body| Tracked {
-                body,
-                _guard: guard,
-            }))
+            Ok(resp.map(|b| Tracked::own(b, guard)))
         }
     });
     let mut builder = auto::Builder::new(TokioExecutor::new());
@@ -353,33 +371,66 @@ impl Drop for InFlight {
     }
 }
 
-/// A response body that keeps its request counted as in flight.
+/// A response body that keeps its request counted as in flight, or the embedder's own, which is not
+/// counted at all.
 struct Tracked {
-    body: Body,
+    body: Inner,
     _guard: Option<InFlight>,
+}
+
+enum Inner {
+    Own(Body),
+    Claimed(RouteBody),
+}
+
+impl Tracked {
+    fn own(body: Body, guard: Option<InFlight>) -> Self {
+        Self {
+            body: Inner::Own(body),
+            _guard: guard,
+        }
+    }
+
+    fn claimed(resp_body: RouteBody) -> Self {
+        Self {
+            body: Inner::Claimed(resp_body),
+            _guard: None,
+        }
+    }
 }
 
 impl HttpBody for Tracked {
     type Data = Bytes;
-    type Error = Infallible;
+    type Error = std::io::Error;
 
     fn poll_frame(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
-        Pin::new(&mut self.body).poll_frame(cx)
+    ) -> Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
+        match &mut self.body {
+            Inner::Own(b) => Pin::new(b)
+                .poll_frame(cx)
+                .map(|o| o.map(|r| r.map_err(|e| match e {}))),
+            Inner::Claimed(b) => Pin::new(b).poll_frame(cx),
+        }
     }
 
     fn is_end_stream(&self) -> bool {
-        self.body.is_end_stream()
+        match &self.body {
+            Inner::Own(b) => b.is_end_stream(),
+            Inner::Claimed(b) => b.is_end_stream(),
+        }
     }
 
     fn size_hint(&self) -> SizeHint {
-        self.body.size_hint()
+        match &self.body {
+            Inner::Own(b) => b.size_hint(),
+            Inner::Claimed(b) => b.size_hint(),
+        }
     }
 }
 
-async fn route(ctx: Arc<Ctx>, req: HttpRequest<Incoming>) -> Resp {
+async fn route(ctx: Arc<Ctx>, req: HttpRequest<Incoming>, checked: bool) -> Resp {
     let (parts, body) = req.into_parts();
     // The one unauthenticated answer, and only to a read: it says the process is up and nothing
     // else. `/healthz` is the same answer under the common name. A POST to either path is an exec request like any other, and is authenticated.
@@ -391,7 +442,7 @@ async fn route(ctx: Arc<Ctx>, req: HttpRequest<Incoming>) -> Resp {
     if parts.method != Method::POST {
         return error_response(405, "POST an exec request");
     }
-    if !authorized(&ctx, &parts.headers) {
+    if !checked && !authorized(&ctx, &parts.headers) {
         crate::log_info!("request kind=auth status=401");
         return error_response(401, "unauthorized");
     }
