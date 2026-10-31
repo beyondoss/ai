@@ -1,5 +1,3 @@
-import readline from "node:readline";
-
 import type { LoadedTool } from "./load.js";
 import {
   handleRpc,
@@ -16,12 +14,8 @@ export async function serveStdio(opts: {
   tools: LoadedTool[];
   base: RpcContextBase;
 }): Promise<void> {
-  const rl = readline.createInterface({
-    input: process.stdin,
-    crlfDelay: Infinity,
-  });
   const calls = new RpcCalls();
-  for await (const line of rl) {
+  for await (const line of stdinLines()) {
     const trimmed = line.trim();
     if (!trimmed) continue;
     let body: unknown;
@@ -51,4 +45,27 @@ export async function serveStdio(opts: {
     const r = await handleRpc(body as never, opts.tools, opts.base, { calls });
     if (r) process.stdout.write(`${serializeRpc(r)}\n`);
   }
+}
+
+/**
+ * The lines of stdin, split on LF alone (a CR before it is dropped). `node:readline` also splits on
+ * U+2028 and U+2029, which a JSON-RPC request may carry inside a string, and would answer it twice.
+ */
+async function* stdinLines(): AsyncGenerator<string> {
+  const decoder = new TextDecoder();
+  let buf = "";
+  for await (const chunk of process.stdin) {
+    buf += typeof chunk === "string"
+      ? chunk
+      : decoder.decode(chunk, { stream: true });
+    let start = 0;
+    let nl: number;
+    while ((nl = buf.indexOf("\n", start)) !== -1) {
+      yield buf.slice(start, nl).replace(/\r$/, "");
+      start = nl + 1;
+    }
+    buf = buf.slice(start);
+  }
+  buf += decoder.decode();
+  if (buf !== "") yield buf.replace(/\r$/, "");
 }

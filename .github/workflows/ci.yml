@@ -617,9 +617,15 @@ jobs:
     name: sdk-ts
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        # readline splits lines on U+2028 from Node 24 on; the driver must not (driver-serve.ts).
+        node: ["22", "24"]
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v4
+      - run: mise use --global node@${{ matrix.node }}
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: sdk-ts
