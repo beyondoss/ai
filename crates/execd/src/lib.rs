@@ -88,6 +88,34 @@ pub type Authorizer = Arc<dyn Fn(&HeaderMap) -> bool + Send + Sync>;
 /// usual 400. See [`Options::job_op_hook`].
 pub type JobOpHook = Arc<dyn Fn(&str, &Value) -> Option<(u16, Value)> + Send + Sync>;
 
+/// The request a [`RouteHook`] is shown: method, path, headers and a body that has not been read.
+pub type HttpRequest = hyper::Request<hyper::body::Incoming>;
+
+/// A response body an embedder streams: any frames, sent as they are produced.
+pub type RouteBody = http_body_util::combinators::BoxBody<bytes::Bytes, std::io::Error>;
+
+/// What a claimed request is answered with: the head is sent as soon as this resolves, then the body
+/// streams for as long as it produces frames.
+pub type RouteAnswer =
+    std::pin::Pin<Box<dyn std::future::Future<Output = hyper::Response<RouteBody>> + Send>>;
+
+/// A [`RouteHook`]'s verdict on a request.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "built once per request and moved straight on; boxing the request would only cost the embedder an allocation"
+)]
+pub enum Route {
+    /// The hook handles it: execd sends this answer and does nothing else with the request.
+    Claimed(RouteAnswer),
+    /// Not the hook's: execd handles the request, handed back untouched, as it would without a hook.
+    Declined(HttpRequest),
+}
+
+/// Lets an embedder claim requests by method and path before execd reads them as exec requests: see
+/// [`Options::route_hook`]. Called inline on the connection's task, so it must decide quickly and
+/// must not block; the work belongs in the returned future.
+pub type RouteHook = Arc<dyn Fn(HttpRequest) -> Route + Send + Sync>;
+
 /// What the deployment tells execd. [`Options::new`] is a conforming notify endpoint with the spec's
 /// numbers and notify off, as an operator's deployment setting starts out.
 #[derive(Clone)]
@@ -140,6 +168,20 @@ pub struct Options {
     /// only for an unknown op, after authentication and request parsing, never for one execd handles.
     /// It is synchronous and runs on the server's own thread, so it must be quick and must not block.
     pub job_op_hook: Option<JobOpHook>,
+    /// Shown every request except the health paths, after [`Self::authorizer`] or [`Self::bearer`]
+    /// has accepted it (a refused one is answered `401` and the hook never sees it) and before its
+    /// body is read: [`Route::Claimed`] takes the request over, [`Route::Declined`] hands it back to
+    /// execd, which then treats it exactly as it would without a hook. With a hook set, a refused
+    /// request of any method gets `401`, where without one a non-`POST` gets `405` unchecked.
+    ///
+    /// A claimed request is not execd's work. It is not counted in [`Activity::in_flight`], nor in the
+    /// connection's idle timeout, so a stream a claimed handler holds open for hours does not keep a
+    /// host that pauses on [`Handle::activity`] awake: if the claimed work must keep the host up, the
+    /// embedder says so itself. The answer's head goes out as soon as the future resolves, so a
+    /// handler can reply at once and then stream the body while it reads the request body, full
+    /// duplex over HTTP/2 (HTTP/1.1 is half duplex in practice for most clients). The request body
+    /// is not bounded by [`Self::max_request_bytes`]; a claimed handler bounds its own.
+    pub route_hook: Option<RouteHook>,
 }
 
 impl Options {
@@ -159,6 +201,7 @@ impl Options {
             observer: None,
             idle_timeout: None,
             job_op_hook: None,
+            route_hook: None,
         }
     }
 }
@@ -181,6 +224,7 @@ impl std::fmt::Debug for Options {
             .field("observer", &self.observer.is_some())
             .field("idle_timeout", &self.idle_timeout)
             .field("job_op_hook", &self.job_op_hook.is_some())
+            .field("route_hook", &self.route_hook.is_some())
             .finish()
     }
 }

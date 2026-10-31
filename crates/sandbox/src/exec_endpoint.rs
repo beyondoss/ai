@@ -31,6 +31,11 @@
 //!
 //! The key words MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119.
 //!
+//! **Every `POST` to that URL is an exec request.** The reference endpoint claims no path. An embedder
+//! MAY claim other paths on the same listener for its own purposes (execd's `Options::route_hook`);
+//! the agent never sends one, so this protocol says nothing about them and a conforming client never
+//! depends on them.
+//!
 //! **Bytes.** `stdout` and `stderr` are the bytes the command wrote, as **standard base64 with
 //! padding** (RFC 4648 section 4), the empty string when there is none, both present on every `200`
 //! answer. There is one shape and no flag: the endpoint MUST NOT apply a lossy conversion (UTF-8
