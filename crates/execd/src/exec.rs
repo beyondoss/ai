@@ -687,7 +687,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::{AfterExit, PIPE_GRACE, reserve};
+    use super::{AfterExit, PIPE_GRACE, pump, reserve};
     use tokio::io::AsyncWriteExt as _;
     use tokio::sync::watch;
 
@@ -740,10 +740,7 @@ mod tests {
         let mut buf = [0u8; 16 * 1024];
         let mut got = 0;
         while got < 40_000 {
-            got += after
-                .read(&mut r, &mut buf)
-                .await
-                .expect("data was waiting");
+            got += after.read(&mut r, &mut buf).await.unwrap();
         }
         assert_eq!(got, 40_000);
     }
@@ -766,5 +763,27 @@ mod tests {
         assert_eq!(after.read(&mut r, &mut buf).await, Some(16));
         assert_eq!(after.read(&mut r, &mut buf).await, Some(16));
         assert_eq!(after.read(&mut r, &mut buf).await, None);
+    }
+
+    /// Both workers are busy for longer than the grace while a pump has its command's output
+    /// waiting in the pipe. When they come free the exchange must still end with every byte.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pump_that_runs_late_still_delivers_the_whole_pipe() {
+        let hog = || tokio::spawn(async { std::thread::sleep(PIPE_GRACE * 4) });
+        let (a, b) = (hog(), hog());
+        std::thread::sleep(PIPE_GRACE / 2);
+        let (mut w, r) = tokio::io::duplex(64 * 1024);
+        w.write_all(&[7u8; 40_000]).await.unwrap();
+        drop(w);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let (exited, _) = watch::channel(false);
+        let _pump = pump(r, "stdout", tx, AfterExit::new(&exited, 64 * 1024));
+        exited.send_replace(true);
+        let mut got = 0;
+        while let Some(f) = rx.recv().await {
+            got += f.len();
+        }
+        assert!(got >= 40_000, "only {got} wire bytes of 40000 arrived");
+        let _ = tokio::join!(a, b);
     }
 }
