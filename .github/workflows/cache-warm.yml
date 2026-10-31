@@ -43,7 +43,7 @@ env:
 jobs:
   tests:
     name: warm (tests)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -62,7 +62,7 @@ jobs:
         run: cargo nextest run --workspace --locked --profile ci --no-run
   clippy:
     name: warm (clippy)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -80,7 +80,7 @@ jobs:
         run: cargo clippy -p beyond-agent --all-targets --features code-mode --locked -- -D warnings
   code-mode:
     name: warm (code-mode)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -99,7 +99,7 @@ jobs:
         run: cargo nextest run -p beyond-agent --locked --profile ci --features code-mode --no-run
   release:
     name: warm (release)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
