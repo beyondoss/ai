@@ -17,6 +17,7 @@
 //!   acknowledging (see `http`). N concurrent streams hold N times a few hundred KiB.
 //! - The process group: killed when the exchange ends any way but a clean finish, by [`GroupSlot`].
 
+use std::os::fd::AsFd;
 use std::os::unix::process::ExitStatusExt as _;
 use std::pin::Pin;
 use std::process::{ExitStatus, Stdio};
@@ -42,41 +43,57 @@ pub(crate) const PIPE_GRACE: Duration = Duration::from_millis(100);
 
 /// How a pipe reader behaves once its command has exited.
 ///
-/// The grace for a pipe a descendant holds open is measured at the pipe, by the reader that reads
-/// it: a read that has waited [`PIPE_GRACE`] on an empty pipe. Measured by whoever awaits the
-/// reader, the grace also counts every moment the reader was runnable but not running, so a loaded
-/// host made it give up on a pipe that still held the command's output. Tokio polls a read before
-/// its deadline, so a reader that was starved past the grace still takes what is waiting.
+/// What the command wrote and had not had read is in the pipe when it exits, and is read before
+/// the pipe is let go: the pipe is asked how many bytes it holds (`FIONREAD`) at that moment. The
+/// pipe's capacity (`F_GETPIPE_SZ`) is not that number: a pipe can hold more bytes than its
+/// nominal size (Linux 7.0 packs large writes into big folios), and a reader that stopped at the
+/// capacity dropped the rest of a clean exit's output. A chatty descendant that holds the pipe
+/// open is let go once that backlog and [`LATE`] more have been read.
+///
+/// The grace for a quiet one is measured at the pipe, by the reader that reads it: a read that has
+/// waited [`PIPE_GRACE`] on an empty pipe. Measured by whoever awaits the reader, it also counts
+/// every moment the reader was runnable but not running. Tokio polls a read before its deadline,
+/// so a reader that was starved past the grace still takes what is waiting.
 pub(crate) struct AfterExit {
     exited: watch::Receiver<bool>,
-    /// What may still be read once the command is gone: all a command can have written and not
-    /// had read is its pipe's capacity; a chatty descendant holding the pipe is let go after that.
-    left: usize,
+    /// Bytes still to read, known once the exit is noticed.
+    left: Option<usize>,
 }
 
+/// What a descendant that keeps writing after the command's exit may still add: one default pipe.
+const LATE: usize = 64 * 1024;
+
 impl AfterExit {
-    pub(crate) fn new(exited: &watch::Sender<bool>, pipe_capacity: usize) -> Self {
+    pub(crate) fn new(exited: &watch::Sender<bool>) -> Self {
         Self {
             exited: exited.subscribe(),
-            left: pipe_capacity,
+            left: None,
         }
     }
 
-    /// Bytes read into `buf`; `None` when the pipe has closed, or has gone quiet or spent its
-    /// allowance since the command exited.
-    pub(crate) async fn read<R: tokio::io::AsyncRead + Unpin>(
+    /// Bytes read into `buf`; `None` when the pipe has closed, or since the command exited has
+    /// gone quiet or been read past what it held.
+    pub(crate) async fn read<R: tokio::io::AsyncRead + AsFd + Unpin>(
         &mut self,
         pipe: &mut R,
         buf: &mut [u8],
     ) -> Option<usize> {
-        if !*self.exited.borrow() {
-            // A closed signal reads as exited too: nobody is left to say the command is running.
-            tokio::select! {
-                r = pipe.read(buf) => return r.ok().filter(|&n| n > 0),
-                _ = self.exited.changed() => {}
+        if self.left.is_none() {
+            if !*self.exited.borrow() {
+                // A closed signal reads as exited too: nobody is left to say it is running.
+                tokio::select! {
+                    r = pipe.read(buf) => return r.ok().filter(|&n| n > 0),
+                    _ = self.exited.changed() => {}
+                }
             }
+            let held = rustix::io::ioctl_fionread(&*pipe)
+                .ok()
+                .and_then(|n| usize::try_from(n).ok())
+                .unwrap_or(0);
+            self.left = Some(held.saturating_add(LATE));
         }
-        if self.left == 0 {
+        let left = self.left.as_mut()?;
+        if *left == 0 {
             return None;
         }
         let n = tokio::time::timeout(PIPE_GRACE, pipe.read(buf))
@@ -84,7 +101,7 @@ impl AfterExit {
             .ok()?
             .ok()
             .filter(|&n| n > 0)?;
-        self.left = self.left.saturating_sub(n);
+        *left = left.saturating_sub(n);
         Some(n)
     }
 }
@@ -219,7 +236,7 @@ fn reserve(budget: &AtomicUsize, n: usize) -> usize {
 
 /// Read `pipe` into `into` as it arrives, keeping at most what is left of `budget` across both
 /// pipes; the rest is read and dropped.
-async fn capture<R: tokio::io::AsyncRead + Unpin>(
+async fn capture<R: tokio::io::AsyncRead + AsFd + Unpin>(
     mut pipe: R,
     into: Arc<std::sync::Mutex<Vec<u8>>>,
     budget: Arc<AtomicUsize>,
@@ -294,7 +311,7 @@ pub(crate) async fn envelope(ctx: &Arc<Ctx>, req: Request) -> Resp {
     let (exited, _) = watch::channel(false);
     let readers = [
         proc.stdout.take().map(|p| {
-            let after = AfterExit::new(&exited, proc::pipe_capacity(&p));
+            let after = AfterExit::new(&exited);
             tokio::spawn(capture(
                 p,
                 out.clone(),
@@ -304,7 +321,7 @@ pub(crate) async fn envelope(ctx: &Arc<Ctx>, req: Request) -> Resp {
             ))
         }),
         proc.stderr.take().map(|p| {
-            let after = AfterExit::new(&exited, proc::pipe_capacity(&p));
+            let after = AfterExit::new(&exited);
             tokio::spawn(capture(
                 p,
                 err.clone(),
@@ -450,7 +467,7 @@ impl Sink {
 
 /// Read `pipe` into `key` frames of at most [`FRAME_MAX`] bytes as they arrive. A full channel
 /// stalls the read, which stalls the command: the backpressure from a slow client.
-fn pump<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
+fn pump<R: tokio::io::AsyncRead + AsFd + Unpin + Send + 'static>(
     mut pipe: R,
     key: &'static str,
     tx: mpsc::Sender<Bytes>,
@@ -548,12 +565,12 @@ async fn run_stream(ctx: Arc<Ctx>, req: Request, out: mpsc::Sender<Bytes>) {
     if let Some(p) = proc.stdout.take() {
         let n = proc::pipe_capacity(&p);
         cap += n;
-        readers.push(pump(p, "stdout", tx.clone(), AfterExit::new(&exited, n)));
+        readers.push(pump(p, "stdout", tx.clone(), AfterExit::new(&exited)));
     }
     if let Some(p) = proc.stderr.take() {
         let n = proc::pipe_capacity(&p);
         cap += n;
-        readers.push(pump(p, "stderr", tx.clone(), AfterExit::new(&exited, n)));
+        readers.push(pump(p, "stderr", tx.clone(), AfterExit::new(&exited)));
     }
     drop(tx);
 
@@ -688,7 +705,6 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{AfterExit, PIPE_GRACE, pump, reserve};
-    use tokio::io::AsyncWriteExt as _;
     use tokio::sync::watch;
 
     #[test]
@@ -726,14 +742,27 @@ mod tests {
         assert_eq!(budget.load(Ordering::Relaxed), 0);
     }
 
+    /// A pipe and its two ends, a writer that has written `n` bytes and closed.
+    async fn full_pipe(n: usize) -> tokio::net::unix::pipe::Receiver {
+        let (w, r) = tokio::net::unix::pipe::pipe().unwrap();
+        let data = vec![7u8; n];
+        let mut at = 0;
+        while at < n {
+            w.writable().await.unwrap();
+            if let Ok(k) = w.try_write(&data[at..]) {
+                at += k;
+            }
+        }
+        r
+    }
+
     /// A reader the scheduler did not run for longer than the grace still takes what its pipe
     /// holds: the grace is a wait on an empty pipe, not time since the command exited.
     #[tokio::test]
     async fn a_starved_reader_still_takes_what_the_pipe_holds() {
         let (exited, _) = watch::channel(false);
-        let mut after = AfterExit::new(&exited, 64 * 1024);
-        let (mut w, mut r) = tokio::io::duplex(64 * 1024);
-        w.write_all(&[7u8; 40_000]).await.unwrap();
+        let mut after = AfterExit::new(&exited);
+        let mut r = full_pipe(40_000).await;
         exited.send_replace(true);
         // The runtime is busy elsewhere for longer than the grace.
         std::thread::sleep(PIPE_GRACE * 3);
@@ -745,24 +774,29 @@ mod tests {
         assert_eq!(got, 40_000);
     }
 
-    /// An empty pipe a descendant holds open is let go after the grace, and a chatty one after
-    /// its allowance.
+    /// An empty pipe a descendant holds open is let go after the grace, and a chatty one once what
+    /// it held at the exit has been read.
     #[tokio::test]
     async fn an_idle_or_chatty_pipe_is_let_go_after_exit() {
         let (exited, _) = watch::channel(true);
-        let (_w, mut r) = tokio::io::duplex(1024);
+        let (_w, mut r) = tokio::net::unix::pipe::pipe().unwrap();
         let mut buf = [0u8; 16];
-        assert_eq!(
-            AfterExit::new(&exited, 1024).read(&mut r, &mut buf).await,
-            None
-        );
+        let t = std::time::Instant::now();
+        assert_eq!(AfterExit::new(&exited).read(&mut r, &mut buf).await, None);
+        // The grace is real: a descendant that is about to detach gets it (see `envelope`).
+        assert!(t.elapsed() >= PIPE_GRACE);
 
-        let (mut w, mut r) = tokio::io::duplex(1024);
-        w.write_all(&[1u8; 64]).await.unwrap();
-        let mut after = AfterExit::new(&exited, 32);
-        assert_eq!(after.read(&mut r, &mut buf).await, Some(16));
-        assert_eq!(after.read(&mut r, &mut buf).await, Some(16));
-        assert_eq!(after.read(&mut r, &mut buf).await, None);
+        let (w, mut r) = tokio::net::unix::pipe::pipe().unwrap();
+        w.writable().await.unwrap();
+        w.try_write(&[1u8; 64]).unwrap();
+        let mut after = AfterExit::new(&exited);
+        let mut got = 0;
+        while let Some(n) = after.read(&mut r, &mut buf).await {
+            got += n;
+            // Still writing after the exit: let go once the late allowance is spent.
+            let _ = w.try_write(&[2u8; 16]);
+        }
+        assert!((64..=64 + super::LATE + 16).contains(&got), "{got}");
     }
 
     /// Both workers are busy for longer than the grace while a pump has its command's output
@@ -772,12 +806,10 @@ mod tests {
         let hog = || tokio::spawn(async { std::thread::sleep(PIPE_GRACE * 4) });
         let (a, b) = (hog(), hog());
         std::thread::sleep(PIPE_GRACE / 2);
-        let (mut w, r) = tokio::io::duplex(64 * 1024);
-        w.write_all(&[7u8; 40_000]).await.unwrap();
-        drop(w);
+        let r = full_pipe(40_000).await;
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let (exited, _) = watch::channel(false);
-        let _pump = pump(r, "stdout", tx, AfterExit::new(&exited, 64 * 1024));
+        let _pump = pump(r, "stdout", tx, AfterExit::new(&exited));
         exited.send_replace(true);
         let mut got = 0;
         while let Some(f) = rx.recv().await {

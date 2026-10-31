@@ -664,13 +664,13 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
     if let Some(p) = proc.stdout.take() {
         let n = proc::pipe_capacity(&p);
         cap += n;
-        let after = AfterExit::new(&exited, n);
+        let after = AfterExit::new(&exited);
         pipes.push(pump(ctx.clone(), cell.clone(), p, progress.clone(), after));
     }
     if let Some(p) = proc.stderr.take() {
         let n = proc::pipe_capacity(&p);
         cap += n;
-        let after = AfterExit::new(&exited, n);
+        let after = AfterExit::new(&exited);
         pipes.push(pump(ctx.clone(), cell.clone(), p, progress.clone(), after));
     }
     tokio::spawn(supervise(
@@ -710,7 +710,7 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
 }
 
 /// Read `pipe` into the job's ring until it closes or the job is removed.
-fn pump<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
+fn pump<R: tokio::io::AsyncRead + std::os::fd::AsFd + Unpin + Send + 'static>(
     ctx: Arc<Ctx>,
     cell: JobCell,
     mut pipe: R,

@@ -38,6 +38,8 @@ hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
 # Process groups, subreaper, the pipe-size query and the socket's user timeout, as safe wrappers:
 # the workspace forbids `unsafe_code`.
 mimalloc = { version = "0.1.52", default-features = false, optional = true }
+# `FIONREAD`: how many bytes a pipe holds, as a safe call.
+rustix = { version = "1", default-features = false, features = ["std"] }
 nix = { version = "0.31", default-features = false, features = ["fs", "net", "process", "signal", "socket", "user"] }
 # Where the OS trust store lives (honours SSL_CERT_FILE and SSL_CERT_DIR), to say when it is empty.
 openssl-probe = "0.1"
