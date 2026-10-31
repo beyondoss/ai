@@ -1,0 +1,24 @@
+name: leftover-probe
+on:
+  push:
+    branches: ["probe/**"]
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        n: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - run: |
+          rustup toolchain install 1.92.0 --profile minimal && rustup default 1.92.0
+          export RUSTFLAGS="-D warnings" CARGO_PROFILE_TEST_DEBUG=0
+          F='package(beyond-agent) and binary(=it) and not (test(/^[^:]*conformance[^:]*::/) or test(/^[^:]*exec_[^:]*::/) or test(/^[^:]*jobs[^:]*::/) or test(/^[^:]*notify[^:]*::/)) and not test(/^[^:]*serve[^:]*::/) and not test(/^exec_endpoint_live::/) and not test(/^[^:]*notify_e2e[^:]*::/)'
+          for r in 1 2 3; do
+            cargo nextest run -p beyond-agent --test it -E "$F" --no-fail-fast --status-level fail --final-status-level fail --failure-output final 2>&1 | grep -E "FAIL|Summary|leftover|panicked|the leftover" | head -12 | sed "s/^/ROUND$r /"
+          done
