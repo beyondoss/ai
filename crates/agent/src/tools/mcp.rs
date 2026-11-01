@@ -184,6 +184,18 @@ struct Dial {
     /// at connect without dialing, then checked against the live list at the first real start. Held
     /// for the session's life, within `service::MAX_SAVED_TOOLS`.
     saved: Option<Arc<Vec<crate::tools::mcp_manifest::CachedTool>>>,
+    /// Set for a `command` server of the workspace's `.mcp.json`: it is started as a job in the
+    /// session's sandbox instead of dialed over HTTP — see [`crate::tools::mcp_sandbox_stdio`].
+    sandbox: Option<(SandboxServers, crate::grant::SandboxCommand)>,
+}
+
+/// Where a session's `command` MCP servers run: its sandbox (through the same runner its tools use),
+/// the scope their jobs live in, and the directory they start in.
+#[derive(Clone)]
+pub struct SandboxServers {
+    pub runner: Arc<dyn crate::tools::exec::CommandRunner>,
+    pub scope: crate::exec_endpoint::jobs::JobScope,
+    pub cwd: String,
 }
 
 impl Default for Dial {
@@ -195,6 +207,7 @@ impl Default for Dial {
             skills_changed: Arc::default(),
             relist: Relist::default(),
             saved: None,
+            sandbox: None,
         }
     }
 }
@@ -2750,6 +2763,7 @@ pub(crate) type ServerConnect = (
 ///
 /// Fail-soft per connector, like `connect_all`: a bad URL or a dead server costs its own tools, not
 /// the session. The warnings are for the replica's log — they are not sent to the tenant.
+#[allow(clippy::too_many_arguments)]
 pub async fn connect_granted(
     connectors: &[crate::grant::McpConnector],
     secrets: &BTreeMap<String, Vec<crate::grant::SecretHeader>>,
@@ -2758,9 +2772,10 @@ pub async fn connect_granted(
     host: Arc<McpHost>,
     idle_reap_after: Duration,
     saved: &BTreeMap<String, Vec<crate::tools::mcp_manifest::CachedTool>>,
+    sandbox: Option<&SandboxServers>,
 ) -> (McpTools, McpCatalog, Vec<String>) {
     let (jobs, refused, mut warnings) = granted_jobs(
-        connectors, secrets, egress, exec_url, host, false, None, saved,
+        connectors, secrets, egress, exec_url, host, false, None, saved, sandbox,
     );
     warnings.extend(
         refused
@@ -2793,6 +2808,7 @@ pub(crate) async fn connect_granted_each(
         true,
         only,
         &BTreeMap::new(),
+        None,
     );
     for warning in &warnings {
         tracing::warn!(%warning, "MCP Apps: a connector header was refused");
@@ -2813,6 +2829,7 @@ fn granted_jobs(
     apps: bool,
     only: Option<&[String]>,
     saved: &BTreeMap<String, Vec<crate::tools::mcp_manifest::CachedTool>>,
+    sandbox: Option<&SandboxServers>,
 ) -> (
     Vec<(McpServerConfig, Dial)>,
     Vec<(String, String)>,
@@ -2826,6 +2843,40 @@ fn granted_jobs(
     let mut exec_egress: Option<McpEgress> = None;
     for connector in connectors {
         if only.is_some_and(|o| !o.contains(&connector.name)) {
+            continue;
+        }
+        if let Some(command) = &connector.command {
+            // MCP Apps render views from a server's HTTP resources; a server in the sandbox has
+            // none to offer them, so the apps pool leaves it alone.
+            if apps {
+                continue;
+            }
+            let Some(servers) = sandbox else {
+                refused.push((
+                    connector.name.clone(),
+                    "this session has no sandbox to run the server in".to_owned(),
+                ));
+                continue;
+            };
+            jobs.push((
+                McpServerConfig {
+                    name: connector.name.clone(),
+                    events: Vec::new(),
+                    transport: McpTransport::Stdio {
+                        command: command.command.clone(),
+                        args: command.args.clone(),
+                        env: command.env.clone(),
+                    },
+                },
+                Dial {
+                    host: host.clone(),
+                    sandbox: Some((servers.clone(), command.clone())),
+                    saved: saved
+                        .get(&connector.name)
+                        .map(|tools| Arc::new(tools.clone())),
+                    ..Dial::default()
+                },
+            ));
             continue;
         }
         let egress = match (connector.sandbox, &exec) {
@@ -2873,6 +2924,7 @@ fn granted_jobs(
                 apps,
                 skills_changed: Arc::default(),
                 relist: Relist::default(),
+                sandbox: None,
                 // Not for an apps dial: its tools carry view metadata a saved list does not.
                 saved: saved
                     .get(&connector.name)
@@ -2975,6 +3027,11 @@ async fn connect_one_client(
 ) -> Result<(McpClient, ServerProc), String> {
     let limit = handshake_timeout(dial);
     let dialing = async {
+        if let Some((servers, command)) = &dial.sandbox {
+            return connect_sandbox_stdio(config, dial, servers, command)
+                .await
+                .map(|c| (c, None));
+        }
         match &config.transport {
             McpTransport::Stdio { command, args, .. } => {
                 connect_stdio(config, dial, command, args).await
@@ -3188,6 +3245,33 @@ async fn connect_one(
     }
     let (client, proc) = connect_one_client(config, dial).await?;
     tools_from_client(config, dial, client, proc, idle_reap_after, manifest_dir).await
+}
+
+/// Start a `command` server in the session's sandbox and complete the handshake over it.
+async fn connect_sandbox_stdio(
+    config: &McpServerConfig,
+    dial: &Dial,
+    servers: &SandboxServers,
+    command: &crate::grant::SandboxCommand,
+) -> Result<McpClient, String> {
+    let (read, write) = crate::tools::mcp_sandbox_stdio::connect(
+        servers.runner.clone(),
+        servers.scope.clone(),
+        &config.name,
+        command,
+        &servers.cwd,
+    )
+    .await
+    .map_err(|e| format!("could not start the server in the sandbox: {e}"))?;
+    let transport = crate::tools::mcp_handshake::Guard::new(rmcp::transport::IntoTransport::<
+        rmcp::RoleClient,
+        std::io::Error,
+        _,
+    >::into_transport((read, write)));
+    McpHandler::for_dial(&config.name, dial)
+        .serve_with_lifecycle(transport, client_lifecycle())
+        .await
+        .map_err(|e| format!("MCP handshake with the in-sandbox server failed: {e}"))
 }
 
 /// Spawns `command` as its own process-group leader (`process_group(0)`), the same way

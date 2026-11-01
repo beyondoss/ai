@@ -6459,7 +6459,7 @@ SSM; the grant minter takes `--mcp`/`--mcp-sandbox`/`--mcp-managed`/`--limits-*`
 and `inspect-grant` unseals a grant with the agent's verifier to look for it. The `coding` and `browser`
 agents each get a private E2B microVM (ports answer only the VM's traffic token, which the grant carries
 as an exec header and a connector header); `rustwright-mcp` is served there as streamable HTTP by
-supergateway (hosted sessions skip `command` entries in `.mcp.json`) and named in the grant as a
+supergateway and named in the grant as a
 `sandbox: true` connector, so the agent keeps no connection to it between calls.
 
 ## Trust Boundaries
@@ -6896,9 +6896,37 @@ modes differ in what they take from it.
   literal, `$VAR`/`${VAR}`, or a leading `!command`. Because the gate is the only thing between a
   checkout and those, an untrusted project's file is never read. A bad entry (or an unparsable
   file) is skipped with a warning on stderr; the file is capped at 256 KiB.
-- **Hosted** (`serve --service`). Only `url` entries, as per-session connectors; see "Per-session
-  MCP". No header, `${VAR}` or `!command` is ever taken from the file, and `command` entries are
-  skipped.
+- **Hosted** (`serve --service`). `url` entries become per-session connectors dialed from the
+  replica; see "Per-session MCP". No header, `${VAR}` or `!command` is ever taken from the file.
+  A `command` entry never runs on the replica: it becomes a `sandbox: true` connector with
+  `McpConnector::command` set (never carried by a grant) and runs as a job in the session's own
+  sandbox — see "Stdio servers in the sandbox". Its `env` goes to the process as the literal
+  strings the file holds.
+
+### Stdio servers in the sandbox
+
+`tools/mcp_sandbox_stdio.rs`. The exec protocol has no live stdin, so a `command` server is built
+from what it does have. The server is a **sandbox job** (`JobScope::for_session_mcp`, a scope
+apart from the `bash` table's, which stops what nobody kept at every reopen) whose script makes a
+fifo, holds it open read-write as fd 3 (so the server never reads EOF while the job lives) and
+`exec`s the server on it, stderr to `<fifo>.log`. **Server → host** is `SandboxJobs::follow` from
+offset 0 (re-followed from the offset reached if the stream breaks while the job lives), fed
+through `mcp_stdio::pump`: the same line reader, size caps and `rescue` as a local stdio server.
+**Host → server** is one plain exec, `cat >> fifo` with the bytes as `stdin_base64`, from a single
+writer task: concurrent writers interleave once a message passes `PIPE_BUF` (4096 bytes), so
+everything rmcp writes queues to that task, which runs one exec at a time (queued bytes ride in the
+next one, in order). The fifo is made under another name and renamed into place only once the job
+holds it, and a connect removes any leftover first, so a write can never wait on a fifo nobody will
+read.
+
+One server per connector per connection. The job id is a digest of the connector name, and a
+connect removes a job under that id before starting (a previous replica's server speaks to a client
+that no longer exists, and a fresh `initialize` to it is not part of the protocol). Dropping the
+transport ends the writer task, which kills the job and removes the files; the idle reaper
+(`idle_reap_after`) and the session end reach the same drop, and `delete_session` wipes the scope.
+The bundle's `.mcp-tools.json` serves `tools/list` until the first call starts the server, so
+opening a session wakes no sandbox. MCP Apps leave these connectors alone. The snapshot carries
+them (`snapshot::VERSION` 2).
 
 ## MCP Server OAuth
 

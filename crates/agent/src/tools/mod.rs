@@ -30,6 +30,7 @@ pub mod mcp_host;
 pub mod mcp_http_exit;
 pub mod mcp_manifest;
 pub(crate) mod mcp_oauth;
+pub mod mcp_sandbox_stdio;
 pub mod mcp_skills;
 pub mod mcp_stdio;
 pub(crate) mod mcp_view_http;

@@ -98,6 +98,7 @@ mod mcp_progress;
 mod mcp_reap;
 mod mcp_redial;
 mod mcp_sandbox_connector;
+mod mcp_sandbox_stdio;
 mod mcp_skills;
 mod mcp_skills_approval;
 mod mcp_skills_integrity;

@@ -284,7 +284,13 @@ async fn setup_exec(
         }
     };
     if mode
-        .connect_session_mcp(cfg, &mcp_host, persistence.session_id(), &from_file)
+        .connect_session_mcp(
+            cfg,
+            &mcp_host,
+            persistence.session_id(),
+            &from_file,
+            &exec_cell,
+        )
         .await
     {
         timing.mark("connect session MCP connectors");

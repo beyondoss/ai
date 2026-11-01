@@ -1,10 +1,10 @@
 //! Service mode: the tenant's `<workspace>/.mcp.json` adds connectors to a session, and only its
-//! `url`s count.
+//! `url`s and `command`s count.
 //!
 //! The file is read from the sandbox, so its content is the tenant's: a `url` becomes a connector
 //! dialed through the same SSRF-checked egress as a grant's, and nothing else in it is trusted. A
-//! header value, `${VAR}` or `!command` would be a secret lookup or a shell on the replica, and a
-//! `command` server would be a process there; the grant alone supplies headers.
+//! header value, `${VAR}` or `!command` would be a secret lookup or a shell on the replica, and the
+//! grant alone supplies headers. A `command` server runs in the sandbox, as a job.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use crate::common;
@@ -163,26 +163,32 @@ async fn a_header_in_the_file_is_never_sent_and_a_var_in_it_is_never_expanded() 
     );
 }
 
-/// A `command` server would be a process on the replica: skipped, and never run.
+/// A `command` server is a process in the tenant's sandbox, never on the replica: its tools reach
+/// the session, and the only way it was started is a job request to the sandbox's exec endpoint.
 #[tokio::test]
-async fn a_command_entry_is_skipped_and_never_run() {
+async fn a_command_entry_runs_in_the_sandbox_and_its_tools_reach_the_session() {
     let (base, _requests) = spawn_model_server(vec![turn_text("hi")]);
     let svc = service(&base).await;
-    let marker = svc.workspace.join("ran-on-replica");
     svc.write_in_workspace(
         ".mcp.json",
         &json!({"mcpServers": {"proc": {
-            "command": "sh", "args": ["-c", format!("touch {}", marker.display())]}}})
+            "command": env!("CARGO_BIN_EXE_mcp_fixture_stdio_server")}}})
         .to_string(),
     );
 
     let mut ws = open_session(&svc, "s1.cmd", &[], &[]).await;
     let tools = advertised_mcp_tools(&mut ws).await;
     assert!(
-        tools.iter().all(|t| !t.starts_with("mcp__proc__")),
-        "{tools:?}"
+        tools.contains(&"mcp__proc__echo".to_string()),
+        "the server's tools must be advertised: {tools:?}"
     );
-    assert!(!marker.exists(), "the file's command was executed");
+    let starts: Vec<_> = svc
+        .exec
+        .bodies()
+        .into_iter()
+        .filter(|b| b["job"]["op"] == "start" && b["job"]["label"] == "mcp proc")
+        .collect();
+    assert_eq!(starts.len(), 1, "the sandbox was asked to run it once");
 }
 
 /// The same name in the grant and the file: the grant's connector is the one dialed.
