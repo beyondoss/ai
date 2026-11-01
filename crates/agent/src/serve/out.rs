@@ -188,6 +188,9 @@ pub(crate) struct ConnTx {
     pub(super) tx: mpsc::UnboundedSender<(OutFrame, usize)>,
     pub(super) backlog: Arc<std::sync::atomic::AtomicUsize>,
     pub(super) dropped: CancellationToken,
+    /// Whether this connection is also sent the `committed` marker (see [`OutFanout::broadcast_commit`]).
+    /// Only the SSE stream asks: a WebSocket client's frames are exactly what they were.
+    pub(super) marks: bool,
 }
 
 /// The receiving end of a [`ConnTx`], owned by the connection's send task.
@@ -205,9 +208,18 @@ pub(crate) fn conn_channel() -> (ConnTx, ConnRx) {
             tx,
             backlog: backlog.clone(),
             dropped: CancellationToken::new(),
+            marks: false,
         },
         ConnRx { rx, backlog },
     )
+}
+
+/// [`conn_channel`] for a connection that is also told, with a `committed` frame, whenever the
+/// session's history commits: the event stream's resume ids.
+pub(crate) fn conn_channel_marked() -> (ConnTx, ConnRx) {
+    let (mut tx, rx) = conn_channel();
+    tx.marks = true;
+    (tx, rx)
 }
 
 impl ConnTx {
@@ -425,9 +437,33 @@ impl OutFanout {
     /// buys the atomicity above, it is bounded by the transcript length, and it happens once per
     /// *attach* (a client reconnecting), never on the hot event path.
     pub(crate) fn add_with_catchup(&mut self, tx: OutSink) -> u64 {
-        if (!self.history.is_empty() || self.recording)
-            && let Ok(data) = messages_payload(&self.history, &self.history_ids, None)
-        {
+        let data = if !self.history.is_empty() || self.recording {
+            messages_payload(&self.history, &self.history_ids, None).ok()
+        } else {
+            None
+        };
+        self.add_seeded(tx, data)
+    }
+
+    /// [`Self::add_with_catchup`] for a client that already holds the history up to the message `since`
+    /// (the event stream's `Last-Event-ID`): the catch-up carries only what was committed after it.
+    /// A `since` this session does not have is an `Err`, and nothing is registered: a stale id must
+    /// not read as a working resume that silently re-sends everything (or nothing).
+    pub(crate) fn add_with_catchup_since(
+        &mut self,
+        tx: OutSink,
+        since: Option<&str>,
+    ) -> Result<u64, String> {
+        let data = if !self.history.is_empty() || self.recording || since.is_some() {
+            Some(messages_payload(&self.history, &self.history_ids, since)?)
+        } else {
+            None
+        };
+        Ok(self.add_seeded(tx, data))
+    }
+
+    fn add_seeded(&mut self, tx: OutSink, data: Option<Value>) -> u64 {
+        if let Some(data) = data {
             tx.seed(OutFrame::Value(json!({
                 "type": "catchup",
                 "data": data,
@@ -688,6 +724,24 @@ impl OutFanout {
     pub(crate) fn end(&mut self, frame: OutFrame) {
         self.ended = Some(frame.clone());
         self.broadcast(frame);
+    }
+
+    /// The session's history just committed: tell the connections that asked (the event stream) the
+    /// id of the newest committed message, which is what they resume from. Not recorded for replay
+    /// (it is about the commit, and the replay ends at it), and not sent to a WebSocket client.
+    pub(crate) fn broadcast_commit(&mut self) {
+        let Some(leaf) = self.history_ids.last() else {
+            return;
+        };
+        let Some(line) = frame_to_line(OutFrame::Value(
+            json!({ "type": "committed", "leaf_id": leaf }),
+        )) else {
+            return;
+        };
+        self.sinks.retain(|(_, tx)| match tx {
+            OutSink::Bounded(c) if c.marks => tx.send_line(line.clone()).is_ok(),
+            _ => true,
+        });
     }
 
     pub(crate) fn broadcast(&mut self, frame: OutFrame) {

@@ -47,6 +47,10 @@
 //! accepted and the run keeps going. Combined with [`crate::lifecycle`]'s outbound POSTs, the
 //! control plane is HTTP in both directions.
 //!
+//! `GET /_beyond/agent/events?session_id=<id>[&since=<id>]` is the same session as a Server-Sent
+//! Events stream (see [`handle_events`]): `catchup`, the turn's replay, then live frames, with `id:` the
+//! newest committed message and `Last-Event-ID`/`since` to resume.
+//!
 //! - A `prompt` that is acknowledged (`{type:"ack"}`) returns **202** with that ack as the body.
 //!   Events and the terminal `response` do **not** stream on this connection — attach a WebSocket
 //!   (same `?session_id=`) or watch lifecycle. A `prompt` rejected before the ack (busy, missing
@@ -115,7 +119,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::serve::{
     OutFanout, OutFrame, OutSink, ServeConfig, SharedOutConn, Signal, UpstreamHttp2, conn_channel,
-    frame_to_line, lock_ignoring_poison, serve_session,
+    conn_channel_marked, frame_to_line, lock_ignoring_poison, serve_session,
 };
 use crate::service::{Refusal, ServiceSession, Shards};
 use crate::session_store::{
@@ -129,6 +133,11 @@ mod tls;
 /// The fixed URL path a WebSocket upgrade must target. The front door maps a service subdomain to this
 /// path on the loopback listener; any other path is rejected at the handshake.
 const WS_PATH: &str = "/_beyond/agent";
+/// `GET` here is the same session as a Server-Sent Events stream, for a client that is not a WebSocket
+/// (`curl -N`, `EventSource`): see [`handle_events`].
+const EVENTS_PATH: &str = "/_beyond/agent/events";
+/// A comment line on an idle event stream, so a proxy's idle timer does not cut it.
+const EVENTS_KEEPALIVE: Duration = Duration::from_secs(15);
 
 /// Liveness: is this process serving at all? Answered unconditionally, so a hung shard cannot get the
 /// replica killed and restarted into the same hung shard.
@@ -2392,7 +2401,7 @@ where
         return Ok(());
     }
 
-    if head.path != WS_PATH {
+    if head.path != WS_PATH && head.path != EVENTS_PATH {
         refuse(&mut stream, &head, &leftover, HttpError::NotFound).await;
         return Ok(());
     }
@@ -2464,6 +2473,10 @@ where
     };
 
     match head.method.as_str() {
+        _ if head.method != "GET" && head.path == EVENTS_PATH => {
+            refuse(&mut stream, &head, &leftover, HttpError::MethodNotAllowed).await;
+            Ok(())
+        }
         "POST" => {
             if let Err(e) = handle_http_post(
                 supervisor,
@@ -2478,6 +2491,9 @@ where
                 supervisor.refuse(&mut stream, &e).await;
             }
             Ok(())
+        }
+        "GET" if head.path == EVENTS_PATH => {
+            handle_events(supervisor, stream, &head, requested_id, service).await
         }
         "GET" => {
             handle_websocket_upgrade(
@@ -2768,6 +2784,160 @@ where
         WebSocketStream::from_partially_read(stream, leftover, Role::Server, Some(config)).await;
     supervisor.attach(pinned, service, ws).await;
     Ok(())
+}
+
+/// `GET /_beyond/agent/events?session_id=<id>[&since=<id>]`: the session as a Server-Sent Events stream.
+///
+/// The same session, the same grant and the same frames as the WebSocket, for a client that cannot
+/// speak one. It is a view like any other: attaching starts nothing and detaching stops nothing.
+///
+/// - `catchup` (an event) first, with the committed transcript, then the current turn's frames
+///   replayed (`replay`, as on a WebSocket), then live frames, each a `data:` line holding the frame.
+/// - `id:` is the tree id of the newest **committed** message: on `catchup`, and on every `committed`
+///   event the replica sends when a run's messages commit. Frames inside a turn carry none; frames
+///   carry no sequence number and this adds none.
+/// - Resume with `Last-Event-ID` (or `?since=`): the catch-up then holds only what was committed after
+///   that message, and the turn in flight is replayed from its start, so a client drops the partial
+///   turn it holds and takes the replay. An id the session does not have is `409`, never a silent
+///   full or empty catch-up.
+/// - A connection that falls too far behind is closed (`event: reconnect`), as a WebSocket is, and
+///   resumes the same way. A `: keepalive` comment goes out every [`EVENTS_KEEPALIVE`].
+async fn handle_events<S>(
+    supervisor: &Arc<Supervisor>,
+    mut stream: S,
+    head: &HttpHead,
+    requested_id: Option<String>,
+    service: Option<Arc<ServiceSession>>,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let since = head
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("last-event-id"))
+        .map(|(_, v)| v.clone())
+        .or_else(|| {
+            head.query.as_deref().and_then(|q| {
+                url::form_urlencoded::parse(q.as_bytes())
+                    .find_map(|(k, v)| (k == "since").then(|| v.into_owned()))
+            })
+        })
+        .filter(|v| !v.is_empty());
+    let pinned = match supervisor.pin(requested_id, service).await {
+        Ok(pinned) => pinned,
+        Err(e) => {
+            supervisor.refuse(&mut stream, &HttpError::from(e)).await;
+            return Ok(());
+        }
+    };
+    let Pinned {
+        id,
+        incarnation,
+        out_conn,
+        ..
+    } = pinned;
+    let (conn_tx, mut conn_rx) = conn_channel_marked();
+    let dropped = conn_tx.dropped();
+    let registered = lock_ignoring_poison(&out_conn)
+        .add_with_catchup_since(OutSink::Bounded(conn_tx), since.as_deref());
+    let sink_id = match registered {
+        Ok(sink_id) => sink_id,
+        Err(_) => {
+            supervisor.unpin(&id, incarnation);
+            supervisor
+                .refuse(
+                    &mut stream,
+                    &HttpError::Conflict("no such message in this session: resume without an id"),
+                )
+                .await;
+            return Ok(());
+        }
+    };
+    let head_bytes = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n{SESSION_ID_HEADER}: {id}\r\n\r\nretry: 2000\n\n"
+    );
+    let mut ok =
+        stream.write_all(head_bytes.as_bytes()).await.is_ok() && stream.flush().await.is_ok();
+    let mut keepalive = tokio::time::interval(EVENTS_KEEPALIVE);
+    keepalive.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    keepalive.tick().await;
+    let mut scratch = [0u8; 256];
+    let mut reason = "";
+    while ok {
+        tokio::select! {
+            biased;
+            () = dropped.cancelled() => {
+                reason = "fell too far behind the session's output";
+                break;
+            }
+            // A GET carries no body; anything the client sends, or its closing the socket, ends this.
+            read = stream.read(&mut scratch) => {
+                if matches!(read, Ok(0) | Err(_)) {
+                    break;
+                }
+            }
+            frame = conn_rx.recv() => match frame {
+                Some(frame) => {
+                    if let Some(line) = frame_to_line(frame) {
+                        ok = stream.write_all(&sse_event(&line)).await.is_ok();
+                    }
+                }
+                None => break,
+            },
+            _ = keepalive.tick() => {
+                ok = stream.write_all(b": keepalive\n\n").await.is_ok();
+            }
+        }
+        if ok {
+            ok = stream.flush().await.is_ok();
+        }
+    }
+    if !reason.is_empty() {
+        let _ = stream
+            .write_all(format!("event: reconnect\ndata: {reason}\n\n").as_bytes())
+            .await;
+        let _ = stream.flush().await;
+    }
+    lock_ignoring_poison(&out_conn).remove(sink_id);
+    supervisor.unpin(&id, incarnation);
+    Ok(())
+}
+
+/// One frame line as an SSE event. `catchup` and `committed` carry the resume id; a frame's own text
+/// never contains a raw newline (it is one JSON line), so one `data:` line holds it.
+fn sse_event(line: &[u8]) -> Vec<u8> {
+    let frame: Option<Value> = serde_json::from_slice(line).ok();
+    let kind = frame
+        .as_ref()
+        .and_then(|v| v.get("type"))
+        .and_then(Value::as_str);
+    let leaf = match kind {
+        Some("catchup") => frame
+            .as_ref()
+            .and_then(|v| v.pointer("/data/leaf_id"))
+            .and_then(Value::as_str),
+        Some("committed") => frame
+            .as_ref()
+            .and_then(|v| v.get("leaf_id"))
+            .and_then(Value::as_str),
+        _ => None,
+    };
+    let mut out = Vec::with_capacity(line.len() + 48);
+    if let Some(kind @ ("catchup" | "committed")) = kind {
+        out.extend_from_slice(b"event: ");
+        out.extend_from_slice(kind.as_bytes());
+        out.push(b'\n');
+        if let Some(leaf) = leaf {
+            out.extend_from_slice(b"id: ");
+            out.extend_from_slice(leaf.as_bytes());
+            out.push(b'\n');
+        }
+    }
+    out.extend_from_slice(b"data: ");
+    out.extend_from_slice(line);
+    out.extend_from_slice(b"\n\n");
+    out
 }
 
 /// POST `/_beyond/mcp-events/<token>`: one MCP Events webhook delivery. Everything past reading the
@@ -3148,6 +3318,8 @@ enum HttpError {
     /// Service mode: the grant is well-formed, but this replica doesn't mount its shard. The client
     /// should be routed elsewhere rather than retried here.
     Misdirected(&'static str),
+    /// The event stream was asked to resume from an id this session does not have.
+    Conflict(&'static str),
     Io,
 }
 
@@ -3171,7 +3343,8 @@ impl std::fmt::Display for HttpError {
             | HttpError::Unauthorized(m)
             | HttpError::Forbidden(m)
             | HttpError::UnsupportedMediaType(m)
-            | HttpError::Misdirected(m) => write!(f, "{m}"),
+            | HttpError::Misdirected(m)
+            | HttpError::Conflict(m) => write!(f, "{m}"),
             HttpError::NotFound => write!(f, "not found: expected {WS_PATH}"),
             HttpError::MethodNotAllowed => write!(f, "method not allowed"),
             HttpError::UpgradeRequired => write!(f, "WebSocket upgrade required"),
@@ -3197,6 +3370,7 @@ impl HttpError {
             HttpError::Forbidden(_) => (403, "Forbidden"),
             HttpError::UnsupportedMediaType(_) => (415, "Unsupported Media Type"),
             HttpError::Misdirected(_) => (421, "Misdirected Request"),
+            HttpError::Conflict(_) => (409, "Conflict"),
             HttpError::Incomplete | HttpError::BadRequest(_) | HttpError::Io => {
                 (400, "Bad Request")
             }

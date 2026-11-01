@@ -147,6 +147,30 @@ and never changes, so there is no lookup table and nothing is ever rebalanced.
 **Never wire them the other way round.** Restarting a replica does not put a missing mount back, and
 killing one mid-drain is the outage the drain exists to avoid.
 
+### The event stream
+
+`GET /_beyond/agent/events?session_id=<id>[&since=<message id>]` is the session as a Server-Sent
+Events stream, for a client that is not a WebSocket (`curl -N`, `EventSource`). It is the same session,
+the same grant (`x-beyond-grant`) and the same frames as the WebSocket, and a view like it: attaching
+starts nothing and detaching stops nothing.
+
+- The first event is `catchup` (the committed transcript, as `get_messages` answers), then the current
+  turn's frames replayed, then live frames. Each frame is one `data:` line.
+- `id:` is the tree id of the newest **committed** message, on `catchup` and on every `committed`
+  event (`{"type":"committed","leaf_id":…}`, sent to event streams only, when a run's messages commit).
+  Frames inside a turn carry no id and there is still no sequence number.
+- To resume, send `Last-Event-ID` (what `EventSource` does) or `?since=`. The catch-up then holds only
+  what was committed after that message, and the turn in flight is replayed from its start: **drop the
+  partial turn you hold and take the replay.** An id the session does not have is `409`.
+- A connection that falls too far behind is closed, after `event: reconnect`, exactly as a WebSocket
+  is; it resumes the same way. A `: keepalive` comment is sent every 15 s.
+
+What the edge must do beyond the table above: route it like any request for the session id (Requirements
+1, 2 and 4, the `503` retry and the ring walk happen **before** the stream starts), pass the response
+through **unbuffered** and without a response timeout (a stream is open for as long as the client
+reads), and forward `Last-Event-ID` and the `409` unchanged. E1–E7 are about callbacks and do not
+apply. Check: `tests/serve_sse_events.rs`.
+
 ### Job-end callbacks
 
 A sandbox reports that a background job changed state by POSTing a `job_ended` command to the
