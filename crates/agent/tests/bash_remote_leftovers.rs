@@ -44,6 +44,18 @@ fn running(cmd: &str) -> Vec<u32> {
     out
 }
 
+/// The leftover is running: the call returns at the shell's exit, which can be before a
+/// `nohup <cmd>` has exec'd into `<cmd>`, so the process is waited for, not sampled once.
+async fn wait_running(cmd: &str) -> bool {
+    for _ in 0..40 {
+        if !running(cmd).is_empty() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
 async fn wait_gone(cmd: &str) -> bool {
     for _ in 0..100 {
         if running(cmd).is_empty() {
@@ -93,7 +105,7 @@ async fn adopted_then_stopped(runner: Arc<dyn CommandRunner>, cmd: &'static str)
         !out.contains('\u{1e}'),
         "no marker reaches the model: {out:?}"
     );
-    assert!(!running(cmd).is_empty(), "the leftover runs");
+    assert!(wait_running(cmd).await, "the leftover runs");
     let stopped = tokio::task::spawn_blocking({
         let bash = bash.clone();
         move || bash.jobs().stop_all()
