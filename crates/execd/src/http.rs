@@ -104,6 +104,27 @@ pub(crate) fn stream_response() -> (Resp, mpsc::Sender<Bytes>) {
     (r, tx)
 }
 
+/// A one-shot answer that has started before it is finished: the same JSON `Content-Type` as ever,
+/// the body fed by the sender.
+pub(crate) fn json_stream_response() -> (Resp, mpsc::Sender<Bytes>) {
+    let (tx, rx) = mpsc::channel(1);
+    let mut r = Response::new(Body::Stream(rx));
+    let h = r.headers_mut();
+    h.insert(
+        CONTENT_TYPE,
+        hyper::header::HeaderValue::from_static("application/json"),
+    );
+    h.insert(
+        CACHE_CONTROL,
+        hyper::header::HeaderValue::from_static("no-store"),
+    );
+    h.insert(
+        "x-accel-buffering",
+        hyper::header::HeaderValue::from_static("no"),
+    );
+    (r, tx)
+}
+
 /// What the agent sends, minus the job operation, which is parsed once it is known to be one.
 #[derive(Deserialize)]
 pub(crate) struct Request {

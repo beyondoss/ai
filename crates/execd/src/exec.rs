@@ -268,7 +268,43 @@ fn answer(code: i32, stdout: &[u8], stderr: &[u8]) -> Value {
 }
 
 /// one-shot: run to completion, answer with one object.
+///
+/// A command that answers within a heartbeat gets its answer as ever, status and all. One that runs
+/// longer gets `200` headers at the first silence and a space every heartbeat after, then the
+/// answer: a proxy's response-header timeout (instd's gateway cuts a response with no headers at
+/// 295 s) otherwise ends any long command with a `502`. The body stays one JSON document (leading
+/// whitespace is JSON's own, RFC 8259, and every client's decoder skips it). What can no longer be a
+/// status is the answer's own: the `422` of an output over the cap arrives as its `{"error"}` body
+/// under `200`, which a client reads as an answer with no `exit_code`.
 pub(crate) async fn envelope(ctx: &Arc<Ctx>, req: Request) -> Resp {
+    let beat = ctx.opts.heartbeat;
+    let mut run = Box::pin(run_oneshot(ctx.clone(), req));
+    if let Ok(resp) = tokio::time::timeout(beat, &mut run).await {
+        return resp;
+    }
+    let (resp, out) = http::json_stream_response();
+    tokio::spawn(async move {
+        let finished = loop {
+            tokio::select! {
+                resp = &mut run => break resp,
+                // The client left: dropping `run` ends the command with its group slot.
+                () = out.closed() => return,
+                () = tokio::time::sleep(beat) => {}
+            }
+            if out.send(Bytes::from_static(b" ")).await.is_err() {
+                return;
+            }
+        };
+        if let http::Body::Full(Some(body)) = finished.into_body() {
+            let _ = out.send(body).await;
+        }
+    });
+    resp
+}
+
+/// The whole one-shot exchange, answered when the command has ended.
+async fn run_oneshot(ctx: Arc<Ctx>, req: Request) -> Resp {
+    let ctx = &ctx;
     let line = Line::new("exec", &req.command);
     let stdin = match req.stdin.as_deref() {
         None => None,

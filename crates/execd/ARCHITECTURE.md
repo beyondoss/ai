@@ -80,6 +80,14 @@ stderr ending in `command exceeded its timeout`. A request without `timeout_ms` 
 that a descendant holds open. The group is then killed (the spec's SHOULD for one-shot), and it is killed if the client leaves
 first.
 
+**A long command's answer starts early.** A command that answers within one heartbeat (`Options::heartbeat`, 5 s) gets
+its answer as ever, status included. One still running then gets `200` headers at that first silence and one space per
+heartbeat after it, then the answer: instd's gateway cuts a response with no headers at 295 s, which ended every longer
+one-shot with a `502`. Leading whitespace is JSON's own (RFC 8259), so the body is still one document and every client's
+decoder (serde_json, `JSON.parse`, `json.loads`, Go's `encoding/json`) reads it unchanged. After the headers a status can no longer change: an
+output over the cap arrives as its `{"error"}` body under `200` (a client reports an answer with no `exit_code`). A client that
+leaves ends the command. `tests/oneshot_headers.rs` pins all of it.
+
 **Output is bytes.** `stdout` and `stderr` are always standard base64 of the bytes the command wrote, both always present
 (the empty string for none). The cap is on the raw bytes across both pipes, so it is on the decoded bytes, as the spec says.
 `answer` is the one place that builds the object, and it never converts. The note a deadline appends to stderr is appended
@@ -219,6 +227,7 @@ What the spec and the conformance verifier assume, and what holds:
 | `tests/baseline.rs`                             | after a mixed workload (one-shot, streams finished and dropped, jobs past the 8 MiB spool, kills, removes, a wipe), `/proc` shows the starting open fds and threads, no zombie child, and an empty jobs directory                                                                                                                                                                                                                                      |
 | `tests/parsers.rs`, `fuzz/` (`request`, `ring`) | no body panics the parsers, every refused body is a `4xx`, and the output ring agrees with a plain buffer for every offset and size                                                                                                                                                                                                                                                                                                                    |
 | `tests/conformance.rs`                          | the full verifier, also at `debug` level (then its log is searched for the bearer) and under `EXECD_RUN_AS`                                                                                                                                                                                                                                                                                                                                            |
+| `tests/oneshot_headers.rs`                      | a one-shot answer to a command that outlives a heartbeat has its headers before the command ends and a body that is one JSON document with leading whitespace; a quick one is unchanged; an error before the start keeps its status; a client that leaves stops the command                                                                                                                                                                            |
 | `tests/output.rs`, `tests/timeout.rs`           | one-shot output is bytes (every byte value on both streams, the empty answer, the deadline note, stdin, the cap on decoded bytes) and `timeout_ms` kills the group and answers 124                                                                                                                                                                                                                                                                     |
 
 Every test that starts the binary owns it from the moment it exists, and a detached watchdog shell kills execd and everything under it if the test process dies without running destructors (`tests/guard.rs` SIGKILLs a test mid-run, as user and as root, and looks for survivors). The tests that need root run execd through `sudo -n` (or as root) and print `SKIPPED` where a host gives them neither. The long
