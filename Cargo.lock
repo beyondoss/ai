@@ -486,7 +486,7 @@ dependencies = [
 
 [[package]]
 name = "beyond-execd"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "base64 0.22.1",
  "beyond-agent",
