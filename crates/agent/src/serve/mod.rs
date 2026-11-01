@@ -1143,6 +1143,9 @@ impl SessionLoop {
         // published. Drop the recording under this *same* lock: a connection attaching must never see
         // the new history and then have the finished turn's frames replayed on top of it.
         fanout.end_turn();
+        if changed {
+            fanout.broadcast_commit();
+        }
     }
 
     /// Install a freshly discovered resource set: the lists `get_commands` and prompt expansion read,

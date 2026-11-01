@@ -221,6 +221,7 @@ mod serve_session_title;
 mod serve_session_tree;
 mod serve_shared_client;
 mod serve_slow_client;
+mod serve_sse_events;
 mod serve_startup_stall;
 mod serve_state_reporting;
 mod serve_stdin_bad_line;

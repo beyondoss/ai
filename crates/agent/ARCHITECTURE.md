@@ -119,7 +119,7 @@ The harness layers several capabilities over the bare tools + loop:
   answers to questions it never asked (`tests/serve_replay_replies.rs`). For the same borrow reason, `get_messages` is answerable **mid-run** from that
   snapshot rather than from `session` (which `run_events_steered` holds `&mut` for a run's whole duration
   — the same escape hatch `LiveStats` gives `get_state`), so a client can reconcile instead of being told
-  to come back later. `serve_ws` owns a `session id → running session`
+  to come back later. The same view is available as a Server-Sent Events stream, `GET /_beyond/agent/events` (`serve_ws::handle_events`, FLEET.md "The event stream"): the identical catch-up and replay, one `data:` line per frame, `id:` the tree id of the newest committed message on `catchup` and on a `committed` event (`OutFanout::broadcast_commit`, sent to event-stream connections only, under the lock that publishes the history), and `Last-Event-ID`/`?since=` through `OutFanout::add_with_catchup_since`, which refuses an id the session does not have. `serve_ws` owns a `session id → running session`
   map; each session is a task on the daemon's **shared Tokio runtime** (the event sink is `FnMut +
   Send`, and `serve_session`'s error type is `Box<dyn Error + Send + Sync>`, so the future is `Send`
   and can be `tokio::spawn`ed — it used to take a dedicated OS thread and current-thread runtime
