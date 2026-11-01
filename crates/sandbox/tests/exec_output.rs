@@ -169,3 +169,22 @@ async fn the_sandbox_surface_returns_bytes() {
         .unwrap();
     assert_eq!(out.stdout, [0xff, 0x00]);
 }
+
+/// A command that outlives a heartbeat is answered with leading whitespace in front of the one JSON
+/// document (execd sends its headers at the first heartbeat and a space after each, so a proxy's
+/// response-header timeout never cuts a long command off). The client reads it as the same answer.
+#[tokio::test]
+async fn an_answer_that_started_early_reads_as_the_same_answer() {
+    let (mock, _dir) = mock(MockOptions {
+        heartbeat: Duration::from_millis(150),
+        ..MockOptions::default()
+    })
+    .await;
+    let runner = HttpExecRunner::new(&mock.url).unwrap();
+    let out = runner
+        .run("sh", &sh("sleep 0.8; echo late; exit 4"), None, SECS)
+        .await
+        .unwrap();
+    assert_eq!(out.code, Some(4));
+    assert_eq!(out.stdout, b"late\n");
+}
