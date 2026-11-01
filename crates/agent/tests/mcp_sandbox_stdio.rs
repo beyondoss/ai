@@ -170,3 +170,27 @@ async fn concurrent_calls_with_large_arguments_never_interleave_on_the_fifo() {
         }
     }
 }
+
+/// What a call costs through the sandbox: each is a write (one exec) and the reply (the followed
+/// stream). Against a local execd this is the floor; a remote sandbox adds its round trips. The
+/// numbers are printed for the record and bounded loosely, so a regression to seconds fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_call_costs_one_exec_round_trip() {
+    let b = sandbox().await;
+    let pidfile = b.dir.path().join("server.pid");
+    let (tools, _catalog, _) = connect(&b, connector(&pidfile, &[])).await;
+    let echo = tool(&tools, "mcp__box__echo");
+    let mut micros = Vec::new();
+    for i in 0..60 {
+        let t = std::time::Instant::now();
+        echo.run(json!({ "text": format!("n{i}") })).await.unwrap();
+        micros.push(t.elapsed().as_micros());
+    }
+    micros.sort_unstable();
+    let (p50, p95) = (micros[micros.len() / 2], micros[micros.len() * 95 / 100]);
+    eprintln!(
+        "sandbox stdio call, n={}: p50 {p50} us, p95 {p95} us",
+        micros.len()
+    );
+    assert!(p95 < 2_000_000, "p95 {p95} us");
+}
