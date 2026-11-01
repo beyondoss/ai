@@ -79,8 +79,9 @@ d("against a loopback execd", () => {
     await sb.files.mkdir(dir);
     const marker = join(dir, "alive");
     // A grandchild keeps touching a marker; killing the stream must stop it.
+    // The first write is synchronous so "started" implies the marker exists.
     const script =
-      `while :; do date +%s%N > "${marker}"; sleep 0.1; done & echo started; wait`;
+      `date +%s%N > "${marker}"; while :; do date +%s%N > "${marker}"; sleep 0.1; done & echo started; wait`;
     const frames: Frame[] = [];
     for await (const f of sb.stream("sh", ["-c", script])) {
       frames.push(f);
