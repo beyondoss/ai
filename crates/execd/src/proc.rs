@@ -168,6 +168,7 @@ pub(crate) fn group_exists(pgid: i32) -> bool {
 
 /// The live (non-zombie) members of group `pgid`, by reading `/proc`: the pids, for an operation
 /// that reports them. A zombie never counts: the spec says a group of zombies is empty.
+#[cfg(test)]
 pub(crate) fn live_members(pgid: i32) -> Vec<u32> {
     if !group_exists(pgid) {
         return Vec::new();
@@ -217,14 +218,6 @@ pub(crate) async fn group_gone(pgid: i32, precise: bool) -> bool {
     off_runtime(move || live_members_scan(pgid).is_empty()).await
 }
 
-/// [`live_members`] without holding up the runtime for the `/proc` scan.
-pub(crate) async fn live_members_async(pgid: i32) -> Vec<u32> {
-    if !group_exists(pgid) {
-        return Vec::new();
-    }
-    off_runtime(move || live_members(pgid)).await
-}
-
 /// Run `f`, a blocking `/proc` scan, on a thread of its own so the runtime is not held up. Where
 /// the process cannot make a thread (its process limit is reached), `f` runs here instead: a few
 /// milliseconds of stalled runtime, where `tokio::task::spawn_blocking` would panic the request.
@@ -251,12 +244,89 @@ pub(crate) async fn off_runtime<T: Default + Send + 'static>(
     f.map_or_else(T::default, |f| f())
 }
 
-/// Whether group `pgid` has no live member, for a caller that is already off the runtime.
-pub(crate) fn group_empty(pgid: i32) -> bool {
-    if !group_exists(pgid) {
-        return true;
+/// The variable every job's processes carry (a job's `mark`, unique to it), so that what leaves
+/// the job's process group still belongs to the job: `timeout` and `setsid` put themselves and
+/// their child in groups and sessions of their own, and a daemon double-forks away. The
+/// environment is inherited by all of them. What clears it (`env -i`, a wrapper that sanitizes)
+/// or is another uid's (`/proc/<pid>/environ` is unreadable to execd unless it is root) is not
+/// found.
+pub(crate) const JOB_MARK_ENV: &str = "EXECD_JOB_MARK";
+
+/// A fresh mark: unguessable enough that one job cannot name another's by accident.
+pub(crate) fn new_job_mark(seq: u64) -> String {
+    use std::hash::{BuildHasher as _, Hasher as _};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u64(seq);
+    format!("{:016x}{seq:x}", h.finish())
+}
+
+/// Whether `pid`'s environment, as it was at exec, holds `EXECD_JOB_MARK=<mark>`.
+fn has_mark(pid: u32, mark: &str) -> bool {
+    let Ok(env) = std::fs::read(format!("/proc/{pid}/environ")) else {
+        return false;
+    };
+    let want = format!("{JOB_MARK_ENV}={mark}");
+    env.split(|&b| b == 0).any(|kv| kv == want.as_bytes())
+}
+
+/// The live (non-zombie) processes of a job: its process group's members and everything that
+/// carries its mark, wherever it has gone. By reading `/proc`.
+pub(crate) fn job_members(pgid: i32, mark: &str) -> Vec<u32> {
+    let mut out = Vec::new();
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return out;
+    };
+    let me = std::process::id();
+    for e in dir.flatten() {
+        let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        if pid == me {
+            continue;
+        }
+        if let Some((state, _, pg)) = stat(pid)
+            && is_live(state)
+            && ((pgid > 1 && pg == pgid) || has_mark(pid, mark))
+        {
+            out.push(pid);
+        }
     }
-    !SUBREAPER.load(Ordering::Relaxed) && live_members_scan(pgid).is_empty()
+    out
+}
+
+/// [`job_members`] without holding up the runtime for the `/proc` scan.
+pub(crate) async fn job_members_async(pgid: i32, mark: &str) -> Vec<u32> {
+    let mark = mark.to_string();
+    off_runtime(move || job_members(pgid, &mark)).await
+}
+
+/// Whether a job has no live process, for a caller that is already off the runtime. Where execd
+/// is the subreaper a group that exists is alive (a zombie is collected at once).
+pub(crate) fn job_empty(pgid: i32, mark: &str) -> bool {
+    if group_exists(pgid) && SUBREAPER.load(Ordering::Relaxed) {
+        return false;
+    }
+    job_members(pgid, mark).is_empty()
+}
+
+/// Whether a job has no live process, as cheaply as is right: [`group_gone`], plus whatever left
+/// the group with the job's mark (found by a scan, which a group that is already empty still needs).
+pub(crate) async fn job_gone(pgid: i32, mark: &str, precise: bool) -> bool {
+    if group_exists(pgid) && SUBREAPER.load(Ordering::Relaxed) && !precise {
+        return false;
+    }
+    let mark = mark.to_string();
+    off_runtime(move || job_members(pgid, &mark).is_empty()).await
+}
+
+/// `sig` to the job's group and to everything that carries its mark.
+pub(crate) fn signal_job(pgid: i32, mark: &str, sig: Signal) {
+    signal_group(pgid, sig);
+    for pid in job_members(pgid, mark) {
+        if let Ok(raw) = i32::try_from(pid) {
+            let _ = nix::sys::signal::kill(Pid::from_raw(raw), sig);
+        }
+    }
 }
 
 /// `(state, ppid, pgrp)` of `pid`, from `/proc/<pid>/stat`.

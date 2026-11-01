@@ -162,6 +162,8 @@ impl Drop for Ring {
 /// One job, as the endpoint keeps it.
 pub(crate) struct Job {
     pgid: i32,
+    /// What every process of the job carries in its environment ([`proc::JOB_MARK_ENV`]).
+    mark: String,
     label: String,
     started: u64,
     ended: u64,
@@ -294,27 +296,40 @@ fn put_signal(j: &Job, obj: &mut Value) {
     }
 }
 
-/// `SIGTERM` the groups, wait up to `grace` for them to empty, `SIGKILL` what is left, wait up to a
-/// second more (jobs `kill`).
-async fn stop_groups(pgids: &[i32], grace: Duration) {
-    for &g in pgids {
-        proc::signal_group(g, Signal::SIGTERM);
-    }
-    let any_live = |pgids: &[i32]| {
-        let pgids = pgids.to_vec();
-        async move { proc::off_runtime(move || pgids.iter().any(|&g| !proc::group_empty(g))).await }
+/// `SIGTERM` the jobs (each `(pgid, mark)`), wait up to `grace` for them to empty, `SIGKILL` what is
+/// left, wait up to a second more (jobs `kill`).
+async fn stop_jobs(jobs: &[(i32, String)], grace: Duration) {
+    let jobs = jobs.to_vec();
+    proc::off_runtime({
+        let jobs = jobs.clone();
+        move || {
+            for (g, m) in &jobs {
+                proc::signal_job(*g, m, Signal::SIGTERM);
+            }
+        }
+    })
+    .await;
+    let any_live = |jobs: &[(i32, String)]| {
+        let jobs = jobs.to_vec();
+        async move { proc::off_runtime(move || jobs.iter().any(|(g, m)| !proc::job_empty(*g, m))).await }
     };
     let deadline = tokio::time::Instant::now() + grace;
-    while any_live(pgids).await && tokio::time::Instant::now() < deadline {
+    while any_live(&jobs).await && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    for &g in pgids {
-        if !proc::group_empty(g) {
-            proc::kill_group(g);
+    proc::off_runtime({
+        let jobs = jobs.clone();
+        move || {
+            for (g, m) in &jobs {
+                if !proc::job_empty(*g, m) {
+                    proc::signal_job(*g, m, Signal::SIGKILL);
+                }
+            }
         }
-    }
+    })
+    .await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-    while any_live(pgids).await && tokio::time::Instant::now() < deadline {
+    while any_live(&jobs).await && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
@@ -475,22 +490,23 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq) -> Resp {
             let wipe = job.op == "wipe";
             let grace = Duration::from_millis(job.grace_ms.unwrap_or(300));
             // Never a group whose job has ended: its number may be reused.
-            let targets: Vec<(Key, JobCell, i32)> = jobs
+            let targets: Vec<(Key, JobCell, i32, String)> = jobs
                 .in_scope(&job.scope, |id| wipe || job.ids.iter().any(|i| i == id))
                 .into_iter()
                 .filter_map(|(k, c)| {
-                    let (running, pgid) = {
+                    let (running, pgid, mark) = {
                         let j = locked(&c);
-                        (j.end.is_none(), j.pgid)
+                        (j.end.is_none(), j.pgid, j.mark.clone())
                     };
-                    running.then_some((k, c, pgid))
+                    running.then_some((k, c, pgid, mark))
                 })
                 .collect();
-            let pgids: Vec<i32> = targets.iter().map(|(_, _, g)| *g).collect();
-            stop_groups(&pgids, grace).await;
+            let stopping: Vec<(i32, String)> =
+                targets.iter().map(|(_, _, g, m)| (*g, m.clone())).collect();
+            stop_jobs(&stopping, grace).await;
             let mut survivors = Vec::new();
-            for ((_, id), _, g) in &targets {
-                let left = proc::live_members_async(*g).await;
+            for ((_, id), _, g, m) in &targets {
+                let left = proc::job_members_async(*g, m).await;
                 if !left.is_empty() {
                     survivors.push(json!({ "id": id, "pids": left }));
                 }
@@ -500,9 +516,12 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq) -> Resp {
                 let named = jobs.in_scope(&job.scope, |id| wipe || job.ids.iter().any(|i| i == id));
                 let mut gone = Vec::new();
                 for (k, c) in named {
-                    let pgid = locked(&c).pgid;
+                    let (pgid, mark) = {
+                        let j = locked(&c);
+                        (j.pgid, j.mark.clone())
+                    };
                     // pgid 0: still being spawned, so not yet a job that can be taken out.
-                    if pgid != 0 && proc::live_members_async(pgid).await.is_empty() {
+                    if pgid != 0 && proc::job_members_async(pgid, &mark).await.is_empty() {
                         gone.push(k);
                     }
                 }
@@ -515,11 +534,11 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq) -> Resp {
             let named = jobs.in_scope(&job.scope, |id| job.ids.iter().any(|i| i == id));
             let mut gone = Vec::new();
             for (k, c) in named {
-                let (ended, pgid) = {
+                let (ended, pgid, mark) = {
                     let j = locked(&c);
-                    (j.end.is_some(), j.pgid)
+                    (j.end.is_some(), j.pgid, j.mark.clone())
                 };
-                if ended || (pgid != 0 && proc::live_members_async(pgid).await.is_empty()) {
+                if ended || (pgid != 0 && proc::job_members_async(pgid, &mark).await.is_empty()) {
                     gone.push(k);
                 }
             }
@@ -622,6 +641,7 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
         // starts of one id cannot both run.
         let cell = Arc::new(Mutex::new(Job {
             pgid: 0,
+            mark: proc::new_job_mark(ctx.next_seq.fetch_add(1, Ordering::Relaxed)),
             label: job.label.clone(),
             started: epoch(),
             ended: 0,
@@ -642,6 +662,8 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
     };
     let mut cmd = exec::command_for(ctx, req);
     cmd.stdin(Stdio::null());
+    let mark = locked(&cell).mark.clone();
+    cmd.env(proc::JOB_MARK_ENV, &mark);
     let mut proc = match proc::spawn(&mut cmd) {
         Ok(p) => p,
         Err(e) => {
@@ -778,6 +800,7 @@ async fn supervise(
     exited: tokio::sync::watch::Sender<bool>,
 ) {
     let pgid = proc.pgid;
+    let mark = locked(&cell).mark.clone();
     let status = proc.wait().await;
     let (code, signal) = status.map_or((-1, None), |s| {
         use std::os::unix::process::ExitStatusExt as _;
@@ -790,7 +813,7 @@ async fn supervise(
         }
     });
     let mut exits = proc::ChildEvents::new();
-    if !proc::group_gone(pgid, false).await {
+    if !proc::job_gone(pgid, &mark, false).await {
         // What the shell printed goes before `shell_exit`; the pumps read on, the group lives.
         drain_pumps(&mut pipes, &progress, cap).await;
         // The moment a held stream would send `shell_exit`: notify calls back.
@@ -803,7 +826,7 @@ async fn supervise(
         ctx.jobs.bump();
         loop {
             let wake = exits.next().await;
-            if proc::group_gone(pgid, wake == proc::Wake::Tick).await {
+            if proc::job_gone(pgid, &mark, wake == proc::Wake::Tick).await {
                 break;
             }
         }
@@ -848,12 +871,12 @@ async fn stream_job(
     }
     // The connection is gone before the job's end: a held job nobody kept dies with it.
     if hold && let Some(cell) = ctx.jobs.get(&key) {
-        let pgid = {
+        let job = {
             let j = locked(&cell);
-            (!j.kept && j.end.is_none()).then_some(j.pgid)
+            (!j.kept && j.end.is_none()).then(|| (j.pgid, j.mark.clone()))
         };
-        if let Some(g) = pgid {
-            proc::kill_group(g);
+        if let Some((g, m)) = job {
+            proc::off_runtime(move || proc::signal_job(g, &m, Signal::SIGKILL)).await;
             return StreamEnd::Disconnected { killed: true };
         }
     }
