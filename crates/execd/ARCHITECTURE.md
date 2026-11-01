@@ -204,8 +204,14 @@ What the spec and the conformance verifier assume, and what holds:
   bearer on a command line leaks it that way: `sudo` records the command it runs in `SUDO_COMMAND`, which every command below
   it inherits. Hand the token over in a file, or in the environment, never as an argument.
 - No `no_new_privs`: it would break `sudo` in a sandbox image that wants it.
-- A kill is of a process group. A command that daemonizes out of its group (`setsid`) survives the kill of its job, a timeout and
-  the shutdown sweep, with or without `EXECD_RUN_AS`; a cgroup per job would close that, and execd does not own one.
+- A one-shot or a stream is killed by its process group. A command that leaves its group (`timeout`, `setsid`, a daemon) survives
+  the kill of its timeout, a disconnect and the shutdown sweep, with or without `EXECD_RUN_AS`.
+- A _job_ is its process group plus every process that carries `EXECD_JOB_MARK=<token>` (the job's own, set in its environment and
+  inherited), so `kill`, `wipe`, `survivors` and the job's end cover what `timeout`, `setsid` and a double fork took out of the
+  group. The mark is found by reading `/proc/<pid>/environ`: a process that clears its environment (`env -i`, a sanitizing wrapper), or
+  one of another uid when execd is not root, is not found, and a job that holds only such a process reads as ended. A cgroup per job
+  would close that; execd does not own one, and the second kill path it needs is not taken until a real escape of the scan shows up.
+  `tests/job_escape.rs` pins it.
 - A capability held by execd as an _ambient_ capability would reach the commands (`EXECD_RUN_AS` from a non-root execd with ambient
   `CAP_SETUID`): run execd as root, or with those capabilities permitted and effective only.
 
