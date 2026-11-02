@@ -151,6 +151,15 @@ async fn the_configured_front_conforms() {
     target.probe = secs("PROBE_SECS").unwrap_or(target.probe);
     target.silence = secs("SILENCE_SECS").unwrap_or(target.silence);
     target.settle = secs("SETTLE_SECS").unwrap_or(target.settle);
+    let cb = |k: &str| {
+        std::env::var(format!("AGENT_CONFORMANCE_CALLBACK_{k}"))
+            .ok()
+            .filter(|v| !v.is_empty())
+    };
+    if let Some(listen) = cb("LISTEN") {
+        target.expect.callback_listen = listen;
+    }
+    target.expect.callback_origin = cb("ORIGIN");
     let report = verify(&target, &CommandHooks(hook)).await;
     println!("{}", report.render());
     assert!(report.passed(), "{}", report.render());
