@@ -21,6 +21,9 @@
 //! - `AGENT_CONFORMANCE_FRONT_HOOK`: the operator hook, below.
 //! - `AGENT_CONFORMANCE_FRONT_PROBE_SECS` / `_SILENCE_SECS` / `_SETTLE_SECS`: the agent's 10 s
 //!   probe and 30 s silence limits, and how long a gone VM may take to leave the routes (10 s).
+//! - `AGENT_CONFORMANCE_CALLBACK_LISTEN` / `_ORIGIN` (optional): where the exec protocol checks' notify
+//!   receiver listens and the origin the sandbox reaches it at, as for `exec_conformance`. Needed when
+//!   the sandbox cannot reach this host's loopback (a container).
 //!
 //! # The operator hook
 //!
@@ -102,6 +105,9 @@ pub struct FrontTarget {
     pub tenant_cap: Option<usize>,
     /// Also run the exec protocol checks through the front (about fifteen seconds).
     pub exec_protocol: bool,
+    /// What the exec protocol checks expect, notably where their callback receiver listens (see
+    /// [`super::Expectations::callback_listen`]) for a sandbox that cannot reach this host's loopback.
+    pub expect: super::Expectations,
     /// The agent's probe limit: a create or wake must produce its first frame within it.
     pub probe: Duration,
     /// The agent's silence limit: no gap between frames may exceed it.
@@ -117,6 +123,7 @@ impl FrontTarget {
             health_url: None,
             tenant_cap: None,
             exec_protocol: false,
+            expect: super::Expectations::default(),
             probe: Duration::from_secs(10),
             silence: Duration::from_secs(30),
             settle: Duration::from_secs(10),
@@ -984,12 +991,7 @@ impl<H: Hooks> Kit<'_, H> {
             Ok(a) => a,
             Err(e) => return fail(EXEC_PROTOCOL, e),
         };
-        let report = super::verify(
-            &self.exec_url(&session),
-            &auth,
-            &super::Expectations::default(),
-        )
-        .await;
+        let report = super::verify(&self.exec_url(&session), &auth, &self.target.expect).await;
         let failed: Vec<_> = report
             .checks
             .iter()
