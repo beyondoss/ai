@@ -257,6 +257,22 @@ pub struct McpConnector {
     /// `sandbox`, **a replica must accept it before any minter emits it**.
     #[serde(default, skip_serializing_if = "is_false")]
     pub managed: bool,
+    /// A `command` server of the workspace's `.mcp.json`, run as a job in the session's own
+    /// sandbox and spoken to over its stdin and stdout ([`crate::tools::mcp_sandbox_stdio`]); `url`
+    /// is empty and `sandbox` true. **Never in a grant**: `serde(skip)` leaves it out of what a
+    /// minter may send and out of what the verifier reads, so only [`crate::mcp_json`] sets it.
+    #[serde(skip)]
+    pub command: Option<SandboxCommand>,
+}
+
+/// What a `command` entry of `.mcp.json` runs: the program and its arguments, in the sandbox's
+/// workspace, with the entry's `env` as the literal strings the file holds (no `$VAR` or `!command`
+/// lookup: nothing on the replica is read for it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxCommand {
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: std::collections::BTreeMap<String, String>,
 }
 
 /// What the grant carries sealed. Every value here is a credential; `Debug` shows only structure.

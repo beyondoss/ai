@@ -150,6 +150,7 @@ async fn connect_granted_sandbox_calls_get_weather() {
         url: mcp.url.clone(),
         sandbox: true,
         managed: false,
+        command: None,
     };
     let (live, _catalog, warnings) = mcp::connect_granted(
         &[connector],
@@ -159,6 +160,7 @@ async fn connect_granted_sandbox_calls_get_weather() {
         mcp::host(),
         Duration::from_secs(30),
         &BTreeMap::new(),
+        None,
     )
     .await;
     assert!(
@@ -351,6 +353,7 @@ async fn connect_as(
         url: url.to_string(),
         sandbox,
         managed: false,
+        command: None,
     };
     let (live, _catalog, warnings) = mcp::connect_granted(
         &[connector],
@@ -360,6 +363,7 @@ async fn connect_as(
         mcp::host(),
         Duration::from_secs(30),
         saved,
+        None,
     )
     .await;
     assert!(

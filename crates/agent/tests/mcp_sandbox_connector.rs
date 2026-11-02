@@ -43,6 +43,7 @@ async fn call_with_idle_gap(
         url: fixture.url.clone(),
         sandbox,
         managed: false,
+        command: None,
     };
     let (tools, _catalog, warnings) = mcp::connect_granted(
         &[connector],
@@ -52,6 +53,7 @@ async fn call_with_idle_gap(
         mcp::host(),
         reap_after,
         &BTreeMap::new(),
+        None,
     )
     .await;
     assert!(warnings.is_empty(), "{warnings:?}");
@@ -146,6 +148,7 @@ async fn dial_guarded(url: &str, sandbox: bool, exec_url: &str) -> (bool, Vec<St
         url: url.into(),
         sandbox,
         managed: false,
+        command: None,
     };
     let (tools, _catalog, warnings) = mcp::connect_granted(
         &[connector],
@@ -155,6 +158,7 @@ async fn dial_guarded(url: &str, sandbox: bool, exec_url: &str) -> (bool, Vec<St
         mcp::host(),
         Duration::ZERO,
         &BTreeMap::new(),
+        None,
     )
     .await;
     let found = tools.snapshot().iter().any(|t| t.name() == "mcp__c__echo");

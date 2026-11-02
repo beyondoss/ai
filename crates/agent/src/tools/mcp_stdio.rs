@@ -288,7 +288,7 @@ pub(crate) struct MessageCaps {
 impl MessageCaps {
     /// Note bytes written to the server; a completed request line that reads a `ui://` resource gets
     /// the view cap. Only lines that mention `resources/read` are parsed.
-    fn wrote(&self, bytes: &[u8]) {
+    pub(crate) fn wrote(&self, bytes: &[u8]) {
         let mut pending = lock(&self.outbound);
         pending.extend_from_slice(bytes);
         while let Some(end) = pending.iter().position(|&b| b == b'\n') {
@@ -767,51 +767,15 @@ impl tokio::io::AsyncWrite for StdinGuard {
     }
 }
 
-/// Spawn a stdio MCP server; return it and an rmcp transport whose inbound lines pass through
-/// [`rescue`].
-///
-/// One small task per server pumps its stdout into an in-memory pipe rmcp reads; it ends when the
-/// server closes stdout or rmcp stops reading. Ending the server is [`retire`]'s, called when the
-/// transport is dropped and when the connection is.
-pub(crate) fn stdio_transport(
-    mut cmd: tokio::process::Command,
-) -> std::io::Result<(
-    std::sync::Arc<ServerProcess>,
-    (tokio::io::DuplexStream, impl tokio::io::AsyncWrite),
-)> {
+/// Pump a server's stdout into the in-memory pipe rmcp reads, a line at a time through
+/// [`read_capped`] and [`rescue`]: the read half of every stdio transport, whether the server is a
+/// child of this process or a job in a sandbox. Returns rmcp's end and the [`MessageCaps`] the write
+/// half must tell about every request it sends (`MessageCaps::wrote`). The task ends when the
+/// stream ends or rmcp stops reading.
+pub(crate) fn pump(
+    stdout: impl tokio::io::AsyncRead + Send + Unpin + 'static,
+) -> (tokio::io::DuplexStream, std::sync::Arc<MessageCaps>) {
     use tokio::io::AsyncWriteExt;
-    let tag = crate::tools::bash_proc::new_tag();
-    cmd.stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
-        .env(
-            crate::tools::bash_proc::TAG_ENV,
-            crate::tools::bash_proc::tag_value(&tag),
-        )
-        .kill_on_drop(true);
-    let mut child = crate::subreaper::spawn_lasting(cmd)?;
-    let procs = child
-        .id()
-        .map(|pid| crate::tools::bash_proc::ProcGroup::new(pid, tag));
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| std::io::Error::other("no stdout"))?;
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| std::io::Error::other("no stdin"))?;
-    let server = std::sync::Arc::new(ServerProcess {
-        procs,
-        child: std::sync::Mutex::new(child),
-        stdin: std::sync::Mutex::new(Some(stdin)),
-        retired: std::sync::atomic::AtomicBool::new(false),
-    });
-    {
-        let mut live = lock(&LIVE);
-        live.retain(|w| w.strong_count() > 0);
-        live.push(std::sync::Arc::downgrade(&server));
-    }
     let (rmcp_side, mut pump_side) = tokio::io::duplex(64 * 1024);
     let caps = std::sync::Arc::new(MessageCaps::default());
     let pump_caps = caps.clone();
@@ -872,6 +836,54 @@ pub(crate) fn stdio_transport(
             }
         }
     });
+    (rmcp_side, caps)
+}
+
+/// Spawn a stdio MCP server; return it and an rmcp transport whose inbound lines pass through
+/// [`rescue`].
+///
+/// One small task per server pumps its stdout into an in-memory pipe rmcp reads; it ends when the
+/// server closes stdout or rmcp stops reading. Ending the server is [`retire`]'s, called when the
+/// transport is dropped and when the connection is.
+pub(crate) fn stdio_transport(
+    mut cmd: tokio::process::Command,
+) -> std::io::Result<(
+    std::sync::Arc<ServerProcess>,
+    (tokio::io::DuplexStream, impl tokio::io::AsyncWrite),
+)> {
+    let tag = crate::tools::bash_proc::new_tag();
+    cmd.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .env(
+            crate::tools::bash_proc::TAG_ENV,
+            crate::tools::bash_proc::tag_value(&tag),
+        )
+        .kill_on_drop(true);
+    let mut child = crate::subreaper::spawn_lasting(cmd)?;
+    let procs = child
+        .id()
+        .map(|pid| crate::tools::bash_proc::ProcGroup::new(pid, tag));
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("no stdout"))?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| std::io::Error::other("no stdin"))?;
+    let server = std::sync::Arc::new(ServerProcess {
+        procs,
+        child: std::sync::Mutex::new(child),
+        stdin: std::sync::Mutex::new(Some(stdin)),
+        retired: std::sync::atomic::AtomicBool::new(false),
+    });
+    {
+        let mut live = lock(&LIVE);
+        live.retain(|w| w.strong_count() > 0);
+        live.push(std::sync::Arc::downgrade(&server));
+    }
+    let (rmcp_side, caps) = pump(stdout);
     let guard = StdinGuard {
         server: server.clone(),
         caps,

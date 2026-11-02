@@ -170,8 +170,8 @@ billing rows can tell the file's model from the default. The managed connector's
 readable by the stand-in's task role only; the checks look for it in the grant (unsealed with the agent's
 verifier), the agent's logs and the session transcript, and read the agent process's memory through ECS
 Exec as far as that is feasible (the report says what was read). The coding and browser agents run in
-private E2B VMs; the browser is `rustwright-mcp` behind supergateway, started by the demo because hosted
-mode skips `command` entries in `.mcp.json`, and named in the grant as a connector with `sandbox: true`.
+private E2B VMs; the browser is `rustwright-mcp` behind supergateway, started by the demo (a `command`
+entry would run as a sandbox job instead), and named in the grant as a connector with `sandbox: true`.
 Their checks are in `usecases.sh`, added the same way as any other (see "Adding a check").
 
 ## What you will see

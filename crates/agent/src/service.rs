@@ -703,6 +703,7 @@ impl ServiceSession {
         egress: Option<&crate::tools::mcp::McpEgress>,
         host: Arc<crate::tools::mcp_host::McpHost>,
         from_file: &[McpConnector],
+        sandbox: Option<&crate::tools::mcp::SandboxServers>,
     ) -> (
         crate::tools::mcp::McpTools,
         crate::tools::mcp::McpCatalog,
@@ -746,6 +747,7 @@ impl ServiceSession {
             host,
             crate::tools::mcp::idle_reap_after_from_env(),
             &saved,
+            sandbox,
         )
         .await
     }
@@ -941,7 +943,7 @@ mod snapshot {
     use super::{Resources, Sandbox, Snapshot};
 
     /// Bumped whenever the shape changes: an older or newer snapshot is ignored, not misread.
-    pub(super) const VERSION: u32 = 1;
+    pub(super) const VERSION: u32 = 2;
 
     /// Every `&'static str` label discovery writes (scopes, resource types, collision sources).
     fn label(s: &str) -> Option<&'static str> {
@@ -971,12 +973,26 @@ mod snapshot {
         prompt_templates: Vec<Prompt>,
         prompt_collisions: Vec<Collision>,
         agents: Vec<Agent>,
-        /// `(name, url)` of the `.mcp.json` connectors. Absent in a snapshot older than the field.
-        #[serde(default)]
-        mcp: Vec<(String, String)>,
+        /// The `.mcp.json` connectors.
+        mcp: Vec<Mcp>,
         context: Vec<(String, String)>,
         system: Option<String>,
         append_system: Option<String>,
+    }
+
+    /// A `.mcp.json` connector: a `url` server, or a `command` one (`url` empty).
+    #[derive(Serialize, Deserialize)]
+    struct Mcp {
+        name: String,
+        url: String,
+        command: Option<Command>,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct Command {
+        command: String,
+        args: Vec<String>,
+        env: std::collections::BTreeMap<String, String>,
     }
 
     #[derive(Serialize, Deserialize)]
@@ -1108,7 +1124,15 @@ mod snapshot {
                 mcp: r
                     .mcp_connectors
                     .iter()
-                    .map(|c| (c.name.clone(), c.url.clone()))
+                    .map(|c| Mcp {
+                        name: c.name.clone(),
+                        url: c.url.clone(),
+                        command: c.command.as_ref().map(|k| Command {
+                            command: k.command.clone(),
+                            args: k.args.clone(),
+                            env: k.env.clone(),
+                        }),
+                    })
                     .collect(),
                 context: r.context_files.clone(),
                 system: r.system.clone(),
@@ -1181,11 +1205,16 @@ mod snapshot {
                     mcp_connectors: self
                         .mcp
                         .into_iter()
-                        .map(|(name, url)| super::McpConnector {
-                            name,
-                            url,
-                            sandbox: false,
+                        .map(|m| super::McpConnector {
+                            name: m.name,
+                            sandbox: m.command.is_some(),
+                            url: m.url,
                             managed: false,
+                            command: m.command.map(|k| crate::grant::SandboxCommand {
+                                command: k.command,
+                                args: k.args,
+                                env: k.env,
+                            }),
                         })
                         .collect(),
                     context_files: self.context,
@@ -1441,6 +1470,7 @@ mod tests {
                 url: "https://e.example/mcp".into(),
                 sandbox: false,
                 managed: false,
+                command: None,
             }],
             context_files: vec![("/w/AGENTS.md".into(), "CONTEXT-MARKER".into())],
             system: Some("SYSTEM".into()),

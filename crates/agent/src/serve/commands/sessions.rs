@@ -107,6 +107,15 @@ impl SessionLoop {
                         ),
                     )
                     .await;
+                    // And the stdio MCP servers it ran there, whose scope is their own.
+                    crate::tools::bash_sandbox::wipe(
+                        self.exec_cell.runner(),
+                        &crate::exec_endpoint::jobs::JobScope::for_session_mcp(
+                            self.mode.tenant(),
+                            target,
+                        ),
+                    )
+                    .await;
                     if !self.emit(response(id, "delete_session", true, None, None)) {
                         return false;
                     }

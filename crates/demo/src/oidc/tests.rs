@@ -353,6 +353,7 @@ impl Harness {
             mcp::host(),
             Duration::ZERO,
             &Default::default(),
+            None,
         )
         .await;
         assert!(warnings.is_empty(), "{warnings:?}");

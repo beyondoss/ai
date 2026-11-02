@@ -522,12 +522,30 @@ impl Mode {
         host: &Arc<crate::tools::mcp_host::McpHost>,
         session_id: &str,
         from_file: &[crate::grant::McpConnector],
+        exec: &ExecCell,
     ) -> bool {
         let Some(service) = self.service() else {
             return false;
         };
+        // The `command` servers of `.mcp.json` run in the session's sandbox, started in its
+        // workspace, in a job scope of their own (see `tools::mcp_sandbox_stdio`).
+        let servers = service
+            .has_sandbox()
+            .then(|| crate::tools::mcp::SandboxServers {
+                runner: exec.runner(),
+                scope: crate::exec_endpoint::jobs::JobScope::for_session_mcp(
+                    Some(service.tenant()),
+                    session_id,
+                ),
+                cwd: service.workspace_root().to_owned(),
+            });
         let (tools, catalog, warnings) = service
-            .mcp(cfg.mcp_http.as_ref(), host.clone(), from_file)
+            .mcp(
+                cfg.mcp_http.as_ref(),
+                host.clone(),
+                from_file,
+                servers.as_ref(),
+            )
             .await;
         cfg.mcp_apps = Some(service.mcp_apps_pool(cfg.mcp_http.clone(), host.clone(), from_file));
         for warning in &warnings {

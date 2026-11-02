@@ -61,6 +61,18 @@ impl JobScope {
     }
 
     /// A scope under another root — for tests, which run the scripts on this host.
+    /// The scope of the stdio MCP servers a session runs in its sandbox: the session's own scope
+    /// name behind an `mcp-` prefix. Apart from [`Self::for_session`] on purpose: that scope is the
+    /// `bash` table's, which reads it back at every reopen and stops what nobody kept, and a server
+    /// is neither a `bash` job nor kept by one.
+    pub fn for_session_mcp(tenant: Option<&str>, session_id: &str) -> Self {
+        let session = Self::for_session(tenant, session_id);
+        Self {
+            root: session.root,
+            name: format!("mcp-{}", session.name),
+        }
+    }
+
     pub fn under(root: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
             root: root.into(),

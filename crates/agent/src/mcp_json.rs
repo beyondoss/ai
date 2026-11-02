@@ -17,16 +17,19 @@
 //!   `mcp_servers` (`settings::effective_settings_for_cwd`, behind the project-trust check), so a
 //!   header or `env` value goes through the settings' own `resolve_config_value` (`$VAR`, `${VAR}`,
 //!   `!command`) exactly as if it had been written in `settings.json`.
-//! - **Hosted** ([`hosted_connectors`]): the file is the tenant's, read from its sandbox on a
-//!   replica. Only the `url` survives. A header, an `env` value or a `command` would be a secret
-//!   lookup or a process on the replica, so none is taken from the file: headers come from the
-//!   session grant alone, and `command` entries are skipped.
+//! - **Hosted** ([`hosted_connectors`]): the file is the tenant's, read from its sandbox (or its
+//!   bundle) on a replica. A `url` server is dialed from the replica, and only the `url` survives:
+//!   a header would be a secret lookup, so headers come from the session grant alone. A `command`
+//!   server is not run on the replica either: it becomes a connector with
+//!   [`McpConnector::command`] set, and [`crate::tools::mcp_sandbox_stdio`] runs it as a job in the
+//!   session's own sandbox, where the tenant's files and nothing of the replica's are. Its `env` is
+//!   carried as the literal strings the file holds, never resolved on the replica.
 
 use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-use crate::grant::McpConnector;
+use crate::grant::{McpConnector, SandboxCommand};
 use crate::settings::{McpServerConfig, McpTransport};
 
 /// The file name, at the workspace root.
@@ -153,9 +156,30 @@ pub fn hosted_connectors(text: &str, grant_limit: Option<u32>) -> (Vec<McpConnec
             continue;
         }
         match entry {
-            Entry::Stdio { .. } => warnings.push(format!(
-                "{FILE}: server `{name}` skipped: a `command` server is not run in a hosted session"
-            )),
+            Entry::Stdio { .. } if connectors.len() >= cap => over_cap += 1,
+            Entry::Stdio { command, args, env } => {
+                if command.is_empty() || command.contains('\0') {
+                    warnings.push(format!(
+                        "{FILE}: server `{name}` skipped: invalid `command`"
+                    ));
+                } else if args.iter().any(|a| a.contains('\0'))
+                    || env
+                        .iter()
+                        .any(|(k, v)| k.is_empty() || k.contains(['=', '\0']) || v.contains('\0'))
+                {
+                    warnings.push(format!(
+                        "{FILE}: server `{name}` skipped: a NUL, or an empty or `=` env name"
+                    ));
+                } else {
+                    connectors.push(McpConnector {
+                        name,
+                        url: String::new(),
+                        sandbox: true,
+                        managed: false,
+                        command: Some(SandboxCommand { command, args, env }),
+                    });
+                }
+            }
             Entry::Http { .. } if connectors.len() >= cap => over_cap += 1,
             Entry::Http { url, headers } => {
                 if !headers.is_empty() {
@@ -169,6 +193,7 @@ pub fn hosted_connectors(text: &str, grant_limit: Option<u32>) -> (Vec<McpConnec
                     url,
                     sandbox: false,
                     managed: false,
+                    command: None,
                 });
             }
         }
@@ -245,23 +270,23 @@ mod tests {
     }
 
     #[test]
-    fn hosted_connectors_keep_only_the_url_and_say_what_they_dropped() {
+    fn hosted_connectors_take_a_command_as_a_sandbox_job_and_drop_headers() {
         let (connectors, warnings) = hosted_connectors(FILE_TEXT, None);
         let mut names: Vec<_> = connectors.iter().map(|c| c.name.as_str()).collect();
         names.sort();
-        assert_eq!(names, ["docs", "legacy", "typed"]);
+        assert_eq!(names, ["docs", "explicit", "files", "legacy", "typed"]);
         let docs = connectors.iter().find(|c| c.name == "docs").unwrap();
         assert_eq!(docs.url, "https://example.com/mcp");
+        assert!(docs.command.is_none() && !docs.sandbox);
+        let files = connectors.iter().find(|c| c.name == "files").unwrap();
+        assert!(files.sandbox && files.url.is_empty());
+        let cmd = files.command.as_ref().unwrap();
+        assert_eq!(cmd.command, "npx");
+        assert_eq!(cmd.args, ["-y", "srv"]);
+        // Literal: the replica resolves nothing from the file.
+        assert_eq!(cmd.env["K"], "${V}");
         assert!(
-            warnings
-                .iter()
-                .any(|w| w.contains("`files`") && w.contains("command")),
-            "{warnings:?}"
-        );
-        assert!(
-            warnings
-                .iter()
-                .any(|w| w.contains("`explicit`") && w.contains("command")),
+            warnings.iter().all(|w| !w.contains("skipped: a `command`")),
             "{warnings:?}"
         );
         assert!(
