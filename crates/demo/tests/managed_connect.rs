@@ -85,6 +85,7 @@ async fn a_managed_connector_calls_through_the_endpoint_holding_no_third_party_k
         mcp::host(),
         Duration::ZERO,
         &std::collections::BTreeMap::new(),
+        None,
     )
     .await;
     assert!(warnings.is_empty(), "{warnings:?}");
