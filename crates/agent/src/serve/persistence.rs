@@ -1165,6 +1165,14 @@ impl Persistence {
             .unwrap_or(&[])
     }
 
+    /// The custom entries of `kind` on the active path; empty without persistence.
+    pub(super) fn active_custom(&self, kind: &str) -> Vec<Value> {
+        self.store
+            .as_ref()
+            .map(|store| store.active_custom(kind))
+            .unwrap_or_default()
+    }
+
     /// MCP task journal entries of `kind` on the active path that the session accepts (see
     /// `SessionStore::active_journal`); empty without persistence.
     pub(super) fn active_journal(&self, kind: &str) -> Vec<Value> {

@@ -186,6 +186,7 @@ mod serve_memory;
 mod serve_models_thinking;
 mod serve_oauth_model_switch;
 mod serve_prompt_flow;
+mod serve_prompt_id;
 mod serve_reaper;
 mod serve_reattach_catchup;
 mod serve_replay_replies;
