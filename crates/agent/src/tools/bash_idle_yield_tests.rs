@@ -257,22 +257,23 @@ async fn dropping_the_tool_kills_a_parked_job() {
 }
 
 #[tokio::test]
-async fn parking_past_the_cap_kills_the_oldest_job() {
+async fn slow_commands_are_never_stopped_to_make_room_for_the_next() {
     let (bash, jobs) = detaching(200);
-    let mut last = String::new();
-    for _ in 0..=MAX_YIELDED_JOBS {
-        last = text(bash.run(json!({ "command": "sleep 60" })).await);
+    let n = 5;
+    for i in 1..=n {
+        let out = text(bash.run(json!({ "command": "sleep 60" })).await);
+        assert!(out.contains(&format!("job {i}")), "{out}");
+        assert!(
+            !out.contains("was stopped"),
+            "a running command was stopped: {out}"
+        );
     }
-    let newest = MAX_YIELDED_JOBS + 1;
-    assert!(last.contains(&format!("job {newest}")), "{last}");
-    assert!(last.contains("Job 1 was stopped"), "{last}");
-    assert!(
-        jobs.run(json!({ "job": 1 })).await.is_err(),
-        "job 1 is gone"
-    );
-    for id in 2..=newest {
+    for id in 1..=n {
         let killed = text(jobs.run(json!({ "job": id, "kill": true })).await);
-        assert!(killed.contains("killed"), "{killed}");
+        assert!(
+            killed.contains("killed"),
+            "job {id} was already gone: {killed}"
+        );
     }
 }
 
