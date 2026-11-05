@@ -1,6 +1,6 @@
-//! `serve` e2e: a prompt's id makes sending it again safe.
+//! `serve` e2e: a prompt's idempotency key makes sending it again safe.
 //!
-//! The control plane delivers a prompt with the run's id as its command id. A hop that times out after
+//! The control plane delivers a prompt with the run's id as its idempotency key. A hop that times out after
 //! the replica read the command leaves the sender unable to tell whether the turn ran, so it must be able
 //! to send the same prompt again without a second turn: a repeat of a taken id is answered as taken (and,
 //! while its turn runs, as already running), across a replica restart too.
@@ -59,7 +59,7 @@ async fn a_prompt_sent_again_after_it_ran_is_taken_not_run() {
     let mut ws = ws_connect(port, Some("pid-1")).await;
     ws_send(
         &mut ws,
-        json!({ "type": "prompt", "id": "run-1", "message": "hello" }),
+        json!({ "type": "prompt", "id": "p", "idempotency_key": "run-1", "message": "hello" }),
     )
     .await;
     let first = ws_read_until_response(&mut ws, "prompt").await;
@@ -69,7 +69,7 @@ async fn a_prompt_sent_again_after_it_ran_is_taken_not_run() {
 
     ws_send(
         &mut ws,
-        json!({ "type": "prompt", "id": "run-1", "message": "hello" }),
+        json!({ "type": "prompt", "id": "p", "idempotency_key": "run-1", "message": "hello" }),
     )
     .await;
     let again = ws_read_until_response(&mut ws, "prompt").await;
@@ -85,7 +85,7 @@ async fn a_prompt_sent_again_after_it_ran_is_taken_not_run() {
     // A different id is a different prompt.
     ws_send(
         &mut ws,
-        json!({ "type": "prompt", "id": "run-2", "message": "again" }),
+        json!({ "type": "prompt", "id": "p", "idempotency_key": "run-2", "message": "again" }),
     )
     .await;
     let other = ws_read_until_response(&mut ws, "prompt").await;
@@ -103,7 +103,7 @@ async fn a_prompt_sent_again_after_a_restart_is_taken_not_run() {
         let mut ws = ws_connect(port, Some("pid-2")).await;
         ws_send(
             &mut ws,
-            json!({ "type": "prompt", "id": "run-1", "message": "hello" }),
+            json!({ "type": "prompt", "id": "p", "idempotency_key": "run-1", "message": "hello" }),
         )
         .await;
         ws_read_until_response(&mut ws, "prompt").await;
@@ -113,7 +113,7 @@ async fn a_prompt_sent_again_after_a_restart_is_taken_not_run() {
     let mut ws = ws_connect(port, Some("pid-2")).await;
     ws_send(
         &mut ws,
-        json!({ "type": "prompt", "id": "run-1", "message": "hello" }),
+        json!({ "type": "prompt", "id": "p", "idempotency_key": "run-1", "message": "hello" }),
     )
     .await;
     let again = ws_read_until_response(&mut ws, "prompt").await;
@@ -140,7 +140,7 @@ async fn a_prompt_sent_again_while_its_turn_runs_is_already_running() {
     let mut ws = ws_connect(port, Some("pid-3")).await;
     ws_send(
         &mut ws,
-        json!({ "type": "prompt", "id": "run-1", "message": "go" }),
+        json!({ "type": "prompt", "id": "p", "idempotency_key": "run-1", "message": "go" }),
     )
     .await;
     // The turn is in flight once the model has been asked.
@@ -153,7 +153,7 @@ async fn a_prompt_sent_again_while_its_turn_runs_is_already_running() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     ws_send(
         &mut ws,
-        json!({ "type": "prompt", "id": "run-1", "message": "go" }),
+        json!({ "type": "prompt", "id": "p", "idempotency_key": "run-1", "message": "go" }),
     )
     .await;
     // Its answer comes among the running turn's own frames.
