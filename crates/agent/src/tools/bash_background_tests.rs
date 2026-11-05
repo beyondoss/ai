@@ -171,36 +171,32 @@ async fn a_background_job_that_exits_later_is_noticed_once() {
 async fn background_jobs_are_never_evicted_by_yielded_ones() {
     let (bash, jobs) = tools(200, 200);
     ok(bash.run(background("sleep 63")).await);
-    let mut last = String::new();
-    for _ in 0..=MAX_YIELDED_JOBS {
-        last = ok(bash.run(json!({ "command": "sleep 64" })).await);
+    for _ in 0..5 {
+        let out = ok(bash.run(json!({ "command": "sleep 64" })).await);
+        assert!(!out.contains("was stopped"), "{out}");
     }
-    // Jobs 2..=6 yielded; parking the fifth evicts job 2, the oldest yielded — never job 1.
-    assert!(last.contains("Job 2 was stopped"), "{last}");
-    assert!(
-        last.contains("jobs whose calls returned early are kept running"),
-        "{last}"
-    );
     let carry = bash.jobs().carry().unwrap();
+    for id in 1..=6 {
+        assert!(
+            carry.contains(&format!("- job {id}:")),
+            "job {id} stays: {carry}"
+        );
+    }
     assert!(
-        carry.contains("- job 1: `sleep 63`"),
-        "the background job stays: {carry}"
-    );
-    assert!(
-        jobs.run(json!({ "job": 2 })).await.is_err(),
-        "job 2 is gone"
+        jobs.run(json!({ "job": 2, "timeout_ms": 0 })).await.is_ok(),
+        "job 2 is still there"
     );
     bash.jobs().stop_all();
 }
 
 #[tokio::test]
-async fn the_intended_cap_counts_background_and_adopted_jobs_and_refuses_before_starting() {
+async fn the_limit_counts_every_running_job_and_refuses_before_starting() {
     let (bash, _jobs) = tools(150, 30_000);
-    let half = MAX_INTENDED_JOBS / 2;
+    let half = MAX_RUNNING_JOBS / 2;
     for i in 0..half {
         ok(bash.run(background(&format!("sleep 65; echo {i}"))).await);
     }
-    for i in half..MAX_INTENDED_JOBS {
+    for i in half..MAX_RUNNING_JOBS {
         let out = ok(bash
             .run(json!({ "command": format!("sleep 66 & echo {i}") }))
             .await);
@@ -217,8 +213,8 @@ async fn the_intended_cap_counts_background_and_adopted_jobs_and_refuses_before_
     };
     assert!(
         msg.starts_with(&format!(
-            "Not started: {MAX_INTENDED_JOBS} jobs started in the background or left running by \
-             a command are already running ("
+            "Not started: {MAX_RUNNING_JOBS} jobs (running commands, in the background or left running \
+             by a command) are already running ("
         )),
         "{msg}"
     );
@@ -229,9 +225,12 @@ async fn the_intended_cap_counts_background_and_adopted_jobs_and_refuses_before_
     );
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(!marker.exists(), "a refused command never runs");
-    // An adoption past the cap is refused against the same count.
-    let adopted = ok(bash.run(json!({ "command": "sleep 68 & echo x" })).await);
-    assert!(adopted.contains("It was stopped"), "{adopted}");
+    // A plain command is refused against the same count, before it starts.
+    let err = bash
+        .run(json!({ "command": "sleep 68" }))
+        .await
+        .unwrap_err();
+    assert!(format!("{err:?}").contains("Not started"), "{err:?}");
     bash.jobs().stop_all();
 }
 

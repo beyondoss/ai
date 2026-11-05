@@ -455,29 +455,28 @@ async fn the_carry_lists_running_and_unread_jobs() {
 }
 
 #[tokio::test]
-async fn eviction_takes_the_oldest_yielded_job_never_an_adopted_one() {
-    let (bash, jobs) = tools(200, 60_000, 60_000);
+async fn yielded_jobs_never_evict_an_adopted_one_or_each_other() {
+    let (bash, _jobs) = tools(200, 60_000, 60_000);
     let adopted = ok(bash.run(json!({ "command": "sleep 76 & echo bg" })).await);
     assert!(adopted.contains("tracked as job 1"), "{adopted}");
-    let mut last = String::new();
-    for _ in 0..=MAX_YIELDED_JOBS {
-        last = ok(bash.run(json!({ "command": "sleep 77" })).await);
+    for _ in 0..5 {
+        let out = ok(bash.run(json!({ "command": "sleep 77" })).await);
+        assert!(!out.contains("was stopped"), "{out}");
     }
-    // Jobs 2..=6 were yielded; the fifth parked evicts job 2, the oldest yielded, not job 1.
-    assert!(last.contains("Job 2 was stopped"), "{last}");
-    assert!(
-        jobs.run(json!({ "job": 2 })).await.is_err(),
-        "job 2 is gone"
-    );
     let carry = bash.jobs().carry().unwrap();
-    assert!(carry.contains("- job 1:"), "the adopted job stays: {carry}");
+    for id in 1..=6 {
+        assert!(
+            carry.contains(&format!("- job {id}:")),
+            "job {id} stays: {carry}"
+        );
+    }
     bash.jobs().stop_all();
 }
 
 #[tokio::test]
-async fn adopting_past_the_intended_cap_is_refused_with_the_list() {
+async fn a_command_at_the_limit_is_refused_with_the_list() {
     let (bash, _jobs) = tools(30_000, 60_000, 60_000);
-    for i in 0..MAX_INTENDED_JOBS {
+    for i in 0..MAX_RUNNING_JOBS {
         let out = ok(bash
             .run(json!({ "command": format!("sleep 78 & echo {i}") }))
             .await);
@@ -485,18 +484,21 @@ async fn adopting_past_the_intended_cap_is_refused_with_the_list() {
     }
     let tmp = tempfile::tempdir().unwrap();
     let pidfile = tmp.path().join("pid");
-    let refused = ok(bash
-        .run(json!({
+    let refused = format!(
+        "{:?}",
+        bash.run(json!({
             "command": format!("sh -c 'echo $$ > {}; exec sleep 79' & echo one-more", pidfile.display())
         }))
-        .await);
-    assert!(refused.contains("It was stopped"), "{refused}");
+        .await
+        .unwrap_err()
+    );
+    assert!(refused.contains("Not started"), "{refused}");
     assert!(
         refused.contains("job 1 `sleep 78 & echo 0`"),
         "lists the running jobs: {refused}"
     );
-    let pid = read_pid(&pidfile).await;
-    assert!(wait_dead(pid).await, "the refused process is stopped");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!pidfile.exists(), "a refused command never starts");
     bash.jobs().stop_all();
 }
 

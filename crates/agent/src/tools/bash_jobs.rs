@@ -3,10 +3,11 @@
 //!
 //! A job outlives its call for one of three reasons ([`JobKind`]): its call returned before it
 //! finished — it went quiet, kept printing past the call's ceiling, or outlasted the model's
-//! `timeout_ms` (**yielded**: unintended, so the oldest is evicted past [`MAX_YIELDED_JOBS`]); the
+//! `timeout_ms` (**yielded**); the
 //! model asked for it with `run_in_background` (**background**); or its command exited but left
 //! processes running (**adopted**, `cmd &`). Background and adopted jobs are intended: never evicted,
-//! and past [`MAX_INTENDED_JOBS`] a new one is refused.
+//! and every kind counts toward one limit, [`MAX_RUNNING_JOBS`]: at it a new command is refused before it
+//! starts, and no running command is ever stopped to make room.
 //!
 //! The table is a [`Background`]: a job that ends while parked becomes a finish notice the loop
 //! folds into the next turn ([`BashJobs::take_notices`]), a would-stop with jobs still running gets
@@ -32,11 +33,10 @@ use super::exec::{ExecResult, Kill};
 use super::output::{OutputAccumulator, OutputSnapshot};
 use crate::exec_endpoint::jobs::JobScope;
 
-/// Most yielded (unintended) jobs kept running; parking another kills the oldest of them.
-pub const MAX_YIELDED_JOBS: usize = 4;
-/// Most intended jobs (started in the background, or adopted) running at once. One past it is
-/// refused, never made room for: the model meant every one of them.
-pub const MAX_INTENDED_JOBS: usize = 8;
+/// Most jobs running at once, of any kind. One shared limit, set from execd's bound on a session's
+/// entries (20: `crates/execd/ARCHITECTURE.md`, "Job table"). At it a new command is refused before it
+/// starts, with the list of what is running; nothing running is ever stopped to make room.
+pub const MAX_RUNNING_JOBS: usize = 20;
 /// Most ended jobs whose output is kept for `bash_job` after their notice; the oldest goes first.
 pub const MAX_ENDED_JOBS: usize = 8;
 /// Lines of new output a finish notice quotes.
@@ -781,43 +781,32 @@ impl BashJobs {
         }
     }
 
-    /// The running intended jobs, listed for the model, when there are already
-    /// [`MAX_INTENDED_JOBS`] of them: a new one would be refused.
-    pub(crate) fn intended_full(&self) -> Option<String> {
-        let running = running_intended(&lock(&self.table));
-        (running.len() >= MAX_INTENDED_JOBS).then(|| running.join(", "))
+    /// The running jobs, listed for the model, when there are already [`MAX_RUNNING_JOBS`] of them: a
+    /// new command would be refused.
+    pub(crate) fn at_limit(&self) -> Option<String> {
+        let running = running_jobs(&lock(&self.table));
+        (running.len() >= MAX_RUNNING_JOBS).then(|| running.join(", "))
     }
 
     /// Park a job whose call returned while it runs (any kind: an intended job a `bash_job` wait
-    /// returned from is parked again here). Returns the yielded job evicted to stay within
-    /// [`MAX_YIELDED_JOBS`], if any (the caller drops it, killing it, outside the lock).
-    pub(crate) fn park(&self, job: Job) -> Option<(u64, Job)> {
-        let id = job.id?;
+    /// returned from is parked again here). Nothing is evicted: the limit is checked before a command
+    /// starts, so a job that is running is never stopped to make room for another.
+    pub(crate) fn park(&self, job: Job) {
+        let Some(id) = job.id else { return };
         let mut parked = Parked::new(job);
         // Processes its shell left running were already reported — by the adoption, a notice, or
         // the background start — so a re-park must not announce them again.
         parked.orphan_notified = parked.job.shared.orphans().is_some();
-        let mut table = lock(&self.table);
-        table.insert(id, parked);
-        let running_yielded: Vec<u64> = table
-            .iter()
-            .filter(|(_, p)| p.job.kind == JobKind::Yielded && !p.job.shared.ended())
-            .map(|(id, _)| *id)
-            .collect();
-        if running_yielded.len() > MAX_YIELDED_JOBS {
-            let oldest = running_yielded[0];
-            return table.remove(&oldest).map(|p| (oldest, p.job));
-        }
-        None
+        lock(&self.table).insert(id, parked);
     }
 
     /// Park an intended job under a fresh id (or the one it already has), unless
-    /// [`MAX_INTENDED_JOBS`] are already running: then the job comes back with the list of running
+    /// [`MAX_RUNNING_JOBS`] are already running: then the job comes back with the list of running
     /// jobs to report.
     pub(crate) fn park_intended(&self, mut job: Job) -> Result<u64, (Job, String)> {
         let mut table = lock(&self.table);
-        let running = running_intended(&table);
-        if running.len() >= MAX_INTENDED_JOBS {
+        let running = running_jobs(&table);
+        if running.len() >= MAX_RUNNING_JOBS {
             return Err((job, running.join(", ")));
         }
         let id = self.assign_id(&mut job);
@@ -1497,11 +1486,11 @@ fn describe_running(job: &Job) -> String {
     }
 }
 
-/// The running intended jobs, as "job N `cmd`".
-fn running_intended(table: &BTreeMap<u64, Parked>) -> Vec<String> {
+/// The running jobs, as "job N `cmd`".
+fn running_jobs(table: &BTreeMap<u64, Parked>) -> Vec<String> {
     table
         .iter()
-        .filter(|(_, p)| p.job.kind.intended() && !p.job.shared.ended())
+        .filter(|(_, p)| !p.job.shared.ended())
         .map(|(id, p)| format!("job {id} `{}`", p.job.command))
         .collect()
 }
