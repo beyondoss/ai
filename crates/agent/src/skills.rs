@@ -1612,7 +1612,10 @@ mod tests {
             "---\nname: solo\ndescription: alone\n---\n",
         );
         let (_, collisions) = discover_with_diagnostics(tmp.path(), true, &[]);
-        assert!(collisions.is_empty(), "got: {collisions:?}");
+        // The standard roots include the real `~/.claude/skills`, which on a developer's machine may
+        // hold duplicates of its own: only a collision over this test's skill is this test's business.
+        let ours: Vec<_> = collisions.iter().filter(|c| c.name == "solo").collect();
+        assert!(ours.is_empty(), "got: {ours:?}");
     }
 
     #[test]
