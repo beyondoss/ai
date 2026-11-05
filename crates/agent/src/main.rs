@@ -585,9 +585,8 @@ enum Command {
         /// --service); `0` never.
         #[usage(long, env = "AI_AGENT_SESSION_IDLE_TIMEOUT")]
         session_idle_timeout: Option<u64>,
-        /// Keep a session with no client attached open this many seconds past the idle timeout while a
-        /// `bash` job is running, so the job's end can wake it. Default 900; `0` reaps it like any idle
-        /// session (the job runs on in its sandbox; its end is read back when the session next opens).
+        /// Seconds a detached session stays open past the idle timeout while a `bash` job runs.
+        /// Default 900; `0` reaps it like any idle session.
         #[usage(long, env = "AI_AGENT_SESSION_JOBS_HOLD", default = "900")]
         session_jobs_hold: u64,
         /// How sessions share connections to the gateway: `auto` (default), `off`, or `h2c`.
