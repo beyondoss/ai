@@ -12,7 +12,22 @@
 use crate::serve::*;
 
 /// What one `prompt` carries from its ack to its terminal response, across every retry attempt.
+/// The transcript entry that records a prompt's idempotency key, so a repeat of the same prompt (a delivery
+/// resent after a hop timed out, to a replica that had already read it, or to the one that took the session
+/// over) is answered and not run again. Only a prompt that carries an `idempotency_key` is recorded: a
+/// command's `id` is a correlation id a client may reuse for every prompt, so it cannot be one.
+const PROMPT_KEY_KIND: &str = "prompt_key";
+
+/// The `idempotency_key` of a prompt command, if it carries one.
+fn idempotency_key(cmd: &Value) -> Option<&str> {
+    cmd.get("idempotency_key")
+        .and_then(Value::as_str)
+        .filter(|k| !k.is_empty())
+}
+
 pub(super) struct PromptRun {
+    /// The idempotency key this prompt came with; a repeat of it while the prompt runs is "already running".
+    key: Option<String>,
     /// The lifecycle record of this prompt; absent when no lifecycle sink is configured.
     life: Option<Arc<crate::lifecycle::Run>>,
     cancel: CancellationToken,
@@ -39,6 +54,24 @@ impl SessionLoop {
     /// Runs one `prompt` to its terminal response. Returns whether the session goes on (`false` ends the
     /// loop: the writer went away, or stdin closed / a shutdown signal arrived mid-run).
     pub(super) async fn cmd_prompt(&mut self, cmd: &Value, id: Option<String>) -> bool {
+        // A prompt may carry an idempotency key so that sending it again is safe: this session already
+        // took it, so it is answered as taken and no second turn runs. The record is in the transcript,
+        // so it holds across a replica restart and a takeover.
+        if let Some(key) = idempotency_key(cmd)
+            && self
+                .persistence
+                .active_custom(PROMPT_KEY_KIND)
+                .iter()
+                .any(|d| d.get("key").and_then(Value::as_str) == Some(key))
+        {
+            return self.emit(response(
+                id,
+                "prompt",
+                true,
+                Some(json!({ "duplicate": true })),
+                None,
+            ));
+        }
         // Whatever moved the model since the last check — a branch or session restore included — a
         // prompt never runs on one the grant's `limits` forbid.
         if let Some(why) = self.mode.model_refusal(&self.current_model) {
@@ -481,6 +514,14 @@ impl SessionLoop {
         if let Some(context) = crate::tools::mcp_apps::take_undelivered_context(&self.mcp_enabled) {
             self.session.attach_request_block(context);
         }
+        // Recorded before the ack, so a prompt that was acknowledged is never one a repeat could run again.
+        if let Some(key) = idempotency_key(cmd)
+            && let Err(e) = self
+                .persistence
+                .append_custom(PROMPT_KEY_KIND, json!({ "key": key }))
+        {
+            tracing::warn!(error = %e, "could not record the prompt key; a repeat of it would run again");
+        }
         // Acknowledge immediately — the turn is queued and about to start — rather than
         // leaving a client with no signal until the (possibly much later) terminal response.
         if !self.emit(ack(id.clone(), "prompt")) {
@@ -573,6 +614,7 @@ impl SessionLoop {
         let own_injection = crate::tools::mcp_events::injection_batch(cmd);
         let steered_injections: Vec<u64> = Vec::new();
         Ok(PromptRun {
+            key: idempotency_key(cmd).map(str::to_owned),
             life,
             cancel,
             refused,
@@ -929,6 +971,9 @@ impl SessionLoop {
                                 // forcing the client to re-encode it as a different command type.
                                 // An injected event follow-up runs as its own prompt once this run is
                                 // over (it is what the coalescer would have sent then anyway).
+                                "prompt" if prompt.key.is_some() && idempotency_key(&c) == prompt.key.as_deref() => {
+                                    let _ = self.out_tx.send(response(cid, "prompt", true, Some(json!({ "duplicate": true, "already_running": true })), None));
+                                }
                                 "prompt" if crate::tools::mcp_events::is_injection(&c)
                                     && c.get("streaming_behavior").and_then(Value::as_str) != Some("steer") =>
                                 {

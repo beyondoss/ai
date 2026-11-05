@@ -37,6 +37,11 @@
 //!     frame (the turn is queued and starting), then `event` frames, then a `response` whose `data`
 //!     includes `refused: bool` — whether the run's last turn ended in a refusal rather than an
 //!     ordinary stop (a refusal doesn't drain queued `steer`/`follow_up` messages; see `agent-core`).
+//!     An optional `idempotency_key` makes sending the same prompt again safe: the session records an
+//!     accepted key in its transcript (before the `ack`), and a prompt whose key it already took is answered
+//!     `success` with `data.duplicate: true` and runs no second turn, and `data.already_running: true` while
+//!     its turn is still running. It holds across a restart and a takeover. A command's `id` is only a
+//!     correlation id and is never deduplicated.
 //!     Sent while another `prompt` is already in flight, it's rejected as busy *unless*
 //!     `streaming_behavior` is `"steer"` or `"follow_up"`, in which case `message` is queued through
 //!     the same `Steering` lane an explicit `steer`/`follow_up` command would use.
