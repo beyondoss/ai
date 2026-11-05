@@ -420,8 +420,9 @@ pub struct ServeConfig {
     /// daemon shuts down. Ignored outside the WebSocket/UDS daemon path.
     pub session_idle_timeout: Option<std::time::Duration>,
     /// How long past [`Self::session_idle_timeout`] a detached session with a `bash` job running stays
-    /// open, so the job's end can wake it. Zero (the default) reaps it like any idle session. Daemon
-    /// mode only; the `serve` command sets it from `--session-jobs-hold`.
+    /// open, so the job's end can wake it. Zero reaps it like any idle session. There is one default,
+    /// 900 s, on the `--session-jobs-hold` flag; `ServeConfig` has no `Default` and is built only by the
+    /// `serve` command, so nothing can start with the hold silently off. Daemon mode only.
     pub session_jobs_hold: std::time::Duration,
     /// How the daemon pools upstream (agent→gateway) connections across sessions — the mode from
     /// `--upstream-http2`. Only consulted in the WebSocket daemon path ([`crate::serve_ws::serve_ws`],
