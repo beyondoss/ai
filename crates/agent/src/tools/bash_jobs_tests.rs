@@ -406,7 +406,7 @@ async fn the_end_of_a_turn_stops_yielded_jobs_and_keeps_intended_ones() {
         .await);
     ok(bash.run(json!({ "command": "sleep 91 & echo bg" })).await);
     ok(bash
-        .run(json!({ "command": "sleep 0.2; echo quick" }))
+        .run(json!({ "command": "sleep 0.8; echo quick" }))
         .await);
     notices_within(&bash, Duration::from_secs(10))
         .await
@@ -440,7 +440,7 @@ async fn the_end_of_a_turn_stops_yielded_jobs_and_keeps_intended_ones() {
 async fn the_carry_lists_running_and_unread_jobs() {
     let (bash, _jobs) = tools(200, 60_000, 60_000);
     ok(bash.run(json!({ "command": "sleep 75" })).await);
-    ok(bash.run(json!({ "command": "sleep 0.5; echo x" })).await);
+    ok(bash.run(json!({ "command": "sleep 0.8; echo x" })).await);
     notices_within(&bash, Duration::from_secs(10))
         .await
         .expect("job 2 ends");
@@ -448,7 +448,7 @@ async fn the_carry_lists_running_and_unread_jobs() {
     assert!(carry.contains("do not start these again"), "{carry}");
     assert!(carry.contains("- job 1: `sleep 75` (running"), "{carry}");
     assert!(
-        carry.contains("- job 2: `sleep 0.5; echo x` (ended, output not yet read"),
+        carry.contains("- job 2: `sleep 0.8; echo x` (ended, output not yet read"),
         "{carry}"
     );
     bash.jobs().stop_all();
