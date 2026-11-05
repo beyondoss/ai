@@ -811,7 +811,8 @@ pub async fn serve(cfg: ServeConfig) -> Result<Option<Signal>, Box<dyn std::erro
     // Stdio has no supervisor and no reaper, so the `running` flag is inert here — a throwaway.
     let running = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let keep_alive = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let sig = serve_session(cfg, input_rx, out_conn, running, keep_alive)
+    let jobs_alive = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sig = serve_session(cfg, input_rx, out_conn, running, keep_alive, jobs_alive)
         .await
         .map_err(|e| e.to_string())?;
     // The session has ended (and dropped its `out_conn` clones), so `conn_rx` is now closed — this
@@ -843,8 +844,11 @@ pub(crate) async fn serve_session(
     // Set by the MCP Events hub while this session holds a live subscription; the daemon's idle
     // reaper leaves such a session alone (unless `--mcp-events-reapable`). Inert over stdio.
     keep_alive: Arc<std::sync::atomic::AtomicBool>,
+    // Set while a `bash` job runs; the daemon's idle reaper leaves such a session alone, so the job's end can wake it.
+    jobs_alive: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<Option<Signal>, Box<dyn std::error::Error + Send + Sync>> {
-    let mut session_loop = SessionLoop::new(cfg, input_rx, out_conn, running, keep_alive).await?;
+    let mut session_loop =
+        SessionLoop::new(cfg, input_rx, out_conn, running, keep_alive, jobs_alive).await?;
     // If this already fails the writer never started; there is nothing to serve.
     if !session_loop.announce_ready() {
         let _ = session_loop.writer.await;

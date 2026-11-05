@@ -361,6 +361,10 @@ struct SessionHandle {
     /// `true` while the session holds a live MCP Events subscription (and `--mcp-events-reapable`
     /// is off): a background trigger, so the idle reaper leaves the session alone.
     keep_alive: Arc<AtomicBool>,
+    /// `true` while the session has a `bash` job running (a background command or one a command left
+    /// running): its end wakes the idle session, which only a session still open can hear, so the idle
+    /// reaper leaves it alone until the last job ends.
+    jobs_alive: Arc<AtomicBool>,
     /// Why this session ended, shared with its [`ExitGuard`]. Written by whoever stops it, read once
     /// as the task exits — so the reason is recorded by the code that knows it, rather than guessed
     /// at the point of exit where every ending looks alike.
@@ -428,6 +432,7 @@ type SessionBody = Box<
             Option<Arc<ServiceSession>>,
             mpsc::Receiver<String>,
             SharedOutConn,
+            Arc<AtomicBool>,
             Arc<AtomicBool>,
             Arc<AtomicBool>,
         ) -> BoxFuture<'static, ()>
@@ -561,7 +566,7 @@ async fn simulated_slow_attach() {}
 /// `main.rs::build_runtime`).
 fn serve_session_body(base: ServeConfig) -> SessionBody {
     Box::new(
-        move |id, service, input_rx, out_conn, running, keep_alive| {
+        move |id, service, input_rx, out_conn, running, keep_alive, jobs_alive| {
             let cfg = session_cfg(&base, id, service);
             let id = id.to_owned();
             // Kept past the move into `serve_session` so a session that fails to *start* can still be
@@ -570,7 +575,9 @@ fn serve_session_body(base: ServeConfig) -> SessionBody {
             // nothing.
             let out_err = out_conn.clone();
             Box::pin(async move {
-                if let Err(e) = serve_session(cfg, input_rx, out_conn, running, keep_alive).await {
+                if let Err(e) =
+                    serve_session(cfg, input_rx, out_conn, running, keep_alive, jobs_alive).await
+                {
                     eprintln!("serve: session {id} ended: {e}");
                     simulated_slow_session_end().await;
                     lock_ignoring_poison(&out_err).end(OutFrame::Value(json!({
@@ -1021,6 +1028,7 @@ impl Supervisor {
         // this handle-side clone to never reclaim a mid-run background session.
         let running = Arc::new(AtomicBool::new(false));
         let keep_alive = Arc::new(AtomicBool::new(false));
+        let jobs_alive = Arc::new(AtomicBool::new(false));
         let exited = CancellationToken::new();
         table.sessions.insert(
             id.to_owned(),
@@ -1034,6 +1042,7 @@ impl Supervisor {
                 last_detached_at: None,
                 running: running.clone(),
                 keep_alive: keep_alive.clone(),
+                jobs_alive: jobs_alive.clone(),
                 end_reason: Arc::clone(&end_reason),
             },
         );
@@ -1071,6 +1080,7 @@ impl Supervisor {
             out_conn.clone(),
             running,
             keep_alive,
+            jobs_alive,
         );
         let session_id = id.to_owned();
         // For the failure paths below: whoever attached to the `Starting` slot while the lock was
@@ -1582,10 +1592,10 @@ impl Supervisor {
     /// (`Stopping`) until the task is gone, which is what makes a reconnect in the meantime wait for it
     /// rather than start a rival. Nothing here waits: the task frees its own id on exit, and a
     /// reconnect to it then respawns and replays from disk.
-    fn reap_idle(&self, timeout: Duration) {
+    fn reap_idle(&self, timeout: Duration, jobs_hold: Duration) {
         let mut table = lock_ignoring_poison(&self.table);
         for h in table.sessions.values_mut() {
-            if is_reapable(h, timeout) {
+            if is_reapable(h, timeout, jobs_hold) {
                 h.stop(crate::metrics::SessionEnd::IdleReap);
             }
         }
@@ -1607,13 +1617,18 @@ impl Supervisor {
 /// is exactly what this design exists to keep alive, so `running` is never reaped out from under it. Nor is a
 /// session with a live MCP Events subscription (`keep_alive`): its triggers fire with no client
 /// attached, which is the point of them.
-fn is_reapable(h: &SessionHandle, timeout: Duration) -> bool {
+fn is_reapable(h: &SessionHandle, timeout: Duration, jobs_hold: Duration) -> bool {
     match h.phase.input() {
         None => false,
         Some(tx) if tx.is_closed() => true,
         Some(_) => {
             h.attached == 0
-                && h.last_detached_at.is_some_and(|d| d.elapsed() >= timeout)
+                && h.last_detached_at.is_some_and(|d| {
+                    let idle = d.elapsed();
+                    // A running job holds the session open for `jobs_hold` more (zero: it does not).
+                    idle >= timeout
+                        && (idle >= timeout + jobs_hold || !h.jobs_alive.load(Ordering::Acquire))
+                })
                 && !h.running.load(Ordering::Relaxed)
                 && !h.keep_alive.load(Ordering::Acquire)
         }
@@ -1967,6 +1982,7 @@ pub async fn serve_ws(
     // Read before `cfg` is moved into the supervisor: how aggressively to reap idle sessions (and
     // whether the operator opted out of reaping altogether).
     let idle_timeout = resolve_idle_timeout(cfg.session_idle_timeout, cfg.mode.verifies_grants());
+    let jobs_hold = cfg.session_jobs_hold;
 
     // Service mode: every connection is verified against this keyring, and a tenant's sessions live
     // on these mounts. `main.rs` has already refused `--service` without both, so a `None` verifier
@@ -2178,7 +2194,7 @@ pub async fn serve_ws(
             tick.tick().await;
             loop {
                 tick.tick().await;
-                supervisor.reap_idle(t);
+                supervisor.reap_idle(t, jobs_hold);
             }
         })
     });
@@ -3690,6 +3706,7 @@ mod tests {
             last_detached_at: detached_ago.and_then(|d| Instant::now().checked_sub(d)),
             running: Arc::new(AtomicBool::new(false)),
             keep_alive: Arc::new(AtomicBool::new(false)),
+            jobs_alive: Arc::new(AtomicBool::new(false)),
             end_reason: Arc::new(Mutex::new(crate::metrics::SessionEnd::Client)),
         };
         (h, input_rx)
@@ -3738,6 +3755,9 @@ mod tests {
         assert_eq!(resolve_idle_timeout(Some(Duration::ZERO), true), None);
     }
 
+    /// No hold for a running job: the session is reaped like any idle one.
+    const NO_HOLD: Duration = Duration::ZERO;
+
     #[test]
     fn a_dead_session_is_reapable_however_it_looks_otherwise() {
         // Its loop ended (input receiver gone) while a connection is *still attached* and its idle clock
@@ -3745,7 +3765,7 @@ mod tests {
         // longer attachable in any useful sense, and its task is on its way out.
         let (h, input_rx) = handle(1, None);
         drop(input_rx);
-        assert!(is_reapable(&h, Duration::from_secs(3600)));
+        assert!(is_reapable(&h, Duration::from_secs(3600), NO_HOLD));
     }
 
     #[test]
@@ -3753,34 +3773,60 @@ mod tests {
         let timeout = Duration::from_secs(60);
 
         let (attached, _rx) = handle(1, None);
-        assert!(!is_reapable(&attached, timeout), "attached: never");
+        assert!(!is_reapable(&attached, timeout, NO_HOLD), "attached: never");
 
         let (fresh, _rx) = handle(0, None);
         assert!(
-            !is_reapable(&fresh, timeout),
+            !is_reapable(&fresh, timeout, NO_HOLD),
             "detached but no clock started: never"
         );
 
         let (recent, _rx) = handle(0, Some(Duration::from_secs(10)));
         assert!(
-            !is_reapable(&recent, timeout),
+            !is_reapable(&recent, timeout, NO_HOLD),
             "detached, but not past the timeout"
         );
 
         let (idle, _rx) = handle(0, Some(Duration::from_secs(120)));
-        assert!(is_reapable(&idle, timeout), "detached past the timeout");
+        assert!(
+            is_reapable(&idle, timeout, NO_HOLD),
+            "detached past the timeout"
+        );
 
         let (mid_run, _rx) = handle(0, Some(Duration::from_secs(120)));
         mid_run.running.store(true, Ordering::Relaxed);
         assert!(
-            !is_reapable(&mid_run, timeout),
+            !is_reapable(&mid_run, timeout, NO_HOLD),
             "a detached background run must never be reaped out from under its turn"
+        );
+
+        let hold = Duration::from_secs(900);
+        let (with_job, _rx) = handle(0, Some(Duration::from_secs(120)));
+        with_job.jobs_alive.store(true, Ordering::Release);
+        assert!(
+            !is_reapable(&with_job, timeout, hold),
+            "a session with a bash job running must stay open: only an open session hears the job end"
+        );
+        assert!(
+            is_reapable(&with_job, timeout, NO_HOLD),
+            "with no hold configured a running job does not keep the session"
+        );
+        with_job.jobs_alive.store(false, Ordering::Release);
+        assert!(
+            is_reapable(&with_job, timeout, hold),
+            "reapable again once the last job ended"
+        );
+        let (long_job, _rx) = handle(0, Some(timeout + hold + Duration::from_secs(1)));
+        long_job.jobs_alive.store(true, Ordering::Release);
+        assert!(
+            is_reapable(&long_job, timeout, hold),
+            "a job that outlives the hold (a dev server) does not pin the session for ever"
         );
 
         let (mut stopping, _rx) = handle(0, Some(Duration::from_secs(120)));
         stopping.stop(crate::metrics::SessionEnd::Client);
         assert!(
-            !is_reapable(&stopping, timeout),
+            !is_reapable(&stopping, timeout, NO_HOLD),
             "already on its way out: nothing left to reap"
         );
     }
@@ -3855,7 +3901,7 @@ mod tests {
             service: None,
             panicked: tokio::sync::mpsc::unbounded_channel().0,
             body: Box::new(
-                move |_id, _service, mut input_rx, _out, _running, _keep_alive| {
+                move |_id, _service, mut input_rx, _out, _running, _keep_alive, _jobs_alive| {
                     let probe = probe.clone();
                     Box::pin(async move {
                         let now = probe.running_now.fetch_add(1, Ordering::SeqCst) + 1;
@@ -3911,7 +3957,7 @@ mod tests {
         until("the first session starts", || probe.started() == 1).await;
 
         // Reap it. Its input closes and it parks mid-exit: the old task is still persisting.
-        sup.reap_idle(Duration::ZERO);
+        sup.reap_idle(Duration::ZERO, NO_HOLD);
         until("the reaped session sees EOF", || probe.exiting() == 1).await;
 
         let reconnect = tokio::spawn({
@@ -3942,7 +3988,7 @@ mod tests {
         let sup = probe_supervisor(&probe, false);
         attach_and_detach(&sup, "s1").await;
         until("the session starts", || probe.started() == 1).await;
-        sup.reap_idle(Duration::ZERO);
+        sup.reap_idle(Duration::ZERO, NO_HOLD);
         until("the reaped session sees EOF", || probe.exiting() == 1).await;
 
         let refused = sup
@@ -3980,7 +4026,7 @@ mod tests {
         // Were the stale unpin counted, the second session would read as detached and be reaped with a
         // connection still attached.
         sup.unpin(&first.id, first.incarnation);
-        sup.reap_idle(Duration::ZERO);
+        sup.reap_idle(Duration::ZERO, NO_HOLD);
         let table = lock_ignoring_poison(&sup.table);
         let h = &table.sessions["s1"];
         assert_eq!(h.incarnation, second.incarnation);
@@ -4001,7 +4047,7 @@ mod tests {
             (p.input_tx, p.id)
         };
         until("both sessions start", || probe.started() == 2).await;
-        sup.reap_idle(Duration::ZERO);
+        sup.reap_idle(Duration::ZERO, NO_HOLD);
         until("the reaped one is exiting", || probe.exiting() == 1).await;
 
         let shutdown = tokio::spawn({
@@ -4034,7 +4080,7 @@ mod tests {
         let sup = probe_supervisor(&probe, false);
         // No yield between spawn and reap: the task hasn't been polled, so it is still `Starting`.
         attach_and_detach(&sup, "s1").await;
-        sup.reap_idle(Duration::ZERO);
+        sup.reap_idle(Duration::ZERO, NO_HOLD);
         until("the id is freed", || {
             lock_ignoring_poison(&sup.table).sessions.is_empty()
         })
