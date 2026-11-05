@@ -31,6 +31,8 @@ fn daemon(base: &str, dir: &str, idle_secs: u64) -> (ChildGuard, u16) {
                 dir,
                 "--session-idle-timeout",
                 &idle_secs.to_string(),
+                "--session-jobs-hold",
+                "0",
             ])
             .env("HOME", ISOLATED_HOME)
             .stdin(Stdio::null())

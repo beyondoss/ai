@@ -717,6 +717,7 @@ fn build_config(
         listen,
         listen_uds,
         session_idle_timeout,
+        session_jobs_hold,
         upstream_http2,
         max_live_sessions,
         notify_origin,
@@ -846,6 +847,7 @@ fn build_config(
         job_notify: None,
         notify_origin: notify_origin.clone(),
         session_idle_timeout: session_idle_timeout.map(std::time::Duration::from_secs),
+        session_jobs_hold: std::time::Duration::from_secs(session_jobs_hold),
         upstream_http2,
         // The daemon path (`serve_ws`) fills this from `upstream_http2` before spawning any
         // session; the stdio/`run` path leaves it `None` and never pools.
