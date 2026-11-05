@@ -1903,7 +1903,7 @@ split is what each tool actually produces:
 | `edit`        | `old_string` matches 0 or >1 times after exact+fuzzy (without single-edit `replace_all`); overlapping/no-op edits; malformed `edits`                                                                                                     | file unreadable/unwritable (writability is checked _before_ any match/diff work — pi's own `access(path, W_OK)` pre-check — so a read-only file fails fast rather than after paying for fuzzy-matching's NFKC normalization) |
 | `ls`          | —                                                                                                                                                                                                                                        | path doesn't exist (`Path not found: {path}`), isn't a directory (`Not a directory: {path}`), or `read_dir` fails                                                                                                            |
 | `grep`/`find` | bad regex / bad glob                                                                                                                                                                                                                     | the `spawn_blocking` task itself panics (walk failures are swallowed per-entry)                                                                                                                                              |
-| `bash`        | missing `command`; a bad `cwd`, `timeout_ms` or `run_in_background`; `run_in_background` where the runner cannot track a job and no sandbox job store serves the session (`bash_sandbox::store_for`; e.g. a transport with no job scope) | spawn failure, non-zero exit or signal, a runner's deadline (`timed_out`), a background start refused at `MAX_INTENDED_JOBS`                                                                                                 |
+| `bash`        | missing `command`; a bad `cwd`, `timeout_ms` or `run_in_background`; `run_in_background` where the runner cannot track a job and no sandbox job store serves the session (`bash_sandbox::store_for`; e.g. a transport with no job scope) | spawn failure, non-zero exit or signal, a runner's deadline (`timed_out`), a command refused at `MAX_RUNNING_JOBS`                                                                                                 |
 
 ### Background work — told, not polled
 
@@ -3130,12 +3130,13 @@ separate host `bash` instance (`build_tools` with `bash_waits_for_exit`) over th
     the ceiling, or the model's `timeout_ms`: foreground work the model expected to finish) never
     outlives the turn —
     `BashJobs::end_turn` stops it when the run ends, however it ends, in `run` and `serve` alike, so
-    an idle session never accumulates hung loops — and is evicted, oldest first, past
-    `MAX_YIELDED_JOBS` (4). `Background` (`run_in_background`) and `Adopted` (the command left
+    an idle session never accumulates hung loops. `Background` (`run_in_background`) and `Adopted` (the command left
     processes running) are intended — the model asked for them: each lives until it exits, is killed,
-    or its owner ends; neither is ever evicted, and together they are capped at `MAX_INTENDED_JOBS`
-    (8): a background start past it is refused before the command runs, an adoption past it is
-    stopped at once, and either result lists the running jobs to stop first. A yielded job whose
+    or its owner ends. No running job is ever stopped to make room for another: every kind counts toward
+    one limit, `MAX_RUNNING_JOBS` (20, execd's bound on a session's job entries), and a command past it
+    is refused before it starts, the result listing the running jobs and how to stop one
+    (`bash_job {"job": N, "kill": true}`). An adoption that races past it (only another session
+    sharing the table can) is stopped at once. A yielded job whose
     shell exits leaving processes running becomes adopted; a background job stays background. Every
     result that parks a job says its lifetime ("it is stopped when you end your turn", "it is stopped
     for you when the run ends", "it keeps running after your turn ends").
@@ -3293,7 +3294,7 @@ separate host `bash` instance (`build_tools` with `bash_waits_for_exit`) over th
   never set wrongly on 400+ short commands (Luna and Sol send `false` on every call), and backgrounded
   server starts 88% (Luna, Sol), 73% (Kimi, plus 13% its own `docker -d`) and 50% (Qwen) of the time.
   The description sentence and the field text are the measured wording. A background call is refused
-  before anything runs when `MAX_INTENDED_JOBS` are already running. Otherwise the command starts as a job and the call waits `BACKGROUND_SETTLE` (1.5 s), or
+  before anything runs when `MAX_RUNNING_JOBS` are already running (so is any other command). Otherwise the command starts as a job and the call waits `BACKGROUND_SETTLE` (1.5 s), or
   less if it exits: a command that dies at once reports its exit in this result, not as a notice a
   turn later. Measured time-to-exit of failed starts on the dev box (three runs each): a bad flag or
   missing command 1–3 ms, Python and Node servers on a port in use 24–90 ms, `npm run`/`npm start` with

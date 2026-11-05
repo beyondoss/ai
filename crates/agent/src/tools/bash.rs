@@ -26,7 +26,7 @@ use regex::Regex;
 use serde_json::{Value, json};
 
 use super::bash_jobs::{
-    BashJobs, COMMAND_CHARS, Job, JobEnd, JobKind, JobShared, MAX_INTENDED_JOBS, MAX_YIELDED_JOBS,
+    BashJobs, COMMAND_CHARS, Job, JobEnd, JobKind, JobShared, MAX_RUNNING_JOBS,
 };
 use super::bash_proc::truncate_command;
 use super::exec::{CommandRunner, ExecResult, JobHooks, Kill, RealRunner};
@@ -455,11 +455,9 @@ impl Bash {
         } else {
             None
         };
-        if start == Start::Background
-            && let Some(running) = self.jobs.intended_full()
-        {
+        if let Some(running) = self.jobs.at_limit() {
             return Err(ToolError::Execution(format!(
-                "Not started: {MAX_INTENDED_JOBS} {INTENDED_JOBS} are already running \
+                "Not started: {MAX_RUNNING_JOBS} {RUNNING_JOBS} are already running \
                  ({running}). Stop one with bash_job {{\"job\": N, \"kill\": true}}, then run \
                  this again."
             )));
@@ -657,8 +655,7 @@ impl Bash {
                     // cancelling a wait on it must not end it. It goes back in the table; only a
                     // call's own fresh command dies with the call.
                     if let Some(id) = job.id {
-                        // An evicted yielded job is dropped (killed) here, outside the table lock.
-                        let _evicted = self.jobs.park(job);
+                        self.jobs.park(job);
                         return Err(ToolError::Execution(append_status(
                             &text,
                             &format!("Wait cancelled; job {id} is still running."),
@@ -764,14 +761,7 @@ impl Bash {
                  processes)."
             )
         };
-        let status = match self.jobs.park(job) {
-            // Dropped at the end of this arm, outside the table lock; dropping kills it.
-            Some((old, _evicted)) => format!(
-                "{status} Job {old} was stopped: at most {MAX_YIELDED_JOBS} jobs whose calls \
-                 returned early are kept running, the oldest stopped first."
-            ),
-            None => status,
-        };
+        self.jobs.park(job);
         Ok(append_status(&text, &status).into())
     }
 
@@ -807,7 +797,7 @@ impl Bash {
                 Err(ToolError::Execution(append_status(
                     &text,
                     &format!(
-                        "It was stopped: {MAX_INTENDED_JOBS} {INTENDED_JOBS} are already running \
+                        "It was stopped: {MAX_RUNNING_JOBS} {RUNNING_JOBS} are already running \
                          ({running}). Stop one with bash_job {{\"job\": N, \"kill\": true}}, then \
                          run this again."
                     ),
@@ -817,7 +807,7 @@ impl Bash {
     }
 
     /// The command's shell exited but left processes running (`cmd &`): they are tracked as a job
-    /// of their own — never evicted, since the command meant them — unless [`MAX_INTENDED_JOBS`] are
+    /// of their own — never evicted, since the command meant them — unless [`MAX_RUNNING_JOBS`] are
     /// already running, in which case they are stopped and the model is told which jobs to stop.
     async fn adopt(
         &self,
@@ -849,7 +839,7 @@ impl Bash {
                 }
                 drop(job);
                 format!(
-                    "The command exited but left {left} running. It was stopped: {MAX_INTENDED_JOBS} \
+                    "The command exited but left {left} running. It was stopped: {MAX_RUNNING_JOBS} \
                      commands' leftover processes are already running in this session."
                 )
             }
@@ -866,7 +856,7 @@ impl Bash {
                 drop(job);
                 format!(
                     "The command exited but left {left} running. It was stopped: \
-                     {MAX_INTENDED_JOBS} {INTENDED_JOBS} are already running ({running}). Stop one \
+                     {MAX_RUNNING_JOBS} {RUNNING_JOBS} are already running ({running}). Stop one \
                      with bash_job {{\"job\": N, \"kill\": true}}, then run this again."
                 )
             }
@@ -1065,8 +1055,9 @@ enum Yield {
     Settled,
 }
 
-/// What the cap on intended jobs counts, as the model is told.
-const INTENDED_JOBS: &str = "jobs started in the background or left running by a command";
+/// What the limit counts, as the model is told.
+const RUNNING_JOBS: &str =
+    "jobs (running commands, in the background or left running by a command)";
 
 /// Records a job's end when its runner task is dropped (aborted) or panics before recording one.
 struct FinishOnDrop(Option<Arc<JobShared>>);
