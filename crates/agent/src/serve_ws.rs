@@ -361,6 +361,10 @@ struct SessionHandle {
     /// `true` while the session holds a live MCP Events subscription (and `--mcp-events-reapable`
     /// is off): a background trigger, so the idle reaper leaves the session alone.
     keep_alive: Arc<AtomicBool>,
+    /// `true` while the session has a `bash` job running (a background command or one a command left
+    /// running): its end wakes the idle session, which only a session still open can hear, so the idle
+    /// reaper leaves it alone until the last job ends.
+    jobs_alive: Arc<AtomicBool>,
     /// Why this session ended, shared with its [`ExitGuard`]. Written by whoever stops it, read once
     /// as the task exits — so the reason is recorded by the code that knows it, rather than guessed
     /// at the point of exit where every ending looks alike.
@@ -428,6 +432,7 @@ type SessionBody = Box<
             Option<Arc<ServiceSession>>,
             mpsc::Receiver<String>,
             SharedOutConn,
+            Arc<AtomicBool>,
             Arc<AtomicBool>,
             Arc<AtomicBool>,
         ) -> BoxFuture<'static, ()>
@@ -561,7 +566,7 @@ async fn simulated_slow_attach() {}
 /// `main.rs::build_runtime`).
 fn serve_session_body(base: ServeConfig) -> SessionBody {
     Box::new(
-        move |id, service, input_rx, out_conn, running, keep_alive| {
+        move |id, service, input_rx, out_conn, running, keep_alive, jobs_alive| {
             let cfg = session_cfg(&base, id, service);
             let id = id.to_owned();
             // Kept past the move into `serve_session` so a session that fails to *start* can still be
@@ -570,7 +575,9 @@ fn serve_session_body(base: ServeConfig) -> SessionBody {
             // nothing.
             let out_err = out_conn.clone();
             Box::pin(async move {
-                if let Err(e) = serve_session(cfg, input_rx, out_conn, running, keep_alive).await {
+                if let Err(e) =
+                    serve_session(cfg, input_rx, out_conn, running, keep_alive, jobs_alive).await
+                {
                     eprintln!("serve: session {id} ended: {e}");
                     simulated_slow_session_end().await;
                     lock_ignoring_poison(&out_err).end(OutFrame::Value(json!({
@@ -1021,6 +1028,7 @@ impl Supervisor {
         // this handle-side clone to never reclaim a mid-run background session.
         let running = Arc::new(AtomicBool::new(false));
         let keep_alive = Arc::new(AtomicBool::new(false));
+        let jobs_alive = Arc::new(AtomicBool::new(false));
         let exited = CancellationToken::new();
         table.sessions.insert(
             id.to_owned(),
@@ -1034,6 +1042,7 @@ impl Supervisor {
                 last_detached_at: None,
                 running: running.clone(),
                 keep_alive: keep_alive.clone(),
+                jobs_alive: jobs_alive.clone(),
                 end_reason: Arc::clone(&end_reason),
             },
         );
@@ -1071,6 +1080,7 @@ impl Supervisor {
             out_conn.clone(),
             running,
             keep_alive,
+            jobs_alive,
         );
         let session_id = id.to_owned();
         // For the failure paths below: whoever attached to the `Starting` slot while the lock was
@@ -1616,6 +1626,7 @@ fn is_reapable(h: &SessionHandle, timeout: Duration) -> bool {
                 && h.last_detached_at.is_some_and(|d| d.elapsed() >= timeout)
                 && !h.running.load(Ordering::Relaxed)
                 && !h.keep_alive.load(Ordering::Acquire)
+                && !h.jobs_alive.load(Ordering::Acquire)
         }
     }
 }
@@ -3690,6 +3701,7 @@ mod tests {
             last_detached_at: detached_ago.and_then(|d| Instant::now().checked_sub(d)),
             running: Arc::new(AtomicBool::new(false)),
             keep_alive: Arc::new(AtomicBool::new(false)),
+            jobs_alive: Arc::new(AtomicBool::new(false)),
             end_reason: Arc::new(Mutex::new(crate::metrics::SessionEnd::Client)),
         };
         (h, input_rx)
@@ -3777,6 +3789,18 @@ mod tests {
             "a detached background run must never be reaped out from under its turn"
         );
 
+        let (with_job, _rx) = handle(0, Some(Duration::from_secs(120)));
+        with_job.jobs_alive.store(true, Ordering::Release);
+        assert!(
+            !is_reapable(&with_job, timeout),
+            "a session with a bash job running must stay open: only an open session hears the job end"
+        );
+        with_job.jobs_alive.store(false, Ordering::Release);
+        assert!(
+            is_reapable(&with_job, timeout),
+            "reapable again once the last job ended"
+        );
+
         let (mut stopping, _rx) = handle(0, Some(Duration::from_secs(120)));
         stopping.stop(crate::metrics::SessionEnd::Client);
         assert!(
@@ -3855,7 +3879,7 @@ mod tests {
             service: None,
             panicked: tokio::sync::mpsc::unbounded_channel().0,
             body: Box::new(
-                move |_id, _service, mut input_rx, _out, _running, _keep_alive| {
+                move |_id, _service, mut input_rx, _out, _running, _keep_alive, _jobs_alive| {
                     let probe = probe.clone();
                     Box::pin(async move {
                         let now = probe.running_now.fetch_add(1, Ordering::SeqCst) + 1;
