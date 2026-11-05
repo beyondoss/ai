@@ -3182,6 +3182,14 @@ separate host `bash` instance (`build_tools` with `bash_waits_for_exit`) over th
     context sidecar, because after a restart the jobs are gone and a persisted copy would describe
     them as running. A reopened summarized session's first request instead says no jobs are running,
     which also corrects a summary whose prose claims one is (`tests/bash_jobs_serve_carry.rs`).
+  - **A running job holds an idle session open, for a while.** A background job's end wakes the idle
+    session, which only a session still open can hear, so `BashJobs::set_alive_flag` keeps
+    `SessionHandle::jobs_alive` true while any job runs and `is_reapable` leaves a detached session open
+    past the idle window until the last job ends, but no longer than `JOBS_HOLD_WINDOW` (15 minutes). The
+    bound is the idle window's own reason: an open session holds its storage lock, and a session that
+    failed over to a replica the edge does not hash to is unreachable until the lock frees. A job that
+    outlives the window (a dev server) is let go like any idle session; its end is read back when the
+    session next opens.
   - **Reopen (`Background::resume`).** A table reads the transcript of the first run it serves —
     once, and again after `stop_all` (a `serve` transcript switch) resets it — because a reopened
     session's jobs are gone: `serve`'s session end (service-mode reap after detach, every deploy,

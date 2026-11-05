@@ -267,6 +267,13 @@ const DEFAULT_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 /// cheap direction: being wrong in the long direction costs availability.
 const DEFAULT_SERVICE_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How long a detached session with a `bash` job running stays open, past the idle window, so the job's
+/// end can wake it. Bounded for the reason the idle window is short: an open session holds its storage
+/// lock, and a session that failed over to a replica the edge does not hash to is unreachable from where
+/// the edge looks until that lock frees. A job that outlives this (a dev server never ends) is let go like
+/// any idle session: the job runs on in its sandbox and its end is read back when the session next opens.
+const JOBS_HOLD_WINDOW: Duration = Duration::from_secs(15 * 60);
+
 /// How often a drain re-checks whether any run is still in flight.
 ///
 /// Short enough that a drain of idle sessions is over in well under a second, long enough that the
@@ -1623,10 +1630,14 @@ fn is_reapable(h: &SessionHandle, timeout: Duration) -> bool {
         Some(tx) if tx.is_closed() => true,
         Some(_) => {
             h.attached == 0
-                && h.last_detached_at.is_some_and(|d| d.elapsed() >= timeout)
+                && h.last_detached_at.is_some_and(|d| {
+                    let idle = d.elapsed();
+                    // A running job holds the session open, up to JOBS_HOLD_WINDOW.
+                    idle >= timeout
+                        && (idle >= JOBS_HOLD_WINDOW || !h.jobs_alive.load(Ordering::Acquire))
+                })
                 && !h.running.load(Ordering::Relaxed)
                 && !h.keep_alive.load(Ordering::Acquire)
-                && !h.jobs_alive.load(Ordering::Acquire)
         }
     }
 }
