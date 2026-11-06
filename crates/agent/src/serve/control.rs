@@ -341,6 +341,21 @@ impl SessionLoop {
                     return false;
                 }
             }
+            // The sandbox told the API that a job it kept changed state, and the API woke this session
+            // for it (`job_wake`). Read the sandbox's jobs back now: an ended job then has its notice
+            // due, and the idle wake above runs the turn that tells the model, the same turn a held
+            // stream's end runs. Idempotent: a job already read back is not read twice, and a
+            // job already reported has no notice left.
+            "job_wake" => {
+                let read = crate::tools::bash_sandbox::reconcile(&self.bash_jobs).await;
+                let (ok, why) = match &read {
+                    Ok(()) => (true, None),
+                    Err(e) => (false, Some(e.as_str())),
+                };
+                if !self.emit(response(id, "job_wake", ok, None, why)) {
+                    return false;
+                }
+            }
             "stop_after_turn" => {
                 // No run is in flight, so there is no turn boundary to stop at. Unlike `steer`/
                 // `follow_up`, deliberately *not* forwarded to `steering.request_stop()` here: that

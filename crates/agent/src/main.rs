@@ -585,10 +585,6 @@ enum Command {
         /// --service); `0` never.
         #[usage(long, env = "AI_AGENT_SESSION_IDLE_TIMEOUT")]
         session_idle_timeout: Option<u64>,
-        /// Seconds a detached session stays open past the idle timeout while a `bash` job runs.
-        /// Default 900; `0` reaps it like any idle session.
-        #[usage(long, env = "AI_AGENT_SESSION_JOBS_HOLD", default = "900")]
-        session_jobs_hold: u64,
         /// How sessions share connections to the gateway: `auto` (default), `off`, or `h2c`.
         #[usage(long, env = "AI_AGENT_UPSTREAM_HTTP2", default = "auto")]
         upstream_http2: serve::UpstreamHttp2,

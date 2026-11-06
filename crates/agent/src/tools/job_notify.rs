@@ -24,8 +24,9 @@ use crate::exec_endpoint::jobs::JobId;
 use crate::notify_token::NotifyKey;
 use kernel::{Action, CallId, Event, Facts, Kernel, Listed, Millis, TableJob};
 
-/// Check `--notify-origin`: an absolute `http`/`https` URL with a host and nothing past the origin
-/// (no path but `/`, no query, no fragment, no userinfo).
+/// Check `--notify-origin`: an absolute `http`/`https` URL with a host, where the fleet is reached
+/// (no query, no fragment, no userinfo). It may carry a path prefix, for a front mounted under one: the
+/// callback is at `<origin>/_beyond/agent`.
 pub fn check_origin(origin: &str) -> Result<(), String> {
     let url = url::Url::parse(origin)
         .map_err(|e| format!("--notify-origin {origin:?} is not a URL: {e}"))?;
@@ -33,14 +34,13 @@ pub fn check_origin(origin: &str) -> Result<(), String> {
         && url.host_str().is_some_and(|h| !h.is_empty())
         && url.username().is_empty()
         && url.password().is_none()
-        && url.path() == "/"
         && url.query().is_none()
         && url.fragment().is_none();
     if bare {
         Ok(())
     } else {
         Err(format!(
-            "--notify-origin {origin:?} must be an http or https origin, like https://edge.example"
+            "--notify-origin {origin:?} must be an http or https URL with no query or fragment, like https://front.example or https://front.example/prefix"
         ))
     }
 }

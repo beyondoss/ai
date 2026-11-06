@@ -611,7 +611,8 @@ fn fixture_key() -> NotifyKey {
     NotifyKey::from_secret_bytes(&bytes)
 }
 
-/// Serve one request through the real receiver over an in-memory stream.
+/// Serve one request through the real receiver over an in-memory stream, with nowhere to pass a
+/// callback for a session nobody holds.
 #[allow(clippy::too_many_arguments)]
 async fn serve_one(
     hub: Option<&NotifyHub>,
@@ -623,10 +624,38 @@ async fn serve_one(
     body: &[u8],
     arrived: Instant,
 ) -> (u16, String) {
+    serve_one_with(
+        hub,
+        service_mode,
+        method,
+        path,
+        query,
+        headers,
+        body,
+        arrived,
+        None,
+    )
+    .await
+}
+
+/// [`serve_one`], where a callback for a session nobody holds is passed to `lifecycle`.
+#[allow(clippy::too_many_arguments)]
+async fn serve_one_with(
+    hub: Option<&NotifyHub>,
+    service_mode: bool,
+    method: &str,
+    path: &str,
+    query: Option<&str>,
+    headers: &[(String, String)],
+    body: &[u8],
+    arrived: Instant,
+    lifecycle: Option<&dyn beyond_agent::lifecycle::RunLifecycle>,
+) -> (u16, String) {
     let (mut client, mut server) = tokio::io::duplex(64 * 1024);
     // Outside service mode a replica has no hub, which is what makes it refuse a callback.
     let rx = job_ended::Receiver {
         hub: hub.filter(|_| service_mode),
+        lifecycle,
     };
     let head = job_ended::Head {
         method,
@@ -1123,4 +1152,90 @@ async fn the_receiver_counts_what_it_answers() {
         value(r#"agent_job_callbacks_total{outcome="not_open"}"#),
         1.0
     );
+}
+
+/// The control plane, as the receiver sees it: it takes the report or it does not.
+struct ControlPlane {
+    takes: bool,
+    reports: Mutex<Vec<beyond_agent::lifecycle::RunEvent>>,
+}
+
+#[async_trait::async_trait]
+impl beyond_agent::lifecycle::RunLifecycle for ControlPlane {
+    async fn report(&self, event: beyond_agent::lifecycle::RunEvent) -> Result<(), String> {
+        self.reports.lock().unwrap().push(event);
+        if self.takes {
+            Ok(())
+        } else {
+            Err("HTTP 503".to_string())
+        }
+    }
+}
+
+/// A callback that passes every check for a session no task here holds is passed to the control
+/// plane, naming the tenant and the session its token proves, and answered `2xx` only if the control
+/// plane took it; if not, `503`, and the sandbox goes on retrying.
+#[tokio::test]
+async fn a_callback_for_a_session_nobody_holds_is_passed_on() {
+    let hub = NotifyHub::new(fixture_key());
+    let scope = JobScope::for_session(Some(TENANT), SESSION);
+    let body = body_for(scope.name(), JOB);
+    let token = fixture_key().mint(TENANT, SESSION, &JobId::parse(JOB).unwrap());
+    let query = format!("session_id={SESSION}&tenant={TENANT}");
+    let headers = |token: &str| {
+        vec![
+            ("Authorization".to_string(), format!("Bearer {token}")),
+            ("Content-Length".to_string(), body.len().to_string()),
+        ]
+    };
+    for (takes, want) in [(true, 200), (false, 503)] {
+        let cp = ControlPlane {
+            takes,
+            reports: Mutex::new(Vec::new()),
+        };
+        let (status, _) = serve_one_with(
+            Some(&hub),
+            true,
+            "POST",
+            "/_beyond/agent",
+            Some(&query),
+            &headers(&token),
+            body.as_bytes(),
+            Instant::now(),
+            Some(&cp),
+        )
+        .await;
+        assert_eq!(status, want);
+        let reports = cp.reports.lock().unwrap();
+        assert_eq!(reports.len(), 1);
+        let beyond_agent::lifecycle::RunEvent::JobEnded {
+            session_id, tenant, ..
+        } = &reports[0]
+        else {
+            panic!("{:?}", reports[0]);
+        };
+        assert_eq!(
+            (session_id.as_str(), tenant.as_deref()),
+            (SESSION, Some(TENANT))
+        );
+    }
+    // A token that does not verify reaches nobody.
+    let cp = ControlPlane {
+        takes: true,
+        reports: Mutex::new(Vec::new()),
+    };
+    let (status, _) = serve_one_with(
+        Some(&hub),
+        true,
+        "POST",
+        "/_beyond/agent",
+        Some(&query),
+        &headers("bjn_v1.00000000.x"),
+        body.as_bytes(),
+        Instant::now(),
+        Some(&cp),
+    )
+    .await;
+    assert_eq!(status, 401);
+    assert!(cp.reports.lock().unwrap().is_empty());
 }

@@ -446,8 +446,6 @@ async fn a_reaped_session_reads_its_jobs_back_on_reopen() {
                 edge.origin.clone(),
                 "--session-idle-timeout".into(),
                 "1".into(),
-                "--session-jobs-hold".into(),
-                "0".into(),
             ],
             exec: Some(MockOptions::default()),
             ..Default::default()

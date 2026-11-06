@@ -93,7 +93,6 @@ async fn setup_exec(
     out_conn: &SharedOutConn,
     running: &Arc<std::sync::atomic::AtomicBool>,
     keep_alive: &Arc<std::sync::atomic::AtomicBool>,
-    jobs_alive: &Arc<std::sync::atomic::AtomicBool>,
     timing: &mut crate::timing::StartupTiming,
     persistence: &Persistence,
 ) -> Result<ExecSetup, SetupError> {
@@ -164,7 +163,6 @@ async fn setup_exec(
     // (they belong to its history).
     let bash_jobs = exec_cell.bash_jobs().clone();
     bash_jobs.set_policy(crate::tools::bash_jobs::EndPolicy::KeepRunning);
-    bash_jobs.set_alive_flag(jobs_alive.clone());
     let bash_jobs_wake = bash_jobs.subscribe();
     // What the host `bash` command (the client's own, not the model's) leaves running (`cmd &`).
     // A table of its own, so those processes never reach the model: no finish notice, no wake (a
@@ -1303,8 +1301,6 @@ impl SessionLoop {
         // Set by the MCP Events hub while this session holds a live subscription; the daemon's idle
         // reaper leaves such a session alone (unless `--mcp-events-reapable`). Inert over stdio.
         keep_alive: Arc<std::sync::atomic::AtomicBool>,
-        // Set while a `bash` job runs: the reaper leaves the session open so the job's end can wake it.
-        jobs_alive: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Self, SetupError> {
         let mut timing = crate::timing::StartupTiming::recording();
         let Opened {
@@ -1336,7 +1332,6 @@ impl SessionLoop {
             &out_conn,
             &running,
             &keep_alive,
-            &jobs_alive,
             &mut timing,
             &persistence,
         )
