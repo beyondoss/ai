@@ -28,7 +28,7 @@ use common::notify_fleet::{
 };
 use common::service::{Options, Service};
 use common::{spawn_model_server, turn_text, turn_tool_use, ws_connect_with_headers, ws_send};
-use serde_json::{Value, json};
+use serde_json::json;
 
 /// N35: `keep` with `notify` alone releases nothing; the proof arriving inside the window does,
 /// and the stream is closed with the job still running. The job's end then reaches the model by
