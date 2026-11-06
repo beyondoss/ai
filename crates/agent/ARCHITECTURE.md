@@ -3192,8 +3192,10 @@ separate host `bash` instance (`build_tools` with `bash_waits_for_exit`) over th
     an ended job's notice is due and the idle wake below runs the turn that tells the model, exactly as
     a held stream's end does. It repeats freely: a job already read back is not read twice and a notice
     already taken is not taken again, so a wake for an end the session already told starts no turn. A
-    callback that never arrives (the whole fleet and the control plane down for the sandbox's 723 s)
-    is read when the session next opens.
+    callback that never arrives (the whole fleet and the control plane down for the sandbox's 723 s) is
+    read when the session next opens. So is the end of a job whose sandbox endpoint restarted: its
+    processes run on, but the new endpoint has no record of them, so nothing calls back; the next open
+    reports them as "supervisor gone, how it ended was not recorded" (`bash_sandbox::read_back`).
   - **Reopen (`Background::resume`).** A table reads the transcript of the first run it serves —
     once, and again after `stop_all` (a `serve` transcript switch) resets it — because a reopened
     session's jobs are gone: `serve`'s session end (service-mode reap after detach, every deploy,
