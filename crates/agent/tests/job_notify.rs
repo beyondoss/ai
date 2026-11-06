@@ -104,46 +104,6 @@ async fn no_callback_keeps_the_stream() {
     assert!(f.model_saw("done-b1", Duration::from_secs(15)).await);
 }
 
-/// N36: no notify without the edge's origin: `keep` is sent without `notify`, exactly as today.
-#[tokio::test(flavor = "multi_thread")]
-async fn keep_without_notify_when_unavailable() {
-    // No origin configured: nothing to name, so no notify.
-    let mut turns = vec![bash_bg("echo up; sleep 3; echo done-c2"), turn_text("ok")];
-    turns.extend((0..4).map(|_| turn_text("noted")));
-    let (base, _r) = spawn_model_server(turns);
-    let svc = Service::start_with(
-        &base,
-        &["s1"],
-        Options {
-            exec: Some(MockOptions::default()),
-            ..Default::default()
-        },
-    )
-    .await;
-    let token = svc.token(TENANT, SESSION);
-    let mut ws = ws_connect_with_headers(svc.port, Some(SESSION), &svc.header(&token))
-        .await
-        .unwrap();
-    ws_send(&mut ws, json!({"type":"prompt","id":"p","message":"go"})).await;
-    common::ws_read_until_response(&mut ws, "prompt").await;
-    svc.exec
-        .wait_for_stream("done-c2", Duration::from_secs(20))
-        .await
-        .unwrap();
-    let keeps: Vec<Value> = svc
-        .exec
-        .bodies()
-        .into_iter()
-        .filter(|b| b["job"]["op"] == "keep")
-        .collect();
-    assert!(!keeps.is_empty());
-    assert!(
-        keeps.iter().all(|k| k["job"].get("notify").is_none()),
-        "{keeps:?}"
-    );
-    assert!(svc.exec.callbacks().is_empty());
-}
-
 /// N37: the window opens before `keep` is sent, so a proof that overtakes `keep`'s answer counts.
 #[tokio::test(flavor = "multi_thread")]
 async fn proof_window_opens_before_keep() {

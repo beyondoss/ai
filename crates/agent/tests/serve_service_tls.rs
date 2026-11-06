@@ -283,7 +283,9 @@ fn refused(extra: &[String]) -> String {
         Some(minter.seal_key()),
         &[("a", shard.as_path())],
     );
-    cmd.args(extra).stderr(Stdio::piped());
+    cmd.args(["--notify-origin", "http://127.0.0.1:9"])
+        .args(extra)
+        .stderr(Stdio::piped());
     let out = cmd.spawn_guarded().wait_with_output().unwrap();
     let err = String::from_utf8_lossy(&out.stderr).into_owned();
     assert!(

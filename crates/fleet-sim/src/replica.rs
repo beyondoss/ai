@@ -127,9 +127,10 @@ impl Replica {
         if let Some(max) = max_live_sessions {
             c.arg("--max-live-sessions").arg(max.to_string());
         }
-        if let Some(origin) = notify_origin {
-            c.arg("--notify-origin").arg(origin);
-        }
+        // Required with --service. A scenario that names none gets an address nothing listens on, so its
+        // jobs stay held by their streams, as without notify.
+        c.arg("--notify-origin")
+            .arg(notify_origin.unwrap_or("http://127.0.0.1:9"));
         if let Some(secs) = session_idle_timeout {
             c.arg("--session-idle-timeout").arg(secs.to_string());
         }

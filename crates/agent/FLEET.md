@@ -179,9 +179,10 @@ session's own address, `/_beyond/agent?session_id=<id>&tenant=<tenant>`, with
 `src/exec_endpoint.rs`). The callback is a hint: the replica re-reads the job from the sandbox, so a
 callback that is lost, repeated or forged can delay a report but cannot make one wrong. The sandbox
 retries a callback for at most 723 s. It stops on `2xx`, on `401`, `403`, `404`, `410`, or on a
-status it cannot fix by repeating itself, and retries `503`. A replica offers notify only when it
-runs with `--service` and `--notify-origin <origin>`, the origin the edge serves sessions at, which
-is what a sandbox's callbacks are sent to; without it every job is held as before notify.
+status it cannot fix by repeating itself, and retries `503`. A replica
+requires `--notify-origin <origin>` with `--service` (it refuses to start without it): the address
+sandboxes reach the fleet at, which is what their callbacks are sent to. Without it a reaped
+session's jobs would end unheard.
 
 **The edge attaches, mints and verifies nothing for a callback.** There is no user behind it, and
 only replicas hold the token's key. A callback never opens a session itself (opening needs a grant,

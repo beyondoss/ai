@@ -116,6 +116,7 @@ impl Service {
             (!opts.seal_key_from_env).then(|| minter.seal_key()),
             &flag_shards,
         );
+        add_notify_origin(&mut cmd, &opts.extra_args);
         cmd.args(&opts.extra_args);
         if let Some(home) = &opts.host_home {
             cmd.env("HOME", home);
@@ -164,6 +165,8 @@ impl Service {
             Some(self.minter.seal_key()),
             &flag_shards,
         );
+        let extra: Vec<String> = extra_args.iter().map(|a| (*a).to_string()).collect();
+        add_notify_origin(&mut cmd, &extra);
         cmd.args(extra_args);
         let (child, port) = spawn_listening(&mut cmd);
         Peer { port, child }
@@ -352,4 +355,12 @@ pub fn far_future() -> u64 {
         .map(|d| d.as_secs())
         .unwrap_or(0)
         + 3600
+}
+
+/// `--service` requires `--notify-origin` (where sandboxes call back). A test that does not name one gets an
+/// address nothing listens on, so its jobs stay held by their streams, as without notify.
+fn add_notify_origin(cmd: &mut std::process::Command, extra_args: &[String]) {
+    if !extra_args.iter().any(|a| a == "--notify-origin") {
+        cmd.args(["--notify-origin", "http://127.0.0.1:9"]);
+    }
 }

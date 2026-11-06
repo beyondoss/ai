@@ -343,6 +343,16 @@ fn validate(cmd: Command) -> Result<(ServeTrust, ServeTransport), Box<dyn std::e
             )
             .into());
         }
+        // A background job's end reaches a session that is no longer open only by the sandbox calling
+        // back to the fleet, and the sandbox is told where by this. Without it a reaped session's jobs
+        // would end unheard, so a replica that cannot say where refuses to serve.
+        if notify_origin.is_none() {
+            return Err(
+                "--service requires --notify-origin: where the fleet is reached by a sandbox, so that a \
+                     background job's end can wake a session no replica holds"
+                    .into(),
+            );
+        }
     }
     Ok((
         ServeTrust {
