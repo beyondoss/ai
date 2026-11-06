@@ -3183,14 +3183,19 @@ separate host `bash` instance (`build_tools` with `bash_waits_for_exit`) over th
     context sidecar, because after a restart the jobs are gone and a persisted copy would describe
     them as running. A reopened summarized session's first request instead says no jobs are running,
     which also corrects a summary whose prose claims one is (`tests/bash_jobs_serve_carry.rs`).
-  - **A running job holds an idle session open, for a while.** A background job's end wakes the idle
-    session, which only a session still open can hear, so `BashJobs::set_alive_flag` keeps
-    `SessionHandle::jobs_alive` true while any job runs and `is_reapable` leaves a detached session open
-    past the idle window until the last job ends, but no longer than `--session-jobs-hold` (default 900 s, `0` = no hold). The
-    bound is the idle window's own reason: an open session holds its storage lock, and a session that
-    failed over to a replica the edge does not hash to is unreachable until the lock frees. A job that
-    outlives the window (a dev server) is let go like any idle session; its end is read back when the
-    session next opens.
+  - **A job's end does not need the session open.** The idle reaper closes a detached session after
+    the idle window whether or not a job runs (there is no hold). With `--notify-origin` the sandbox
+    calls back to the fleet when a kept job changes state, and a replica that does not hold the session
+    passes the report to the control plane (`job_ended` lifecycle event, answered `2xx` only once the
+    control plane took it); the control plane sends the session a `job_wake` command, which opens it on
+    a replica if none holds it. `job_wake` reads the sandbox's jobs back (`bash_sandbox::reconcile`), so
+    an ended job's notice is due and the idle wake below runs the turn that tells the model, exactly as
+    a held stream's end does. It repeats freely: a job already read back is not read twice and a notice
+    already taken is not taken again, so a wake for an end the session already told starts no turn. A
+    callback that never arrives (the whole fleet and the control plane down for the sandbox's 723 s) is
+    read when the session next opens. So is the end of a job whose sandbox endpoint restarted: its
+    processes run on, but the new endpoint has no record of them, so nothing calls back; the next open
+    reports them as "supervisor gone, how it ended was not recorded" (`bash_sandbox::read_back`).
   - **Reopen (`Background::resume`).** A table reads the transcript of the first run it serves —
     once, and again after `stop_all` (a `serve` transcript switch) resets it — because a reopened
     session's jobs are gone: `serve`'s session end (service-mode reap after detach, every deploy,

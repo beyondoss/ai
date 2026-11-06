@@ -148,6 +148,8 @@ pub struct Receiver<'a> {
     /// The replica's notify key and open sessions; `None` outside `serve --service`, where
     /// callbacks are refused (`403`).
     pub hub: Option<&'a NotifyHub>,
+    /// Where a callback for a session nobody here holds is passed on, to wake it.
+    pub lifecycle: Option<&'a dyn crate::lifecycle::RunLifecycle>,
 }
 
 /// A callback's request head, as the listener parsed it.
@@ -319,12 +321,36 @@ where
     if scope != JobScope::for_session(Some(&tenant), &session_id).name() {
         return Err(Some(401));
     }
-    // Only now: is the session held here? A callback never opens one.
+    // Only now: is the session held here? A callback never opens one. Not held here, the token is
+    // still this session's own (a replica mints for no other), so the report is true: pass it to the
+    // control plane, which wakes the session on whichever replica opens it, and answer `2xx` only once
+    // it has taken the wake. The sandbox goes on retrying until then.
     let Some(session) = hub.find(&tenant, &session_id) else {
+        let relayed = match rx.lifecycle {
+            Some(l) => l
+                .report(crate::lifecycle::RunEvent::JobEnded {
+                    session_id: session_id.clone(),
+                    tenant: Some(tenant.clone()),
+                    ts: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs()),
+                })
+                .await
+                .is_ok(),
+            None => false,
+        };
         if let Some(m) = hub.metrics() {
-            m.job_callback(crate::metrics::JobCallback::NotOpen);
+            m.job_callback(if relayed {
+                crate::metrics::JobCallback::Relayed
+            } else {
+                crate::metrics::JobCallback::NotOpen
+            });
         }
-        refuse(stream, 503).await;
+        if relayed {
+            let _ = write(stream, 200, "OK", ANSWER_BODY).await;
+        } else {
+            refuse(stream, 503).await;
+        }
         return Err(None);
     };
     let Some(id) = JobId::parse(id) else {

@@ -585,10 +585,6 @@ enum Command {
         /// --service); `0` never.
         #[usage(long, env = "AI_AGENT_SESSION_IDLE_TIMEOUT")]
         session_idle_timeout: Option<u64>,
-        /// Seconds a detached session stays open past the idle timeout while a `bash` job runs.
-        /// Default 900; `0` reaps it like any idle session.
-        #[usage(long, env = "AI_AGENT_SESSION_JOBS_HOLD", default = "900")]
-        session_jobs_hold: u64,
         /// How sessions share connections to the gateway: `auto` (default), `off`, or `h2c`.
         #[usage(long, env = "AI_AGENT_UPSTREAM_HTTP2", default = "auto")]
         upstream_http2: serve::UpstreamHttp2,
@@ -619,8 +615,9 @@ enum Command {
         /// Serve Prometheus metrics on this loopback address.
         #[usage(long, env = "AI_AGENT_METRICS_LISTEN")]
         metrics_listen: Option<String>,
-        /// With --service, the origin the fleet's edge serves sessions at: sandboxes that offer
-        /// job notify (exec notify) report a kept job's end to `<origin>/_beyond/agent`.
+        /// Required with --service: where sandboxes reach the fleet (a URL, with a path prefix if
+        /// the front is mounted under one). A sandbox that offers job notify (exec notify) reports a
+        /// kept job's end to `<origin>/_beyond/agent`, which is how it reaches a session no replica holds.
         #[usage(long, env = "AI_AGENT_NOTIFY_ORIGIN")]
         notify_origin: Option<String>,
         /// On shutdown, wait up to this many seconds for running prompts to finish. Default 0.

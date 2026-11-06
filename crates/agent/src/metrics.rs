@@ -136,20 +136,23 @@ pub enum JobCallback {
     Gone,
     /// `503` from the session: a call has the job, the list failed, too many waiting, or late.
     Unavailable,
-    /// `503`: no session task here holds the session.
+    /// `503`: no session task here holds the session, and the control plane could not be told.
     NotOpen,
+    /// `200`: no session task here holds the session, and the control plane took the wake.
+    Relayed,
     /// Refused before the session was looked up (the request, the token or the scope).
     Refused,
 }
 
 impl JobCallback {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::Accepted,
         Self::Proof,
         Self::Duplicate,
         Self::Gone,
         Self::Unavailable,
         Self::NotOpen,
+        Self::Relayed,
         Self::Refused,
     ];
 
@@ -161,6 +164,7 @@ impl JobCallback {
             Self::Gone => "gone",
             Self::Unavailable => "unavailable",
             Self::NotOpen => "not_open",
+            Self::Relayed => "relayed",
             Self::Refused => "refused",
         }
     }

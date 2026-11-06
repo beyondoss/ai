@@ -71,6 +71,13 @@ pub trait RunLifecycle: Send + Sync {
     /// without a separate code path at every emit site.
     fn emit(&self, _event: RunEvent) {}
 
+    /// Send one event now and say whether the control plane took it (any `2xx`): the caller answers
+    /// someone who retries on this, so unlike [`Self::emit`] it is neither queued nor dropped. An
+    /// unconfigured emitter has nobody to tell, and says so.
+    async fn report(&self, _event: RunEvent) -> Result<(), String> {
+        Err("no lifecycle URL is configured".to_string())
+    }
+
     /// Wait (bounded) for outstanding durable events to leave the process. No-op by default.
     async fn drain(&self) {}
 }
@@ -221,6 +228,17 @@ pub enum RunEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         title: Option<String>,
     },
+    /// A sandbox reported that a job its session kept changed state, to a replica that does not hold
+    /// the session (it was reaped, or its replica died). The control plane wakes the session, which
+    /// opens on a replica, reads the sandbox's jobs back and tells the model of any end it has not
+    /// been told of. A **session** fact with no run, like [`Self::SessionArchived`]; the replica
+    /// answers the sandbox only once the control plane has taken it (see [`RunLifecycle::report`]).
+    JobEnded {
+        session_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tenant: Option<String>,
+        ts: u64,
+    },
     Progress {
         run_id: String,
         session_id: String,
@@ -298,7 +316,7 @@ impl RunEvent {
     /// The run this event belongs to; empty for [`Self::SessionArchived`], which has none.
     pub fn run_id(&self) -> &str {
         match self {
-            Self::SessionArchived { .. } => "",
+            Self::SessionArchived { .. } | Self::JobEnded { .. } => "",
             Self::Started { run_id, .. }
             | Self::Progress { run_id, .. }
             | Self::SessionNamed { run_id, .. }
@@ -684,6 +702,10 @@ impl HttpLifecycle {
 
 #[async_trait]
 impl RunLifecycle for HttpLifecycle {
+    async fn report(&self, event: RunEvent) -> Result<(), String> {
+        post_once(&self.inner, &event).await
+    }
+
     fn emit(&self, event: RunEvent) {
         if event.is_progress() {
             let id = event.run_id().to_string();

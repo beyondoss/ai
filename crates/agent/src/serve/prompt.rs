@@ -917,6 +917,17 @@ impl SessionLoop {
                                     self.steering.request_stop();
                                     let _ = self.out_tx.send(response(cid, "stop_after_turn", true, None, None));
                                 }
+                                // A job's end, told by the API (see the idle table's `job_wake`). A run in
+                                // flight reads its sandbox's jobs back beside it and answers at once.
+                                "job_wake" => {
+                                    let jobs = self.bash_jobs.clone();
+                                    tokio::spawn(async move {
+                                        if let Err(e) = crate::tools::bash_sandbox::reconcile(&jobs).await {
+                                            tracing::warn!(error = %e, "job_wake: the sandbox's jobs could not be read back during a run");
+                                        }
+                                    });
+                                    let _ = self.out_tx.send(response(cid, "job_wake", true, None, None));
+                                }
                                 "switch_model" => {
                                     // Pi-parity gap (pi's `prepareNextTurn`): unlike `set_model`
                                     // (which only takes effect on the *next* `prompt`), this

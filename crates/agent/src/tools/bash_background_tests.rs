@@ -545,29 +545,3 @@ async fn a_bad_bash_job_timeout_ms_is_refused_before_the_job_is_touched() {
     );
     ok(jobs.run(json!({ "job": 1, "kill": true })).await);
 }
-
-#[tokio::test]
-async fn the_alive_flag_follows_the_running_jobs() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    let (bash, jobs) = tools(150, 30_000);
-    let alive = Arc::new(AtomicBool::new(false));
-    bash.jobs().set_alive_flag(alive.clone());
-    assert!(!alive.load(Ordering::Acquire), "no job, not alive");
-    ok(bash.run(background("sleep 1; echo done")).await);
-    assert!(alive.load(Ordering::Acquire), "a background job is running");
-    assert!(
-        notices_within(&bash, Duration::from_secs(10))
-            .await
-            .is_some(),
-        "the job ended"
-    );
-    assert!(
-        !alive.load(Ordering::Acquire),
-        "the last job ended: not alive"
-    );
-    ok(bash.run(background("sleep 65")).await);
-    assert!(alive.load(Ordering::Acquire));
-    ok(jobs.run(json!({ "job": 2, "kill": true })).await);
-    assert!(!alive.load(Ordering::Acquire), "killed: not alive");
-    bash.jobs().stop_all();
-}

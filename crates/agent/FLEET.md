@@ -179,16 +179,24 @@ session's own address, `/_beyond/agent?session_id=<id>&tenant=<tenant>`, with
 `src/exec_endpoint.rs`). The callback is a hint: the replica re-reads the job from the sandbox, so a
 callback that is lost, repeated or forged can delay a report but cannot make one wrong. The sandbox
 retries a callback for at most 723 s. It stops on `2xx`, on `401`, `403`, `404`, `410`, or on a
-status it cannot fix by repeating itself, and retries `503`. A replica offers notify only when it
-runs with `--service` and `--notify-origin <origin>`, the origin the edge serves sessions at, which
-is what a sandbox's callbacks are sent to; without it every job is held as before notify.
+status it cannot fix by repeating itself, and retries `503`. A replica
+requires `--notify-origin <origin>` with `--service` (it refuses to start without it): the address
+sandboxes reach the fleet at, which is what their callbacks are sent to. Without it a reaped
+session's jobs would end unheard.
 
 **The edge attaches, mints and verifies nothing for a callback.** There is no user behind it, and
-only replicas hold the token's key. A callback never opens a session either: a session that is not
-open learns of its jobs' ends when it next opens, as it does today, so a callback matters only to
-the replica that has the session open now. That replica verifies the token and reconciles; any other
-verifies the token and answers `503`, as it answers any request for a session it does not hold, so
-the edge's usual retry and ring walk find the replica that has it. Each requirement is tagged (E1,
+only replicas hold the token's key. A callback never opens a session itself (opening needs a grant,
+which only the control plane mints). The replica that has the session open verifies the token and
+reconciles. A replica that does not hold it verifies the token and, if it was started with
+`--lifecycle-url`, passes the report to the control plane as a `job_ended` lifecycle event and answers
+`2xx` only once the control plane has taken it; the control plane then wakes the session, which opens
+on a replica, reads its sandbox's jobs back and tells the model of any end it has not been told of.
+Without a lifecycle URL, or while the control plane is not answering, it answers `503`, and the
+sandbox retries (up to its 723 s; a job's end that no callback delivers is read when the session next
+opens). With several replicas the first replica a callback reaches may be a non-holder: it passes the
+report on and answers `2xx`, so the walk ends there and the replica that holds the session is not
+told directly. That costs the holder one release of its stream (it stays held until the session is
+reaped) and nothing else, because the wake reaches the holder through the control plane too. Each requirement is tagged (E1,
 E2, …) and names the check that tests it; `tests/fixtures/exec/notify-checks.json` lists them all.
 
 - **E1** The edge MUST classify a request with exactly the two rules of the exec spec's N21: a request

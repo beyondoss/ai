@@ -461,9 +461,6 @@ pub struct BashJobs {
     in_call: Mutex<Vec<Weak<JobShared>>>,
     /// exec notify: the session's notify driver, where the host registered one (`serve --service`).
     notify: Mutex<Option<Weak<super::job_notify::SessionNotify>>>,
-    /// Kept `true` while a job in the table is running: `serve`'s idle reaper reads it so a session
-    /// whose background job is still going is not closed, since only an open session hears the job end.
-    alive: Mutex<Option<Arc<AtomicBool>>>,
 }
 
 impl Default for BashJobs {
@@ -489,7 +486,6 @@ impl BashJobs {
             checked_gone: Mutex::new(Vec::new()),
             in_call: Mutex::new(Vec::new()),
             notify: Mutex::new(None),
-            alive: Mutex::new(None),
         }
     }
 
@@ -697,7 +693,6 @@ impl BashJobs {
         let mut parked = Parked::new(job);
         parked.orphan_notified = true;
         lock(&self.table).insert(id, parked);
-        self.refresh_alive();
     }
 
     /// The session is over without being ended (a reap, a deploy, a shutdown): stop the jobs this
@@ -718,21 +713,6 @@ impl BashJobs {
 
     fn changed(&self) {
         self.wake.send_modify(|v| *v = v.wrapping_add(1));
-        self.refresh_alive();
-    }
-
-    /// Where to say whether a job is running ([`Self::refresh_alive`]). Set once by the host.
-    pub fn set_alive_flag(&self, flag: Arc<AtomicBool>) {
-        *lock(&self.alive) = Some(flag);
-    }
-
-    /// Tell the host whether any job in the table is running.
-    fn refresh_alive(&self) {
-        let flag = lock(&self.alive).clone();
-        if let Some(flag) = flag {
-            let running = lock(&self.table).values().any(|p| !p.job.shared.ended());
-            flag.store(running, Ordering::Release);
-        }
     }
 
     /// A receiver that changes whenever a parked job ends or is orphaned. A host with no run in
@@ -817,7 +797,6 @@ impl BashJobs {
         parked.orphan_notified = true;
         table.insert(id, parked);
         drop(table);
-        self.refresh_alive();
         Ok(id)
     }
 
@@ -825,7 +804,6 @@ impl BashJobs {
     /// report as ended).
     pub(crate) fn take(&self, id: u64) -> Option<Job> {
         let job = lock(&self.table).remove(&id).map(|p| p.job);
-        self.refresh_alive();
         let job = job?;
         if job.shared.sandbox().is_some() {
             let mut in_call = lock(&self.in_call);
@@ -848,7 +826,6 @@ impl BashJobs {
             ids.iter().filter_map(|id| table.remove(id)).collect()
         };
         drop(ended);
-        self.refresh_alive();
     }
 
     /// Stop every running job, oldest first, and say which. Ended jobs are dropped too: nobody will
@@ -916,7 +893,6 @@ impl BashJobs {
             }
         }
         drop(taken);
-        self.refresh_alive();
         stopped
     }
 

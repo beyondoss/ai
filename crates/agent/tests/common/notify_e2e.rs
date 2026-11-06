@@ -597,8 +597,6 @@ impl E2e {
         }
         if let Some(secs) = setup.idle_timeout {
             replica_args.extend(["--session-idle-timeout".to_string(), secs.to_string()]);
-            // These orderings are about a session reaped with its job running: no hold.
-            replica_args.extend(["--session-jobs-hold".to_string(), "0".to_string()]);
         }
         let mut mock = setup.mode.mock(setup.notify);
         (setup.tweak)(&mut mock);
