@@ -1165,6 +1165,15 @@ impl Persistence {
             .unwrap_or(&[])
     }
 
+    /// [`Self::active_ids`] for the message nodes only: 1:1 with the transcript a client is sent, so
+    /// a `since` or a `committed` id names a message. Empty without persistence.
+    pub(super) fn active_message_ids(&self) -> Vec<String> {
+        self.store
+            .as_ref()
+            .map(SessionStore::active_message_ids)
+            .unwrap_or_default()
+    }
+
     /// The custom entries of `kind` on the active path; empty without persistence.
     pub(super) fn active_custom(&self, kind: &str) -> Vec<Value> {
         self.store

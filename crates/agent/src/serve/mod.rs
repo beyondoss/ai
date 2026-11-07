@@ -1142,7 +1142,10 @@ impl SessionLoop {
         }
         let mut fanout = lock_ignoring_poison(&self.out_conn);
         if changed {
-            fanout.set_history(self.last_history.clone(), self.persistence.active_ids());
+            fanout.set_history(
+                self.last_history.clone(),
+                &self.persistence.active_message_ids(),
+            );
         }
         // Idle, so any run that was recording has finished and its messages are in the history just
         // published. Drop the recording under this *same* lock: a connection attaching must never see

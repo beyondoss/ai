@@ -310,3 +310,94 @@ async fn the_event_stream_wants_the_same_grant_as_the_websocket() {
         "the session's own grant"
     );
 }
+
+/// A prompt that carries an idempotency key records a custom entry on the session's active path.
+/// That entry is not a message: the ids a client is given (`get_messages`' tags and `leaf_id`, the
+/// `committed` event's `id:`) stay 1:1 with the messages, so the commit a client holds is accepted
+/// back as `since`.
+#[tokio::test]
+async fn a_keyed_prompt_leaves_the_message_ids_aligned_and_resumable() {
+    const SID: &str = "ssekeyed1";
+    let dir = tempfile::tempdir().unwrap();
+    let (base, _requests) =
+        spawn_model_server(vec![turn_text("ANSWER_ONE"), turn_text("ANSWER_TWO")]);
+    let (_child, port) = spawn_listening(
+        crate::common::agent_cmd()
+            .args([
+                "serve",
+                "--gateway-url",
+                &base,
+                "--key",
+                "bai_v1.test",
+                "--model",
+                "claude-test",
+                "--session-dir",
+                dir.path().to_str().unwrap(),
+            ])
+            .env("HOME", ISOLATED_HOME)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null()),
+    );
+    let mut sse = Sse::open(port, SID, "", None).await;
+    let mut ws = ws_connect(port, Some(SID)).await;
+    ws_send(
+        &mut ws,
+        json!({ "type": "prompt", "id": "p1", "message": "first", "idempotency_key": "k1" }),
+    )
+    .await;
+    let id1 = sse
+        .until_committed()
+        .await
+        .last()
+        .unwrap()
+        .1
+        .clone()
+        .expect("a committed event carries the id");
+    ws_read_until_response(&mut ws, "prompt").await;
+    ws_send(
+        &mut ws,
+        json!({ "type": "prompt", "id": "p2", "message": "second", "idempotency_key": "k2" }),
+    )
+    .await;
+    let id2 = sse
+        .until_committed()
+        .await
+        .last()
+        .unwrap()
+        .1
+        .clone()
+        .unwrap();
+    ws_read_until_response(&mut ws, "prompt").await;
+
+    // The whole transcript: every message tagged, the last tag the newest commit.
+    ws_send(&mut ws, json!({ "type": "get_messages", "id": "g1" })).await;
+    let all = ws_read_until_response(&mut ws, "get_messages")
+        .await
+        .pop()
+        .unwrap();
+    let messages = all["data"]["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 4, "{all}");
+    assert!(
+        messages.iter().all(|m| m["id"].is_string()),
+        "every message carries its id: {all}"
+    );
+    assert_eq!(messages[1]["id"], json!(id1));
+    assert_eq!(all["data"]["leaf_id"], json!(id2));
+
+    // The commit held is accepted back as `since`, and returns only what came after it.
+    ws_send(
+        &mut ws,
+        json!({ "type": "get_messages", "id": "g2", "since": id1 }),
+    )
+    .await;
+    let after = ws_read_until_response(&mut ws, "get_messages")
+        .await
+        .pop()
+        .unwrap();
+    assert_eq!(after["success"], json!(true), "{after}");
+    let text = texts(&after["data"]["messages"]).join("");
+    assert!(
+        text.contains("ANSWER_TWO") && !text.contains("ANSWER_ONE"),
+        "{text}"
+    );
+}
