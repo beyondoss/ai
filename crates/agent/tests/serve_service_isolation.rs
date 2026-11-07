@@ -10,7 +10,6 @@ use crate::common;
 
 use std::path::Path;
 
-use beyond_agent::memory::{MemPath, MemoryBackend, View};
 use common::service::{EXEC_HEADER, GATEWAY_KEY, Options, Service, files_under};
 use common::{
     spawn_model_server, turn_text, turn_tool_use, ws_connect_with_headers, ws_next_frame,
@@ -337,56 +336,69 @@ async fn the_persisted_session_records_the_sandbox_workspace_as_its_cwd() {
     );
 }
 
-/// Durable memory is the tenant's, on its home shard — not a directory derived from the replica's
-/// cwd, which every tenant on the box would share.
+/// A fleet session has no durable memory. A tenant's agents and end users all share its directory,
+/// so a durable `/memories` mount would carry one end user's facts — and its `MEMORY.md` index, which
+/// is injected into the system prompt — into every other session. Until memory has scopes there is
+/// no such mount; the per-session `/session` mount is already one session's own and stays.
 #[tokio::test]
-async fn durable_memory_lands_in_the_tenants_own_directory() {
-    // One turn that writes a durable memory document, so the backend has to resolve its directory.
-    let (base, _requests) = spawn_model_server(vec![
+async fn a_service_session_has_no_durable_memory_to_share_with_its_tenants_other_sessions() {
+    const SECRET: &str = "ALICE-PRIVATE-FACT-MARKER";
+    let create = |id: &str, path: &str, text: &str| {
         turn_tool_use(
-            "m1",
+            id,
             "memory",
-            &json!({"command":"create","path":"/memories/note.md","file_text":"kept\n"})
-                .to_string(),
-        ),
+            &json!({"command":"create","path":path,"file_text":text}).to_string(),
+        )
+    };
+    let (base, requests) = spawn_model_server(vec![
+        // Session A writes the fact and the index line that would be injected into a prompt …
+        create("a1", "/memories/MEMORY.md", &format!("- {SECRET}\n")),
+        create("a2", "/session/scratch.md", "own\n"),
         turn_text("noted"),
+        // … session B, same tenant, looks for it.
+        turn_tool_use(
+            "b1",
+            "memory",
+            &json!({"command":"view","path":"/memories/MEMORY.md"}).to_string(),
+        ),
+        turn_text("looked"),
     ]);
     let svc = Service::start(&base, &["s1", "s2"]).await;
-    let token = svc.token("00tenant1", "s2.alpha");
-    let mut ws = ws_connect_with_headers(svc.port, Some("s2.alpha"), &svc.header(&token))
-        .await
-        .unwrap();
-    ws_send(
-        &mut ws,
-        json!({"type":"prompt","id":"p1","message":"remember this"}),
-    )
-    .await;
-    let frames = ws_read_until_response(&mut ws, "prompt").await;
-    assert_eq!(frames.last().unwrap()["success"], true, "{frames:#?}");
 
-    // The session lives on its id's shard …
-    assert!(svc.sessions_dir("s2", "00tenant1").is_dir());
-    // … and durable memory on the grant's *home* shard, which is `s1` here, sealed with the tenant's
-    // own key (the mount is shared with every other tenant on the shard).
-    let doc = svc.memory_dir("s1", "00tenant1").join("note.md");
+    for (id, message) in [
+        ("s2.alice", "remember this"),
+        ("s2.bob", "what do you know"),
+    ] {
+        let token = svc.token("00tenant1", id);
+        let mut ws = ws_connect_with_headers(svc.port, Some(id), &svc.header(&token))
+            .await
+            .unwrap();
+        ws_send(
+            &mut ws,
+            json!({"type":"prompt","id":"p1","message":message}),
+        )
+        .await;
+        let frames = ws_read_until_response(&mut ws, "prompt").await;
+        assert_eq!(frames.last().unwrap()["success"], true, "{frames:#?}");
+    }
+
+    let recorded = requests.lock().unwrap().clone();
+    assert_eq!(recorded.len(), 5, "{recorded:#?}");
+    for (n, raw) in recorded[3..].iter().enumerate() {
+        assert!(
+            !raw.contains(SECRET),
+            "request {} of the other session carries the first session's memory",
+            n + 3
+        );
+    }
     assert!(
-        !std::fs::read_to_string(&doc).unwrap().contains("kept"),
-        "a memory document must not sit in plaintext on a shared mount"
+        !svc.memory_dir("s1", "00tenant1").exists() && !svc.memory_dir("s2", "00tenant1").exists(),
+        "no tenant-wide memory directory may exist"
     );
-    let View::Document(text) = svc
-        .tenant_memory("s1", "00tenant1")
-        .view(&MemPath::parse("/memories/note.md").unwrap(), None)
-        .await
-        .unwrap()
-    else {
-        panic!("expected a document at {}", doc.display());
-    };
-    assert_eq!(
-        text, "kept\n",
-        "durable memory must be rooted at <home shard>/<tenant>/memory"
-    );
-    assert!(
-        !svc.memory_dir("s2", "00tenant1").exists(),
-        "memory must not follow the session's shard"
-    );
+    // The session's own working memory is untouched.
+    let scratch = svc
+        .sessions_dir("s2", "00tenant1")
+        .join("s2.alice")
+        .join("memory");
+    assert!(scratch.is_dir(), "the /session mount must still work");
 }

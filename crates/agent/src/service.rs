@@ -10,8 +10,7 @@
 //! - [`authorize`] turns a token plus a `?session_id=` into a [`ServiceSession`], or into exactly one
 //!   [`Refusal`] (and so exactly one HTTP status). Nothing downstream re-derives tenancy.
 //! - [`ServiceSession`] then answers every "where does this session's *X* live?" question `serve`
-//!   used to answer from the replica host: persistence ([`ServiceSession::session_dir`]), durable
-//!   memory ([`ServiceSession::memory_backend`]), the exec target every tool runs in
+//!   used to answer from the replica host: persistence ([`ServiceSession::session_dir`]), the exec target every tool runs in
 //!   ([`ServiceSession::connect_exec`]), the gateway credential ([`ServiceSession::gateway_key`]),
 //!   and the MCP connectors this session may reach ([`ServiceSession::mcp`]).
 //!
@@ -275,12 +274,11 @@ pub fn authorize(
     let session_root = shards.get(shard).ok_or(Refusal::Misdirected(
         "this replica does not mount that shard",
     ))?;
-    let home_root = shards.get(&grant.home_shard).ok_or(Refusal::Misdirected(
+    shards.get(&grant.home_shard).ok_or(Refusal::Misdirected(
         "this replica does not mount the grant's home shard",
     ))?;
 
     let session_dir = session_root.join(&grant.tenant).join("sessions");
-    let memory_dir = home_root.join(&grant.tenant).join("memory");
     // Derived once per connection, from a key that never leaves this struct: `Debug` on the codec
     // shows only the tenant and the key fingerprint, and nothing ever writes the DEK itself down.
     let codec = Arc::new(TenantCodec::new(&grant.tenant, grant.secrets.dek.expose()));
@@ -288,7 +286,6 @@ pub fn authorize(
         grant: Arc::new(grant),
         shards: Arc::clone(shards),
         session_dir,
-        memory_dir,
         codec,
         sandbox: RwLock::new(None),
         bundle_dir: std::sync::OnceLock::new(),
@@ -323,8 +320,6 @@ pub struct ServiceSession {
     pub shards: Arc<Shards>,
     /// `<shard of the session id>/<tenant>/sessions` — where this session's transcript lives.
     pub session_dir: PathBuf,
-    /// `<home shard>/<tenant>/memory` — the tenant's durable memory, shared by all of its sessions.
-    pub memory_dir: PathBuf,
     /// This tenant's sealing keys, derived from the grant's per-tenant `dek`. Every transcript,
     /// listing cache and memory document this connection writes goes through it.
     codec: Arc<TenantCodec>,
@@ -434,16 +429,6 @@ impl ServiceSession {
     /// takes a lock on, and the parent of its segments and its `/session` memory.
     pub fn session_path(&self) -> PathBuf {
         self.session_dir.join(self.session_id())
-    }
-
-    /// Durable memory, rooted at the tenant's own directory rather than resolved from the replica's
-    /// cwd or `--memory` DSN, and sealed with the tenant's own key — the mount is shared with every
-    /// other tenant on the shard.
-    pub fn memory_backend(&self) -> Arc<dyn crate::memory::MemoryBackend> {
-        Arc::new(
-            crate::memory::file::FileBackend::at(self.memory_dir.clone())
-                .sealed(Arc::clone(&self.codec)),
-        )
     }
 
     /// Build this session's exec target from the grant, **strictly**: the endpoint is probed before
@@ -1368,7 +1353,6 @@ mod tests {
             grant: Arc::new(grant),
             shards: shards(mounts),
             session_dir: PathBuf::from("/mnt/efs/a/t1/sessions"),
-            memory_dir: PathBuf::from("/mnt/efs/a/t1/memory"),
             codec,
             sandbox: RwLock::new(None),
             bundle_dir: std::sync::OnceLock::new(),

@@ -494,10 +494,12 @@ impl Mode {
 
     // ---- memory -------------------------------------------------------------------------------
 
-    /// The tenant's own `<home shard>/<tenant>/memory`, never a DSN and never a path derived from
-    /// the replica's cwd.
-    pub(crate) fn tenant_memory_backend(&self) -> Option<Arc<dyn crate::memory::MemoryBackend>> {
-        self.service().map(|service| service.memory_backend())
+    /// Whether this mode mounts durable (`/memories`) memory. A fleet session does not: a tenant's
+    /// agents and end users would all read and write one store, and its `MEMORY.md` index is injected
+    /// into every session's prompt, so one end user's facts would reach another's. Only the
+    /// per-session `/session` mount (one session's own) exists there until memory has scopes.
+    pub(crate) fn has_durable_memory(&self) -> bool {
+        !matches!(self, Mode::Service(_))
     }
 
     /// Seal the per-session memory mount with the tenant's key, exactly like the durable mount and
