@@ -14,6 +14,22 @@ impl SessionStore {
         &self.active
     }
 
+    /// [`Self::active_ids`] without the non-message entries (custom entries ride the active path
+    /// too), so the ids are 1:1 with the messages a caller sends to a client. The last one is the
+    /// newest committed message: what a client resumes from.
+    pub fn active_message_ids(&self) -> Vec<String> {
+        self.active
+            .iter()
+            .filter(|id| {
+                matches!(
+                    self.nodes.get(*id).map(|n| n.content.as_ref()),
+                    Some(NodeContent::Message(_))
+                )
+            })
+            .cloned()
+            .collect()
+    }
+
     /// The `data` of every custom entry of `kind` on the active path, oldest first — see
     /// [`Self::append_custom`].
     pub fn active_custom(&self, kind: &str) -> Vec<serde_json::Value> {

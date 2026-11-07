@@ -244,7 +244,7 @@ impl SessionLoop {
             id,
             cmd.get("since").and_then(Value::as_str),
             &self.session.messages,
-            self.persistence.active_ids(),
+            &self.persistence.active_message_ids(),
         );
         self.emit(frame)
     }
