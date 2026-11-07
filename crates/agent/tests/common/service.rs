@@ -204,7 +204,7 @@ impl Service {
         self.shard(shard).join(tenant).join("sessions")
     }
 
-    /// Where a tenant's durable memory lands on `shard`.
+    /// Where a tenant's durable memory would land on `shard` — which nothing may create.
     pub fn memory_dir(&self, shard: &str, tenant: &str) -> PathBuf {
         self.shard(shard).join(tenant).join("memory")
     }
@@ -227,11 +227,6 @@ impl Service {
             },
         )
         .unwrap()
-    }
-
-    /// A tenant's durable memory store on `shard`, sealed with its own key.
-    pub fn tenant_memory(&self, shard: &str, tenant: &str) -> FileBackend {
-        FileBackend::at(self.memory_dir(shard, tenant)).sealed(self.codec(tenant))
     }
 
     pub fn claims(&self, tenant: &str, session_id: &str, home_shard: &str) -> Claims {

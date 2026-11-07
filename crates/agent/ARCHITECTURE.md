@@ -720,7 +720,7 @@ The harness layers several capabilities over the bare tools + loop:
   can't strip it. In `serve` the `/session` mount rides a shared, swappable `SessionDir` cell so a
   `switch_session`/`new_session`/`fork` re-points every holder with one cell write — no tool or agent
   rebuild. `--memory <dsn>`/`AI_AGENT_MEMORY_URL` (with the stored `default_memory_backend` setting folded
-  in) selects the durable backend; `--no-memory` opts out entirely. **Subagents share the parent's
+  in) selects the durable backend (local modes only; service mode mounts no durable backend); `--no-memory` opts out entirely. **Subagents share the parent's
   mounts**: the same backend `Arc`s are threaded through `SubagentCtx` (not re-derived from the child's
   cwd, so even a `worktree`-isolated child shares them rather than private ones), and every child gets the
   `memory` tool plus the current injected indices — a subagent grounds its work in what the project
@@ -4987,7 +4987,7 @@ being baked into a key. Three HKDF-SHA256 subkeys, XChaCha20-Poly1305, nonces fr
 | ---------------- | ------------------- | ------------------------------------------------------- | ---------- |
 | transcript lines | `bsg_v1 transcript` | `tenant ‖ 0x00 ‖ session_id`                            | per line   |
 | `.listings.json` | `bsg_v1 listing`    | `tenant`                                                | whole file |
-| memory documents | `bsg_v1 memory`     | `tenant`                                                | whole file |
+| `/session` memory documents | `bsg_v1 memory` | `tenant`                                             | whole file |
 | session sidecars | `bsg_v1 transcript` | `tenant ‖ 0x00 ‖ session_id ‖ 0x00 ‖ "sidecar:" ‖ kind` | whole file |
 
 Segment headers and base trailers stay plaintext, so a reader can bound a file it cannot open.
@@ -5202,7 +5202,6 @@ domain, not a tenant: many tenants live on one shard.
 
 ```text
 <shard root>/<tenant>/sessions/     the tenant's transcripts on this shard
-<shard root>/<tenant>/memory/       the tenant's durable memory (on its home shard only)
 ```
 
 A session id carries its shard as a `<shard>.` prefix, so an id alone says which mount to open — no
@@ -5210,9 +5209,8 @@ lookup, and a session for an unmounted shard is a routing answer (421) rather th
 no prefix belongs to the grant's `home_shard`. Shard names are letters, digits, `-` and `_` — no
 `.`, so `<shard>.<opaque>` splits unambiguously.
 
-From that, one connection's `ServiceSession` derives `session_dir = <id's shard>/<tenant>/sessions`
-and `memory_dir = <home shard>/<tenant>/memory`. Durable memory follows the _home_ shard so a
-tenant's memory does not fragment as its sessions spread across mounts.
+From that, one connection's `ServiceSession` derives `session_dir = <id's shard>/<tenant>/sessions`.
+There is no tenant-level memory directory: see "Memory" under Startup.
 
 ### Startup
 
@@ -5287,8 +5285,11 @@ skill/template paths, memory backend, session directory, model or gateway URL), 
   `APPEND_SYSTEM.md` never apply, and a subagent inherits that. Everything the prompt _is_ made of
   comes from the sandbox instead; see "Sandbox discovery". No worktree sweep, no trust store, no
   untrusted-project warning — sandbox content is the tenant's own, so it counts as trusted.
-- **Memory** is `FileBackend::at(service.memory_dir)`, sealed with the tenant's codec
-  (`ServiceSession::memory_backend`).
+- **Memory** is the `/session` mount only, sealed with the tenant's codec. There is **no durable
+  `/memories` mount** in service mode (`Mode::has_durable_memory`): a tenant's agents and end users
+  would share one store and its `MEMORY.md` index would be injected into every session's prompt, so
+  one end user's facts would reach another's. Fail closed until memory has scopes; no flag restores
+  it. Pinned by `serve_service_isolation::a_service_session_has_no_durable_memory_*`.
 
 ### Commands
 
@@ -5460,8 +5461,8 @@ reaches for opens the same way: `delete_session`, `restore_session`, `preview_fo
 through `ServiceSession::repo_options_for(<target id>)`, which puts each one on **that id's** mount
 with **that id's** prefix, and the listing scans (`list_sessions`, `list_all_sessions`,
 `list_daemon_sessions`, `list_trash`) take the tenant's `Layout` so they read directories rather than
-`*.jsonl` and open the sealed `.listings.json` cache. Both memory mounts are sealed with the same
-codec: durable memory at `<home shard>/<tenant>/memory`, and the `/session` mount at the session's own
+`*.jsonl` and open the sealed `.listings.json` cache. The `/session` memory mount is sealed with the same
+codec, at the session's own
 `memory/`, whose path is asked of the store (`SessionStore::memory_dir`) because deriving it from the
 file name would collapse every session on a shard into one `<shard>.memory` directory.
 

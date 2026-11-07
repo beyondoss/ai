@@ -538,19 +538,18 @@ async fn setup_prompt(
     // session runs. The `MEMORY.md` index is read once and injected into the system prompt — a session's
     // memory is surfaced from its start (Claude Code's auto-memory model).
     //
-    // In service mode the backend is the tenant's own `<home shard>/<tenant>/memory` — never a DSN
-    // (`--memory` is refused) and never a path derived from the replica's cwd.
-    let memory_backend: Option<Arc<dyn crate::memory::MemoryBackend>> =
-        if cfg.no_memory || cfg.no_tools {
-            None
-        } else {
-            Some(match mode.tenant_memory_backend() {
-                Some(backend) => backend,
-                None => crate::memory::open(cfg.memory.as_deref(), cwd)
+    // In service mode there is no durable backend at all (see `Mode::has_durable_memory`); only the
+    // per-session `/session` mount below. `--no-memory` / `--no-tools` still turn memory off entirely.
+    let memory_enabled = !(cfg.no_memory || cfg.no_tools);
+    let durable_backend: Option<Arc<dyn crate::memory::MemoryBackend>> =
+        if memory_enabled && mode.has_durable_memory() {
+            Some(
+                crate::memory::open(cfg.memory.as_deref(), cwd)
                     .map_err(Box::<dyn std::error::Error + Send + Sync>::from)?,
-            })
+            )
+        } else {
+            None
         };
-    let has_memory = memory_backend.is_some();
     // The per-session working-memory mount (`/session`) rides a *shared, swappable* directory cell: a
     // `switch_session`/`new_session`/`fork` re-points the cell (below) and every holder — this session's
     // `memory` tool and every subagent sharing it by `Arc` — follows with no tool/agent rebuild. Off when
@@ -558,25 +557,26 @@ async fn setup_prompt(
     let session_dir_cell = crate::memory::file::SessionDir::new(persistence.memory_dir());
     let mounts: Vec<crate::memory::Mount> = {
         let mut v = Vec::new();
-        if let Some(backend) = &memory_backend {
+        if let Some(backend) = durable_backend {
             v.push(crate::memory::Mount {
                 kind: crate::memory::MountKind::Durable,
-                backend: backend.clone(),
+                backend,
             });
-            if !cfg.no_session_memory {
-                // Sealed with the tenant's key in service mode, exactly like the durable mount and
-                // the transcript beside it: `<id>/memory/` lives on the same shared mount they do.
-                let session_backend =
-                    crate::memory::file::FileBackend::session_shared(session_dir_cell.clone());
-                let session_backend = mode.seal_session_memory(session_backend);
-                v.push(crate::memory::Mount {
-                    kind: crate::memory::MountKind::Session,
-                    backend: Arc::new(session_backend),
-                });
-            }
+        }
+        if memory_enabled && !cfg.no_session_memory {
+            // Sealed with the tenant's key in service mode, like the transcript beside it:
+            // `<id>/memory/` lives on the same shared mount it does.
+            let session_backend =
+                crate::memory::file::FileBackend::session_shared(session_dir_cell.clone());
+            let session_backend = mode.seal_session_memory(session_backend);
+            v.push(crate::memory::Mount {
+                kind: crate::memory::MountKind::Session,
+                backend: Arc::new(session_backend),
+            });
         }
         v
     };
+    let has_memory = !mounts.is_empty();
     let memory_tool: Option<Arc<dyn agent_core::Tool>> = if mounts.is_empty() {
         None
     } else {
