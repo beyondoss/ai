@@ -4983,12 +4983,12 @@ that says the session exists.
 preview all open _other_ ids, so the session id is mixed in as associated data per call instead of
 being baked into a key. Three HKDF-SHA256 subkeys, XChaCha20-Poly1305, nonces from `getrandom::fill`:
 
-| surface          | HKDF `info`         | AAD                                                     | shape      |
-| ---------------- | ------------------- | ------------------------------------------------------- | ---------- |
-| transcript lines | `bsg_v1 transcript` | `tenant ‖ 0x00 ‖ session_id`                            | per line   |
-| `.listings.json` | `bsg_v1 listing`    | `tenant`                                                | whole file |
-| `/session` memory documents | `bsg_v1 memory` | `tenant`                                             | whole file |
-| session sidecars | `bsg_v1 transcript` | `tenant ‖ 0x00 ‖ session_id ‖ 0x00 ‖ "sidecar:" ‖ kind` | whole file |
+| surface                     | HKDF `info`         | AAD                                                     | shape      |
+| --------------------------- | ------------------- | ------------------------------------------------------- | ---------- |
+| transcript lines            | `bsg_v1 transcript` | `tenant ‖ 0x00 ‖ session_id`                            | per line   |
+| `.listings.json`            | `bsg_v1 listing`    | `tenant`                                                | whole file |
+| `/session` memory documents | `bsg_v1 memory`     | `tenant`                                                | whole file |
+| session sidecars            | `bsg_v1 transcript` | `tenant ‖ 0x00 ‖ session_id ‖ 0x00 ‖ "sidecar:" ‖ kind` | whole file |
 
 Segment headers and base trailers stay plaintext, so a reader can bound a file it cannot open.
 Memory documents are bound to the tenant and **not** to their path, because `rename` moves a document
