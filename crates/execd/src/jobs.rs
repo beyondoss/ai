@@ -548,7 +548,7 @@ fn scopeguard_remove(p: PathBuf) -> RemoveOnDrop {
 /// A job operation: the request's `job` object.
 #[derive(Deserialize, Default)]
 #[serde(default)]
-struct JobReq<'a> {
+struct JobReq {
     op: String,
     scope: String,
     id: String,
@@ -567,12 +567,9 @@ struct JobReq<'a> {
     stdin_open: bool,
     /// `signal`: the signal's name.
     signal: Option<String>,
-    /// `write`: the stream position of `data`'s first byte, the bytes (base64) and whether to close
+    /// `write`: the stream position of the data's first byte and whether to close
     /// the job's stdin after them.
     at: u64,
-    /// Borrowed from the request's own `Value`: a 128 KiB write's base64 is not copied again.
-    #[serde(borrow)]
-    data: Option<std::borrow::Cow<'a, str>>,
     eof: bool,
 }
 
@@ -642,8 +639,7 @@ impl Drop for Waiter<'_> {
 }
 
 /// `write`: apply `data` at position `at` of the job's stdin. See the spec's "Job stdin".
-async fn write_stdin(ctx: &Arc<Ctx>, req: &Request, job: &JobReq<'_>) -> Resp {
-    use base64::Engine as _;
+async fn write_stdin(ctx: &Arc<Ctx>, req: &Request, job: &JobReq, data: Vec<u8>) -> Resp {
     use tokio::io::AsyncWriteExt as _;
     let Some(cell) = ctx.jobs.get(&(job.scope.clone(), job.id.clone())) else {
         return http::error_response(404, "no such job");
@@ -651,17 +647,6 @@ async fn write_stdin(ctx: &Arc<Ctx>, req: &Request, job: &JobReq<'_>) -> Resp {
     let Some(stdin) = locked(&cell).stdin.clone() else {
         return http::error_response(409, "the job has no stdin");
     };
-    let b64: &str = job.data.as_deref().unwrap_or("");
-    if b64.len() > WRITE_MAX.div_ceil(3) * 4 {
-        return http::error_response(413, "write too large");
-    }
-    let data = match base64::engine::general_purpose::STANDARD.decode(b64) {
-        Ok(d) => d,
-        Err(_) => return http::error_response(400, "data is not base64"),
-    };
-    if data.len() > WRITE_MAX {
-        return http::error_response(413, "write too large");
-    }
     if stdin.waiters.fetch_add(1, Ordering::Relaxed) >= WAITERS_MAX {
         stdin.waiters.fetch_sub(1, Ordering::Relaxed);
         return http::error_response(429, "too many writes waiting on this job");
@@ -763,18 +748,42 @@ fn closed(state: &Value) -> Resp {
 }
 
 /// Answer a request carrying a `job` object.
-pub(crate) async fn serve(ctx: &Arc<Ctx>, req: &Request) -> Resp {
+pub(crate) async fn serve(ctx: &Arc<Ctx>, mut req: Request) -> Resp {
+    // A write's bytes are decoded once, here, and the request's base64 text is dropped at once: a
+    // write that waits (for the pipe, or for earlier bytes) holds its decoded bytes and nothing of
+    // the request that carried them.
+    let mut data = Vec::new();
+    if let Some(Value::Object(o)) = req.job.as_mut()
+        && o.get("op").and_then(Value::as_str) == Some("write")
+        && let Some(d) = o.remove("data")
+    {
+        use base64::Engine as _;
+        let Value::String(text) = d else {
+            return http::error_response(400, "data is not base64");
+        };
+        if text.len() > WRITE_MAX.div_ceil(3) * 4 {
+            return http::error_response(413, "write too large");
+        }
+        data = match base64::engine::general_purpose::STANDARD.decode(&text) {
+            Ok(d) => d,
+            Err(_) => return http::error_response(400, "data is not base64"),
+        };
+        if data.len() > WRITE_MAX {
+            return http::error_response(413, "write too large");
+        }
+    }
+    let req = &req;
     let job: JobReq = match req.job.as_ref().map(JobReq::deserialize) {
         Some(Ok(j)) => j,
         _ => return http::error_response(400, "bad job"),
     };
     let line = Line::new("job", &req.command);
-    let resp = serve_op(ctx, req, job).await;
+    let resp = serve_op(ctx, req, job, data).await;
     line.done(resp.status().as_u16(), "answered");
     resp
 }
 
-async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq<'_>) -> Resp {
+async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq, data: Vec<u8>) -> Resp {
     let jobs = &ctx.jobs;
     let key = |id: &str| (job.scope.clone(), id.to_string());
     match job.op.as_str() {
@@ -814,7 +823,7 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq<'_>) -> Resp {
             };
             http::json_response(200, &body)
         }
-        "write" => write_stdin(ctx, req, &job).await,
+        "write" => write_stdin(ctx, req, &job, data).await,
         "signal" => {
             let Some(sig) = job.signal.as_deref().and_then(parse_signal) else {
                 return http::error_response(400, "unsupported signal");
@@ -950,7 +959,7 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq<'_>) -> Resp {
 
 /// `keep` (the job is the endpoint's now, with its `notify`) and `seen` (how much output the model
 /// has been shown).
-fn keep_or_seen(ctx: &Arc<Ctx>, job: &JobReq<'_>) -> Resp {
+fn keep_or_seen(ctx: &Arc<Ctx>, job: &JobReq) -> Resp {
     let keep = job.op == "keep";
     // notify: a `notify` that fails the grammar refuses the whole `keep`, before anything is
     // recorded (N4, N5). The reason never quotes the token.
@@ -992,7 +1001,7 @@ fn keep_or_seen(ctx: &Arc<Ctx>, job: &JobReq<'_>) -> Resp {
 
 /// Start a job: its own process group, its output kept under the retention, its end recorded once
 /// the group is empty.
-async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq<'_>) -> Resp {
+async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
     let key = (job.scope.clone(), job.id.clone());
     let cell: JobCell = {
         let mut map = locked(&ctx.jobs.map);

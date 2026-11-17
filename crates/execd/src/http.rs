@@ -540,18 +540,28 @@ async fn route(ctx: Arc<Ctx>, req: HttpRequest<Incoming>, checked: bool) -> Resp
         crate::log_info!("request kind=body status=413");
         return error_response(413, "request too large");
     }
-    // Read at most `max` bytes, declared or not (chunked bodies declare nothing).
-    let bytes = match Limited::new(body, max).collect().await {
-        Ok(c) => c.to_bytes(),
-        Err(e)
-            if e.downcast_ref::<http_body_util::LengthLimitError>()
-                .is_some() =>
-        {
-            crate::log_info!("request kind=body status=413");
-            return error_response(413, "request too large");
+    // Read at most `max` bytes, declared or not (chunked bodies declare nothing), straight into one
+    // buffer sized by the declared length: collecting the frames and joining them held the body
+    // twice at once.
+    let mut limited = Limited::new(body, max);
+    let mut bytes: Vec<u8> = Vec::with_capacity(declared.unwrap_or(0).min(max));
+    while let Some(frame) = limited.frame().await {
+        match frame {
+            Ok(f) => {
+                if let Ok(data) = f.into_data() {
+                    bytes.extend_from_slice(&data);
+                }
+            }
+            Err(e)
+                if e.downcast_ref::<http_body_util::LengthLimitError>()
+                    .is_some() =>
+            {
+                crate::log_info!("request kind=body status=413");
+                return error_response(413, "request too large");
+            }
+            Err(_) => return error_response(400, "request body not readable"),
         }
-        Err(_) => return error_response(400, "request body not readable"),
-    };
+    }
     let mut req: Request = match serde_json::from_slice(&bytes) {
         Ok(r) => r,
         Err(e) => {
@@ -580,7 +590,7 @@ async fn route(ctx: Arc<Ctx>, req: HttpRequest<Incoming>, checked: bool) -> Resp
     drop(bytes);
 
     if req.job.as_ref().is_some_and(Value::is_object) {
-        return crate::jobs::serve(&ctx, &req).await;
+        return crate::jobs::serve(&ctx, req).await;
     }
     if req.wants_stream() {
         crate::exec::stream(&ctx, req)
