@@ -170,7 +170,30 @@ def new_only(binary, n):
     return r
 
 
+def stalled_sweep(binary):
+    """P5 stalled: RSS growth against the number of queued 128 KiB writers on a job that never reads.
+    A per-writer cost shows as a slope, a fixed cost as the intercept."""
+    out = {}
+    for w in (0, 1, 4, 8, 16):
+        s = Server(binary); c = s.conn()
+        try:
+            s.start(c, "z", "sleep 600", stdin_open=True)
+            big = base64.b64encode(b"x" * (128 * 1024)).decode()
+            r0 = s.rss_kb()
+            def wr(i):
+                cc = s.conn(); s.call(cc, {"command": "true", "timeout_ms": 30000, "job": dict(op="write", scope="b", id="z", at=i * 131072, data=big)})
+            ths = [threading.Thread(target=wr, args=(i,), daemon=True) for i in range(w)]
+            [t.start() for t in ths]
+            time.sleep(3); r1 = s.rss_kb(); time.sleep(10); r2 = s.rss_kb()
+            out[w] = {"rss_kb_before": r0, "delta_3s_kb": r1 - r0, "delta_13s_kb": r2 - r0, "kb_per_writer": round((r1 - r0) / w, 1) if w else None}
+        finally:
+            s.stop()
+    return out
+
+
 if __name__ == "__main__":
+    if "--p5" in os.sys.argv:
+        print(json.dumps(stalled_sweep(os.sys.argv[os.sys.argv.index("--bin") + 1]), indent=1)); raise SystemExit
     ap = argparse.ArgumentParser(); ap.add_argument("--bin", required=True); ap.add_argument("--base"); ap.add_argument("-n", type=int, default=2000); ap.add_argument("--rounds", type=int, default=3)
     a = ap.parse_args(); out = {"load": os.getloadavg(), "rounds": []}
     for rd in range(a.rounds):

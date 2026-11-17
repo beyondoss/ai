@@ -167,6 +167,21 @@ async fn a_jobs_env_is_its_own_and_its_mark_cannot_be_overridden() {
     assert_eq!(read_all(addr, "s2", "a1").await.0, b"none");
 }
 
+#[tokio::test]
+async fn the_requests_home_wins_over_the_endpoints() {
+    let execd = Execd::start(&[("EXECD_HOME", "/endpoint-home")], &[]);
+    let addr = std::net::SocketAddr::V4(execd.addr);
+    let home = |env: Value| {
+        let body = json!({"command":"sh","args":["-c","printf %s \"$HOME\""],"env":env,"timeout_ms":10000});
+        async move { unb64(&post(addr, &[], &body).await.json()["stdout"]) }
+    };
+    assert_eq!(home(json!({})).await, b"/endpoint-home");
+    assert_eq!(
+        home(json!({"HOME":"/request-home"})).await,
+        b"/request-home"
+    );
+}
+
 // ---- streams ---------------------------------------------------------------------------------
 
 #[tokio::test]
@@ -190,6 +205,30 @@ async fn stderr_is_told_from_stdout_on_one_clock() {
             .any(|&(a, n)| (i as u64) >= a && (i as u64) < a + n);
         assert_eq!(in_range, *b == b'e', "byte {i}");
     }
+    // A window from the middle names its ranges on the output's own offsets, clipped to it.
+    let (s, v) = job(
+        addr,
+        json!({"op":"read","scope":"st","id":"a1","offset":101,"max":50}),
+    )
+    .await;
+    assert_eq!(s, 200);
+    let window: Vec<(u64, u64)> = v["stderr_ranges"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|r| (r[0].as_u64().unwrap(), r[1].as_u64().unwrap()))
+        .collect();
+    let mut want = Vec::new();
+    for off in 101u64..151 {
+        if data[off as usize] == b'e' {
+            match want.last_mut() {
+                Some((a, n)) if *a + *n == off => *n += 1,
+                _ => want.push((off, 1)),
+            }
+        }
+    }
+    assert_eq!(window, want);
     // An attach: frames re-concatenate to the same bytes, each keyed by what it holds.
     let a = post(
         addr,
@@ -228,7 +267,14 @@ async fn a_read_answers_at_most_1024_ranges_and_the_client_reads_on() {
     assert!(n <= 1024, "{n} ranges in one answer");
     let (data, ranges, _) = read_all(addr, "rg", "a1").await;
     assert_eq!(data.len(), 3000);
-    assert_eq!(ranges.len(), 1500, "every stderr byte is named once");
+    // Every stderr byte is named once. Under load two stderr bytes can be read back to back and
+    // merge into one range, so the count is not exactly 1500, but it is far past the clip.
+    assert_eq!(ranges.iter().map(|r| r.1).sum::<u64>(), 1500);
+    assert!(
+        ranges.len() > 1024,
+        "{} ranges: the clip was never needed",
+        ranges.len()
+    );
 }
 
 // ---- stdin -----------------------------------------------------------------------------------
@@ -282,6 +328,23 @@ async fn stdin_writes_are_positional_ordered_idempotent_and_close_on_eof() {
     // After the end: bytes are refused, a repeat of applied bytes is not.
     assert_eq!(write(addr, "a1", 19, b"late", false).await.0, 409);
     assert_eq!(write(addr, "a1", 0, b"hello ", false).await.0, 200);
+    // EOF closes the pipe while the job lives on: more bytes are refused, a repeat is not.
+    start(
+        addr,
+        "sw",
+        "a9",
+        &["sh", "-c", "cat >/dev/null; sleep 30"],
+        json!({"stdin_open":true}),
+    )
+    .await;
+    assert_eq!(write(addr, "a9", 0, b"x", true).await.1["closed"], true);
+    assert_eq!(write(addr, "a9", 1, b"y", false).await.0, 409);
+    assert_eq!(write(addr, "a9", 0, b"x", false).await.0, 200);
+    job(
+        addr,
+        json!({"op":"kill","scope":"sw","ids":["a9"],"remove":true,"grace_ms":100}),
+    )
+    .await;
     // Another scope's job is not found.
     let (s, _) = job(
         addr,
@@ -289,6 +352,56 @@ async fn stdin_writes_are_positional_ordered_idempotent_and_close_on_eof() {
     )
     .await;
     assert_eq!(s, 404);
+}
+
+fn fds(execd: &Execd) -> usize {
+    std::fs::read_dir(format!("/proc/{}/fd", execd.pid()))
+        .unwrap()
+        .count()
+}
+
+#[tokio::test]
+async fn a_stdin_pipe_is_released_when_its_job_ends_or_is_removed() {
+    let execd = Execd::start(&[], &[]);
+    let addr = std::net::SocketAddr::V4(execd.addr);
+    let before = fds(&execd);
+    for i in 0..5 {
+        start(
+            addr,
+            "sw",
+            &format!("e{i}"),
+            &["sh", "-c", "sleep 0.2"],
+            json!({"stdin_open":true}),
+        )
+        .await;
+    }
+    start(
+        addr,
+        "sw",
+        "k1",
+        &["sleep", "60"],
+        json!({"stdin_open":true}),
+    )
+    .await;
+    for i in 0..5 {
+        wait_ended(addr, "sw", &format!("e{i}")).await;
+    }
+    job(
+        addr,
+        json!({"op":"kill","scope":"sw","ids":["k1"],"remove":true,"grace_ms":100}),
+    )
+    .await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while fds(&execd) > before {
+        assert!(
+            Instant::now() < deadline,
+            "{} fds, started with {before}",
+            fds(&execd)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // After the end, nothing is accepted on a pipe that was never closed by EOF.
+    assert_eq!(write(addr, "e0", 0, b"x", false).await.0, 409);
 }
 
 #[tokio::test]
@@ -415,6 +528,101 @@ async fn signal_reaches_the_group_once_inside_the_scope_and_never_an_ended_job()
     );
     sig("sg", json!(["a1"]), "SIGKILL").await;
     wait_ended(addr, "sg", "a1").await;
+}
+
+#[tokio::test]
+async fn signal_reaches_the_leader_and_a_child_exactly_once_each() {
+    let execd = Execd::start(&[], &[]);
+    let addr = std::net::SocketAddr::V4(execd.addr);
+    let f = execd.dir.path().join("heard");
+    let f = f.display();
+    // The leader and a background child each log the signals they hear.
+    let script = format!(
+        "trap 'printf L >> {f}' USR1; sh -c \"trap 'printf C >> {f}' USR1; printf up >> {f}.up; while :; do sleep 0.1; done\" & \
+         while :; do (trap '' USR1; sleep 0.1); done"
+    );
+    start(addr, "sg", "a1", &["sh", "-c", &script], json!({})).await;
+    let up = execd.dir.path().join("heard.up");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !up.exists() {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    job(
+        addr,
+        json!({"op":"signal","scope":"sg","ids":["a1"],"signal":"SIGUSR1"}),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let mut heard: Vec<char> = std::fs::read_to_string(execd.dir.path().join("heard"))
+        .unwrap()
+        .chars()
+        .collect();
+    heard.sort_unstable();
+    assert_eq!(
+        heard,
+        vec!['C', 'L'],
+        "each process of the job hears the signal once"
+    );
+    // `kill` reaches the group through the same path.
+    job(
+        addr,
+        json!({"op":"kill","scope":"sg","ids":["a1"],"remove":false,"grace_ms":300}),
+    )
+    .await;
+    wait_ended(addr, "sg", "a1").await;
+}
+
+#[tokio::test]
+async fn a_signal_does_not_hold_up_the_runtime_with_its_proc_scan() {
+    // One worker thread (execd's default): a scan on it would stop everything else.
+    let execd = Execd::start(&[], &[]);
+    let addr = std::net::SocketAddr::V4(execd.addr);
+    start(
+        addr,
+        "sg",
+        "a1",
+        &["sh", "-c", "trap '' USR2; while :; do sleep 0.2; done"],
+        json!({}),
+    )
+    .await;
+    let one = Instant::now();
+    job(
+        addr,
+        json!({"op":"signal","scope":"sg","ids":["a1"],"signal":"SIGUSR2"}),
+    )
+    .await;
+    let one = one.elapsed();
+    let burst: Vec<_> = (0..120)
+        .map(|_| {
+            tokio::spawn(async move {
+                job(
+                    addr,
+                    json!({"op":"signal","scope":"sg","ids":["a1"],"signal":"SIGUSR2"}),
+                )
+                .await
+            })
+        })
+        .collect();
+    let mut worst = Duration::ZERO;
+    for _ in 0..30 {
+        let t = Instant::now();
+        let (s, _) = job(addr, json!({"op":"list","scope":"sg"})).await;
+        assert_eq!(s, 200);
+        worst = worst.max(t.elapsed());
+    }
+    for b in burst {
+        b.await.unwrap();
+    }
+    assert!(
+        worst < one * 20 + Duration::from_millis(100),
+        "a list waited {worst:?} behind signals that take {one:?} each"
+    );
+    job(
+        addr,
+        json!({"op":"kill","scope":"sg","ids":["a1"],"remove":true,"grace_ms":100}),
+    )
+    .await;
 }
 
 // ---- run-as ----------------------------------------------------------------------------------

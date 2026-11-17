@@ -794,18 +794,26 @@ mod tests {
         assert_eq!(budget.load(Ordering::Relaxed), 0);
     }
 
-    /// A pipe and its two ends, a writer that has written `n` bytes and closed.
-    async fn full_pipe(n: usize) -> tokio::net::unix::pipe::Receiver {
+    /// A pipe whose writer has written up to `n` bytes without waiting and closed: the reader end,
+    /// and how many bytes it holds. Never waits for room: a kernel that has shrunk this user's new
+    /// pipes (`pipe-user-pages-soft` exceeded by other processes) gives a page, and a writer that
+    /// waited for a reader that is not yet running would hang the test forever.
+    async fn full_pipe(n: usize) -> (tokio::net::unix::pipe::Receiver, usize) {
         let (w, r) = tokio::net::unix::pipe::pipe().unwrap();
         let data = vec![7u8; n];
         let mut at = 0;
+        // An empty pipe always has room: this wait ends at once, and registers the readiness
+        // `try_write` needs.
+        w.writable().await.unwrap();
         while at < n {
-            w.writable().await.unwrap();
-            if let Ok(k) = w.try_write(&data[at..]) {
-                at += k;
+            let r = w.try_write(&data[at..]);
+            if matches!(&r, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock) {
+                break;
             }
+            at += r.unwrap();
         }
-        r
+        assert!(at > 0, "the pipe took nothing");
+        (r, at)
     }
 
     /// A reader the scheduler did not run for longer than the grace still takes what its pipe
@@ -814,16 +822,16 @@ mod tests {
     async fn a_starved_reader_still_takes_what_the_pipe_holds() {
         let (exited, _) = watch::channel(false);
         let mut after = AfterExit::new(&exited);
-        let mut r = full_pipe(40_000).await;
+        let (mut r, held) = full_pipe(40_000).await;
         exited.send_replace(true);
         // The runtime is busy elsewhere for longer than the grace.
         std::thread::sleep(PIPE_GRACE * 3);
         let mut buf = [0u8; 16 * 1024];
         let mut got = 0;
-        while got < 40_000 {
+        while got < held {
             got += after.read(&mut r, &mut buf).await.unwrap();
         }
-        assert_eq!(got, 40_000);
+        assert_eq!(got, held);
     }
 
     /// An empty pipe a descendant holds open is let go after the grace, and a chatty one once what
@@ -858,7 +866,7 @@ mod tests {
         let hog = || tokio::spawn(async { std::thread::sleep(PIPE_GRACE * 4) });
         let (a, b) = (hog(), hog());
         std::thread::sleep(PIPE_GRACE / 2);
-        let r = full_pipe(40_000).await;
+        let (r, held) = full_pipe(40_000).await;
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let (exited, _) = watch::channel(false);
         let _pump = pump(r, "stdout", tx, AfterExit::new(&exited));
@@ -867,7 +875,7 @@ mod tests {
         while let Some(f) = rx.recv().await {
             got += f.len();
         }
-        assert!(got >= 40_000, "only {got} wire bytes of 40000 arrived");
+        assert!(got >= held, "only {got} wire bytes of {held} arrived");
         let _ = tokio::join!(a, b);
     }
 }

@@ -57,6 +57,13 @@
           "description": "Working directory. Default: the sandbox's own.",
           "type": "string"
         },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Environment variables for this command only, over the sandbox's own: names are\n`[A-Za-z_][A-Za-z0-9_]*` and must not start `EXECD_`. Not combinable with stdin.",
+          "type": "object"
+        },
         "stdin": {
           "description": "Text for the command's standard input.",
           "type": "string"
@@ -182,6 +189,42 @@
       "openWorldHint": false,
       "readOnlyHint": false
     },
+    "description": "Send a signal (SIGHUP, SIGINT, SIGQUIT, SIGUSR1, SIGUSR2, SIGTERM or SIGKILL) to the processes of running jobs, with no wait. Returns sent, the ids that were running. Ended or unknown ids are not errors; use job_kill to stop a job and wait for it.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "ids": {
+          "description": "The jobs to signal.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "scope": {
+          "description": "The group the jobs belong to. Default: this server's.",
+          "type": "string"
+        },
+        "signal": {
+          "description": "One of SIGHUP, SIGINT, SIGQUIT, SIGUSR1, SIGUSR2, SIGTERM, SIGKILL.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "ids",
+        "signal"
+      ],
+      "type": "object"
+    },
+    "name": "job_signal"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
     "description": "Start a shell command line (sh -c, like exec) that keeps running after this call returns; the sandbox keeps it and its output. Returns the job id. Read output with job_output, check on it with job_list, stop it with job_kill. Use this for servers, builds and anything slower than a few seconds.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -195,6 +238,13 @@
           "description": "Working directory. Default: the sandbox's own.",
           "type": "string"
         },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Environment variables for this job only, over the sandbox's own (names as for exec).",
+          "type": "object"
+        },
         "id": {
           "description": "The job's id: 1 to 32 characters of [0-9a-z]. Default: a random one, returned.",
           "type": "string"
@@ -206,6 +256,10 @@
         "scope": {
           "description": "The group the job belongs to. Default: this server's.",
           "type": "string"
+        },
+        "stdin_open": {
+          "description": "Keep the job's standard input open for `job_write`. Default false: the job reads EOF.",
+          "type": "boolean"
         }
       },
       "required": [
@@ -214,6 +268,53 @@
       "type": "object"
     },
     "name": "job_start"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Write to the standard input of a job started with stdin_open. `at` is the position in the input stream of the first byte (0, then the previous `written`), so repeating a call changes nothing. Returns written (how much input the job has taken) and closed. With eof the job's input is closed after the write. Not found, a job with no stdin, or a closed input are errors.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "at": {
+          "description": "The position in the job's input stream of the first byte of this write: 0 for the first\nwrite, then the previous `written`. A repeat of a write applies nothing twice.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "content": {
+          "description": "Text to write.",
+          "type": "string"
+        },
+        "content_base64": {
+          "description": "Bytes to write, base64, instead of `content`. At most 128 KiB.",
+          "type": "string"
+        },
+        "eof": {
+          "description": "Close the job's input after this write. Default false.",
+          "type": "boolean"
+        },
+        "id": {
+          "description": "The job's id; it must have been started with `stdin_open`.",
+          "type": "string"
+        },
+        "scope": {
+          "description": "The group the job belongs to. Default: this server's.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "at"
+      ],
+      "type": "object"
+    },
+    "name": "job_write"
   },
   {
     "annotations": {

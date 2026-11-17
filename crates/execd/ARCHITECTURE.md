@@ -150,7 +150,7 @@ parks the request on the reactor, `timeout_ms` bounds the wait (short write), a 
 128 KiB, `WAITERS_MAX` 16 per job (429). The token cancels and the pipe is dropped when the job ends or is removed, so no fd
 outlives the job. The std `Mutex<Job>` is never held across an await.
 
-**Signal.** `signal` sends one of seven named signals with `proc::signal_job_once` (the group, plus marked processes that left
+**Signal.** `signal` sends one of seven named signals with `proc::signal_job` (the group, plus marked processes that left
 it: each process of the job hears it once) off the runtime, never to a job that has ended (its group number may be reused), and
 answers the ids it signalled. No grace, no table change; a signal that kills the shell is seen by the supervisor like any death.
 
@@ -413,10 +413,10 @@ at start and end), exclusive `homelab-live`, `instd-suite` and all `rust-build` 
 | B1 | `list` op, keep-alive | new 0.047-0.049 / 0.064-0.080 ms; baseline 0.047-0.054 / 0.055-0.077 | baseline |
 | P1 | `write` 1 KiB to a `cat >/dev/null` job | 0.054 / 0.072 ms = 1.13 x / 1.12 x B1 | met (<= 1.15 x, <= 1.5 x) |
 | P2 | `write` 1 KiB, until the bytes arrive on an open `attach` | 0.067 / 0.105 ms = 1.4 x / 1.6 x B1 | met (<= 2 x, <= 3 x): no polling tick |
-| P3 | 1 GiB as 128 KiB writes, 8 connections (HTTP/1.1; no h2 client in the harness), `cat >/dev/null` | 145.9 MiB/s vs B3 167.1 (16 MiB one-shot stdin) = 0.87 x | met (>= 0.7 x). Constraint: JSON + base64 per request, not the pipe, so the pipe stays 64 KiB |
+| P3 | 1 GiB as 128 KiB writes, 8 in flight on ONE h2c connection (`benches/jobs_stdin_h2.rs`), `cat >/dev/null`; B3 = one 16 MiB one-shot stdin on the same connection | 607-670 MiB/s against B3 107-185 MiB/s: 3.6-5.7 x B3 (the same bench on the build before the borrowed-`data` change: 644-680 MiB/s) | met (>= 0.7 x). A one-shot is bounded by one request's JSON + base64 + one spawn; writes pipeline, so the constraint of P3 is the same JSON + base64 per request, not the pipe, which stays 64 KiB. The 8-connection HTTP/1.1 figure of `jobs_stdin.py` (146 MiB/s) is kept for comparison only. Load 33 and 6 runnable threads at the start of this run (2 at the end): above the ~4 bar, so read the ratios, not the absolute rates |
 | P4 | threads and fds, 10,000 writes | 1 thread, 17 fds before and after | met |
-| P5 idle | 100 idle jobs | stdin adds 0.6 KiB per job (38.8 against 38.2 KiB without `stdin_open`; the baseline's 46.5 KiB is the two pump buffers and the table entry every job has) | met for what stdin adds; the 4 KiB bar read as absolute is not (38 KiB), and was never a stdin cost |
-| P5 stalled | a job that never reads, 16 queued 128 KiB writers | RSS +8.1 MiB (bound 16 x 0.5 MiB = 8.0 MiB), flat from 3 s to 23 s | within 1.3% of the bound; flat |
+| P5 idle | 100 idle jobs: what `stdin_open` adds per job | +0.6 KiB per job (38.8 against 38.2 KiB without `stdin_open`). The 4 KiB bar is the cost stdin adds, by ruling; a job's own 38 KiB (two pump buffers, a table entry; 46.5 KiB on the baseline) is not stdin's | met |
+| P5 stalled | a job that never reads, N queued 128 KiB writers, RSS growth after 3 s and 13 s | N = 0: 0 KiB; 1: 496; 4: 2032; 8: 4180; 16: 8264 KiB (516 KiB per writer, flat from 3 s to 13 s; the build before the borrowed-`data` change: 516, 504, 526, 523 per writer). Per writer it is 4.05-4.28 x the payload at 16, 32, 64 and 128 KiB (68, 134, 259, 524 KiB) | miss by 72 KiB at 16 writers (8264 against 16 x 512 = 8192 KiB, 0.9%): the intercept is 0 and the cost is per writer and proportional to the payload (4.1 x: the request body, its parsed `Value`, the decoded bytes, and allocator rounding), not a fixed cost. A bar of 16 x 0.5 MiB is 4.0 x. Not tuned, not lowered |
 | P6 | idle wakeups, 100 stdin-open jobs, 20 s | 0.0 switches/s (baseline 0.0) | met |
 | P7 | one-shot `true`; job start + read + remove; one-shot `cat` with stdin | 0.94-0.99 / 1.14-1.19 ms vs 0.95-0.97 / 1.17-1.18; 9.3-10.5 ms vs 9.5-10.0; 1.10-1.13 vs 1.08-1.14 ms | within noise |
 

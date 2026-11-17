@@ -451,7 +451,7 @@ async fn stop_jobs(jobs: &[(i32, String)], grace: Duration) {
 /// Fuzz seam: whether `job` is a well-formed job operation (and its `notify`, if it has one, passes
 /// the grammar). Never panics.
 pub(crate) fn fuzz_job(job: &Value) -> bool {
-    match serde_json::from_value::<JobReq>(job.clone()) {
+    match JobReq::deserialize(job) {
         Ok(j) => {
             j.op != "keep"
                 || j.notify
@@ -548,7 +548,7 @@ fn scopeguard_remove(p: PathBuf) -> RemoveOnDrop {
 /// A job operation: the request's `job` object.
 #[derive(Deserialize, Default)]
 #[serde(default)]
-struct JobReq {
+struct JobReq<'a> {
     op: String,
     scope: String,
     id: String,
@@ -570,7 +570,9 @@ struct JobReq {
     /// `write`: the stream position of `data`'s first byte, the bytes (base64) and whether to close
     /// the job's stdin after them.
     at: u64,
-    data: Option<String>,
+    /// Borrowed from the request's own `Value`: a 128 KiB write's base64 is not copied again.
+    #[serde(borrow)]
+    data: Option<std::borrow::Cow<'a, str>>,
     eof: bool,
 }
 
@@ -640,7 +642,7 @@ impl Drop for Waiter<'_> {
 }
 
 /// `write`: apply `data` at position `at` of the job's stdin. See the spec's "Job stdin".
-async fn write_stdin(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
+async fn write_stdin(ctx: &Arc<Ctx>, req: &Request, job: &JobReq<'_>) -> Resp {
     use base64::Engine as _;
     use tokio::io::AsyncWriteExt as _;
     let Some(cell) = ctx.jobs.get(&(job.scope.clone(), job.id.clone())) else {
@@ -649,7 +651,7 @@ async fn write_stdin(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
     let Some(stdin) = locked(&cell).stdin.clone() else {
         return http::error_response(409, "the job has no stdin");
     };
-    let b64 = job.data.as_deref().unwrap_or("");
+    let b64: &str = job.data.as_deref().unwrap_or("");
     if b64.len() > WRITE_MAX.div_ceil(3) * 4 {
         return http::error_response(413, "write too large");
     }
@@ -762,7 +764,7 @@ fn closed(state: &Value) -> Resp {
 
 /// Answer a request carrying a `job` object.
 pub(crate) async fn serve(ctx: &Arc<Ctx>, req: &Request) -> Resp {
-    let job: JobReq = match req.job.clone().map(serde_json::from_value) {
+    let job: JobReq = match req.job.as_ref().map(JobReq::deserialize) {
         Some(Ok(j)) => j,
         _ => return http::error_response(400, "bad job"),
     };
@@ -772,7 +774,7 @@ pub(crate) async fn serve(ctx: &Arc<Ctx>, req: &Request) -> Resp {
     resp
 }
 
-async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq) -> Resp {
+async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq<'_>) -> Resp {
     let jobs = &ctx.jobs;
     let key = |id: &str| (job.scope.clone(), id.to_string());
     match job.op.as_str() {
@@ -839,7 +841,7 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq) -> Resp {
             }
             proc::off_runtime(move || {
                 for (g, m) in &targets {
-                    proc::signal_job_once(*g, m, sig);
+                    proc::signal_job(*g, m, sig);
                 }
             })
             .await;
@@ -948,7 +950,7 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq) -> Resp {
 
 /// `keep` (the job is the endpoint's now, with its `notify`) and `seen` (how much output the model
 /// has been shown).
-fn keep_or_seen(ctx: &Arc<Ctx>, job: &JobReq) -> Resp {
+fn keep_or_seen(ctx: &Arc<Ctx>, job: &JobReq<'_>) -> Resp {
     let keep = job.op == "keep";
     // notify: a `notify` that fails the grammar refuses the whole `keep`, before anything is
     // recorded (N4, N5). The reason never quotes the token.
@@ -990,7 +992,7 @@ fn keep_or_seen(ctx: &Arc<Ctx>, job: &JobReq) -> Resp {
 
 /// Start a job: its own process group, its output kept under the retention, its end recorded once
 /// the group is empty.
-async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
+async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq<'_>) -> Resp {
     let key = (job.scope.clone(), job.id.clone());
     let cell: JobCell = {
         let mut map = locked(&ctx.jobs.map);

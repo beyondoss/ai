@@ -92,7 +92,7 @@ async fn an_agent_lists_the_tools_writes_a_file_runs_cat_and_reads_it_back() {
         );
         assert_eq!(
             tools.len(),
-            12,
+            14,
             "upload and download need SANDBOX_LOCAL_ROOT"
         );
 
@@ -683,7 +683,7 @@ async fn an_unreachable_sandbox_starts_the_server_and_fails_each_call_with_a_kin
         // Nothing listens on port 1.
         let client = connect("http://127.0.0.1:1/").await;
         let peer = client.peer();
-        assert_eq!(peer.list_all_tools().await.unwrap().len(), 12);
+        assert_eq!(peer.list_all_tools().await.unwrap().len(), 14);
         let r = call(peer, "exec", json!({"command": "true"})).await;
         assert_eq!(error_kind(&r), "transport");
 
@@ -790,7 +790,7 @@ async fn streamable_http_serves_the_same_tools_on_loopback_and_refuses_a_public_
             .to_string();
 
         let client = ().serve(StreamableHttpClientTransport::from_uri(url)).await.unwrap();
-        assert_eq!(client.peer().list_all_tools().await.unwrap().len(), 12);
+        assert_eq!(client.peer().list_all_tools().await.unwrap().len(), 14);
         let r = call(client.peer(), "exec", json!({"command": "echo over http"})).await;
         assert_eq!(ok(&r)["stdout"], "over http\n");
         client.cancel().await.unwrap();
@@ -868,7 +868,7 @@ async fn upload_and_download_copy_trees_below_the_local_root_only() {
         cmd.env("SANDBOX_LOCAL_ROOT", &lroot);
         let client = ().serve(TokioChildProcess::new(cmd).unwrap()).await.unwrap();
         let peer = client.peer();
-        assert_eq!(peer.list_all_tools().await.unwrap().len(), 14);
+        assert_eq!(peer.list_all_tools().await.unwrap().len(), 16);
 
         let dest = format!("{}/dst", remote.display());
         let up = call(peer, "upload", json!({"local": "src", "remote_dir": dest})).await;

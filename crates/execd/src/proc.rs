@@ -330,21 +330,10 @@ pub(crate) async fn job_gone(pgid: i32, mark: &str, precise: bool) -> bool {
 }
 
 /// `sig` to the job's group, and to each process that carries its mark and has left the group:
-/// every process of the job gets it once (the `signal` op's contract; [`signal_job`] may reach a
-/// group member twice, which a kill does not mind and a `SIGINT` handler does).
-pub(crate) fn signal_job_once(pgid: i32, mark: &str, sig: Signal) {
-    signal_group(pgid, sig);
-    for pid in members(pgid, mark, true) {
-        if let Ok(raw) = i32::try_from(pid) {
-            let _ = nix::sys::signal::kill(Pid::from_raw(raw), sig);
-        }
-    }
-}
-
-/// `sig` to the job's group and to everything that carries its mark.
+/// every process of the job hears it exactly once (a `SIGINT` handler counts deliveries).
 pub(crate) fn signal_job(pgid: i32, mark: &str, sig: Signal) {
     signal_group(pgid, sig);
-    for pid in job_members(pgid, mark) {
+    for pid in members(pgid, mark, true) {
         if let Ok(raw) = i32::try_from(pid) {
             let _ = nix::sys::signal::kill(Pid::from_raw(raw), sig);
         }
@@ -630,7 +619,14 @@ mod tests {
         c.stdout(std::process::Stdio::piped());
         let mut child = c.spawn().unwrap();
         let out = child.stdout.take().unwrap();
-        assert_eq!(pipe_capacity(&out), 64 * 1024);
+        // Whatever the kernel gave this pipe (64 KiB, or one page once the user's pipes exceed
+        // `pipe-user-pages-soft`), never a constant.
+        let given = nix::fcntl::fcntl(&out, nix::fcntl::FcntlArg::F_GETPIPE_SZ).unwrap();
+        assert_eq!(pipe_capacity(&out), usize::try_from(given).unwrap());
+        // And after the size is changed, the new number.
+        if nix::fcntl::fcntl(&out, nix::fcntl::FcntlArg::F_SETPIPE_SZ(128 * 1024)).is_ok() {
+            assert_eq!(pipe_capacity(&out), 128 * 1024);
+        }
         child.wait().unwrap();
     }
 
