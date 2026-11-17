@@ -11,10 +11,10 @@ export type {
   JobInfo,
   JobOps,
   JobSpec,
-  StdinWritten,
   JobState,
   RunOptions,
   RunResult,
+  StdinWritten,
   Survivor,
   Transport,
 } from "./transport.js";

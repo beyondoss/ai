@@ -80,10 +80,10 @@ if the endpoint cannot be used (for example `auth`).
 
 ### Exec (layer 1)
 
-| op            | request                                                                                | result                                                                                  |
-| ------------- | -------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| op            | request                                                                                        | result                                                                                  |
+| ------------- | ---------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
 | `exec`        | `command`, `args` (default `[]`), `cwd?`, `env?`, `timeout_ms?` (default 120000), `stdin_b64?` | `{exit_code, stdout_b64, stderr_b64}`                                                   |
-| `exec_stream` | `command`, `args`, `cwd?`, `timeout_ms?`                                               | `{stdout_b64, stderr_b64}` plus exactly one of `exit_code`, `signal`, `timed_out: true` |
+| `exec_stream` | `command`, `args`, `cwd?`, `timeout_ms?`                                                       | `{stdout_b64, stderr_b64}` plus exactly one of `exit_code`, `signal`, `timed_out: true` |
 
 `exec` is the one-shot call: a non-zero `exit_code` is a normal result; a
 timeout is `exit_code` 124 (stderr ending `command exceeded its timeout`), a
@@ -99,17 +99,17 @@ Every job op carries `scope`, a string of 1 to 64 characters of `[0-9a-z-]`
 naming one session's jobs; the harness sends a scope unique to the scenario.
 `job` is the job id, 1 to 32 characters of `[0-9a-z]`, chosen by the caller.
 
-| op           | request                                             | result                                                                                                                                                                                  |
-| ------------ | --------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `job_start`  | `scope`, `job`, `command`, `args`, `cwd?`, `env?`, `stdin_open?`, `label?` | `{pgid}`: the job is kept by the sandbox from the start                                                                                                                                 |
-| `job_list`   | `scope`                                             | `{jobs: [{id, state, code, signal?, kept, num, kind, seen, started, ended, label}]}`                                                                                                    |
-| `job_read`   | `scope`, `job`, `offset` (0), `max` (131072)        | `{state, code, signal?, offset, end, data_b64, stderr_ranges?}`                                                                                                                                       |
-| `job_attach` | `scope`, `job`, `offset` (0)                        | `{exit_code \| signal, output_b64, stderr_b64?, gap}`: follows to the job's end, ending as `exec_stream` does (`signal` in place of `exit_code` for a shell a signal killed); `gap` is bytes dropped |
-| `job_kill`   | `scope`, `jobs: [ids]`, `remove?`                   | `{survivors: [{id, detail}]}`: groups still alive after TERM, grace and KILL                                                                                                            |
-| `job_remove` | `scope`, `jobs: [ids]`                              | `{}`                                                                                                                                                                                    |
-| `job_write`  | `scope`, `job`, `at`, `data_b64`, `eof?`            | `{written, closed?}`: positional stdin write                                                                                                                                            |
-| `job_signal` | `scope`, `jobs: [ids]`, `signal`                    | `{sent: [ids]}`                                                                                                                                                                         |
-| `job_wipe`   | `scope`                                             | `{survivors: [..]}`                                                                                                                                                                     |
+| op           | request                                                                    | result                                                                                                                                                                                               |
+| ------------ | -------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `job_start`  | `scope`, `job`, `command`, `args`, `cwd?`, `env?`, `stdin_open?`, `label?` | `{pgid}`: the job is kept by the sandbox from the start                                                                                                                                              |
+| `job_list`   | `scope`                                                                    | `{jobs: [{id, state, code, signal?, kept, num, kind, seen, started, ended, label}]}`                                                                                                                 |
+| `job_read`   | `scope`, `job`, `offset` (0), `max` (131072)                               | `{state, code, signal?, offset, end, data_b64, stderr_ranges?}`                                                                                                                                      |
+| `job_attach` | `scope`, `job`, `offset` (0)                                               | `{exit_code \| signal, output_b64, stderr_b64?, gap}`: follows to the job's end, ending as `exec_stream` does (`signal` in place of `exit_code` for a shell a signal killed); `gap` is bytes dropped |
+| `job_kill`   | `scope`, `jobs: [ids]`, `remove?`                                          | `{survivors: [{id, detail}]}`: groups still alive after TERM, grace and KILL                                                                                                                         |
+| `job_remove` | `scope`, `jobs: [ids]`                                                     | `{}`                                                                                                                                                                                                 |
+| `job_write`  | `scope`, `job`, `at`, `data_b64`, `eof?`                                   | `{written, closed?}`: positional stdin write                                                                                                                                                         |
+| `job_signal` | `scope`, `jobs: [ids]`, `signal`                                           | `{sent: [ids]}`                                                                                                                                                                                      |
+| `job_wipe`   | `scope`                                                                    | `{survivors: [..]}`                                                                                                                                                                                  |
 
 `state` is `running`, `exited` (the shell exited, its group runs on), `ended`,
 `lost` or `gone`; `code` is null unless `exited` or `ended`. `signal` is present
@@ -325,7 +325,7 @@ scenario whose point is something a driver's transport cannot show, however the 
 | `frames`           | the stream's own frames (heartbeats, splitting of output into frames), not only its final answer                         |
 | `unbounded_stream` | a stream longer than any retention window: output beyond 8 MiB arrives whole, with no head lost                          |
 | `exit_signal`      | a kill by signal N told apart from an exit of 128+N (`signal` in place of `exit_code`; for jobs, `signal` beside `code`) |
-| `exec_env`         | a command's own `env` on `exec` and `job_start`                                                                           |
+| `exec_env`         | a command's own `env` on `exec` and `job_start`                                                                          |
 | `job_streams`      | a job's stderr told from its stdout: `stderr_ranges` in `job_read`, `stderr_b64` in `job_attach`                         |
 | `job_stdin`        | `job_start`'s `stdin_open` and `job_write`                                                                               |
 | `job_signal_op`    | `job_signal`                                                                                                             |

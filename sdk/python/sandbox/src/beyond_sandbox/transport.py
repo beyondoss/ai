@@ -377,10 +377,15 @@ class HttpTransport:
         if self._env_proved:
             return
         body = _wire.request_body(
-            "sh", ["-c", 'printf %s "$BEYOND_ENV_PROBE"'], cwd=None, timeout_ms=10_000,
+            "sh",
+            ["-c", 'printf %s "$BEYOND_ENV_PROBE"'],
+            cwd=None,
+            timeout_ms=10_000,
             env={"BEYOND_ENV_PROBE": "1"},
         )
-        r = _wire.parse_envelope(self.url, self._post(body, 10_000, _wire.body_cap(self._cap)), self._cap)
+        r = _wire.parse_envelope(
+            self.url, self._post(body, 10_000, _wire.body_cap(self._cap)), self._cap
+        )
         if r.exit_code != 0 or r.stdout != b"1":
             raise NotOfferedError(
                 f"exec endpoint {self.url} predates per-command env: it ran the command without "

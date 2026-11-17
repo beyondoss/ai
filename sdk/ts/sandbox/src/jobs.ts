@@ -128,8 +128,7 @@ export class Jobs {
       if (f.type === "output") {
         chunks.push(f.data);
         if (f.stream === "stderr") errs.push(f.data);
-      }
-      else if (f.type === "gap") gap += f.bytes;
+      } else if (f.type === "gap") gap += f.bytes;
       else if (f.type === "exit") {
         return {
           exitCode: f.code,
@@ -203,7 +202,11 @@ export class Jobs {
    * Send a signal (`SIGHUP SIGINT SIGQUIT SIGUSR1 SIGUSR2 SIGTERM SIGKILL`) to each running job's
    * group, with no grace and no wait. The ids that were running.
    */
-  async signal(scope: string, ids: string[], signal: string): Promise<string[]> {
+  async signal(
+    scope: string,
+    ids: string[],
+    signal: string,
+  ): Promise<string[]> {
     validScope(scope);
     ids.forEach(validId);
     return this.transport.jobs.signal(scope, ids, signal);

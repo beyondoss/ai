@@ -15,6 +15,7 @@ import {
 import {
   type Frame,
   isJobId,
+  JOB_SIGNALS,
   type JobChunk,
   type JobFrame,
   type JobInfo,
@@ -26,7 +27,6 @@ import {
   type StdinWritten,
   type Survivor,
   type Transport,
-  JOB_SIGNALS,
   WRITE_MAX,
 } from "./transport.js";
 
@@ -228,7 +228,7 @@ export class HttpTransport implements Transport {
     if (!env || Object.keys(env).length === 0 || this.envProved) return;
     const ex = await this.post({
       command: "sh",
-      args: ["-c", 'printf %s "$BEYOND_ENV_PROBE"'],
+      args: ["-c", "printf %s \"$BEYOND_ENV_PROBE\""],
       timeoutMs: 10_000,
       env: { BEYOND_ENV_PROBE: "1" },
     });
@@ -846,10 +846,12 @@ class HttpJobs implements JobOps {
     if (v.stderr_ranges !== undefined && v.stderr_ranges !== null) {
       const r = v.stderr_ranges;
       if (
-        !Array.isArray(r) ||
-        !r.every((p) =>
-          Array.isArray(p) && p.length === 2 &&
-          p.every((n) => typeof n === "number" && Number.isInteger(n) && n >= 0)
+        !Array.isArray(r)
+        || !r.every((p) =>
+          Array.isArray(p) && p.length === 2
+          && p.every((n) =>
+            typeof n === "number" && Number.isInteger(n) && n >= 0
+          )
         )
       ) throw badJob("read", v);
       stderrRanges = r as [number, number][];
@@ -953,7 +955,9 @@ class HttpJobs implements JobOps {
   ): Promise<string[]> {
     if (!JOB_SIGNALS.includes(signal)) {
       throw new InvalidRequestError(
-        `unsupported signal ${JSON.stringify(signal)}; one of ${JOB_SIGNALS.join(", ")}`,
+        `unsupported signal ${JSON.stringify(signal)}; one of ${
+          JOB_SIGNALS.join(", ")
+        }`,
       );
     }
     if (ids.length === 0) return [];

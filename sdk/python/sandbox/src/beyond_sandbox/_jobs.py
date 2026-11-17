@@ -1,11 +1,13 @@
 """Sandbox jobs: the operations, as sans-IO generators (see :mod:`beyond_sandbox._drive`).
 
-A job is kept by the sandbox from the start (``hold: false``), so closing a connection never kills
+A job is kept by the sandbox
+from the start (``hold: false``), so closing a connection never kills
 it. Every operation asks the transport for a ``Call`` (one JSON answer) or a ``Follow`` (a stream).
 """
 
 from __future__ import annotations
 
+import contextlib
 import re
 from typing import Sequence
 
@@ -70,10 +72,8 @@ def start(
         raise IoError(f"the endpoint did not report the job's start: {str(v)[:200]}")
     if stdin_open and not (isinstance(v, dict) and v.get("stdin") is True):
         # Started without its stdin: stop it, so nothing is left running that reads EOF.
-        try:
+        with contextlib.suppress(SandboxError):
             yield Call(_wire.job_op("kill", scope, ids=[job], remove=True, grace_ms=KILL_GRACE_MS))
-        except SandboxError:
-            pass
         raise NotOfferedError("the endpoint predates job stdin: it ran the job without it")
     return pgid
 
@@ -124,9 +124,7 @@ def wipe(scope: str) -> Op[list[Survivor]]:
     return _wire.parse_survivors(v)
 
 
-def write_stdin(
-    scope: str, job: str, at: int, data: bytes, eof: bool = False
-) -> Op[StdinWritten]:
+def write_stdin(scope: str, job: str, at: int, data: bytes, eof: bool = False) -> Op[StdinWritten]:
     """Write ``data`` at position ``at`` of the job's stdin (it must have been started with
     ``stdin_open``). Positional: a repeat applies nothing twice, a write ahead of the stream waits for
     the bytes before it. ``NotFoundError``: no such job; ``ConflictError``: no stdin, closed, or a gap

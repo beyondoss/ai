@@ -13,7 +13,6 @@ from beyond_sandbox import _wire
 from beyond_sandbox._http import Malformed, ResponseReader, Truncated, build_request, parse_url
 from beyond_sandbox.errors import InvalidRequestError, ProtocolError, TooLargeError, TransportError
 from beyond_sandbox.models import (
-    StdinWritten,
     Exit,
     JobEnd,
     JobGap,
@@ -23,6 +22,7 @@ from beyond_sandbox.models import (
     ShellExit,
     Signal,
     Stderr,
+    StdinWritten,
     Stdout,
     TimedOut,
 )

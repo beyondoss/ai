@@ -23,7 +23,9 @@ describe("job frames keep their stream", () => {
       pgid: 7,
       stdin: true,
     });
-    expect(decodeJobFrame(line({ started: 7 }))).toMatchObject({ stdin: false });
+    expect(decodeJobFrame(line({ started: 7 }))).toMatchObject({
+      stdin: false,
+    });
   });
 });
 
@@ -92,7 +94,9 @@ describe("job ops over HTTP", () => {
   });
 
   it("fails closed when an endpoint ignores env", async () => {
-    const { t } = await jobs(() => [200, { exit_code: 0, stdout: "", stderr: "" }]);
+    const { t } = await jobs(
+      () => [200, { exit_code: 0, stdout: "", stderr: "" }],
+    );
     await expect(t.run("true", [], { env: { A: "1" } })).rejects.toMatchObject({
       kind: "not_offered",
     });

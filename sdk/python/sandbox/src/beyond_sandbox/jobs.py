@@ -62,9 +62,7 @@ class Jobs:
         """Start a job the sandbox keeps from the start; returns its process group. ``env`` is the
         command's own environment; ``stdin_open`` keeps its stdin open for :meth:`write_stdin`
         (an endpoint that predates it is a ``NotOfferedError`` and the job is stopped)."""
-        return drive(
-            _jobs.start(scope, job, command, args, cwd, label, env, stdin_open), self._t
-        )
+        return drive(_jobs.start(scope, job, command, args, cwd, label, env, stdin_open), self._t)
 
     def write_stdin(
         self, scope: str, job: str, at: int, data: bytes, eof: bool = False
