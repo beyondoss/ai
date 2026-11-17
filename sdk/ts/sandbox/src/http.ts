@@ -1,7 +1,11 @@
 import { concat, fromBase64, text, toBase64 } from "./bytes.js";
 import {
   AuthError,
+  ConflictError,
   EndpointError,
+  InvalidRequestError,
+  NotFoundError,
+  NotOfferedError,
   ProtocolError,
   SandboxError,
   TimeoutError,
@@ -19,8 +23,11 @@ import {
   type JobState,
   type RunOptions,
   type RunResult,
+  type StdinWritten,
   type Survivor,
   type Transport,
+  JOB_SIGNALS,
+  WRITE_MAX,
 } from "./transport.js";
 
 /** The response cap: a larger one-shot answer fails with `too_large` (the command ran). */
@@ -81,6 +88,7 @@ interface Body {
   stdin?: Uint8Array | undefined;
   stream?: boolean | undefined;
   job?: Record<string, unknown> | undefined;
+  env?: Record<string, string> | undefined;
 }
 
 /** The default transport: the exec protocol over HTTP `POST`. */
@@ -93,6 +101,8 @@ export class HttpTransport implements Transport {
   private readonly cap: number;
   private readonly grace: number;
   private readonly fetchFn: typeof fetch;
+  /** An `env` was proved applied by this endpoint. */
+  private envProved = false;
 
   constructor(options: HttpTransportOptions) {
     this.url = options.url;
@@ -116,6 +126,7 @@ export class HttpTransport implements Transport {
   ): Promise<RunResult> {
     const { signal, timeoutMs: t, ...rest } = options;
     const timeoutMs = t ?? DEFAULT_TIMEOUT_MS;
+    await this.proveEnv(rest.env);
     const ex = await this.post({ command, args, ...rest, timeoutMs }, signal);
     try {
       return decodeOutput(
@@ -137,6 +148,7 @@ export class HttpTransport implements Transport {
   ): AsyncGenerator<Frame> {
     const { signal, timeoutMs: t, ...rest } = options;
     const timeoutMs = t ?? STREAM_DEADLINE_MS;
+    await this.proveEnv(rest.env);
     const ex = await this.post({
       command,
       args,
@@ -207,6 +219,37 @@ export class HttpTransport implements Transport {
     return token;
   }
 
+  /**
+   * An endpoint that predates `env` ignores it and says nothing, so before the first `env` sent to
+   * one, prove it applies one (a command that prints a variable only `env` could have set) and fail
+   * closed otherwise: running the command without its environment is a silent wrong answer.
+   */
+  async proveEnv(env: Record<string, string> | undefined): Promise<void> {
+    if (!env || Object.keys(env).length === 0 || this.envProved) return;
+    const ex = await this.post({
+      command: "sh",
+      args: ["-c", 'printf %s "$BEYOND_ENV_PROBE"'],
+      timeoutMs: 10_000,
+      env: { BEYOND_ENV_PROBE: "1" },
+    });
+    let r: RunResult;
+    try {
+      r = decodeOutput(
+        this.parseObject(await this.readBounded(ex, bodyCap(this.cap))),
+        this.url,
+        this.cap,
+      );
+    } finally {
+      ex.close();
+    }
+    if (r.exitCode !== 0 || text(r.stdout) !== "1") {
+      throw new NotOfferedError(
+        `exec endpoint ${this.url} predates per-command env: it ran the command without the environment it was given`,
+      );
+    }
+    this.envProved = true;
+  }
+
   /** POST one request. Resolves once the status is known to be a success. */
   async post(body: Body, signal?: AbortSignal): Promise<Exchange> {
     const payload: Record<string, unknown> = {
@@ -218,6 +261,9 @@ export class HttpTransport implements Transport {
     if (body.stdin !== undefined) payload.stdin = toBase64(body.stdin);
     if (body.stream) payload.stream = true;
     if (body.job !== undefined) payload.job = body.job;
+    if (body.env !== undefined && Object.keys(body.env).length > 0) {
+      payload.env = body.env;
+    }
     const json = JSON.stringify(payload);
     const deadline = Math.min(body.timeoutMs + this.grace, MAX_TIMER_MS);
 
@@ -716,13 +762,16 @@ class HttpJobs implements JobOps {
       id,
       hold: false,
       label: spec.label ?? "",
+      stdin_open: spec.stdinOpen === true,
     });
+    await this.t.proveEnv(spec.env);
     const ex = await this.t.post({
       command: spec.command,
       args: spec.args ?? [],
       cwd: spec.cwd,
       timeoutMs: JOB_OP_TIMEOUT_MS,
       job,
+      env: spec.env,
     });
     try {
       const { body, over } = await this.t.readCapped(ex);
@@ -730,11 +779,20 @@ class HttpJobs implements JobOps {
         throw new TooLargeError("a job answer exceeded the response cap");
       }
       let started: unknown;
+      let echoed = false;
       try {
         const v: unknown = JSON.parse(text(body));
         started = isRecord(v) ? v.started : undefined;
+        echoed = isRecord(v) && v.stdin === true;
       } catch {
         started = undefined;
+      }
+      if (spec.stdinOpen === true && !echoed) {
+        // Started without its stdin: stop it, so nothing is left running that reads EOF.
+        await this.kill(scope, [id], true).catch(() => {});
+        throw new NotOfferedError(
+          "the endpoint predates job stdin: it ran the job without it",
+        );
       }
       if (typeof started !== "number") {
         throw new ProtocolError(
@@ -784,12 +842,25 @@ class HttpJobs implements JobOps {
     const st = jobState(v.state, v.code);
     const data = typeof v.data === "string" ? fromBase64(v.data) : null;
     if (!st || data === null) throw badJob("read", v);
+    let stderrRanges: [number, number][] | undefined;
+    if (v.stderr_ranges !== undefined && v.stderr_ranges !== null) {
+      const r = v.stderr_ranges;
+      if (
+        !Array.isArray(r) ||
+        !r.every((p) =>
+          Array.isArray(p) && p.length === 2 &&
+          p.every((n) => typeof n === "number" && Number.isInteger(n) && n >= 0)
+        )
+      ) throw badJob("read", v);
+      stderrRanges = r as [number, number][];
+    }
     return {
       ...st,
       ...jobSignal(v, st),
       offset: count(v.offset),
       end: count(v.end),
       data,
+      ...(stderrRanges ? { stderrRanges } : {}),
     };
   }
 
@@ -842,6 +913,55 @@ class HttpJobs implements JobOps {
     await this.t.jobCall(this.job("remove", scope, { ids }));
   }
 
+  async writeStdin(
+    scope: string,
+    id: string,
+    at: number,
+    data: Uint8Array,
+    eof: boolean,
+  ): Promise<StdinWritten> {
+    if (data.length > WRITE_MAX) {
+      throw new InvalidRequestError(
+        `a write is at most ${WRITE_MAX} bytes, got ${data.length}`,
+      );
+    }
+    let v: Record<string, unknown>;
+    try {
+      v = await this.t.jobCall(
+        this.job("write", scope, { id, at, eof, data: toBase64(data) }),
+      );
+    } catch (e) {
+      if (e instanceof EndpointError) {
+        if (e.status === 404) throw new NotFoundError(e.detail, { cause: e });
+        if (e.status === 409 || e.status === 429) {
+          throw new ConflictError(`job stdin: ${e.detail}`, { cause: e });
+        }
+        if (e.status === 413) {
+          throw new InvalidRequestError(e.detail, { cause: e });
+        }
+      }
+      throw e;
+    }
+    if (typeof v.written !== "number") throw badJob("write", v);
+    return { written: v.written, closed: v.closed === true };
+  }
+
+  async signal(
+    scope: string,
+    ids: string[],
+    signal: string,
+  ): Promise<string[]> {
+    if (!JOB_SIGNALS.includes(signal)) {
+      throw new InvalidRequestError(
+        `unsupported signal ${JSON.stringify(signal)}; one of ${JOB_SIGNALS.join(", ")}`,
+      );
+    }
+    if (ids.length === 0) return [];
+    const v = await this.t.jobCall(this.job("signal", scope, { ids, signal }));
+    if (!Array.isArray(v.sent)) throw badJob("signal", v);
+    return v.sent.filter((i): i is string => typeof i === "string");
+  }
+
   async wipe(scope: string): Promise<Survivor[]> {
     return parseSurvivors(
       await this.t.jobCall(
@@ -873,19 +993,19 @@ export function decodeJobFrame(line: Uint8Array): JobFrame | "heartbeat" {
     throw new TransportError(`job stream: ${v.error}`);
   }
   if (typeof v.started === "number") {
-    return { type: "started", pgid: v.started };
+    return { type: "started", pgid: v.started, stdin: v.stdin === true };
   }
-  const out = typeof v.stdout === "string"
-    ? v.stdout
+  const stream = typeof v.stdout === "string"
+    ? "stdout"
     : typeof v.stderr === "string"
-    ? v.stderr
+    ? "stderr"
     : null;
-  if (out !== null) {
-    const data = fromBase64(out);
+  if (stream !== null) {
+    const data = fromBase64(String(v[stream]));
     if (!data) {
       throw new ProtocolError("job stream: output is not standard base64");
     }
-    return { type: "output", data };
+    return { type: "output", data, stream };
   }
   if (typeof v.gap === "number") return { type: "gap", bytes: v.gap };
   if (typeof v.shell_exit === "number" && Number.isInteger(v.shell_exit)) {

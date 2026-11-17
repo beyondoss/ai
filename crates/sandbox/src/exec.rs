@@ -340,6 +340,24 @@ pub trait CommandRunner: Send + Sync {
             "this command runner cannot feed a command's stdin",
         ))
     }
+
+    /// Like [`run`](CommandRunner::run), with the command's own environment over the runner's.
+    /// Defaults to [`std::io::ErrorKind::Unsupported`]: a runner that cannot set one says so rather
+    /// than running the command without it.
+    async fn run_with_env(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        timeout: Duration,
+        env: &[(String, String)],
+    ) -> std::io::Result<ExecResult> {
+        let _ = (program, args, cwd, timeout, env);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "this command runner cannot set a command's environment",
+        ))
+    }
 }
 
 /// Write `bytes` to a child's stdin, then close it (dropping the handle is the EOF).

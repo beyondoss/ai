@@ -37,7 +37,7 @@ fn line(data: &[u8]) {
         return;
     };
     match frame {
-        JobFrame::Event(Event::Output(b)) => {
+        JobFrame::Event(Event::Output(b, _)) => {
             let s = v["stdout"].as_str().or_else(|| v["stderr"].as_str());
             assert_eq!(s, Some(B64.encode(&b).as_str()), "non-canonical output");
         }

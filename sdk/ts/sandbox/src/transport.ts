@@ -13,6 +13,11 @@ export interface RunOptions {
   /** Bytes fed to the command's stdin, then closed. */
   stdin?: Uint8Array;
   /**
+   * The command's own environment, over the endpoint's. An endpoint that predates it is proved
+   * once and refused (`not_offered`): the command is never run without it.
+   */
+  env?: Record<string, string>;
+  /**
    * Abort the request. For a stream, closes the connection so the sandbox kills the command (same
    * as stopping iteration). Reported as `transport` with detail mentioning abort.
    */
@@ -80,12 +85,15 @@ export interface JobChunk {
   /** The end of the job's output so far, whatever `max` was. */
   end: number;
   data: Uint8Array;
+  /** Which bytes of `data` came from stderr, as absolute `[from, len]` offsets; absent when none. */
+  stderrRanges?: [number, number][];
 }
 
 /** What a job stream says: output, a gap, the shell's exit, and the final status. */
 export type JobFrame =
-  | { type: "started"; pgid: number }
-  | { type: "output"; data: Uint8Array }
+  | { type: "started"; pgid: number; stdin?: boolean }
+  /** `stream` is the pipe the bytes came from; concatenated, the pieces are the combined output. */
+  | { type: "output"; data: Uint8Array; stream: "stdout" | "stderr" }
   /** `bytes` of output from the requested offset are no longer kept. */
   | { type: "gap"; bytes: number }
   | { type: "shell_exit"; code: number }
@@ -100,6 +108,30 @@ export interface JobSpec {
   args?: string[];
   cwd?: string;
   label?: string;
+  /** The command's own environment (see {@link RunOptions.env}). */
+  env?: Record<string, string>;
+  /** Keep the job's stdin open for `writeStdin`; default: empty (EOF at once). */
+  stdinOpen?: boolean;
+}
+
+/** The most bytes one `writeStdin` carries. */
+export const WRITE_MAX = 128 * 1024;
+
+/** The signals a job can be sent: names only. */
+export const JOB_SIGNALS = [
+  "SIGHUP",
+  "SIGINT",
+  "SIGQUIT",
+  "SIGUSR1",
+  "SIGUSR2",
+  "SIGTERM",
+  "SIGKILL",
+];
+
+/** What a `writeStdin` left: bytes of the stdin stream applied so far, and whether it is closed. */
+export interface StdinWritten {
+  written: number;
+  closed: boolean;
 }
 
 /** A process that survived a `kill`. */
@@ -132,6 +164,16 @@ export interface JobOps {
   kill(scope: string, ids: string[], remove: boolean): Promise<Survivor[]>;
   remove(scope: string, ids: string[]): Promise<void>;
   wipe(scope: string): Promise<Survivor[]>;
+  /** Positional write to the job's stdin (see the spec's "Job stdin"). */
+  writeStdin(
+    scope: string,
+    id: string,
+    at: number,
+    data: Uint8Array,
+    eof: boolean,
+  ): Promise<StdinWritten>;
+  /** Send a named signal to each running job's group; the ids that were signalled. */
+  signal(scope: string, ids: string[], signal: string): Promise<string[]>;
 }
 
 /**

@@ -6,6 +6,7 @@ import type {
   JobFrame,
   JobInfo,
   JobSpec,
+  StdinWritten,
   Survivor,
   Transport,
 } from "./transport.js";
@@ -30,6 +31,8 @@ export interface JobOutput {
   /** The signal that killed the shell; absent for a shell that exited, whatever its code. */
   signal?: number;
   output: Uint8Array;
+  /** The bytes of `output` that came on stderr frames. */
+  stderr: Uint8Array;
   /** Bytes of output dropped before they could be read. */
   gap: number;
 }
@@ -119,17 +122,27 @@ export class Jobs {
    */
   async collect(scope: string, id: string, offset = 0): Promise<JobOutput> {
     const chunks: Uint8Array[] = [];
+    const errs: Uint8Array[] = [];
     let gap = 0;
     for await (const f of this.follow(scope, id, offset)) {
-      if (f.type === "output") chunks.push(f.data);
+      if (f.type === "output") {
+        chunks.push(f.data);
+        if (f.stream === "stderr") errs.push(f.data);
+      }
       else if (f.type === "gap") gap += f.bytes;
       else if (f.type === "exit") {
-        return { exitCode: f.code, output: concat(chunks), gap };
+        return {
+          exitCode: f.code,
+          output: concat(chunks),
+          stderr: concat(errs),
+          gap,
+        };
       } else if (f.type === "signal") {
         return {
           exitCode: 128 + f.signal,
           signal: f.signal,
           output: concat(chunks),
+          stderr: concat(errs),
           gap,
         };
       }
@@ -165,6 +178,35 @@ export class Jobs {
     ids.forEach(validId);
     if (ids.length === 0) return;
     return this.transport.jobs.remove(scope, ids);
+  }
+
+  /**
+   * Write `data` at position `at` of the job's stdin (the job must have started with `stdinOpen`);
+   * `eof` closes it after. Positional: a retry (same `at`) applies nothing twice and a write ahead of
+   * the stream waits for the bytes before it. A stdin that is closed, absent or never filled is
+   * `conflict`; no such job is `not_found`; over 128 KiB is `invalid_request`.
+   */
+  async writeStdin(
+    scope: string,
+    id: string,
+    at: number,
+    data: Uint8Array,
+    eof = false,
+  ): Promise<StdinWritten> {
+    validScope(scope);
+    validId(id);
+    count("at", at, 0);
+    return this.transport.jobs.writeStdin(scope, id, at, data, eof);
+  }
+
+  /**
+   * Send a signal (`SIGHUP SIGINT SIGQUIT SIGUSR1 SIGUSR2 SIGTERM SIGKILL`) to each running job's
+   * group, with no grace and no wait. The ids that were running.
+   */
+  async signal(scope: string, ids: string[], signal: string): Promise<string[]> {
+    validScope(scope);
+    ids.forEach(validId);
+    return this.transport.jobs.signal(scope, ids, signal);
   }
 
   /** Kill every job in the scope and delete it. Returns what survived. */

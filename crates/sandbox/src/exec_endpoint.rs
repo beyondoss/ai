@@ -68,7 +68,7 @@
 //! Deliberately the smallest thing that can carry a command and its result. Putting an adapter in
 //! front of a vendor's SDK is a few dozen lines on their side, and that seam is where vendor
 //! specifics belong — not in here. An endpoint implements the whole of this document: the one-shot
-//! call, streaming, jobs and job notify. A client sends what it needs and probes nothing.
+//! call, streaming, jobs (with stdin, signals and per-command `env`) and job notify. A client sends what it needs and probes nothing, except that it proves once that an endpoint applies a command's `env` ("Per-command environment"): a field an endpoint ignores gives no other sign.
 //!
 //! **The response is capped** ([`DEFAULT_MAX_RESPONSE_BYTES`], `--exec-max-response-bytes`). The body
 //! is read incrementally and reading stops at the cap; an oversized response is an **error**, never a
@@ -215,24 +215,29 @@
 //! unique within its scope. A **status** is a job's exit code, or 128 + N for signal N; a job a signal
 //! killed also reports **`signal`**: N (see "States"). Except for
 //! `start`, the request's `command` is `true` with no arguments: harmless if run. Unknown fields are
-//! ignored. A refusal before answering (an unknown job for `attach`, a bad request) is a non-2xx
+//! ignored by every endpoint (so a client that sends `env` or `stdin_open` to an endpoint that
+//! predates them learns of it from the answer, see "Per-command environment" and "Job stdin"). A refusal before answering (an unknown job for `attach`, a bad request) is a non-2xx
 //! status, as for a one-shot call.
 //!
 //! | op | `job` fields | answer |
 //! |---|---|---|
-//! | `start` | `id`, `hold`, `label` — the command is the request's `command`/`args`/`cwd` | `hold: true` (with `"stream": true`): a job stream; `hold: false`: `{"started": pgid}` |
+//! | `start` | `id`, `hold`, `label`, `stdin_open` — the command is the request's `command`/`args`/`cwd`/`env` | `hold: true` (with `"stream": true`): a job stream; `hold: false`: `{"started": pgid}`; both say `"stdin": true` when `stdin_open` was honoured |
 //! | `attach` | `id`, `offset` (with `"stream": true`) | a job stream from `offset` |
-//! | `read` | `id`, `offset`, `max` | `{"state", "code", "signal"?, "offset", "end", "data"}` |
+//! | `read` | `id`, `offset`, `max` | `{"state", "code", "signal"?, "offset", "end", "data", "stderr_ranges"?}` |
 //! | `keep` | `id`, `num`, `kind`, `seen` | `{}` |
 //! | `seen` | `id`, `offset` | `{}` |
 //! | `kill` | `ids`, `remove`, `grace_ms` | `{"survivors": [{"id", "pids": [..]}]}` |
 //! | `list` | | `{"jobs": [{"id", "state", "code", "signal"?, "kept", "num", "kind", "seen", "started", "ended", "label"}]}` |
 //! | `remove` | `ids` | `{}` |
 //! | `wipe` | `grace_ms` | `{"survivors": [{"pids": [..]}]}` |
+//! | `write` | `id`, `at`, `data`, `eof` | `{"written": N, "closed"?: true}` |
+//! | `signal` | `ids`, `signal` | `{"sent": [id, ..]}` |
 //!
-//! - **A job** runs in a process group (or cgroup) of its own, its stdin empty, its stdout and stderr
-//!   one combined **output**, of which the endpoint MUST keep at least the last 8 MiB, addressed by
-//!   byte offset from the job's first byte. Offsets never move: dropping old output leaves a gap.
+//! - **A job** runs in a process group (or cgroup) of its own, its stdin empty unless it was
+//!   started with `stdin_open` ("Job stdin"), its stdout and stderr one combined **output**, of
+//!   which the endpoint MUST keep at least the last 8 MiB, addressed by byte offset from the job's
+//!   first byte. Offsets never move: dropping old output leaves a gap. Which of the bytes came from
+//!   stderr is kept on the same clock ("Output streams").
 //! - **States** (`read`, `list`): `running`; `exited` — the shell exited with status `code` but
 //!   processes of its group run on; `ended` — the group is empty, `code` the shell's status and
 //!   `ended` its epoch second; `lost` — the endpoint no longer knows how it ended; `gone` — no such
@@ -254,7 +259,7 @@
 //! - **A job stream** is a stream (`application/x-ndjson`, heartbeats, frame size, flushing,
 //!   unknown fields) with two more frames: `{"started": pgid}` first on a held start, and
 //!   `{"gap": n}` when `n` bytes of output from the requested offset are no longer kept. Output
-//!   frames (`stdout`; `stderr` is accepted too) carry the combined output in order. `{"shell_exit":
+//!   frames (`stdout`, or `stderr`: "Output streams") carry the combined output in order. `{"shell_exit":
 //!   N}` follows the output read up to the shell's exit when the shell exits leaving its group alive,
 //!   once per stream. The final frame — after all output up to the job's end — is the job's status:
 //!   `{"exit_code": N}` (or `{"signal": S}` for a shell a signal killed), or `{"error"}`. An `attach` of an ended job streams
@@ -267,6 +272,63 @@
 //!   it then deletes each job whose group is empty. `remove` deletes ended jobs and never a running
 //!   one; `wipe` kills every job of the scope and deletes them all.
 //!
+//! **Output streams.** An output frame of a job stream carries the key of the pipe its bytes came
+//! from, `{"stdout": b64}` or `{"stderr": b64}`, and a frame never spans a change of stream; the
+//! payloads concatenated in order are the combined output, byte for byte. A `read` answer carries
+//! `"stderr_ranges": [[from, len], ...]` when its window holds stderr: absolute offsets (the same
+//! clock as `offset`), ascending, disjoint, inside the returned window; every byte inside a range
+//! is stderr and every other byte of the window is stdout. The member is absent when the window
+//! holds no stderr. An endpoint returns at most 1024 ranges per answer by ending the window before
+//! the range that would exceed it (a `read` already returns "up to `max`"); the client reads on
+//! from `end`. The order in which the two pipes' bytes interleave is the order the endpoint read
+//! them, no stronger.
+//!
+//! ## Per-command environment
+//!
+//! A request that runs a command (a one-shot, a stream, a job `start`) may carry `"env": {NAME:
+//! value, ...}`: the command's own environment, over the endpoint's (the request's value wins, `HOME`
+//! included). Every rule is checked before any process exists, and a violation is a `400` that names
+//! the rule and never a value: a name is `[A-Za-z_][A-Za-z0-9_]*` of at most 256 bytes, a value has no
+//! NUL, there are at most 128 variables and at most 32 KiB of names and values together, and **a name
+//! starting `EXECD_` is refused** (an endpoint's own variables, and a job's mark, are not the
+//! request's to set). An object whose values are not all strings is refused. Operations that run no
+//! command ignore `env`. An endpoint that predates `env` ignores it and says nothing, so a client
+//! about to send one proves the endpoint applies it first (a command that prints a variable only
+//! `env` could have set) and fails closed otherwise; [`HttpExecRunner`] does, once per endpoint
+//! until it is suspected replaced.
+//!
+//! ## Job stdin
+//!
+//! A job's stdin is empty (EOF at once) unless `start` carried `"stdin_open": true`: the default
+//! stays closed, so a job that reads its stdin to EOF does not hang. The answer to such a start says
+//! `"stdin": true` (a held start's first frame does, with `started`); a client that asked and was not
+//! told stops the job and fails, because the endpoint predates it. `write` puts bytes into it:
+//! `{"op":"write","scope","id","at": POS,"data": b64,"eof": false}`. **Writes are positional**, like a
+//! ranged PUT: `at` is the position in the job's stdin stream of `data`'s first byte (0 for the first
+//! write), and the answer is `{"written": N}`, N the stream's length applied so far. Bytes below `N` are
+//! already applied and skipped; if `at` is past `N` the write waits for the earlier bytes (for
+//! `timeout_ms`, else 30 s) and then answers `409 {"error": "gap", "written": N}`. So a write is ordered
+//! however its requests arrive, idempotent (a retry, or a replay by a proxy, applies nothing twice) and
+//! safe to cut off (`written` is exact). `eof: true` closes the pipe after `data`, and closing a
+//! closed stdin is `200 {"written": N, "closed": true}`. `data` is at most 128 KiB decoded (`413`
+//! beyond), at most 16 writes wait on one job at a time (`429`). Errors, with nothing written unless
+//! the body says: `404` no such job; `409 {"error": "the job has no stdin"}` (not opened); `409
+//! {"error": "stdin is closed", "written": N}` for bytes after EOF or after the job ended or its
+//! reader left; `400` bad base64. The answer comes when the bytes are **in the pipe**, not when the
+//! job read them: a job that does not read blocks the write, and `timeout_ms` bounds the wait (a
+//! `200` with `written` short of the request's end is a short write, as POSIX). Dropping the
+//! connection cancels the write. The pipe is closed when the job ends or is removed.
+//!
+//! ## Job signal
+//!
+//! `{"op":"signal","scope","ids":[..],"signal":"SIGINT"}` sends the signal to the group of each named
+//! job that is running, at once, with no grace and no wait (that is `kill`). `signal` is one of
+//! `SIGHUP`, `SIGINT`, `SIGQUIT`, `SIGUSR1`, `SIGUSR2`, `SIGTERM`, `SIGKILL`, by name; anything else is
+//! `400 unsupported signal`. The answer is `{"sent": [id, ..]}`, the ids that were running and were
+//! signalled: an ended, removed or unknown id is absent and no error, and an endpoint MUST NOT signal a
+//! group whose job has ended (its number may be reused). A signal that kills the shell is reported
+//! as any death by signal is (`signal` in `read`, `list` and the final frame).
+//!
 //! Mapping a vendor's own primitives is the adapter's business; two that fit: **E2B** background
 //! commands (`commands.run(cmd, background=True, timeout=0)` returns a handle whose `pid`
 //! `commands.connect(pid)` reattaches to; `commands.list()`, `kill()`) — its streamed output reaches
@@ -278,8 +340,10 @@
 //! [`conformance::verify`] checks it: a held job's
 //! live output and end, a dropped hold killing an unkept job (measured on the far side), a kept job
 //! surviving its hold and reading back from an offset (read and attach), `kill` reaching a job that
-//! ignores `SIGTERM`, a job's `signal` told from an exit of 128 + S, and `list`/`wipe` staying inside
-//! their scope. `tests/fixtures/exec/jobs.json`
+//! ignores `SIGTERM`, a job's `signal` told from an exit of 128 + S, `list`/`wipe` staying inside
+//! their scope, a job's stderr told from its stdout (`JOBS_STREAMS`), a command's own `env` (`EXEC_ENV`),
+//! positional stdin writes (`JOBS_STDIN`) and the `signal` op (`JOBS_SIGNAL_OP`). All four additions are
+//! mandatory: an endpoint implements the whole document. `tests/fixtures/exec/jobs.json`
 //! holds the decoding vectors.
 //!
 //! ## Sandbox job notify
@@ -805,6 +869,9 @@ struct ExecRequest<'a> {
     /// jobs: a job operation (see "Sandbox jobs"). Absent means the command is run as ever.
     #[serde(skip_serializing_if = "Option::is_none")]
     job: Option<&'a serde_json::Value>,
+    /// The command's own environment (see "Per-command environment"). Absent means none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    env: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 /// What the agent expects back. Extra fields are ignored, so an endpoint may return more.
@@ -870,6 +937,29 @@ fn too_large(url: &str, cap: usize) -> std::io::Error {
     )
 }
 
+/// What a non-2xx answer carries, as the source of the [`std::io::Error`] a request returns: its
+/// status and body, for the callers (a job `write`'s `409`) that read them. `Display` is the
+/// message every caller has always seen.
+#[derive(Debug)]
+pub struct EndpointStatus {
+    pub status: u16,
+    pub body: String,
+    text: String,
+}
+
+impl std::fmt::Display for EndpointStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+impl std::error::Error for EndpointStatus {}
+
+/// The status and body of the non-2xx answer behind `e`, if it is one.
+pub fn endpoint_status(e: &std::io::Error) -> Option<&EndpointStatus> {
+    e.get_ref()?.downcast_ref::<EndpointStatus>()
+}
+
 /// The `timeout_ms` a streamed `bash` job sends: `i32::MAX` ms (~24.8 days), the longest deadline
 /// every endpoint can honor — Node's `setTimeout` fires at once for anything longer. A job's lifetime
 /// is the connection's (see "Disconnect kills"), so this only has to outlast any session; it is not a
@@ -907,6 +997,8 @@ pub struct HttpExecRunner {
     /// behind it may have been replaced, so whatever was learned about it (the probe, the
     /// capabilities above) should be learned again. The agent's lazy attach reads this flag.
     suspect: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// An `env` was proved to be applied by this endpoint; cleared when it is suspected replaced.
+    env_proved: std::sync::atomic::AtomicBool,
 }
 
 impl HttpExecRunner {
@@ -939,6 +1031,7 @@ impl HttpExecRunner {
             auth: None,
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
             suspect: None,
+            env_proved: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -950,6 +1043,8 @@ impl HttpExecRunner {
     }
 
     fn suspect(&self) {
+        self.env_proved
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         if let Some(flag) = &self.suspect {
             flag.store(true, std::sync::atomic::Ordering::Relaxed);
         }
@@ -1021,6 +1116,31 @@ impl HttpExecRunner {
         stream: bool,
         job: Option<&serde_json::Value>,
     ) -> std::io::Result<reqwest::Response> {
+        self.send_env(program, args, cwd, timeout, stdin, stream, job, &[])
+            .await
+    }
+
+    /// [`Self::send_job`] with the command's own environment. An endpoint ignores a field it does
+    /// not know and has no way to say so, so before the first `env` to an endpoint this proves it
+    /// applies one (a command that prints a variable only `env` gave it), and fails closed on one
+    /// that does not: running the command without the environment it was given would be a silent
+    /// wrong answer. Proved again after the endpoint is suspected replaced.
+    #[allow(clippy::too_many_arguments)]
+    #[doc(hidden)]
+    pub async fn send_env(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        timeout: Duration,
+        stdin: Option<&[u8]>,
+        stream: bool,
+        job: Option<&serde_json::Value>,
+        env: &[(String, String)],
+    ) -> std::io::Result<reqwest::Response> {
+        if !env.is_empty() && !self.env_proved.load(std::sync::atomic::Ordering::Relaxed) {
+            self.prove_env().await?;
+        }
         let body = ExecRequest {
             command: program,
             args,
@@ -1029,8 +1149,53 @@ impl HttpExecRunner {
             stdin: stdin.map(|b| base64::engine::general_purpose::STANDARD.encode(b)),
             stream,
             job,
+            env: (!env.is_empty()).then(|| {
+                env.iter()
+                    .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                    .collect()
+            }),
         };
         self.send_request(timeout, &body).await
+    }
+
+    /// The behavioural proof [`Self::send_env`] runs once per endpoint identity.
+    async fn prove_env(&self) -> std::io::Result<()> {
+        let args = [
+            "-c".to_string(),
+            "printf %s \"$BEYOND_ENV_PROBE\"".to_string(),
+        ];
+        let body = ExecRequest {
+            command: "sh",
+            args: &args,
+            cwd: None,
+            timeout_ms: 10_000,
+            stdin: None,
+            stream: false,
+            job: None,
+            env: Some(
+                [(
+                    "BEYOND_ENV_PROBE".to_string(),
+                    serde_json::Value::String("1".into()),
+                )]
+                .into_iter()
+                .collect(),
+            ),
+        };
+        let resp = self.send_request(Duration::from_secs(10), &body).await?;
+        let answer = self.envelope(resp).await?;
+        if answer.exit_code != 0 || answer.stdout != "MQ==" {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!(
+                    "exec endpoint {} predates per-command env: it ran the command without the \
+                     environment it was given",
+                    self.url
+                ),
+            ));
+        }
+        self.env_proved
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
     }
 
     /// Send one request body and return the response once its status is known to be a success.
@@ -1111,12 +1276,16 @@ impl HttpExecRunner {
             };
             return Err(std::io::Error::new(
                 kind,
-                format!(
-                    "exec endpoint {} returned {}: {}",
-                    self.url,
-                    status.as_u16(),
-                    excerpt(&body)
-                ),
+                EndpointStatus {
+                    status: status.as_u16(),
+                    body: String::from_utf8_lossy(&body).into_owned(),
+                    text: format!(
+                        "exec endpoint {} returned {}: {}",
+                        self.url,
+                        status.as_u16(),
+                        excerpt(&body)
+                    ),
+                },
             ));
         }
         Ok(resp)
@@ -1221,6 +1390,20 @@ impl CommandRunner for HttpExecRunner {
         timeout: Duration,
     ) -> std::io::Result<ExecResult> {
         let resp = self.send(program, args, cwd, timeout, None, false).await?;
+        self.answer(resp).await
+    }
+
+    async fn run_with_env(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        timeout: Duration,
+        env: &[(String, String)],
+    ) -> std::io::Result<ExecResult> {
+        let resp = self
+            .send_env(program, args, cwd, timeout, None, false, None, env)
+            .await?;
         self.answer(resp).await
     }
 

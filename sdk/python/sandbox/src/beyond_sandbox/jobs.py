@@ -21,6 +21,7 @@ from .models import (
     JobOutput,
     JobRead,
     JobShellExit,
+    StdinWritten,
     Survivor,
 )
 from .transport import JobTransport
@@ -31,6 +32,8 @@ READ_MAX = _jobs.READ_MAX
 def _collect(a: Attached, ev: JobFrame) -> None:
     if isinstance(ev, JobOutput):
         a.output += ev.data
+        if ev.stderr:
+            a.stderr += ev.data
     elif isinstance(ev, JobGap):
         a.gap += ev.bytes
     elif isinstance(ev, JobShellExit):
@@ -53,9 +56,25 @@ class Jobs:
         *,
         cwd: str | None = None,
         label: str = "",
+        env: dict[str, str] | None = None,
+        stdin_open: bool = False,
     ) -> int:
-        """Start a job the sandbox keeps from the start; returns its process group."""
-        return drive(_jobs.start(scope, job, command, args, cwd, label), self._t)
+        """Start a job the sandbox keeps from the start; returns its process group. ``env`` is the
+        command's own environment; ``stdin_open`` keeps its stdin open for :meth:`write_stdin`
+        (an endpoint that predates it is a ``NotOfferedError`` and the job is stopped)."""
+        return drive(
+            _jobs.start(scope, job, command, args, cwd, label, env, stdin_open), self._t
+        )
+
+    def write_stdin(
+        self, scope: str, job: str, at: int, data: bytes, eof: bool = False
+    ) -> StdinWritten:
+        """Write ``data`` at position ``at`` of the job's stdin; ``eof`` closes it after."""
+        return drive(_jobs.write_stdin(scope, job, at, data, eof), self._t)
+
+    def signal(self, scope: str, jobs: Sequence[str], signal: str) -> builtins.list[str]:
+        """Send a named signal to the running jobs' groups; the ids that were running."""
+        return drive(_jobs.signal(scope, jobs, signal), self._t)
 
     def list(self, scope: str) -> builtins.list[JobInfo]:
         return drive(_jobs.list_jobs(scope), self._t)
@@ -114,9 +133,19 @@ class AsyncJobs:
         *,
         cwd: str | None = None,
         label: str = "",
+        env: dict[str, str] | None = None,
+        stdin_open: bool = False,
     ) -> int:
-        op = _jobs.start(scope, job, command, args, cwd, label)
+        op = _jobs.start(scope, job, command, args, cwd, label, env, stdin_open)
         return await adrive(op, self._t)
+
+    async def write_stdin(
+        self, scope: str, job: str, at: int, data: bytes, eof: bool = False
+    ) -> StdinWritten:
+        return await adrive(_jobs.write_stdin(scope, job, at, data, eof), self._t)
+
+    async def signal(self, scope: str, jobs: Sequence[str], signal: str) -> builtins.list[str]:
+        return await adrive(_jobs.signal(scope, jobs, signal), self._t)
 
     async def list(self, scope: str) -> builtins.list[JobInfo]:
         return await adrive(_jobs.list_jobs(scope), self._t)

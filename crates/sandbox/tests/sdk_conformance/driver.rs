@@ -16,7 +16,9 @@ use base64::Engine as _;
 use beyond_sandbox::Sandbox;
 use beyond_sandbox::exec::CommandRunner;
 use beyond_sandbox::exec_endpoint::HttpExecRunner;
-use beyond_sandbox::exec_endpoint::jobs::{JobEnd, JobEvent, JobId, JobScope, JobSpec, JobStatus};
+use beyond_sandbox::exec_endpoint::jobs::{
+    JobEnd, JobEvent, JobId, JobScope, JobSpec, JobStatus, Stream,
+};
 use beyond_sandbox::fs::shell::{Capabilities, SearchEngine};
 use beyond_sandbox::fs::{FileKind, FsBackend, FsError, SearchQuery};
 use sandbox_conformance::trees::{Layout, Tree};
@@ -189,6 +191,22 @@ fn opt_str<'a>(req: &'a Value, key: &str) -> Result<Option<&'a str>, Value> {
     }
 }
 
+/// `env`: an object of strings, or nothing.
+fn env_arg(req: &Value) -> Result<Vec<(String, String)>, Value> {
+    match &req["env"] {
+        Value::Null => Ok(Vec::new()),
+        Value::Object(m) => m
+            .iter()
+            .map(|(k, v)| {
+                v.as_str()
+                    .map(|v| (k.clone(), v.to_string()))
+                    .ok_or_else(|| err("invalid_request", "`env` must hold strings"))
+            })
+            .collect(),
+        _ => Err(err("invalid_request", "`env` must be an object")),
+    }
+}
+
 fn flag(req: &Value, key: &str) -> Result<bool, Value> {
     match &req[key] {
         Value::Null => Ok(false),
@@ -316,6 +334,8 @@ impl Driver {
                 "job_kill",
                 "job_remove",
                 "job_wipe",
+                "job_write",
+                "job_signal",
             ]);
         }
         ops.extend([
@@ -358,7 +378,10 @@ impl Driver {
                 "driver": "agent-reference",
                 "protocol": 1,
                 "ops": self.ops(),
-                "features": ["frames", "unbounded_stream", "exit_signal"],
+                "features": [
+                    "frames", "unbounded_stream", "exit_signal", "exec_env", "job_streams",
+                    "job_stdin", "job_signal_op"
+                ],
             }));
         }
         if let Some(e) = &self.connect_error {
@@ -393,6 +416,8 @@ impl Driver {
             "job_kill" => self.job_kill(req).await,
             "job_remove" => self.job_remove(req).await,
             "job_wipe" => self.job_wipe(req).await,
+            "job_write" => self.job_write(req).await,
+            "job_signal" => self.job_signal(req).await,
             "stat" => self.stat(req).await,
             "read" => self.read(req).await,
             "write" => self.write(req).await,
@@ -425,6 +450,9 @@ impl Driver {
         }
         if let Some(stdin) = stdin {
             cmd = cmd.stdin(stdin);
+        }
+        for (k, v) in env_arg(req)? {
+            cmd = cmd.env(k, v);
         }
         let r = cmd.run().await.map_err(|e| io_err(&e))?;
         Ok(json!({
@@ -490,6 +518,8 @@ impl Driver {
             args: strings(req, "args")?,
             cwd: opt_str(req, "cwd")?.map(str::to_string),
             label: opt_str(req, "label")?.unwrap_or("").to_string(),
+            env: env_arg(req)?,
+            stdin_open: flag(req, "stdin_open")?,
         };
         let pgid = self
             .jobs()?
@@ -535,6 +565,9 @@ impl Driver {
             "state": state, "code": code, "offset": c.offset, "end": c.end,
             "data_b64": b64(&c.data),
         });
+        if !c.stderr.is_empty() {
+            out["stderr_ranges"] = c.stderr.iter().map(|&(a, n)| json!([a, n])).collect();
+        }
         if let Some(s) = c.signal {
             out["signal"] = json!(s);
         }
@@ -546,11 +579,17 @@ impl Driver {
         let id = Self::job_id(req, "job")?;
         let offset = u64_arg(req, "offset")?.unwrap_or(0);
         let out = Mutex::new(Vec::new());
+        let errs = Mutex::new(Vec::new());
         let gaps = Mutex::new(0u64);
         let end = self
             .jobs()?
             .follow(&scope, &id, offset, &|ev: JobEvent<'_>| match ev {
-                JobEvent::Output(b) => out.lock().unwrap().extend_from_slice(b),
+                JobEvent::Output(b, s) => {
+                    out.lock().unwrap().extend_from_slice(b);
+                    if s == Stream::Stderr {
+                        errs.lock().unwrap().extend_from_slice(b);
+                    }
+                }
                 JobEvent::Gap(n) => *gaps.lock().unwrap() += n,
                 JobEvent::Started(_) | JobEvent::ShellExit(_) => {}
             })
@@ -560,6 +599,9 @@ impl Driver {
             "output_b64": b64(&out.lock().unwrap()),
             "gap": *gaps.lock().unwrap(),
         });
+        if !errs.lock().unwrap().is_empty() {
+            v["stderr_b64"] = json!(b64(&errs.lock().unwrap()));
+        }
         // As `exec_stream` ends: `signal` in place of `exit_code` for a death by signal.
         match end {
             JobEnd::Exit(c) => v["exit_code"] = json!(c),
@@ -585,6 +627,57 @@ impl Driver {
             .map(|(id, d)| json!({ "id": id.as_str(), "detail": d }))
             .collect();
         Ok(json!({ "survivors": survivors }))
+    }
+
+    async fn job_write(&self, req: &Value) -> Out {
+        let scope = self.scope(req)?;
+        let id = Self::job_id(req, "job")?;
+        let at =
+            u64_arg(req, "at")?.ok_or_else(|| err("invalid_request", "`at` must be a count"))?;
+        let data = bytes_arg(req, "data_b64")?;
+        let eof = flag(req, "eof")?;
+        if data.len() > beyond_sandbox::exec_endpoint::jobs::WRITE_MAX {
+            return Err(err("invalid_request", "a write is at most 128 KiB"));
+        }
+        match self.jobs()?.write_stdin(&scope, &id, at, &data, eof).await {
+            Ok(w) => {
+                let mut v = json!({ "written": w.written });
+                if w.closed {
+                    v["closed"] = json!(true);
+                }
+                Ok(v)
+            }
+            Err(e) => {
+                use std::io::ErrorKind::{BrokenPipe, InvalidInput, NotFound, TimedOut};
+                Err(match e.kind() {
+                    NotFound => err("not_found", e.to_string()),
+                    BrokenPipe | TimedOut | InvalidInput => err("conflict", e.to_string()),
+                    _ => io_err(&e),
+                })
+            }
+        }
+    }
+
+    async fn job_signal(&self, req: &Value) -> Out {
+        let scope = self.scope(req)?;
+        let ids: Vec<JobId> = strings(req, "jobs")?
+            .iter()
+            .map(|s| JobId::parse(s).ok_or_else(|| err("invalid_request", "bad job id")))
+            .collect::<Result<_, _>>()?;
+        let signal = str_arg(req, "signal")?;
+        if !beyond_sandbox::exec_endpoint::jobs::JOB_SIGNALS.contains(&signal) {
+            return Err(err(
+                "invalid_request",
+                format!("unsupported signal {signal:?}"),
+            ));
+        }
+        let sent = self
+            .jobs()?
+            .signal(&scope, &ids, signal)
+            .await
+            .map_err(|e| io_err(&e))?;
+        let sent: Vec<&str> = sent.iter().map(JobId::as_str).collect();
+        Ok(json!({ "sent": sent }))
     }
 
     async fn job_remove(&self, req: &Value) -> Out {

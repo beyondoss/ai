@@ -12,8 +12,8 @@ use serde_json::{Value, json};
 
 use super::HttpExecRunner;
 use super::jobs::{
-    EventSink, JobEnd, JobEvent, JobId, JobInfo, JobNotify, JobScope, JobSpec, JobStatus,
-    ReadChunk, SandboxJobs,
+    EventSink, JOB_SIGNALS, JobEnd, JobEvent, JobId, JobInfo, JobNotify, JobScope, JobSpec,
+    JobStatus, ReadChunk, SandboxJobs, StdinWritten, Stream, WRITE_MAX,
 };
 use super::stream::{FRAME_SILENCE_LIMIT, FrameReader};
 
@@ -131,6 +131,26 @@ impl SandboxJobs for HttpJobs {
         dispatch!(self, list(scope))
     }
 
+    async fn write_stdin(
+        &self,
+        scope: &JobScope,
+        id: &JobId,
+        at: u64,
+        data: &[u8],
+        eof: bool,
+    ) -> std::io::Result<StdinWritten> {
+        dispatch!(self, write_stdin(scope, id, at, data, eof))
+    }
+
+    async fn signal(
+        &self,
+        scope: &JobScope,
+        ids: &[JobId],
+        signal: &str,
+    ) -> std::io::Result<Vec<JobId>> {
+        dispatch!(self, signal(scope, ids, signal))
+    }
+
     async fn remove(&self, scope: &JobScope, ids: &[JobId]) -> std::io::Result<()> {
         dispatch!(self, remove(scope, ids))
     }
@@ -181,17 +201,20 @@ impl<'a> NativeJobs<'a> {
     }
 
     /// One streamed operation: frames to `events`, until the final one.
+    #[allow(clippy::too_many_arguments)] // the request's parts, each used once
     async fn stream(
         &self,
         program: &str,
         args: &[String],
         cwd: Option<&str>,
+        env: &[(String, String)],
         job: Value,
+        stdin_open: bool,
         events: EventSink<'_>,
     ) -> std::io::Result<JobEnd> {
         let resp = self
             .runner
-            .send_job(
+            .send_env(
                 program,
                 args,
                 cwd,
@@ -199,6 +222,7 @@ impl<'a> NativeJobs<'a> {
                 None,
                 true,
                 Some(&job),
+                env,
             )
             .await?;
         let mut reader = FrameReader::new(resp);
@@ -214,8 +238,15 @@ impl<'a> NativeJobs<'a> {
                 ));
             };
             match decode_job_frame(&line).map_err(broken)? {
-                JobFrame::Event(Event::Started(pgid)) => events(JobEvent::Started(pgid)),
-                JobFrame::Event(Event::Output(b)) => events(JobEvent::Output(&b)),
+                JobFrame::Event(Event::Started(pgid, stdin)) => {
+                    // An endpoint that predates job stdin ignores the flag and says nothing:
+                    // the job it started would read EOF. Not a job to leave running.
+                    if stdin_open && !stdin {
+                        return Err(predates("job stdin"));
+                    }
+                    events(JobEvent::Started(pgid));
+                }
+                JobFrame::Event(Event::Output(b, s)) => events(JobEvent::Output(&b, s)),
                 JobFrame::Event(Event::Gap(n)) => events(JobEvent::Gap(n)),
                 JobFrame::Event(Event::ShellExit(c)) => events(JobEvent::ShellExit(c)),
                 JobFrame::Heartbeat => {}
@@ -241,10 +272,21 @@ impl SandboxJobs for NativeJobs<'_> {
         let job = Self::op(
             "start",
             scope,
-            json!({ "id": id.as_str(), "hold": true, "label": spec.label }),
+            json!({
+                "id": id.as_str(), "hold": true, "label": spec.label,
+                "stdin_open": spec.stdin_open,
+            }),
         );
-        self.stream(&spec.program, &spec.args, spec.cwd.as_deref(), job, events)
-            .await
+        self.stream(
+            &spec.program,
+            &spec.args,
+            spec.cwd.as_deref(),
+            &spec.env,
+            job,
+            spec.stdin_open,
+            events,
+        )
+        .await
     }
 
     async fn start_kept(
@@ -256,11 +298,14 @@ impl SandboxJobs for NativeJobs<'_> {
         let job = Self::op(
             "start",
             scope,
-            json!({ "id": id.as_str(), "hold": false, "label": spec.label }),
+            json!({
+                "id": id.as_str(), "hold": false, "label": spec.label,
+                "stdin_open": spec.stdin_open,
+            }),
         );
         let resp = self
             .runner
-            .send_job(
+            .send_env(
                 &spec.program,
                 &spec.args,
                 spec.cwd.as_deref(),
@@ -268,11 +313,18 @@ impl SandboxJobs for NativeJobs<'_> {
                 None,
                 false,
                 Some(&job),
+                &spec.env,
             )
             .await?;
         let (body, _) = self.runner.read_capped(resp).await?;
-        let started = serde_json::from_slice::<Value>(&body)
-            .ok()
+        let answer = serde_json::from_slice::<Value>(&body).ok();
+        if spec.stdin_open && answer.as_ref().and_then(|v| v.get("stdin")?.as_bool()) != Some(true)
+        {
+            // Started without its stdin: stop it, so nothing is left running that reads EOF.
+            let _ = self.kill(scope, std::slice::from_ref(id), true).await;
+            return Err(predates("job stdin"));
+        }
+        let started = answer
             .and_then(|v| v.get("started")?.as_u64())
             .ok_or_else(|| {
                 std::io::Error::other(format!(
@@ -299,7 +351,7 @@ impl SandboxJobs for NativeJobs<'_> {
             scope,
             json!({ "id": id.as_str(), "offset": from }),
         );
-        self.stream(INERT, &[], None, job, events).await
+        self.stream(INERT, &[], None, &[], job, false, events).await
     }
 
     async fn read(
@@ -395,6 +447,83 @@ impl SandboxJobs for NativeJobs<'_> {
         parse_list(&v)
     }
 
+    async fn write_stdin(
+        &self,
+        scope: &JobScope,
+        id: &JobId,
+        at: u64,
+        data: &[u8],
+        eof: bool,
+    ) -> std::io::Result<StdinWritten> {
+        use std::io::ErrorKind::{BrokenPipe, InvalidInput, NotFound};
+        if data.len() > WRITE_MAX {
+            return Err(std::io::Error::new(
+                InvalidInput,
+                format!("a write is at most {WRITE_MAX} bytes, got {}", data.len()),
+            ));
+        }
+        let job = Self::op(
+            "write",
+            scope,
+            json!({
+                "id": id.as_str(), "at": at, "eof": eof,
+                "data": base64::engine::general_purpose::STANDARD.encode(data),
+            }),
+        );
+        match self.call(job).await {
+            Ok(v) => parse_written(&v),
+            Err(e) => {
+                let Some(st) = super::endpoint_status(&e) else {
+                    return Err(e);
+                };
+                let kind = match st.status {
+                    404 => NotFound,
+                    409 if st.body.contains("has no stdin") => InvalidInput,
+                    409 if st.body.contains("\"gap\"") => std::io::ErrorKind::TimedOut,
+                    409 | 429 => BrokenPipe,
+                    413 => InvalidInput,
+                    _ => return Err(e),
+                };
+                // The 409 for a gap that never filled and the one for a closed stdin both carry
+                // `written`; the message says which.
+                Err(std::io::Error::new(kind, format!("job stdin: {}", st.body)))
+            }
+        }
+    }
+
+    async fn signal(
+        &self,
+        scope: &JobScope,
+        ids: &[JobId],
+        signal: &str,
+    ) -> std::io::Result<Vec<JobId>> {
+        if !JOB_SIGNALS.contains(&signal) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("unsupported signal {signal:?}; one of {JOB_SIGNALS:?}"),
+            ));
+        }
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<&str> = ids.iter().map(JobId::as_str).collect();
+        let v = self
+            .call(Self::op(
+                "signal",
+                scope,
+                json!({ "ids": ids, "signal": signal }),
+            ))
+            .await?;
+        let sent = v
+            .get("sent")
+            .and_then(Value::as_array)
+            .ok_or_else(|| bad("signal", &v))?;
+        Ok(sent
+            .iter()
+            .filter_map(|i| JobId::parse(i.as_str()?))
+            .collect())
+    }
+
     async fn remove(&self, scope: &JobScope, ids: &[JobId]) -> std::io::Result<()> {
         if ids.is_empty() {
             return Ok(());
@@ -431,8 +560,10 @@ pub enum JobFrame {
 /// A job stream's non-final news, owned.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Event {
-    Started(u32),
-    Output(Vec<u8>),
+    /// The job's process group, and whether it was started with its stdin open (the echo of
+    /// `stdin_open`).
+    Started(u32, bool),
+    Output(Vec<u8>, Stream),
     Gap(u64),
     ShellExit(i32),
 }
@@ -440,6 +571,8 @@ pub enum Event {
 #[derive(Deserialize)]
 struct WireJobFrame {
     started: Option<u64>,
+    #[serde(default)]
+    stdin: bool,
     stdout: Option<String>,
     stderr: Option<String>,
     gap: Option<u64>,
@@ -452,8 +585,8 @@ struct WireJobFrame {
 }
 
 /// Decode one line of a job stream. The frames are streaming's (`stdout`, `stderr`, `{}`,
-/// `shell_exit`, `exit_code`, `signal`, `error`) plus `started` and `gap`; both output streams are
-/// the job's combined output. Unknown fields are ignored, and a line with none known is a heartbeat.
+/// `shell_exit`, `exit_code`, `signal`, `error`) plus `started` and `gap`; an output frame names its
+/// stream, and concatenated they are the job's combined output. Unknown fields are ignored, and a line with none known is a heartbeat.
 pub fn decode_job_frame(line: &[u8]) -> Result<JobFrame, String> {
     let line = line.strip_suffix(b"\r").unwrap_or(line);
     if line.iter().all(u8::is_ascii_whitespace) {
@@ -476,9 +609,11 @@ pub fn decode_job_frame(line: &[u8]) -> Result<JobFrame, String> {
         JobFrame::Error(e)
     } else if let Some(p) = w.started {
         let p = u32::try_from(p).map_err(|_| wire_out_of_range("started", p))?;
-        JobFrame::Event(Event::Started(p))
-    } else if let Some(s) = w.stdout.as_deref().or(w.stderr.as_deref()) {
-        JobFrame::Event(Event::Output(b64(s)?))
+        JobFrame::Event(Event::Started(p, w.stdin))
+    } else if let Some(s) = w.stdout.as_deref() {
+        JobFrame::Event(Event::Output(b64(s)?, Stream::Stdout))
+    } else if let Some(s) = w.stderr.as_deref() {
+        JobFrame::Event(Event::Output(b64(s)?, Stream::Stderr))
     } else if let Some(n) = w.gap {
         JobFrame::Event(Event::Gap(n))
     } else if let Some(c) = w.shell_exit {
@@ -570,13 +705,47 @@ pub fn parse_read(v: &Value) -> std::io::Result<ReadChunk> {
     let data = base64::engine::general_purpose::STANDARD
         .decode(v.get("data").and_then(Value::as_str).unwrap_or(""))
         .map_err(|_| bad("read", v))?;
+    let stderr = match v.get("stderr_ranges") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(r) => r
+            .as_array()
+            .and_then(|a| {
+                a.iter()
+                    .map(|p| {
+                        let p = p.as_array()?;
+                        Some((p.first()?.as_u64()?, p.get(1)?.as_u64()?))
+                    })
+                    .collect::<Option<Vec<_>>>()
+            })
+            .ok_or_else(|| bad("read", v))?,
+    };
     Ok(ReadChunk {
         status: st,
         signal,
         offset: num("offset"),
         end: num("end"),
         data,
+        stderr,
     })
+}
+
+/// A `write` answer: `{"written", "closed"?}`.
+pub fn parse_written(v: &Value) -> std::io::Result<StdinWritten> {
+    Ok(StdinWritten {
+        written: v
+            .get("written")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| bad("write", v))?,
+        closed: v.get("closed").and_then(Value::as_bool).unwrap_or(false),
+    })
+}
+
+/// The error for an endpoint that ignores something the request asked for.
+fn predates(what: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        format!("the endpoint predates {what}: it ran the job without it"),
+    )
 }
 
 /// A `list` answer: `{"jobs": [{"id", "state", "code", "signal"?, "kept", "num", "kind", "seen", "started",

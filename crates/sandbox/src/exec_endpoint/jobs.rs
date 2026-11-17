@@ -139,7 +139,37 @@ pub struct JobSpec {
     pub cwd: Option<String>,
     /// One line; newlines are replaced before it is written.
     pub label: String,
+    /// The command's own environment, over the endpoint's (see the spec's "Per-command
+    /// environment"). A name must be `[A-Za-z_][A-Za-z0-9_]*`, not start `EXECD_`; at most 128
+    /// variables and 32 KiB in all, else the endpoint refuses the start.
+    pub env: Vec<(String, String)>,
+    /// Keep the job's stdin open for [`SandboxJobs::write_stdin`] (default: empty, so a job that
+    /// reads its stdin sees EOF at once).
+    pub stdin_open: bool,
 }
+
+/// The output stream a piece of a job's output came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stream {
+    Stdout,
+    Stderr,
+}
+
+/// What one `write` to a job's stdin left: how many bytes of the stream the job's stdin has taken
+/// in all, and whether it is closed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StdinWritten {
+    pub written: u64,
+    pub closed: bool,
+}
+
+/// The most decoded bytes one `write_stdin` carries.
+pub const WRITE_MAX: usize = 128 * 1024;
+
+/// The signals a job can be sent (`signal`): names only.
+pub const JOB_SIGNALS: [&str; 7] = [
+    "SIGHUP", "SIGINT", "SIGQUIT", "SIGUSR1", "SIGUSR2", "SIGTERM", "SIGKILL",
+];
 
 /// Where a job is in its life, as its directory says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -192,6 +222,10 @@ pub struct ReadChunk {
     pub offset: u64,
     pub end: u64,
     pub data: Vec<u8>,
+    /// Which bytes of `data` came from stderr, as absolute `(from, len)` offsets on the same clock
+    /// as `offset`: ascending, disjoint, inside the window. The rest is stdout. Empty when the
+    /// window holds no stderr, and for an endpoint that keeps the two apart no further than frames.
+    pub stderr: Vec<(u64, u64)>,
 }
 
 /// How a job ended, as a stream's final frame says it: the shell exited with a code, or a signal
@@ -225,8 +259,9 @@ impl JobEnd {
 pub enum JobEvent<'a> {
     /// It started, leading process group `pgid`.
     Started(u32),
-    /// Output, in order.
-    Output(&'a [u8]),
+    /// Output, in order, and the stream it came from. Concatenated, the pieces are the job's
+    /// combined output.
+    Output(&'a [u8], Stream),
     /// This many bytes of output are gone (past the cap) before they could be read.
     Gap(u64),
     /// The shell exited with this status, leaving processes of its group running.
@@ -333,6 +368,29 @@ pub trait SandboxJobs: Send + Sync {
 
     /// Every job in the scope.
     async fn list(&self, scope: &JobScope) -> std::io::Result<Vec<JobInfo>>;
+
+    /// Write `data` at position `at` of the job's stdin (the job must have started with
+    /// `stdin_open`); `eof` closes it after. Positional, so a retry (the same `at`) applies nothing
+    /// twice and a write ahead of the stream waits for the bytes before it. `Err` of kind
+    /// `BrokenPipe` is a stdin that is closed or a job that ended; `TimedOut` a write ahead of the stream whose earlier bytes never came; `NotFound` a job
+    /// that is not there; `InvalidInput` a job without stdin or a write larger than [`WRITE_MAX`].
+    async fn write_stdin(
+        &self,
+        scope: &JobScope,
+        id: &JobId,
+        at: u64,
+        data: &[u8],
+        eof: bool,
+    ) -> std::io::Result<StdinWritten>;
+
+    /// Send `signal` (one of [`JOB_SIGNALS`]) to the jobs' process groups, with no grace and no
+    /// wait. The ids that were running and were signalled; an ended or unknown job is absent.
+    async fn signal(
+        &self,
+        scope: &JobScope,
+        ids: &[JobId],
+        signal: &str,
+    ) -> std::io::Result<Vec<JobId>>;
 
     /// Delete jobs whose processes are gone (a running one is left alone).
     async fn remove(&self, scope: &JobScope, ids: &[JobId]) -> std::io::Result<()>;

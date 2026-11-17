@@ -11,6 +11,7 @@ export type {
   JobInfo,
   JobOps,
   JobSpec,
+  StdinWritten,
   JobState,
   RunOptions,
   RunResult,

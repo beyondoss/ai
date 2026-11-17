@@ -13,6 +13,7 @@ from beyond_sandbox import _wire
 from beyond_sandbox._http import Malformed, ResponseReader, Truncated, build_request, parse_url
 from beyond_sandbox.errors import InvalidRequestError, ProtocolError, TooLargeError, TransportError
 from beyond_sandbox.models import (
+    StdinWritten,
     Exit,
     JobEnd,
     JobGap,
@@ -332,3 +333,34 @@ def test_the_one_shot_answer_vectors() -> None:
         assert r.exit_code == want["exit_code"], name
         assert r.stdout == b64(want["stdout_base64"]), name
         assert r.stderr == b64(want["stderr_base64"]), name
+
+
+# ---- jobs: streams, stdin, signal ----------------------------------------------------------------
+
+
+def test_job_frames_keep_their_stream_and_the_stdin_echo() -> None:
+    assert _wire.decode_job_line(b'{"stderr":"ZXJy"}') == [JobOutput(b"err", True)]
+    assert _wire.decode_job_line(b'{"stdout":"b3V0"}') == [JobOutput(b"out", False)]
+    assert _wire.decode_job_line(b'{"started":7,"stdin":true}') == [JobStarted(7, True)]
+    assert _wire.decode_job_line(b'{"started":7}') == [JobStarted(7, False)]
+
+
+def test_a_read_answer_names_its_stderr_ranges() -> None:
+    v = {"state": "ended", "code": 0, "offset": 0, "end": 9, "data": "QUFBQkJCQ0ND"}
+    assert _wire.parse_read(v).stderr_ranges == ()
+    assert _wire.parse_read({**v, "stderr_ranges": [[3, 3]]}).stderr_ranges == ((3, 3),)
+    with pytest.raises(ProtocolError):
+        _wire.parse_read({**v, "stderr_ranges": [[3]]})
+
+
+def test_a_write_answer_carries_written_and_closed() -> None:
+    assert _wire.parse_written({"written": 6}) == StdinWritten(6, False)
+    assert _wire.parse_written({"written": 6, "closed": True}) == StdinWritten(6, True)
+    with pytest.raises(ProtocolError):
+        _wire.parse_written({})
+
+
+def test_a_request_carries_env_only_when_given() -> None:
+    body = _wire.request_body("true", [], cwd=None, timeout_ms=1, env={"A": "b"})
+    assert json.loads(body)["env"] == {"A": "b"}
+    assert "env" not in json.loads(_wire.request_body("true", [], cwd=None, timeout_ms=1))

@@ -544,6 +544,8 @@ impl Bash {
                             args,
                             cwd,
                             label,
+                            env: Vec::new(),
+                            stdin_open: false,
                         };
                         super::bash_sandbox::run(&shared, &link, &spec).await
                     }

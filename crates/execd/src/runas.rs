@@ -191,6 +191,31 @@ impl RunAs {
     }
 }
 
+/// The one variable that carries a request's `env` to the helper: hex of a JSON array of
+/// `[name, value]` pairs. Reserved by the `EXECD_` prefix, which a request cannot set.
+pub(crate) const ENV_BLOB: &str = "EXECD_CMD_ENV";
+
+pub(crate) fn encode_env(pairs: &[(String, String)]) -> String {
+    use std::fmt::Write as _;
+    let json = serde_json::to_vec(pairs).unwrap_or_default();
+    json.iter()
+        .fold(String::with_capacity(json.len() * 2), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+}
+
+fn decode_env(hex: &str) -> Option<Vec<(String, String)>> {
+    if !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    let bytes: Option<Vec<u8>> = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
+        .collect();
+    serde_json::from_slice(&bytes?).ok()
+}
+
 /// If this process was started as the switch helper, do its job and say how to exit; `None` for a
 /// normal start. A successful `run` never returns: the process becomes the command.
 pub fn helper_main() -> Option<ExitCode> {
@@ -220,6 +245,15 @@ fn helper(args: &[OsString]) -> ExitCode {
         .filter_map(|g| g.parse::<u32>().ok())
         .map(Gid::from_raw)
         .collect();
+    // The request's env, read before the switch and applied only to the final command: it is never
+    // set on this process, so a `LD_PRELOAD` in it takes effect at the exec, as the target.
+    let env = match std::env::var_os(ENV_BLOB) {
+        None => Vec::new(),
+        Some(blob) => match blob.to_str().and_then(decode_env) {
+            Some(pairs) => pairs,
+            None => return fail("bad env blob".into()),
+        },
+    };
     if let Err(e) = switch(uid, gid, &groups) {
         return fail(format!("cannot switch to uid {uid} gid {gid}: {e}"));
     }
@@ -245,7 +279,11 @@ fn helper(args: &[OsString]) -> ExitCode {
                 );
                 return ExitCode::from(127);
             }
-            let err = std::process::Command::new(command).args(argv).exec();
+            let err = std::process::Command::new(command)
+                .args(argv)
+                .env_remove(ENV_BLOB)
+                .envs(env)
+                .exec();
             // 127: not there; 126: there and cannot be run (see `exec::spawn_failure`).
             if err.kind() == std::io::ErrorKind::NotFound {
                 eprint!("{}", crate::exec::not_found(&command.to_string_lossy()));

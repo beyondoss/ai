@@ -123,6 +123,8 @@ pub(crate) async fn connect(
         args,
         cwd: Some(cwd.to_owned()),
         label: format!("mcp {name}"),
+        env: Vec::new(),
+        stdin_open: false,
     };
     store.start_kept(&scope, &id, &spec).await?;
 
@@ -165,7 +167,7 @@ async fn follow_to_end(
 ) {
     let offset = AtomicU64::new(0);
     let sink = |event: JobEvent<'_>| match event {
-        JobEvent::Output(bytes) => {
+        JobEvent::Output(bytes, _) => {
             offset.fetch_add(bytes.len() as u64, Ordering::Relaxed);
             let _ = out.send(bytes.to_vec());
         }

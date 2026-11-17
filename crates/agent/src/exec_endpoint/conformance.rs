@@ -30,6 +30,8 @@
 //! the end, for [`Expectations::notify_idle`]). They add about 35 s to a run, the idle window
 //! included.
 
+mod jobs_ext;
+
 use std::time::{Duration, Instant};
 
 use super::HttpExecRunner;
@@ -148,6 +150,10 @@ pub const JOBS_KEEP: &str = "a kept job outlives its hold and reads back from an
 pub const JOBS_KILL: &str = "kill stops a job's group and removes it";
 pub const JOBS_SIGNAL: &str = "a job's end tells a signal from an exit of 128 + S";
 pub const JOBS_SCOPE: &str = "list and wipe stay inside their scope";
+pub const JOBS_STREAMS: &str = "a job's stderr is told from its stdout on one clock";
+pub const EXEC_ENV: &str = "a command's own environment is applied, EXECD_ names refused";
+pub const JOBS_STDIN: &str = "a job's stdin takes positional writes";
+pub const JOBS_SIGNAL_OP: &str = "the signal op reaches a job's group";
 
 /// Run every check against the endpoint at `url`.
 pub async fn verify(url: &str, headers: &[(String, String)], expect: &Expectations) -> Report {
@@ -215,6 +221,13 @@ pub async fn verify(url: &str, headers: &[(String, String)], expect: &Expectatio
         v.jobs_scope()
     );
     checks.extend([held, hold, keep, kill, signal, scope]);
+    let (streams, env, stdin, signal_op) = tokio::join!(
+        v.jobs_streams(),
+        v.exec_env(),
+        v.jobs_stdin(),
+        v.jobs_signal_op()
+    );
+    checks.extend([streams, env, stdin, signal_op]);
     notify::checks(&v, &mut checks).await;
     Report { checks }
 }
@@ -1087,6 +1100,8 @@ impl Verifier {
             args: Self::args(script),
             cwd: None,
             label: script.into(),
+            env: Vec::new(),
+            stdin_open: false,
         }
     }
 
@@ -1124,7 +1139,7 @@ impl Verifier {
             let mut h = heard.lock().unwrap_or_else(|e| e.into_inner());
             match e {
                 JobEvent::Started(p) => h.0 = Some(p),
-                JobEvent::Output(b) => {
+                JobEvent::Output(b, _) => {
                     h.1.extend_from_slice(b);
                     h.2.get_or_insert_with(Instant::now);
                 }
@@ -1232,7 +1247,7 @@ impl Verifier {
             let mut h = heard.lock().unwrap_or_else(|e| e.into_inner());
             match e {
                 JobEvent::Started(p) => h.0 = Some(p),
-                JobEvent::Output(b) => h.1.extend_from_slice(b),
+                JobEvent::Output(b, _) => h.1.extend_from_slice(b),
                 _ => {}
             }
         };
@@ -1306,7 +1321,7 @@ impl Verifier {
         }
         let follow = std::sync::Mutex::new(Vec::new());
         let events = |e: JobEvent<'_>| {
-            if let JobEvent::Output(b) = e {
+            if let JobEvent::Output(b, _) = e {
                 follow
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())

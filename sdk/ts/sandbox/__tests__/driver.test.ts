@@ -17,7 +17,15 @@ describe("driver without an endpoint", () => {
         driver: "beyond-sandbox-ts",
         protocol: 1,
         ops: [...OPS],
-        features: ["frames", "unbounded_stream", "exit_signal"],
+        features: [
+          "frames",
+          "unbounded_stream",
+          "exit_signal",
+          "exec_env",
+          "job_streams",
+          "job_stdin",
+          "job_signal_op",
+        ],
       },
     });
   });

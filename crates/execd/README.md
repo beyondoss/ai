@@ -12,6 +12,7 @@ from a hung one, and cannot kill. execd implements all of it, and a client sends
 | one-shot  | one request, one answer, with stdin in and the command's bytes out: `stdin`, `stdout` and `stderr` are standard base64, so nothing is lost to text                                                                                      |
 | streaming | the connection is the command's lifetime. `bash` shows progress, a silent command is handed back as a background job instead of blocking the turn, and closing the stream kills the process group                                       |
 | jobs      | sandbox-native jobs: jobs live in the endpoint, survive the agent replica moving, and their output is readable from an offset; a job a signal killed reports `signal` beside `code` 128 + S, so a kill by 9 differs from an exit of 137 |
+| job extras | a job's stderr told from its stdout on one offset clock, positional writes to a kept job's stdin, a named `signal` op, and a command's own `env` (never `EXECD_*`) |
 | notify    | job-end notify: the sandbox calls back when a kept job ends                                                                                                                                                                             |
 
 **Proven:** exec conformance 32/32 live on AWS Fargate and E2B; a 5 MB static binary; 2,372 KiB idle PSS and zero

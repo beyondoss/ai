@@ -75,6 +75,8 @@ fn spec(script: &str) -> JobSpec {
         args: vec!["-c".into(), script.into()],
         cwd: None,
         label: script.into(),
+        env: Vec::new(),
+        stdin_open: false,
     }
 }
 

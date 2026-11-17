@@ -14,7 +14,15 @@ use tokio::io::{AsyncBufReadExt as _, BufReader};
 
 /// What a scenario's `requires.features` may name (sdk/conformance/DRIVER.md): this client reads the
 /// raw stream, so it has all of them.
-const FEATURES: [&str; 3] = ["frames", "unbounded_stream", "exit_signal"];
+const FEATURES: [&str; 7] = [
+    "frames",
+    "unbounded_stream",
+    "exit_signal",
+    "exec_env",
+    "job_streams",
+    "job_stdin",
+    "job_signal_op",
+];
 
 fn config() -> Config {
     let url = std::env::var("CONFORMANCE_URL").unwrap_or_default();

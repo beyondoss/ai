@@ -77,6 +77,10 @@ fn missing_features() -> Value {
     json!({
         "frames": "an MCP tool result arrives whole, so there are no frames or heartbeats to see",
         "unbounded_stream": "exec_stream is job_output over a job's log, which keeps the last 8 MiB of output (a bound of the job protocol): a longer stream loses its head",
+        "exec_env": "the MCP tools take no per-command environment",
+        "job_streams": "job_output returns one combined text, with no stderr ranges",
+        "job_stdin": "the MCP tools have no way to write to a job's stdin",
+        "job_signal_op": "the MCP tools stop a job (job_stop) but send it no other signal",
     })
 }
 

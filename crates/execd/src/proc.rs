@@ -272,6 +272,12 @@ fn has_mark(pid: u32, mark: &str) -> bool {
 /// The live (non-zombie) processes of a job: its process group's members and everything that
 /// carries its mark, wherever it has gone. By reading `/proc`.
 pub(crate) fn job_members(pgid: i32, mark: &str) -> Vec<u32> {
+    members(pgid, mark, false)
+}
+
+/// The scan behind [`job_members`]; `strays_only` keeps just the marked processes that have left
+/// the job's group.
+fn members(pgid: i32, mark: &str, strays_only: bool) -> Vec<u32> {
     let mut out = Vec::new();
     let Ok(dir) = std::fs::read_dir("/proc") else {
         return out;
@@ -286,7 +292,11 @@ pub(crate) fn job_members(pgid: i32, mark: &str) -> Vec<u32> {
         }
         if let Some((state, _, pg)) = stat(pid)
             && is_live(state)
-            && ((pgid > 1 && pg == pgid) || has_mark(pid, mark))
+            && if strays_only {
+                pg != pgid && has_mark(pid, mark)
+            } else {
+                (pgid > 1 && pg == pgid) || has_mark(pid, mark)
+            }
         {
             out.push(pid);
         }
@@ -317,6 +327,18 @@ pub(crate) async fn job_gone(pgid: i32, mark: &str, precise: bool) -> bool {
     }
     let mark = mark.to_string();
     off_runtime(move || job_members(pgid, &mark).is_empty()).await
+}
+
+/// `sig` to the job's group, and to each process that carries its mark and has left the group:
+/// every process of the job gets it once (the `signal` op's contract; [`signal_job`] may reach a
+/// group member twice, which a kill does not mind and a `SIGINT` handler does).
+pub(crate) fn signal_job_once(pgid: i32, mark: &str, sig: Signal) {
+    signal_group(pgid, sig);
+    for pid in members(pgid, mark, true) {
+        if let Ok(raw) = i32::try_from(pid) {
+            let _ = nix::sys::signal::kill(Pid::from_raw(raw), sig);
+        }
+    }
 }
 
 /// `sig` to the job's group and to everything that carries its mark.

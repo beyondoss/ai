@@ -132,6 +132,22 @@ pub(crate) fn command_for(ctx: &Ctx, req: &Request) -> std::process::Command {
     if let Some(home) = &ctx.opts.home {
         cmd.env("HOME", home);
     }
+    // The request's own, last, so it wins over `HOME`; `EXECD_*` was refused at parse, and a job's
+    // mark is set after this returns. Under run-as they ride in one blob the helper applies after
+    // the switch, never on the root helper's own environment.
+    if !req.env_pairs.is_empty() {
+        match &ctx.opts.run_as {
+            Some(_) => {
+                cmd.env(
+                    crate::runas::ENV_BLOB,
+                    crate::runas::encode_env(&req.env_pairs),
+                );
+            }
+            None => {
+                cmd.envs(req.env_pairs.iter().map(|(k, v)| (k, v)));
+            }
+        }
+    }
     cmd
 }
 

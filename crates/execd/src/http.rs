@@ -139,9 +139,72 @@ pub(crate) struct Request {
     /// Kept as a value: only `true` streams, and any other type is an unknown shape to ignore.
     pub stream: Option<Value>,
     pub job: Option<Value>,
+    /// Per-command environment: an object of strings. Kept as a value so a bad shape is a `400`
+    /// naming the rule ([`parse_env`]), not a serde message that could quote a value.
+    pub env: Option<Value>,
+    /// `env`, once it passed [`parse_env`] (empty until the handler has checked it).
+    #[serde(skip)]
+    pub env_pairs: Vec<(String, String)>,
+}
+
+/// The most variables one command's `env` names.
+pub(crate) const ENV_VARS_MAX: usize = 128;
+/// The most bytes of names and values together: keeps the run-as helper's blob (hex, so twice this)
+/// far under the single-string `execve` limit of 128 KiB.
+pub(crate) const ENV_BYTES_MAX: usize = 32 * 1024;
+/// The longest variable name.
+pub(crate) const ENV_NAME_MAX: usize = 256;
+
+/// The rules for a command's `env`, all checked before any process exists. The reason names the rule,
+/// never a value. A name starting `EXECD_` is execd's own (its scrubbed names, the job mark, the run-as
+/// blob): a request must not set one, whatever it names.
+pub(crate) fn parse_env(v: &Value) -> Result<Vec<(String, String)>, String> {
+    let Value::Object(map) = v else {
+        return Err("env must be an object of strings".into());
+    };
+    if map.len() > ENV_VARS_MAX {
+        return Err(format!("env has more than {ENV_VARS_MAX} variables"));
+    }
+    let mut total = 0usize;
+    let mut out = Vec::with_capacity(map.len());
+    for (name, value) in map {
+        let Value::String(value) = value else {
+            return Err("env values must be strings".into());
+        };
+        let mut chars = name.bytes();
+        let first_ok = chars
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_');
+        if !first_ok || !chars.all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            return Err("an env name must match [A-Za-z_][A-Za-z0-9_]*".into());
+        }
+        if name.len() > ENV_NAME_MAX {
+            return Err(format!("an env name is longer than {ENV_NAME_MAX} bytes"));
+        }
+        if name.starts_with("EXECD_") {
+            return Err("env names starting EXECD_ are reserved".into());
+        }
+        if value.contains('\0') {
+            return Err("an env value must not contain NUL".into());
+        }
+        total += name.len() + value.len();
+        if total > ENV_BYTES_MAX {
+            return Err(format!("env is larger than {ENV_BYTES_MAX} bytes"));
+        }
+        out.push((name.clone(), value.clone()));
+    }
+    Ok(out)
 }
 
 impl Request {
+    /// Whether the request starts a command: a one-shot, a stream, or a job `start`.
+    pub fn runs_command(&self) -> bool {
+        match self.job.as_ref().filter(|j| j.is_object()) {
+            None => true,
+            Some(j) => j.get("op").and_then(Value::as_str) == Some("start"),
+        }
+    }
+
     pub fn wants_stream(&self) -> bool {
         self.stream == Some(Value::Bool(true))
     }
@@ -489,13 +552,22 @@ async fn route(ctx: Arc<Ctx>, req: HttpRequest<Incoming>, checked: bool) -> Resp
         }
         Err(_) => return error_response(400, "request body not readable"),
     };
-    let req: Request = match serde_json::from_slice(&bytes) {
+    let mut req: Request = match serde_json::from_slice(&bytes) {
         Ok(r) => r,
         Err(e) => {
             crate::log_info!("request kind=body status=400");
             return error_response(400, &format!("bad request: {e}"));
         }
     };
+    if let Some(env) = req.env.take().filter(|_| req.runs_command()) {
+        match parse_env(&env) {
+            Ok(pairs) => req.env_pairs = pairs,
+            Err(why) => {
+                crate::log_info!("request kind=body status=400");
+                return error_response(400, &why);
+            }
+        }
+    }
     if let Some(observer) = &ctx.opts.observer {
         let headers: Vec<(String, String)> = parts
             .headers
@@ -527,6 +599,11 @@ pub(crate) fn fuzz_request(bytes: &[u8]) -> bool {
     };
     if let Some(job) = req.job.as_ref().filter(|j| j.is_object())
         && !crate::jobs::fuzz_job(job)
+    {
+        return false;
+    }
+    if let Some(env) = req.env.as_ref().filter(|_| req.runs_command())
+        && parse_env(env).is_err()
     {
         return false;
     }

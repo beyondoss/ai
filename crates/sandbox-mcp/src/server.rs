@@ -1028,6 +1028,8 @@ impl SandboxMcp {
             args: vec!["-c".to_string(), a.command],
             cwd: a.cwd.into_inner(),
             label: a.label.unwrap_or_default(),
+            env: Vec::new(),
+            stdin_open: false,
         };
         let t = self.target().await?;
         let pgid = t.sandbox.jobs()?.start_kept(&scope, &id, &spec).await?;

@@ -133,6 +133,34 @@ beside `code` 128 + S, set in the same step as `shell_exit` or the end, so no re
 in place of `{"exit_code": 128 + S}`, as a one-shot stream's is. A job stopped by `kill` therefore reports the signal that
 killed its shell (15, or 9 after the grace). Nothing is persisted: a job lives in the table and is gone with execd.
 
+**Output streams.** The ring keeps which pipe each byte came from, one bit per byte: an in-memory bitmap for the unfinished tail,
+allocated at the job's first stderr byte, and a `<chunk>.e` sidecar (8 KiB, same `0600`, `O_EXCL|O_NOFOLLOW`) beside each full
+chunk that holds any stderr. A job that never writes stderr allocates and writes nothing extra. Eviction removes the sidecar with
+its chunk; a sidecar that cannot be written turns its chunk into a gap, so bytes are never read back mislabelled. `read` answers
+`stderr_ranges` (absolute `[from, len]`, ascending, disjoint, at most `RANGES_MAX` = 1024: the window is cut before the range that
+would exceed it, so an alternating writer cannot grow an answer), and a job stream's frames are keyed `stdout` or `stderr` and
+never span a change of stream. Arrival order between the two pipes is the order the pumps took the job lock, as before.
+
+**Stdin.** `start` with `stdin_open` spawns with a piped stdin (default `/dev/null`: a job that reads to EOF must not hang) and
+the answer echoes `stdin: true`. The job holds a `JobStdin`: the pipe behind an async (FIFO) mutex, `written` (a `watch`), a
+cancel token and a waiter count. `write` is positional (`at`): bytes below `written` are skipped, a write ahead waits on the
+`watch` without holding the pipe (so the write that fills the gap can run), then applies under the mutex, advancing `written`
+after every `write(2)`. So writes are ordered, idempotent and exact when cut off. There is no queue and no polling: a full pipe
+parks the request on the reactor, `timeout_ms` bounds the wait (short write), a dropped connection cancels it. `WRITE_MAX`
+128 KiB, `WAITERS_MAX` 16 per job (429). The token cancels and the pipe is dropped when the job ends or is removed, so no fd
+outlives the job. The std `Mutex<Job>` is never held across an await.
+
+**Signal.** `signal` sends one of seven named signals with `proc::signal_job_once` (the group, plus marked processes that left
+it: each process of the job hears it once) off the runtime, never to a job that has ended (its group number may be reused), and
+answers the ids it signalled. No grace, no table change; a signal that kills the shell is seen by the supervisor like any death.
+
+**Per-command env.** `Request.env` is parsed once, before dispatch, by `http::parse_env` (names, 128 variables, 32 KiB, no NUL,
+`EXECD_` prefix refused, a `400` that names the rule and never a value). `exec::command_for` applies it last (after the scrub
+and `HOME`); the job mark is set after that. Under `EXECD_RUN_AS` it travels in one reserved variable `EXECD_CMD_ENV` (hex JSON)
+that the helper reads and removes before it switches users and applies only to the final `Command`, so a request's `LD_PRELOAD`
+takes effect at the exec, as the target, never in the root helper. An embedder's `Observer.request` receives the raw body, env
+included.
+
 notify is the `notify` module driving `crates/exec-notify`, the pure timing kernel every endpoint shares. The kernel says when an
 attempt begins, when to wait, and when to stop; `notify` makes the request (one `POST`, no redirect, the server's certificate
 verified, 30 s at most) and feeds back what happened. A job's latest `keep` governs, a `keep` abandons the attempt in flight,
@@ -230,6 +258,7 @@ What the spec and the conformance verifier assume, and what holds:
 | `tests/security.rs`                             | the bearer is in none of a command's `env`, its parent's environ, or any readable `/proc/*/environ` (by environment, by file, for streams and jobs); fail-closed start in all its cases, including a bearer that cannot be moved out of the environment; `EXECD_RUN_AS` refusals; as root, a user who cannot read execd's memory, environ or a root-owned bearer file, gets the right uid, groups, `HOME` and directory, and is killed by the shutdown |
 | `tests/auth_matrix.rs`                          | path, method, `Authorization`, body-framing and smuggling cases over HTTP/1.1 and h2c, each refused and each proven to have run nothing by a command that would create a marker file; a control per family proves the vehicle runs                                                                                                                                                                                                                     |
 | `tests/jobtable.rs`                             | the job table against a model, over random operations (`EXECD_JOBS_SEED`, `EXECD_JOBS_CASES`, `EXECD_JOBS_SECS`, `EXECD_JOBS_OPS`; a failure prints its seed and a shrunk list); at the end of every case, once every scope is wiped, execd is back at its starting state (see `tests/baseline.rs`)                                                                                                                                                    |
+| `tests/jobproto.rs`                             | env (applied, hostile shapes refused with nothing run, `EXECD_*` unreachable, `HOME` wins, scope isolation, under `EXECD_RUN_AS` a preload runs only as the target uid), stderr/stdout told apart on one clock with frames and the 1024-range clip, positional stdin writes (retry, overlap, out-of-order over several connections, EOF, after end, 413, bounded waiters, a stalled write does not freeze `list`), the `signal` op (once, scope, ended job, allow-list) |
 | `tests/baseline.rs`                             | after a mixed workload (one-shot, streams finished and dropped, jobs past the 8 MiB spool, kills, removes, a wipe), `/proc` shows the starting open fds and threads, no zombie child, and an empty jobs directory                                                                                                                                                                                                                                      |
 | `tests/parsers.rs`, `fuzz/` (`request`, `ring`) | no body panics the parsers, every refused body is a `4xx`, and the output ring agrees with a plain buffer for every offset and size                                                                                                                                                                                                                                                                                                                    |
 | `tests/conformance.rs`                          | the full verifier, also at `debug` level (then its log is searched for the bearer) and under `EXECD_RUN_AS`                                                                                                                                                                                                                                                                                                                                            |
@@ -372,6 +401,24 @@ EXEC_BENCH_A=/path/to/beyond-ai-demo mise run bench:execd           # on the hos
 sandbox execd is built for. The baseline answers every request with `Connection: close`, so it cannot hold a kept-alive
 connection; its sequential round trips include a connect on each request, and the "new connection each" row gives execd the
 same.
+
+### Job stdin, streams, signal and env (`benches/jobs_stdin.py`)
+
+Loopback, keep-alive HTTP/1.1, release builds, n = 2000 per row, 3 rounds with the baseline (`f8dd7249`) and this tree alternating
+per round (so drift lands on both); date 2026-11-17, load average 17 to 19 from other work on the host (runnable threads 1 to 3
+at start and end), exclusive `homelab-live`, `instd-suite` and all `rust-build` slots held. Raw JSON: `benches/results/2026-11-17-jobs-stdin.json`.
+
+| bar | measure | result (p50 / p95, per-round medians) | verdict |
+| --- | --- | --- | --- |
+| B1 | `list` op, keep-alive | new 0.047-0.049 / 0.064-0.080 ms; baseline 0.047-0.054 / 0.055-0.077 | baseline |
+| P1 | `write` 1 KiB to a `cat >/dev/null` job | 0.054 / 0.072 ms = 1.13 x / 1.12 x B1 | met (<= 1.15 x, <= 1.5 x) |
+| P2 | `write` 1 KiB, until the bytes arrive on an open `attach` | 0.067 / 0.105 ms = 1.4 x / 1.6 x B1 | met (<= 2 x, <= 3 x): no polling tick |
+| P3 | 1 GiB as 128 KiB writes, 8 connections (HTTP/1.1; no h2 client in the harness), `cat >/dev/null` | 145.9 MiB/s vs B3 167.1 (16 MiB one-shot stdin) = 0.87 x | met (>= 0.7 x). Constraint: JSON + base64 per request, not the pipe, so the pipe stays 64 KiB |
+| P4 | threads and fds, 10,000 writes | 1 thread, 17 fds before and after | met |
+| P5 idle | 100 idle jobs | stdin adds 0.6 KiB per job (38.8 against 38.2 KiB without `stdin_open`; the baseline's 46.5 KiB is the two pump buffers and the table entry every job has) | met for what stdin adds; the 4 KiB bar read as absolute is not (38 KiB), and was never a stdin cost |
+| P5 stalled | a job that never reads, 16 queued 128 KiB writers | RSS +8.1 MiB (bound 16 x 0.5 MiB = 8.0 MiB), flat from 3 s to 23 s | within 1.3% of the bound; flat |
+| P6 | idle wakeups, 100 stdin-open jobs, 20 s | 0.0 switches/s (baseline 0.0) | met |
+| P7 | one-shot `true`; job start + read + remove; one-shot `cat` with stdin | 0.94-0.99 / 1.14-1.19 ms vs 0.95-0.97 / 1.17-1.18; 9.3-10.5 ms vs 9.5-10.0; 1.10-1.13 vs 1.08-1.14 ms | within noise |
 
 ### Sandbox-like host (few processes in `/proc`)
 

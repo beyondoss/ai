@@ -31,6 +31,18 @@ use beyond_agent::exec_endpoint::conformance::{self, Expectations, Verdict, veri
 use common::exec_mock::{ExecMock, MockOptions, NotifyFaults, Protocol};
 
 /// The mocks heartbeat fast so the verifier's silent command need not wait out the spec's 5 s.
+/// The four job-protocol additions the mock's own server (every fault variant below) does not have:
+/// a test about another defect does not count them.
+fn lacks_job_protocol(name: &str) -> bool {
+    [
+        conformance::JOBS_STREAMS,
+        conformance::EXEC_ENV,
+        conformance::JOBS_STDIN,
+        conformance::JOBS_SIGNAL_OP,
+    ]
+    .contains(&name)
+}
+
 fn quick() -> (MockOptions, Expectations) {
     (
         MockOptions {
@@ -70,7 +82,7 @@ async fn a_conforming_endpoint_passes_every_check() {
         "{}",
         report.render()
     );
-    assert_eq!(report.checks.len(), 21 + conformance::notify::CHECKS.len());
+    assert_eq!(report.checks.len(), 25 + conformance::notify::CHECKS.len());
 }
 
 /// A conforming mock with one fault: of the notify checks, exactly `check` fails. (The other checks
@@ -191,7 +203,7 @@ async fn an_endpoint_whose_dropped_hold_leaves_the_job_running_fails_the_hold_ch
     let failed: Vec<&str> = report
         .checks
         .iter()
-        .filter(|c| c.verdict == Verdict::Fail)
+        .filter(|c| c.verdict == Verdict::Fail && !lacks_job_protocol(c.name))
         .map(|c| c.name)
         .collect();
     assert_eq!(failed, vec![conformance::JOBS_HOLD], "{}", report.render());
@@ -246,7 +258,7 @@ async fn an_endpoint_that_ends_the_stream_with_the_shell_fails_the_leftover_chec
         report
             .checks
             .iter()
-            .filter(|c| c.verdict == Verdict::Fail)
+            .filter(|c| c.verdict == Verdict::Fail && !lacks_job_protocol(c.name))
             .count(),
         1,
         "{}",
@@ -273,7 +285,7 @@ async fn an_endpoint_that_survives_a_disconnect_fails_the_kill_check() {
     let failed: Vec<&str> = report
         .checks
         .iter()
-        .filter(|c| c.verdict == Verdict::Fail)
+        .filter(|c| c.verdict == Verdict::Fail && !lacks_job_protocol(c.name))
         .map(|c| c.name)
         .collect();
     assert_eq!(
@@ -300,7 +312,7 @@ async fn an_endpoint_that_ignores_the_one_shot_timeout_fails_that_check_alone() 
     let failed: Vec<&str> = report
         .checks
         .iter()
-        .filter(|c| c.verdict == Verdict::Fail)
+        .filter(|c| c.verdict == Verdict::Fail && !lacks_job_protocol(c.name))
         .map(|c| c.name)
         .collect();
     assert_eq!(
@@ -336,7 +348,7 @@ async fn an_endpoint_that_collapses_a_jobs_signal_fails_that_check_alone() {
     let failed: Vec<&str> = report
         .checks
         .iter()
-        .filter(|c| c.verdict == Verdict::Fail)
+        .filter(|c| c.verdict == Verdict::Fail && !lacks_job_protocol(c.name))
         .map(|c| c.name)
         .collect();
     assert_eq!(
@@ -354,6 +366,88 @@ async fn an_endpoint_that_collapses_a_jobs_signal_fails_that_check_alone() {
         "{}",
         report.render()
     );
+}
+
+/// A conforming endpoint without one of the four job-protocol additions fails the check for it
+/// alone, naming what is missing (each flag is the mock's own server, which has none of them).
+async fn only_fails(opts: MockOptions, name: &str, detail: &str) {
+    let (quick_opts, expect) = quick();
+    let report = verify_mock(merge(quick_opts, opts), &expect).await;
+    let failed: Vec<&str> = report
+        .checks
+        .iter()
+        .filter(|c| c.verdict == Verdict::Fail)
+        .map(|c| c.name)
+        .collect();
+    assert_eq!(failed, vec![name], "{}", report.render());
+    assert!(
+        report.check(name).unwrap().detail.contains(detail),
+        "{}",
+        report.render()
+    );
+}
+
+/// `quick()`'s settings with the one defect `broken` sets.
+fn merge(quick: MockOptions, broken: MockOptions) -> MockOptions {
+    MockOptions {
+        splits_job_streams: broken.splits_job_streams,
+        job_stdin: broken.job_stdin,
+        command_env: broken.command_env,
+        job_signal_op: broken.job_signal_op,
+        ..quick
+    }
+}
+
+#[tokio::test]
+async fn an_endpoint_that_merges_a_jobs_streams_fails_that_check_alone() {
+    only_fails(
+        MockOptions {
+            splits_job_streams: false,
+            ..MockOptions::default()
+        },
+        conformance::JOBS_STREAMS,
+        "keyed by the pipe",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn an_endpoint_that_ignores_a_commands_env_fails_that_check_alone() {
+    only_fails(
+        MockOptions {
+            command_env: false,
+            ..MockOptions::default()
+        },
+        conformance::EXEC_ENV,
+        "predates per-command env",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn an_endpoint_without_job_stdin_fails_that_check_alone() {
+    only_fails(
+        MockOptions {
+            job_stdin: false,
+            ..MockOptions::default()
+        },
+        conformance::JOBS_STDIN,
+        "predates job stdin",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn an_endpoint_without_the_signal_op_fails_that_check_alone() {
+    only_fails(
+        MockOptions {
+            job_signal_op: false,
+            ..MockOptions::default()
+        },
+        conformance::JOBS_SIGNAL_OP,
+        "unknown job op",
+    )
+    .await;
 }
 
 /// An endpoint whose base64 is not base64 delivers nothing the client can decode: the verifier must
@@ -374,7 +468,7 @@ async fn an_endpoint_that_reports_a_bare_os_error_fails_the_spawn_check() {
     let failed: Vec<&str> = report
         .checks
         .iter()
-        .filter(|c| c.verdict == Verdict::Fail)
+        .filter(|c| c.verdict == Verdict::Fail && !lacks_job_protocol(c.name))
         .map(|c| c.name)
         .collect();
     assert_eq!(
