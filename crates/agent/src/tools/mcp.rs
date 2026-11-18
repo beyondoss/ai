@@ -3263,11 +3263,9 @@ async fn connect_sandbox_stdio(
     )
     .await
     .map_err(|e| format!("could not start the server in the sandbox: {e}"))?;
-    let transport = crate::tools::mcp_handshake::Guard::new(rmcp::transport::IntoTransport::<
-        rmcp::RoleClient,
-        std::io::Error,
-        _,
-    >::into_transport((read, write)));
+    let transport = crate::tools::mcp_handshake::Guard::new(
+        crate::tools::mcp_stdio::client_transport(read, write),
+    );
     McpHandler::for_dial(&config.name, dial)
         .serve_with_lifecycle(transport, client_lifecycle())
         .await
@@ -3336,11 +3334,9 @@ async fn connect_stdio(
         .map_err(|e| format!("failed to spawn `{command}`: {e}"))?;
 
     // A slow server's late discover answer must not fail the handshake — see `mcp_handshake`.
-    let transport = crate::tools::mcp_handshake::Guard::new(rmcp::transport::IntoTransport::<
-        rmcp::RoleClient,
-        std::io::Error,
-        _,
-    >::into_transport(transport));
+    let transport = crate::tools::mcp_handshake::Guard::new(
+        crate::tools::mcp_stdio::client_transport(transport.0, transport.1),
+    );
     let client = McpHandler::for_dial(&config.name, dial)
         .serve_with_lifecycle(transport, client_lifecycle())
         .await

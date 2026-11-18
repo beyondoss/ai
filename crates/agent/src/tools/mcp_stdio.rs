@@ -185,6 +185,21 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
     hay.windows(needle.len()).any(|w| w == needle)
 }
 
+/// The rmcp client transport over a stdio server's pipe, reading a line up to
+/// [`max_message_bytes`]: rmcp's own default (16 MiB) is smaller than this host's cap, and a line past
+/// it is dropped without an answer, so a tool result between the two would hang its call forever.
+pub(crate) fn client_transport<R, W>(
+    read: R,
+    write: W,
+) -> rmcp::transport::async_rw::AsyncRwTransport<rmcp::RoleClient, R, W>
+where
+    R: tokio::io::AsyncRead + Send + Unpin,
+    W: tokio::io::AsyncWrite + Send + Unpin + 'static,
+{
+    rmcp::transport::async_rw::AsyncRwTransport::new_client(read, write)
+        .with_max_line_length(max_message_bytes())
+}
+
 // ---- per-message caps -------------------------------------------------------------------------------
 
 /// The most one inbound message from a stdio server may be before the host refuses it, in bytes

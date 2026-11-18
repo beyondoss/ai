@@ -30,7 +30,6 @@ use rmcp::model::{
     CallToolRequestParams, CallToolResult, ReadResourceRequestParams, ResourceContents,
 };
 use rmcp::service::{Peer, RunningService};
-use rmcp::transport::TokioChildProcess;
 use rmcp::{RoleClient, ServiceExt as _};
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncBufReadExt as _, BufReader};
@@ -277,6 +276,7 @@ struct Followed {
 
 struct Mcp {
     // Held so the server (a child process) lives as long as the driver.
+    _child: tokio::process::Child,
     _service: RunningService<RoleClient, ()>,
     peer: Peer<RoleClient>,
     /// Counts `exec_stream` jobs, for their ids.
@@ -338,14 +338,27 @@ impl Mcp {
         {
             cmd.env("SANDBOX_CAPS", c);
         }
-        let transport = TokioChildProcess::new(cmd)
+        // Spawned here, not by `TokioChildProcess`, so the read side can take lines past rmcp's 16 MiB
+        // default (see `sandbox_mcp::MAX_LINE`); the child dies with the driver.
+        cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = cmd
+            .spawn()
             .map_err(|e| err("transport", format!("cannot start {bin}: {e}")))?;
+        let (Some(to_server), Some(from_server)) = (child.stdin.take(), child.stdout.take()) else {
+            return Err(err("transport", format!("cannot start {bin}: no pipes")));
+        };
+        let transport =
+            rmcp::transport::async_rw::AsyncRwTransport::new_client(from_server, to_server)
+                .with_max_line_length(sandbox_mcp::MAX_LINE);
         let service = ()
             .serve(transport)
             .await
             .map_err(|e| err("transport", format!("MCP handshake with {bin} failed: {e}")))?;
         let peer = service.peer().clone();
         Ok(Self {
+            _child: child,
             _service: service,
             peer,
             jobs: 0.into(),
