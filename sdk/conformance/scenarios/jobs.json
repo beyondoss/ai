@@ -2807,7 +2807,7 @@
           }
         },
         {
-          "id": "rd",
+          "id": "ready",
           "op": "job_read",
           "scope": "${SCOPE}",
           "job": "sg01",
@@ -2839,7 +2839,7 @@
           }
         },
         {
-          "id": "rd",
+          "id": "after-int",
           "op": "job_read",
           "scope": "${SCOPE}",
           "job": "sg01",
@@ -2871,7 +2871,7 @@
           }
         },
         {
-          "id": "rd",
+          "id": "after-kill",
           "op": "job_read",
           "scope": "${SCOPE}",
           "job": "sg01",
