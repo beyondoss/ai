@@ -399,7 +399,9 @@ impl Verifier {
         }
     }
 
-    /// The `signal` op: a trap in the job hears exactly what was sent, nothing outside the scope or
+    /// The `signal` op (with `SIGUSR1`/`SIGUSR2`, which no launcher pre-ignores: a shell's `cmd &`
+    /// starts a child with `SIGINT` and `SIGQUIT` ignored, and an ignored signal cannot be trapped,
+    /// so a sandbox-exec started that way could never show a `SIGINT` handler run): a trap in the job hears exactly what was sent, nothing outside the scope or
     /// the list is touched, an ended job is not signalled, a bad name is a 400.
     pub(super) async fn jobs_signal_op(&self) -> Check {
         let r: Result<String, String> = async {
@@ -408,8 +410,8 @@ impl Verifier {
             let other = self.scope("sigop-other");
             let id = JobId::fresh();
             let script = format!(
-                "trap 'printf I' INT; trap 'printf U' USR1; printf ready; \
-                 while :; do (trap '' INT USR1; {PAUSE}); done"
+                "trap 'printf 2' USR2; trap 'printf 1' USR1; printf ready; \
+                 while :; do (trap '' USR2 USR1; {PAUSE}); done"
             );
             jobs.start_kept(&scope, &id, &Self::spec(&script))
                 .await
@@ -417,17 +419,17 @@ impl Verifier {
             let sec = Duration::from_secs(10);
             output_until(&jobs, &scope, &id, |o| o == b"ready", sec).await?;
             let sent = jobs
-                .signal(&scope, std::slice::from_ref(&id), "SIGINT")
+                .signal(&scope, std::slice::from_ref(&id), "SIGUSR2")
                 .await
-                .map_err(|e| format!("signal SIGINT: {e}"))?;
+                .map_err(|e| format!("signal SIGUSR2: {e}"))?;
             if sent != [id.clone()] {
-                return Err(format!("SIGINT to a running job answered sent {sent:?}"));
+                return Err(format!("SIGUSR2 to a running job answered sent {sent:?}"));
             }
-            output_until(&jobs, &scope, &id, |o| o == b"readyI", sec).await?;
+            output_until(&jobs, &scope, &id, |o| o == b"ready2", sec).await?;
             jobs.signal(&scope, std::slice::from_ref(&id), "SIGUSR1")
                 .await
                 .map_err(|e| format!("signal SIGUSR1: {e}"))?;
-            output_until(&jobs, &scope, &id, |o| o == b"readyIU", sec).await?;
+            output_until(&jobs, &scope, &id, |o| o == b"ready21", sec).await?;
             // Another scope's signal reaches nothing, and an unknown id is absent, not an error.
             let foreign = jobs
                 .signal(&other, &[id.clone(), JobId::fresh()], "SIGUSR1")
@@ -438,9 +440,9 @@ impl Verifier {
             }
             tokio::time::sleep(Duration::from_millis(400)).await;
             let (out, _, _) = read_all(&jobs, &scope, &id).await.map_err(|e| e.to_string())?;
-            if out != b"readyIU" {
+            if out != b"ready21" {
                 return Err(format!(
-                    "the job heard {:?} after a foreign-scope signal, want readyIU",
+                    "the job heard {:?} after a foreign-scope signal, want ready21",
                     String::from_utf8_lossy(&out)
                 ));
             }

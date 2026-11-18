@@ -2795,7 +2795,7 @@
           "command": "sh",
           "args": [
             "-c",
-            "trap 'printf I' INT; trap 'printf U' USR1; printf ready; while :; do (trap '' INT USR1; sleep 0.2); done"
+            "trap 'printf 2' USR2; trap 'printf 1' USR1; printf ready; while :; do (trap '' USR2 USR1; sleep 0.2); done"
           ],
           "label": "",
           "expect": {
@@ -2829,7 +2829,7 @@
           "jobs": [
             "sg01"
           ],
-          "signal": "SIGINT",
+          "signal": "SIGUSR2",
           "expect": {
             "ok": {
               "sent": [
@@ -2850,7 +2850,7 @@
           },
           "expect": {
             "ok": {
-              "data_utf8": "readyI"
+              "data_utf8": "ready2"
             }
           }
         },
