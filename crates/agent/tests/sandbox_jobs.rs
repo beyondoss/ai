@@ -92,6 +92,8 @@ fn sh(cmd: &str) -> JobSpec {
         args: vec!["-c".into(), cmd.into()],
         cwd: None,
         label: cmd.into(),
+        env: Vec::new(),
+        stdin_open: false,
     }
 }
 
@@ -109,7 +111,7 @@ fn recorder(heard: &Mutex<Heard>) -> impl Fn(JobEvent<'_>) + Send + Sync + '_ {
         let mut h = heard.lock().unwrap();
         match e {
             JobEvent::Started(pgid) => h.started = Some(pgid),
-            JobEvent::Output(b) => h.output.extend_from_slice(b),
+            JobEvent::Output(b, _) => h.output.extend_from_slice(b),
             JobEvent::Gap(n) => h.gaps += n,
             JobEvent::ShellExit(c) => h.shell_exit = Some(c),
         }

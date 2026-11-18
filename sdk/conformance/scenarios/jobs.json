@@ -1616,7 +1616,11 @@
     {
       "id": "jobs.attach.signal",
       "description": "attach reports a signalled job as `signal` N, not an exit code.",
-      "requires": { "features": ["exit_signal"] },
+      "requires": {
+        "features": [
+          "exit_signal"
+        ]
+      },
       "steps": [
         {
           "id": "start",
@@ -1647,7 +1651,9 @@
             "ok": {
               "output_utf8": "up\n",
               "signal": 15,
-              "exit_code": { "$absent": true }
+              "exit_code": {
+                "$absent": true
+              }
             }
           }
         }
@@ -2303,6 +2309,622 @@
                 "$absent": true
               },
               "gap": 0
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.streams.read-names-the-stderr-bytes",
+      "description": "A job's stderr bytes are named on the output's own offsets: read answers stderr_ranges, and the combined data is unchanged.",
+      "requires": {
+        "features": [
+          "job_streams"
+        ]
+      },
+      "steps": [
+        {
+          "id": "start",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "sa01",
+          "command": "sh",
+          "args": [
+            "-c",
+            "printf AAA; sleep 0.3; printf BBB >&2; sleep 0.3; printf CCC"
+          ],
+          "label": "",
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              }
+            }
+          }
+        },
+        {
+          "id": "ended",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "sa01",
+          "offset": 0,
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          },
+          "expect": {
+            "ok": {
+              "state": "ended",
+              "code": 0,
+              "data_utf8": "AAABBBCCC",
+              "stderr_ranges": [
+                [
+                  3,
+                  3
+                ]
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.streams.no-stderr-no-ranges",
+      "description": "A window with no stderr carries no stderr_ranges.",
+      "requires": {
+        "features": [
+          "job_streams"
+        ]
+      },
+      "steps": [
+        {
+          "id": "start",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "sa02",
+          "command": "sh",
+          "args": [
+            "-c",
+            "printf out"
+          ],
+          "label": "",
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              }
+            }
+          }
+        },
+        {
+          "id": "ended",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "sa02",
+          "offset": 0,
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          },
+          "expect": {
+            "ok": {
+              "state": "ended",
+              "data_utf8": "out",
+              "stderr_ranges": {
+                "$absent": true
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.streams.attach-names-stderr",
+      "description": "An attach keys each output frame by its pipe; the combined output is unchanged.",
+      "requires": {
+        "features": [
+          "job_streams"
+        ]
+      },
+      "steps": [
+        {
+          "id": "start",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "sa03",
+          "command": "sh",
+          "args": [
+            "-c",
+            "printf AAA; sleep 0.3; printf BBB >&2; sleep 0.3; printf CCC"
+          ],
+          "label": "",
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              }
+            }
+          }
+        },
+        {
+          "id": "attach",
+          "op": "job_attach",
+          "scope": "${SCOPE}",
+          "job": "sa03",
+          "offset": 0,
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "output_utf8": "AAABBBCCC",
+              "stderr_utf8": "BBB",
+              "gap": 0
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.env.exec",
+      "description": "A one-shot command runs with the env it was given, values exact.",
+      "requires": {
+        "features": [
+          "exec_env"
+        ]
+      },
+      "steps": [
+        {
+          "id": "run",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "printf %s \"$VFY_ENV\""
+          ],
+          "env": {
+            "VFY_ENV": "a b=c $x"
+          },
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "a b=c $x"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.env.job",
+      "description": "A job runs with the env it was started with.",
+      "requires": {
+        "features": [
+          "exec_env"
+        ]
+      },
+      "steps": [
+        {
+          "id": "start",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "ev01",
+          "command": "sh",
+          "args": [
+            "-c",
+            "printf %s \"$VFY_ENV\""
+          ],
+          "label": "",
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              }
+            }
+          },
+          "env": {
+            "VFY_ENV": "in a job"
+          }
+        },
+        {
+          "id": "ended",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "ev01",
+          "offset": 0,
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          },
+          "expect": {
+            "ok": {
+              "state": "ended",
+              "code": 0,
+              "data_utf8": "in a job"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.env.execd-names-are-refused",
+      "description": "A name starting EXECD_ is refused and runs nothing.",
+      "requires": {
+        "features": [
+          "exec_env"
+        ]
+      },
+      "steps": [
+        {
+          "id": "run",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "echo ran"
+          ],
+          "env": {
+            "EXECD_X": "1"
+          },
+          "expect": {
+            "error": {
+              "kind": "endpoint"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.stdin.writes-land-in-order-once",
+      "description": "Positional writes to an open stdin: a repeat applies nothing twice, an overlap applies its new suffix, EOF ends cat.",
+      "requires": {
+        "features": [
+          "job_stdin"
+        ]
+      },
+      "steps": [
+        {
+          "id": "start",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "si01",
+          "command": "cat",
+          "args": [],
+          "stdin_open": true,
+          "label": "",
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              }
+            }
+          }
+        },
+        {
+          "id": "w1",
+          "op": "job_write",
+          "scope": "${SCOPE}",
+          "job": "si01",
+          "at": 0,
+          "data_b64": "aGVsbG8g",
+          "expect": {
+            "ok": {
+              "written": 6
+            }
+          }
+        },
+        {
+          "id": "w2",
+          "op": "job_write",
+          "scope": "${SCOPE}",
+          "job": "si01",
+          "at": 6,
+          "data_b64": "d29ybGQK",
+          "expect": {
+            "ok": {
+              "written": 12
+            }
+          }
+        },
+        {
+          "id": "retry",
+          "op": "job_write",
+          "scope": "${SCOPE}",
+          "job": "si01",
+          "at": 0,
+          "data_b64": "aGVsbG8g",
+          "expect": {
+            "ok": {
+              "written": 12
+            }
+          }
+        },
+        {
+          "id": "overlap",
+          "op": "job_write",
+          "scope": "${SCOPE}",
+          "job": "si01",
+          "at": 6,
+          "data_b64": "d29ybGQKbW9yZQ==",
+          "expect": {
+            "ok": {
+              "written": 16
+            }
+          }
+        },
+        {
+          "id": "eof",
+          "op": "job_write",
+          "scope": "${SCOPE}",
+          "job": "si01",
+          "at": 16,
+          "data_b64": "",
+          "eof": true,
+          "expect": {
+            "ok": {
+              "written": 16,
+              "closed": true
+            }
+          }
+        },
+        {
+          "id": "ended",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "si01",
+          "offset": 0,
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          },
+          "expect": {
+            "ok": {
+              "state": "ended",
+              "code": 0,
+              "data_utf8": "hello world\nmore"
+            }
+          }
+        },
+        {
+          "id": "late",
+          "op": "job_write",
+          "scope": "${SCOPE}",
+          "job": "si01",
+          "at": 16,
+          "data_b64": "bGF0ZQ==",
+          "expect": {
+            "error": {
+              "kind": "conflict"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.stdin.closed-by-default",
+      "description": "A job started without stdin_open has no stdin to write.",
+      "requires": {
+        "features": [
+          "job_stdin"
+        ]
+      },
+      "steps": [
+        {
+          "id": "start",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "si02",
+          "command": "sh",
+          "args": [
+            "-c",
+            "sleep 30"
+          ],
+          "label": "",
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              }
+            }
+          }
+        },
+        {
+          "id": "w",
+          "op": "job_write",
+          "scope": "${SCOPE}",
+          "job": "si02",
+          "at": 0,
+          "data_b64": "eA==",
+          "expect": {
+            "error": {
+              "kind": "conflict"
+            }
+          }
+        },
+        {
+          "id": "kill",
+          "op": "job_kill",
+          "scope": "${SCOPE}",
+          "jobs": [
+            "si02"
+          ],
+          "expect": {
+            "ok": {
+              "survivors": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.stdin.unknown-job",
+      "description": "A write to no job is not_found.",
+      "requires": {
+        "features": [
+          "job_stdin"
+        ]
+      },
+      "steps": [
+        {
+          "id": "w",
+          "op": "job_write",
+          "scope": "${SCOPE}",
+          "job": "si03x",
+          "at": 0,
+          "data_b64": "eA==",
+          "expect": {
+            "error": {
+              "kind": "not_found"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.signal-op.delivers-the-named-signal",
+      "description": "signal reaches the job's group once; an ended job is not signalled; SIGKILL reads as signal 9.",
+      "requires": {
+        "features": [
+          "job_signal_op",
+          "exit_signal"
+        ]
+      },
+      "steps": [
+        {
+          "id": "start",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "sg01",
+          "command": "sh",
+          "args": [
+            "-c",
+            "trap 'printf I' INT; trap 'printf U' USR1; printf ready; while :; do (trap '' INT USR1; sleep 0.2); done"
+          ],
+          "label": "",
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              }
+            }
+          }
+        },
+        {
+          "id": "ready",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "sg01",
+          "offset": 0,
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          },
+          "expect": {
+            "ok": {
+              "data_utf8": "ready"
+            }
+          }
+        },
+        {
+          "id": "int",
+          "op": "job_signal",
+          "scope": "${SCOPE}",
+          "jobs": [
+            "sg01"
+          ],
+          "signal": "SIGINT",
+          "expect": {
+            "ok": {
+              "sent": [
+                "sg01"
+              ]
+            }
+          }
+        },
+        {
+          "id": "after-int",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "sg01",
+          "offset": 0,
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          },
+          "expect": {
+            "ok": {
+              "data_utf8": "readyI"
+            }
+          }
+        },
+        {
+          "id": "kill",
+          "op": "job_signal",
+          "scope": "${SCOPE}",
+          "jobs": [
+            "sg01"
+          ],
+          "signal": "SIGKILL",
+          "expect": {
+            "ok": {
+              "sent": [
+                "sg01"
+              ]
+            }
+          }
+        },
+        {
+          "id": "after-kill",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "sg01",
+          "offset": 0,
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          },
+          "expect": {
+            "ok": {
+              "state": "ended",
+              "code": 137,
+              "signal": 9
+            }
+          }
+        },
+        {
+          "id": "late",
+          "op": "job_signal",
+          "scope": "${SCOPE}",
+          "jobs": [
+            "sg01",
+            "nope"
+          ],
+          "signal": "SIGTERM",
+          "expect": {
+            "ok": {
+              "sent": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.signal-op.refuses-an-unlisted-signal",
+      "description": "A signal off the list is invalid_request.",
+      "requires": {
+        "features": [
+          "job_signal_op"
+        ]
+      },
+      "steps": [
+        {
+          "id": "stop",
+          "op": "job_signal",
+          "scope": "${SCOPE}",
+          "jobs": [
+            "sg02"
+          ],
+          "signal": "SIGSTOP",
+          "expect": {
+            "error": {
+              "kind": "invalid_request"
             }
           }
         }

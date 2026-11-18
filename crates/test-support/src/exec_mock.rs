@@ -133,6 +133,16 @@ pub struct MockOptions {
     /// job stream's final frame. `false` is the endpoint that collapses it into the code alone, so
     /// a kill by signal 9 and an exit of 137 look alike, which the conformance verifier has to catch.
     pub reports_job_signal: bool,
+    /// Keep a job's stderr apart from its stdout: frames keyed by pipe, `stderr_ranges` in `read`.
+    /// `false` is the endpoint that merges them into one stream, which the verifier has to catch.
+    pub splits_job_streams: bool,
+    /// Honour a job's `stdin_open` and the `write` op. `false` is the endpoint whose jobs always
+    /// read EOF.
+    pub job_stdin: bool,
+    /// Apply a request's `env`. `false` is the endpoint that ignores it.
+    pub command_env: bool,
+    /// Implement the job `signal` op. `false` answers it as an unknown op.
+    pub job_signal_op: bool,
 }
 
 /// One way per notify conformance check for an endpoint to get the spec wrong. Each is a change to
@@ -200,6 +210,10 @@ impl Default for MockOptions {
             require_bearer: None,
             enforces_timeout: true,
             reports_job_signal: true,
+            splits_job_streams: true,
+            job_stdin: true,
+            command_env: true,
+            job_signal_op: true,
         }
     }
 }
@@ -210,6 +224,18 @@ impl MockOptions {
     /// offering (a sandbox that kills idle jobs, a callback path that loses its callbacks, a front
     /// that refuses the extensions, a v1 endpoint that ignores stdin), keeps the mock's own server.
     pub fn is_conforming(&self) -> bool {
+        self.conforming_but_for_job_protocol()
+            && self.splits_job_streams
+            && self.job_stdin
+            && self.command_env
+            && self.job_signal_op
+    }
+
+    /// Conforming in everything but the four job-protocol additions
+    /// ([`Self::splits_job_streams`], [`Self::job_stdin`], [`Self::command_env`],
+    /// [`Self::job_signal_op`]), which are each missing from an endpoint by a filter in front of
+    /// execd and not by a second implementation: see [`ExecMock::delegate_lacking`].
+    fn conforming_but_for_job_protocol(&self) -> bool {
         !self.corrupts_base64
             && !self.bare_spawn_errors
             && self.protocol == Protocol::Streaming
@@ -328,6 +354,9 @@ impl ExecMock {
         if opts.is_conforming() {
             return Self::delegate(listener, root, url, &opts);
         }
+        if opts.conforming_but_for_job_protocol() {
+            return Self::delegate_lacking(listener, root, url, opts);
+        }
         let shared = Shared {
             root: root.to_path_buf(),
             opts,
@@ -383,6 +412,39 @@ impl ExecMock {
         }));
         // The handle is dropped: the server runs until the test's runtime ends, as the mock always has.
         execd::serve(listener, o).expect("execd serves");
+        mock
+    }
+
+    /// execd behind a filter that takes away the job-protocol additions `opts` turns off, so that
+    /// each is missing alone: a request loses its `env` or its `stdin_open`, `write` and `signal`
+    /// are unknown ops, and a job's stderr frames and `stderr_ranges` are folded into stdout.
+    fn delegate_lacking(
+        outer: tokio::net::TcpListener,
+        root: &Path,
+        url: String,
+        opts: MockOptions,
+    ) -> Self {
+        let inner_listener = crate::ports::listener();
+        inner_listener.set_nonblocking(true).expect("nonblocking");
+        let inner_url = format!("http://{}/exec", inner_listener.local_addr().expect("addr"));
+        let inner = Self::delegate(
+            tokio::net::TcpListener::from_std(inner_listener).expect("listener"),
+            root,
+            inner_url.clone(),
+            &opts,
+        );
+        let mock = Self { url, ..inner };
+        let client = reqwest::Client::new();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = outer.accept().await {
+                tokio::spawn(lacking_one(
+                    sock,
+                    inner_url.clone(),
+                    client.clone(),
+                    opts.clone(),
+                ));
+            }
+        });
         mock
     }
 
@@ -1920,4 +1982,93 @@ async fn idle_killer(shared: Shared, idle: Duration) {
             signal_group(g, "-KILL");
         }
     }
+}
+
+/// One connection through [`ExecMock::delegate_lacking`]'s filter.
+async fn lacking_one(
+    mut sock: tokio::net::TcpStream,
+    inner: String,
+    client: reqwest::Client,
+    opts: MockOptions,
+) {
+    let Some((headers, mut req)) = read_request(&mut sock).await else {
+        return;
+    };
+    let is_job = req.get("job").is_some_and(Value::is_object);
+    if !opts.command_env
+        && let Some(o) = req.as_object_mut()
+    {
+        o.remove("env");
+    }
+    if let Some(job) = req.get_mut("job").and_then(Value::as_object_mut) {
+        let op = job
+            .get("op")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if (!opts.job_stdin && op == "write") || (!opts.job_signal_op && op == "signal") {
+            let why = format!("unknown job op {op:?}");
+            respond_json(sock, 400, &json!({ "error": why })).await;
+            return;
+        }
+        if !opts.job_stdin {
+            job.remove("stdin_open");
+        }
+    }
+    let mut post = client.post(&inner).json(&req);
+    for (n, v) in &headers {
+        if !matches!(
+            n.as_str(),
+            "host" | "content-length" | "connection" | "transfer-encoding" | "content-type"
+        ) {
+            post = post.header(n.as_str(), v.as_str());
+        }
+    }
+    let Ok(mut resp) = post.send().await else {
+        return;
+    };
+    let status = resp.status().as_u16();
+    let ndjson = resp
+        .headers()
+        .get("content-type")
+        .is_some_and(|v| v.as_bytes().starts_with(b"application/x-ndjson"));
+    if !ndjson {
+        let body = resp.bytes().await.unwrap_or_default();
+        let mut v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        if !opts.splits_job_streams
+            && is_job
+            && let Some(o) = v.as_object_mut()
+        {
+            o.remove("stderr_ranges");
+        }
+        respond_json(sock, status, &v).await;
+        return;
+    }
+    let head = "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nTransfer-Encoding: chunked\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n";
+    if sock.write_all(head.as_bytes()).await.is_err() {
+        return;
+    }
+    let mut pending: Vec<u8> = Vec::new();
+    while let Ok(Some(piece)) = resp.chunk().await {
+        pending.extend_from_slice(&piece);
+        let Some(cut) = pending.iter().rposition(|&b| b == b'\n') else {
+            continue;
+        };
+        let lines: Vec<u8> = pending.drain(..=cut).collect();
+        let lines = if !opts.splits_job_streams && is_job {
+            String::from_utf8_lossy(&lines)
+                .replace("{\"stderr\":", "{\"stdout\":")
+                .into_bytes()
+        } else {
+            lines
+        };
+        let mut out = format!("{:x}\r\n", lines.len()).into_bytes();
+        out.extend_from_slice(&lines);
+        out.extend_from_slice(b"\r\n");
+        if sock.write_all(&out).await.is_err() {
+            return;
+        }
+    }
+    let _ = sock.write_all(b"0\r\n\r\n").await;
+    let _ = sock.shutdown().await;
 }

@@ -14,6 +14,7 @@ export type {
   JobState,
   RunOptions,
   RunResult,
+  StdinWritten,
   Survivor,
   Transport,
 } from "./transport.js";

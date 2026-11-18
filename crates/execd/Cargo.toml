@@ -68,3 +68,8 @@ tempfile = "3"
 [[bench]]
 name = "exec_compare"
 harness = false
+
+# P3 of the job-stdin bars: 1 GiB of 128 KiB writes with 8 in flight over one h2c connection.
+[[bench]]
+name = "jobs_stdin_h2"
+harness = false

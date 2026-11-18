@@ -1,4 +1,4 @@
-//! The MCP server: one sandbox connection, twelve tools (fourteen with a local root) and one resource.
+//! The MCP server: one sandbox connection, fourteen tools (sixteen with a local root) and one resource.
 //!
 //! Every tool is a thin mapping from its arguments to one call of [`beyond_sandbox`] (raw exec,
 //! the file helpers, jobs) and from its outcome to a structured result. The connection is made on
@@ -166,6 +166,9 @@ pub struct ExecArgs {
     stdin: Opt<String>,
     /// Bytes for the command's standard input, base64. Use instead of `stdin` for binary data.
     stdin_base64: Opt<String>,
+    /// Environment variables for this command only, over the sandbox's own: names are
+    /// `[A-Za-z_][A-Za-z0-9_]*` and must not start `EXECD_`. Not combinable with stdin.
+    env: Opt<std::collections::BTreeMap<String, String>>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -274,6 +277,39 @@ pub struct JobStartArgs {
     /// The job's id: 1 to 32 characters of [0-9a-z]. Default: a random one, returned.
     id: Opt<String>,
     /// The group the job belongs to. Default: this server's.
+    scope: Opt<String>,
+    /// Environment variables for this job only, over the sandbox's own (names as for exec).
+    env: Opt<std::collections::BTreeMap<String, String>>,
+    /// Keep the job's standard input open for `job_write`. Default false: the job reads EOF.
+    stdin_open: Opt<bool>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct JobWriteArgs {
+    /// The job's id; it must have been started with `stdin_open`.
+    id: String,
+    /// The position in the job's input stream of the first byte of this write: 0 for the first
+    /// write, then the previous `written`. A repeat of a write applies nothing twice.
+    at: u64,
+    /// Text to write.
+    content: Opt<String>,
+    /// Bytes to write, base64, instead of `content`. At most 128 KiB.
+    content_base64: Opt<String>,
+    /// Close the job's input after this write. Default false.
+    eof: Opt<bool>,
+    /// The group the job belongs to. Default: this server's.
+    scope: Opt<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct JobSignalArgs {
+    /// The jobs to signal.
+    ids: Vec<String>,
+    /// One of SIGHUP, SIGINT, SIGQUIT, SIGUSR1, SIGUSR2, SIGTERM, SIGKILL.
+    signal: String,
+    /// The group the jobs belong to. Default: this server's.
     scope: Opt<String>,
 }
 
@@ -685,6 +721,34 @@ impl SandboxMcp {
     async fn job_kill(&self, Parameters(a): Parameters<JobKillArgs>) -> ToolReply {
         Ok(reply(self.do_job_kill(a).await))
     }
+
+    #[tool(
+        name = "job_write",
+        description = "Write to the standard input of a job started with stdin_open. `at` is the position in the input stream of the first byte (0, then the previous `written`), so repeating a call changes nothing. Returns written (how much input the job has taken) and closed. With eof the job's input is closed after the write. Not found, a job with no stdin, or a closed input are errors.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn job_write(&self, Parameters(a): Parameters<JobWriteArgs>) -> ToolReply {
+        Ok(reply(self.do_job_write(a).await))
+    }
+
+    #[tool(
+        name = "job_signal",
+        description = "Send a signal (SIGHUP, SIGINT, SIGQUIT, SIGUSR1, SIGUSR2, SIGTERM or SIGKILL) to the processes of running jobs, with no wait. Returns sent, the ids that were running. Ended or unknown ids are not errors; use job_kill to stop a job and wait for it.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn job_signal(&self, Parameters(a): Parameters<JobSignalArgs>) -> ToolReply {
+        Ok(reply(self.do_job_signal(a).await))
+    }
 }
 
 impl SandboxMcp {
@@ -707,6 +771,9 @@ impl SandboxMcp {
         }
         if let Some(stdin) = stdin {
             cmd = cmd.stdin(stdin);
+        }
+        for (k, v) in a.env.into_inner().unwrap_or_default() {
+            cmd = cmd.env(k, v);
         }
         let r = cmd.run().await?;
         let (stdout_enc, stdout) = text_or_base64(r.stdout);
@@ -1028,6 +1095,8 @@ impl SandboxMcp {
             args: vec!["-c".to_string(), a.command],
             cwd: a.cwd.into_inner(),
             label: a.label.unwrap_or_default(),
+            env: a.env.into_inner().unwrap_or_default().into_iter().collect(),
+            stdin_open: a.stdin_open.unwrap_or(false),
         };
         let t = self.target().await?;
         let pgid = t.sandbox.jobs()?.start_kept(&scope, &id, &spec).await?;
@@ -1078,7 +1147,61 @@ impl SandboxMcp {
             "end": c.end,
         });
         put_signal(&mut out, c.signal);
+        if !c.stderr.is_empty() {
+            out["stderr_ranges"] = c.stderr.iter().map(|&(a, n)| json!([a, n])).collect();
+        }
         Ok(out)
+    }
+
+    async fn do_job_write(&self, a: JobWriteArgs) -> Out {
+        let scope = self.scope(a.scope.as_deref())?;
+        let id = job_id(&a.id)?;
+        let data = match (a.content.into_inner(), a.content_base64.into_inner()) {
+            (Some(_), Some(_)) => {
+                return Err(ToolError::invalid(
+                    "give content or content_base64, not both",
+                ));
+            }
+            (Some(t), None) => t.into_bytes(),
+            (None, Some(b)) => decode("content_base64", &b)?,
+            (None, None) => Vec::new(),
+        };
+        let t = self.target().await?;
+        let w = t
+            .sandbox
+            .jobs()?
+            .write_stdin(&scope, &id, a.at, &data, a.eof.unwrap_or(false))
+            .await
+            .map_err(|e| {
+                use std::io::ErrorKind::{BrokenPipe, InvalidInput, NotFound, TimedOut};
+                match e.kind() {
+                    NotFound => ToolError::new("not_found", e.to_string()),
+                    BrokenPipe | TimedOut | InvalidInput => {
+                        ToolError::new("conflict", e.to_string())
+                    }
+                    _ => ToolError::from(e),
+                }
+            })?;
+        Ok(json!({ "written": w.written, "closed": w.closed }))
+    }
+
+    async fn do_job_signal(&self, a: JobSignalArgs) -> Out {
+        let scope = self.scope(a.scope.as_deref())?;
+        let ids = a
+            .ids
+            .iter()
+            .map(|s| job_id(s))
+            .collect::<Result<Vec<_>, _>>()?;
+        if !beyond_sandbox::exec_endpoint::jobs::JOB_SIGNALS.contains(&a.signal.as_str()) {
+            return Err(ToolError::invalid(format!(
+                "unsupported signal {:?}; one of SIGHUP, SIGINT, SIGQUIT, SIGUSR1, SIGUSR2, SIGTERM, SIGKILL",
+                a.signal
+            )));
+        }
+        let t = self.target().await?;
+        let sent = t.sandbox.jobs()?.signal(&scope, &ids, &a.signal).await?;
+        let sent: Vec<&str> = sent.iter().map(JobId::as_str).collect();
+        Ok(json!({ "sent": sent }))
     }
 
     async fn do_job_kill(&self, a: JobKillArgs) -> Out {
@@ -1118,7 +1241,7 @@ impl ServerHandler for SandboxMcp {
         .with_instructions(
             "Tools for one sandbox: exec, files (read_file, write_file, edit_file, list_dir, stat, \
              search, mkdir), bulk copy between this machine and the sandbox (upload, download; only \
-             when the server has a local root) and background jobs (job_start, job_list, job_output, job_kill). A failed \
+             when the server has a local root) and background jobs (job_start, job_list, job_output, job_write, job_signal, job_kill). A failed \
              call returns isError with structuredContent.error.kind (not_found, permission_denied, \
              conflict, auth, transport, ...). The sandbox://capabilities resource says what the \
              sandbox supports.",

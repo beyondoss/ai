@@ -24,6 +24,7 @@ from typing import (
 
 from . import _http, _wire
 from .errors import (
+    NotOfferedError,
     ProtocolError,
     SandboxError,
     TimeoutError,
@@ -85,6 +86,7 @@ class AsyncJobTransport(AsyncTransport, Protocol):
         command: str = "true",
         args: Sequence[str] = (),
         cwd: str | None = None,
+        env: dict[str, str] | None = None,
     ) -> Any: ...
 
     async def job_stream(self, job: dict[str, Any]) -> AsyncJobFrameStream: ...
@@ -304,9 +306,14 @@ class AsyncHttpTransport:
         cwd: str | None = None,
         timeout_ms: int = DEFAULT_TIMEOUT_MS,
         stdin: bytes | None = None,
+        env: dict[str, str] | None = None,
     ) -> ExecResult:
         """As :meth:`HttpTransport.run`: the command's bytes."""
-        body = _wire.request_body(command, args, cwd=cwd, timeout_ms=timeout_ms, stdin=stdin)
+        if env:
+            await self._prove_env()
+        body = _wire.request_body(
+            command, args, cwd=cwd, timeout_ms=timeout_ms, stdin=stdin, env=env
+        )
         raw = await self._post(body, timeout_ms, _wire.body_cap(self._cap))
         return _wire.parse_envelope(self.url, raw, self._cap)
 
@@ -332,8 +339,11 @@ class AsyncHttpTransport:
         command: str = "true",
         args: Sequence[str] = (),
         cwd: str | None = None,
+        env: dict[str, str] | None = None,
     ) -> Any:
-        body = _wire.request_body(command, args, cwd=cwd, timeout_ms=30_000, job=job)
+        if env:
+            await self._prove_env()
+        body = _wire.request_body(command, args, cwd=cwd, timeout_ms=30_000, job=job, env=env)
         try:
             return _wire.parse_json(self.url, await self._post(body, 30_000))
         except TooLargeError:
@@ -345,6 +355,30 @@ class AsyncHttpTransport:
         )
         resp = await self._open(body, _wire.STREAM_DEADLINE_MS)
         return _Frames(resp, _wire.job_decoder())
+
+    _env_proved = False
+
+    async def _prove_env(self) -> None:
+        """An endpoint that predates ``env`` ignores it silently: prove once that this one applies
+        it (a command that prints a variable only ``env`` could have set), and fail closed."""
+        if self._env_proved:
+            return
+        body = _wire.request_body(
+            "sh",
+            ["-c", 'printf %s "$BEYOND_ENV_PROBE"'],
+            cwd=None,
+            timeout_ms=10_000,
+            env={"BEYOND_ENV_PROBE": "1"},
+        )
+        r = _wire.parse_envelope(
+            self.url, await self._post(body, 10_000, _wire.body_cap(self._cap)), self._cap
+        )
+        if r.exit_code != 0 or r.stdout != b"1":
+            raise NotOfferedError(
+                f"exec endpoint {self.url} predates per-command env: it ran the command without "
+                "the environment it was given"
+            )
+        self._env_proved = True
 
     async def aclose(self) -> None:
         """Nothing is held between requests; present so a transport can be used as a context."""

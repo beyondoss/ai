@@ -132,6 +132,26 @@ async fn round(addr: SocketAddr, n: usize) {
         stream(addr, &b, Some("stdout")).await;
     }
 
+    // A job with its stdin open and writing both pipes: a write, an EOF, one left open (the wipe
+    // takes it), and stderr past a chunk (sidecars) that eviction must take along.
+    let io = format!("io{n:x}");
+    let mut b = start(&io, "cat; head -c 300000 /dev/zero >&2", false);
+    b["job"]["stdin_open"] = json!(true);
+    post_ok(addr, b).await;
+    for (eof, at) in [(false, 0), (true, 2)] {
+        let w = job(
+            addr,
+            json!({"op":"write","id":io,"at":at,"data":"aGk=","eof":eof}),
+        )
+        .await;
+        assert!(w["written"].is_u64(), "{w}");
+    }
+    wait_ended(addr, &io).await;
+    let open = format!("op{n:x}");
+    let mut b = start(&open, "cat >/dev/null", false);
+    b["job"]["stdin_open"] = json!(true);
+    post_ok(addr, b).await;
+
     // Jobs. One writes past the 8 MiB the spool keeps: the oldest chunks are evicted.
     let big = format!("big{n:x}");
     post_ok(addr, start(&big, "head -c 12582912 /dev/zero", false)).await;

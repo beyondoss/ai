@@ -1,0 +1,668 @@
+start load 33.31 24.71 18.33 7/2932 3762771 runnable 6
+== round 1 P3 h2 prev
+{"B3_oneshot_stdin_MiBps_h2":160.79390220480698,"P3_MiBps_h2":644.168631818198,"gib":1,"inflight":8,"ratio":4.006175750357158}
+== round 1 P3 h2 new
+{"B3_oneshot_stdin_MiBps_h2":184.5807984333151,"P3_MiBps_h2":669.5956800087854,"gib":1,"inflight":8,"ratio":3.6276562117629765}
+== round 2 P3 h2 prev
+{"B3_oneshot_stdin_MiBps_h2":171.86375685428914,"P3_MiBps_h2":679.5972660675376,"gib":1,"inflight":8,"ratio":3.954279124968268}
+== round 2 P3 h2 new
+{"B3_oneshot_stdin_MiBps_h2":107.29474866641009,"P3_MiBps_h2":606.5577267151828,"gib":1,"inflight":8,"ratio":5.653191179011289}
+== P5 sweep prev
+Exception in thread Thread-1 (wr):
+Traceback (most recent call last):
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1075, in _bootstrap_inner
+    self.run()
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1012, in run
+    self._target(*self._args, **self._kwargs)
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 184, in wr
+    cc = s.conn(); s.call(cc, {"command": "true", "timeout_ms": 30000, "job": dict(op="write", scope="b", id="z", at=i * 131072, data=big)})
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 40, in call
+    r = c.getresponse(); d = r.read()
+        ^^^^^^^^^^^^^^^
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 1450, in getresponse
+    response.begin()
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 336, in begin
+    version, status, reason = self._read_status()
+                              ^^^^^^^^^^^^^^^^^^^
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 305, in _read_status
+    raise RemoteDisconnected("Remote end closed connection without"
+http.client.RemoteDisconnected: Remote end closed connection without response
+Exception in thread Thread-5 (wr):
+Traceback (most recent call last):
+Exception in thread Thread-2 (wr):
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1075, in _bootstrap_inner
+Exception in thread Thread-3 (wr):
+Traceback (most recent call last):
+Exception in thread Thread-4 (wr):
+Traceback (most recent call last):
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1075, in _bootstrap_inner
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1075, in _bootstrap_inner
+    self.run()
+    self.run()
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1012, in run
+Traceback (most recent call last):
+    self.run()
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1012, in run
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1075, in _bootstrap_inner
+    self._target(*self._args, **self._kwargs)
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1012, in run
+    self._target(*self._args, **self._kwargs)
+    self.run()
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 184, in wr
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1012, in run
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 184, in wr
+    self._target(*self._args, **self._kwargs)
+    cc = s.conn(); s.call(cc, {"command": "true", "timeout_ms": 30000, "job": dict(op="write", scope="b", id="z", at=i * 131072, data=big)})
+    self._target(*self._args, **self._kwargs)
+    cc = s.conn(); s.call(cc, {"command": "true", "timeout_ms": 30000, "job": dict(op="write", scope="b", id="z", at=i * 131072, data=big)})
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 184, in wr
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 184, in wr
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 40, in call
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 40, in call
+    cc = s.conn(); s.call(cc, {"command": "true", "timeout_ms": 30000, "job": dict(op="write", scope="b", id="z", at=i * 131072, data=big)})
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 40, in call
+    r = c.getresponse(); d = r.read()
+        ^^^^^^^^^^^^^^^
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 1450, in getresponse
+    r = c.getresponse(); d = r.read()
+        ^^^^^^^^^^^^^^^
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 1450, in getresponse
+    cc = s.conn(); s.call(cc, {"command": "true", "timeout_ms": 30000, "job": dict(op="write", scope="b", id="z", at=i * 131072, data=big)})
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 40, in call
+    response.begin()
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 336, in begin
+    r = c.getresponse(); d = r.read()
+        ^^^^^^^^^^^^^^^
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 1450, in getresponse
+    version, status, reason = self._read_status()
+                              ^^^^^^^^^^^^^^^^^^^
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 305, in _read_status
+    r = c.getresponse(); d = r.read()
+    response.begin()
+    raise RemoteDisconnected("Remote end closed connection without"
+    response.begin()
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 336, in begin
+http.client.RemoteDisconnected: Remote end closed connection without response
+        ^^^^^^^^^^^^^^^
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 336, in begin
+    version, status, reason = self._read_status()
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 1450, in getresponse
+                              ^^^^^^^^^^^^^^^^^^^
+    version, status, reason = self._read_status()
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 305, in _read_status
+                              ^^^^^^^^^^^^^^^^^^^
+    response.begin()
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 305, in _read_status
+    raise RemoteDisconnected("Remote end closed connection without"
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 336, in begin
+http.client.RemoteDisconnected: Remote end closed connection without response
+    raise RemoteDisconnected("Remote end closed connection without"
+http.client.RemoteDisconnected: Remote end closed connection without response
+    version, status, reason = self._read_status()
+                              ^^^^^^^^^^^^^^^^^^^
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 305, in _read_status
+    raise RemoteDisconnected("Remote end closed connection without"
+http.client.RemoteDisconnected: Remote end closed connection without response
+Exception in thread Thread-10 (wr):
+Exception in thread Thread-13 (wr):
+Traceback (most recent call last):
+Exception in thread Thread-12 (wr):
+Traceback (most recent call last):
+Exception in thread Thread-8 (wr):
+Traceback (most recent call last):
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1075, in _bootstrap_inner
+Exception in thread Thread-6 (wr):
+Exception in thread Thread-11 (wr):
+Traceback (most recent call last):
+Exception in thread Thread-9 (wr):
+Traceback (most recent call last):
+    self.run()
+Exception in thread Thread-7 (wr):
+Traceback (most recent call last):
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1075, in _bootstrap_inner
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1075, in _bootstrap_inner
+Traceback (most recent call last):
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1075, in _bootstrap_inner
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1075, in _bootstrap_inner
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1012, in run
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1075, in _bootstrap_inner
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1075, in _bootstrap_inner
+    self.run()
+    self._target(*self._args, **self._kwargs)
+    self.run()
+Traceback (most recent call last):
+    self.run()
+    self.run()
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1012, in run
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1075, in _bootstrap_inner
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1012, in run
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1012, in run
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 184, in wr
+    self.run()
+    self.run()
+    self._target(*self._args, **self._kwargs)
+    self.run()
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1012, in run
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1012, in run
+    cc = s.conn(); s.call(cc, {"command": "true", "timeout_ms": 30000, "job": dict(op="write", scope="b", id="z", at=i * 131072, data=big)})
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 184, in wr
+    self._target(*self._args, **self._kwargs)
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1012, in run
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1012, in run
+    cc = s.conn(); s.call(cc, {"command": "true", "timeout_ms": 30000, "job": dict(op="write", scope="b", id="z", at=i * 131072, data=big)})
+    self._target(*self._args, **self._kwargs)
+    self._target(*self._args, **self._kwargs)
+    self._target(*self._args, **self._kwargs)
+    self._target(*self._args, **self._kwargs)
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 184, in wr
+    self._target(*self._args, **self._kwargs)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 40, in call
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 184, in wr
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 184, in wr
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 40, in call
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 184, in wr
+    cc = s.conn(); s.call(cc, {"command": "true", "timeout_ms": 30000, "job": dict(op="write", scope="b", id="z", at=i * 131072, data=big)})
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 184, in wr
+    r = c.getresponse(); d = r.read()
+    cc = s.conn(); s.call(cc, {"command": "true", "timeout_ms": 30000, "job": dict(op="write", scope="b", id="z", at=i * 131072, data=big)})
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 184, in wr
+    r = c.getresponse(); d = r.read()
+    cc = s.conn(); s.call(cc, {"command": "true", "timeout_ms": 30000, "job": dict(op="write", scope="b", id="z", at=i * 131072, data=big)})
+        ^^^^^^^^^^^^^^^
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    cc = s.conn(); s.call(cc, {"command": "true", "timeout_ms": 30000, "job": dict(op="write", scope="b", id="z", at=i * 131072, data=big)})
+    cc = s.conn(); s.call(cc, {"command": "true", "timeout_ms": 30000, "job": dict(op="write", scope="b", id="z", at=i * 131072, data=big)})
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 1450, in getresponse
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 40, in call
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 40, in call
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 40, in call
+    r = c.getresponse(); d = r.read()
+    cc = s.conn(); s.call(cc, {"command": "true", "timeout_ms": 30000, "job": dict(op="write", scope="b", id="z", at=i * 131072, data=big)})
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    response.begin()
+    r = c.getresponse(); d = r.read()
+    r = c.getresponse(); d = r.read()
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 40, in call
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 336, in begin
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        ^^^^^^^^^^^^^^^
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 40, in call
+        ^^^^^^^^^^^^^^^
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 1450, in getresponse
+    r = c.getresponse(); d = r.read()
+        ^^^^^^^^^^^^^^^
+        ^^^^^^^^^^^^^^^
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 1450, in getresponse
+    response.begin()
+    r = c.getresponse(); d = r.read()
+    version, status, reason = self._read_status()
+        ^^^^^^^^^^^^^^^
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 1450, in getresponse
+        ^^^^^^^^^^^^^^^
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 1450, in getresponse
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 336, in begin
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 40, in call
+                              ^^^^^^^^^^^^^^^^^^^
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 305, in _read_status
+    response.begin()
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 1450, in getresponse
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 1450, in getresponse
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 336, in begin
+    version, status, reason = self._read_status()
+    r = c.getresponse(); d = r.read()
+    response.begin()
+    response.begin()
+                              ^^^^^^^^^^^^^^^^^^^
+    version, status, reason = self._read_status()
+    response.begin()
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 336, in begin
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 336, in begin
+        ^^^^^^^^^^^^^^^
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 1450, in getresponse
+    raise RemoteDisconnected("Remote end closed connection without"
+    version, status, reason = self._read_status()
+    response.begin()
+    version, status, reason = self._read_status()
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 305, in _read_status
+                              ^^^^^^^^^^^^^^^^^^^
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 305, in _read_status
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 336, in begin
+                              ^^^^^^^^^^^^^^^^^^^
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 305, in _read_status
+                              ^^^^^^^^^^^^^^^^^^^
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 305, in _read_status
+http.client.RemoteDisconnected: Remote end closed connection without response
+    raise RemoteDisconnected("Remote end closed connection without"
+    response.begin()
+    raise RemoteDisconnected("Remote end closed connection without"
+http.client.RemoteDisconnected: Remote end closed connection without response
+    raise RemoteDisconnected("Remote end closed connection without"
+    raise RemoteDisconnected("Remote end closed connection without"
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 336, in begin
+http.client.RemoteDisconnected: Remote end closed connection without response
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 336, in begin
+http.client.RemoteDisconnected: Remote end closed connection without response
+http.client.RemoteDisconnected: Remote end closed connection without response
+    version, status, reason = self._read_status()
+    version, status, reason = self._read_status()
+                              ^^^^^^^^^^^^^^^^^^^
+    version, status, reason = self._read_status()
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 305, in _read_status
+                              ^^^^^^^^^^^^^^^^^^^
+                              ^^^^^^^^^^^^^^^^^^^
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 305, in _read_status
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 305, in _read_status
+    raise RemoteDisconnected("Remote end closed connection without"
+    raise RemoteDisconnected("Remote end closed connection without"
+    raise RemoteDisconnected("Remote end closed connection without"
+http.client.RemoteDisconnected: Remote end closed connection without response
+http.client.RemoteDisconnected: Remote end closed connection without response
+http.client.RemoteDisconnected: Remote end closed connection without response
+Exception in thread Thread-29 (wr):
+Exception in thread Thread-21 (wr):
+Traceback (most recent call last):
+Traceback (most recent call last):
+Exception in thread Thread-23 (wr):
+Traceback (most recent call last):
+Exception in thread Thread-18 (wr):
+Exception in thread Thread-16 (wr):
+Traceback (most recent call last):
+Exception in thread Thread-15 (wr):
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1075, in _bootstrap_inner
+Exception in thread Thread-19 (wr):
+Exception in thread Thread-25 (wr):
+Exception in thread Thread-27 (wr):
+Traceback (most recent call last):
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1075, in _bootstrap_inner
+Exception in thread Thread-26 (wr):
+Traceback (most recent call last):
+Exception in thread Thread-17 (wr):
+Traceback (most recent call last):
+{
+ "0": {
+  "rss_kb_before": 5348,
+  "delta_3s_kb": 0,
+  "delta_13s_kb": 0,
+  "kb_per_writer": null
+ },
+ "1": {
+  "rss_kb_before": 5140,
+  "delta_3s_kb": 516,
+  "delta_13s_kb": 516,
+  "kb_per_writer": 516.0
+ },
+ "4": {
+  "rss_kb_before": 5440,
+  "delta_3s_kb": 2016,
+  "delta_13s_kb": 2016,
+  "kb_per_writer": 504.0
+ },
+ "8": {
+  "rss_kb_before": 5376,
+  "delta_3s_kb": 4208,
+  "delta_13s_kb": 4208,
+  "kb_per_writer": 526.0
+ },
+ "16": {
+  "rss_kb_before": 5400,
+  "delta_3s_kb": 8368,
+  "delta_13s_kb": 8368,
+  "kb_per_writer": 523.0
+ }
+}
+Fatal Python error: _enter_buffered_busy: could not acquire lock for <_io.BufferedWriter name='<stderr>'> at interpreter shutdown, possibly due to daemon threads
+Python runtime state: finalizing (tstate=0x00000000015a5808)
+
+Current thread 0x00007fe0a52d2740 (most recent call first):
+  <no Python frame>
+/home/jared/.cache/execd-build/perf2.sh: line 14: 3768268 Aborted                 python3 $HOME/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py --p5 --bin $E/execd-prev
+== P5 sweep new
+Exception in thread Thread-1 (wr):
+Traceback (most recent call last):
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1075, in _bootstrap_inner
+    self.run()
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1012, in run
+    self._target(*self._args, **self._kwargs)
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 184, in wr
+    cc = s.conn(); s.call(cc, {"command": "true", "timeout_ms": 30000, "job": dict(op="write", scope="b", id="z", at=i * 131072, data=big)})
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 40, in call
+    r = c.getresponse(); d = r.read()
+        ^^^^^^^^^^^^^^^
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 1450, in getresponse
+    response.begin()
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 336, in begin
+    version, status, reason = self._read_status()
+                              ^^^^^^^^^^^^^^^^^^^
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 305, in _read_status
+    raise RemoteDisconnected("Remote end closed connection without"
+http.client.RemoteDisconnected: Remote end closed connection without response
+Exception in thread Thread-5 (wr):
+Exception in thread Thread-4 (wr):
+Traceback (most recent call last):
+Traceback (most recent call last):
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1075, in _bootstrap_inner
+Exception in thread Thread-3 (wr):
+Traceback (most recent call last):
+Exception in thread Thread-2 (wr):
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1075, in _bootstrap_inner
+    self.run()
+Traceback (most recent call last):
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1075, in _bootstrap_inner
+    self.run()
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1012, in run
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1075, in _bootstrap_inner
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1012, in run
+    self.run()
+    self._target(*self._args, **self._kwargs)
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1012, in run
+    self.run()
+    self._target(*self._args, **self._kwargs)
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 184, in wr
+    self._target(*self._args, **self._kwargs)
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 184, in wr
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1012, in run
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 184, in wr
+    cc = s.conn(); s.call(cc, {"command": "true", "timeout_ms": 30000, "job": dict(op="write", scope="b", id="z", at=i * 131072, data=big)})
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 40, in call
+    cc = s.conn(); s.call(cc, {"command": "true", "timeout_ms": 30000, "job": dict(op="write", scope="b", id="z", at=i * 131072, data=big)})
+    self._target(*self._args, **self._kwargs)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    cc = s.conn(); s.call(cc, {"command": "true", "timeout_ms": 30000, "job": dict(op="write", scope="b", id="z", at=i * 131072, data=big)})
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 40, in call
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 184, in wr
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 40, in call
+    r = c.getresponse(); d = r.read()
+    cc = s.conn(); s.call(cc, {"command": "true", "timeout_ms": 30000, "job": dict(op="write", scope="b", id="z", at=i * 131072, data=big)})
+    r = c.getresponse(); d = r.read()
+    r = c.getresponse(); d = r.read()
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        ^^^^^^^^^^^^^^^
+        ^^^^^^^^^^^^^^^
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 1450, in getresponse
+        ^^^^^^^^^^^^^^^
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 1450, in getresponse
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 40, in call
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 1450, in getresponse
+    r = c.getresponse(); d = r.read()
+    response.begin()
+    response.begin()
+    response.begin()
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 336, in begin
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 336, in begin
+        ^^^^^^^^^^^^^^^
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 336, in begin
+    version, status, reason = self._read_status()
+    version, status, reason = self._read_status()
+                              ^^^^^^^^^^^^^^^^^^^
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 305, in _read_status
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 1450, in getresponse
+                              ^^^^^^^^^^^^^^^^^^^
+    version, status, reason = self._read_status()
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 305, in _read_status
+                              ^^^^^^^^^^^^^^^^^^^
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 305, in _read_status
+    raise RemoteDisconnected("Remote end closed connection without"
+http.client.RemoteDisconnected: Remote end closed connection without response
+    raise RemoteDisconnected("Remote end closed connection without"
+http.client.RemoteDisconnected: Remote end closed connection without response
+    raise RemoteDisconnected("Remote end closed connection without"
+http.client.RemoteDisconnected: Remote end closed connection without response
+    response.begin()
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 336, in begin
+    version, status, reason = self._read_status()
+                              ^^^^^^^^^^^^^^^^^^^
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 305, in _read_status
+    raise RemoteDisconnected("Remote end closed connection without"
+http.client.RemoteDisconnected: Remote end closed connection without response
+Exception in thread Thread-9 (wr):
+Traceback (most recent call last):
+Exception in thread Thread-8 (wr):
+Traceback (most recent call last):
+Exception in thread Thread-11 (wr):
+Exception in thread Thread-6 (wr):
+Exception in thread Thread-7 (wr):
+Traceback (most recent call last):
+Exception in thread Thread-13 (wr):
+Traceback (most recent call last):
+Traceback (most recent call last):
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1075, in _bootstrap_inner
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1075, in _bootstrap_inner
+Exception in thread Thread-12 (wr):
+Traceback (most recent call last):
+Traceback (most recent call last):
+    self.run()
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1075, in _bootstrap_inner
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1075, in _bootstrap_inner
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1075, in _bootstrap_inner
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1075, in _bootstrap_inner
+Exception in thread Thread-10 (wr):
+Traceback (most recent call last):
+    self.run()
+    self.run()
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1075, in _bootstrap_inner
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1075, in _bootstrap_inner
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1012, in run
+    self.run()
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1012, in run
+    self.run()
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1012, in run
+    self._target(*self._args, **self._kwargs)
+    self.run()
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1012, in run
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1012, in run
+    self._target(*self._args, **self._kwargs)
+    self.run()
+    self._target(*self._args, **self._kwargs)
+    self._target(*self._args, **self._kwargs)
+    self._target(*self._args, **self._kwargs)
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1012, in run
+    self.run()
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 184, in wr
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 184, in wr
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1012, in run
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 184, in wr
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 184, in wr
+    cc = s.conn(); s.call(cc, {"command": "true", "timeout_ms": 30000, "job": dict(op="write", scope="b", id="z", at=i * 131072, data=big)})
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1012, in run
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 184, in wr
+    cc = s.conn(); s.call(cc, {"command": "true", "timeout_ms": 30000, "job": dict(op="write", scope="b", id="z", at=i * 131072, data=big)})
+    cc = s.conn(); s.call(cc, {"command": "true", "timeout_ms": 30000, "job": dict(op="write", scope="b", id="z", at=i * 131072, data=big)})
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    cc = s.conn(); s.call(cc, {"command": "true", "timeout_ms": 30000, "job": dict(op="write", scope="b", id="z", at=i * 131072, data=big)})
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    cc = s.conn(); s.call(cc, {"command": "true", "timeout_ms": 30000, "job": dict(op="write", scope="b", id="z", at=i * 131072, data=big)})
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 40, in call
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    self._target(*self._args, **self._kwargs)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 40, in call
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 40, in call
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 184, in wr
+    self._target(*self._args, **self._kwargs)
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 40, in call
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 40, in call
+    r = c.getresponse(); d = r.read()
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 184, in wr
+    r = c.getresponse(); d = r.read()
+    self._target(*self._args, **self._kwargs)
+    r = c.getresponse(); d = r.read()
+    r = c.getresponse(); d = r.read()
+        ^^^^^^^^^^^^^^^
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 184, in wr
+    cc = s.conn(); s.call(cc, {"command": "true", "timeout_ms": 30000, "job": dict(op="write", scope="b", id="z", at=i * 131072, data=big)})
+    r = c.getresponse(); d = r.read()
+        ^^^^^^^^^^^^^^^
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 1450, in getresponse
+        ^^^^^^^^^^^^^^^
+    cc = s.conn(); s.call(cc, {"command": "true", "timeout_ms": 30000, "job": dict(op="write", scope="b", id="z", at=i * 131072, data=big)})
+        ^^^^^^^^^^^^^^^
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 1450, in getresponse
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 1450, in getresponse
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 40, in call
+    response.begin()
+        ^^^^^^^^^^^^^^^
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 1450, in getresponse
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 40, in call
+    response.begin()
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 1450, in getresponse
+    cc = s.conn(); s.call(cc, {"command": "true", "timeout_ms": 30000, "job": dict(op="write", scope="b", id="z", at=i * 131072, data=big)})
+    r = c.getresponse(); d = r.read()
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 336, in begin
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 336, in begin
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    response.begin()
+    response.begin()
+    response.begin()
+  File "/home/jared/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py", line 40, in call
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 336, in begin
+    version, status, reason = self._read_status()
+    version, status, reason = self._read_status()
+    r = c.getresponse(); d = r.read()
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 336, in begin
+                              ^^^^^^^^^^^^^^^^^^^
+                              ^^^^^^^^^^^^^^^^^^^
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 305, in _read_status
+        ^^^^^^^^^^^^^^^
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 1450, in getresponse
+    r = c.getresponse(); d = r.read()
+    version, status, reason = self._read_status()
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 305, in _read_status
+        ^^^^^^^^^^^^^^^
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 1450, in getresponse
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 336, in begin
+    version, status, reason = self._read_status()
+        ^^^^^^^^^^^^^^^
+                              ^^^^^^^^^^^^^^^^^^^
+    raise RemoteDisconnected("Remote end closed connection without"
+    response.begin()
+    response.begin()
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 305, in _read_status
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 1450, in getresponse
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 336, in begin
+http.client.RemoteDisconnected: Remote end closed connection without response
+    raise RemoteDisconnected("Remote end closed connection without"
+    response.begin()
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 336, in begin
+    raise RemoteDisconnected("Remote end closed connection without"
+    version, status, reason = self._read_status()
+                              ^^^^^^^^^^^^^^^^^^^
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 305, in _read_status
+    version, status, reason = self._read_status()
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 336, in begin
+http.client.RemoteDisconnected: Remote end closed connection without response
+                              ^^^^^^^^^^^^^^^^^^^
+    raise RemoteDisconnected("Remote end closed connection without"
+http.client.RemoteDisconnected: Remote end closed connection without response
+    version, status, reason = self._read_status()
+                              ^^^^^^^^^^^^^^^^^^^
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 305, in _read_status
+http.client.RemoteDisconnected: Remote end closed connection without response
+    version, status, reason = self._read_status()
+                              ^^^^^^^^^^^^^^^^^^^
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 305, in _read_status
+                              ^^^^^^^^^^^^^^^^^^^
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 305, in _read_status
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/http/client.py", line 305, in _read_status
+    raise RemoteDisconnected("Remote end closed connection without"
+    raise RemoteDisconnected("Remote end closed connection without"
+    raise RemoteDisconnected("Remote end closed connection without"
+    raise RemoteDisconnected("Remote end closed connection without"
+http.client.RemoteDisconnected: Remote end closed connection without response
+http.client.RemoteDisconnected: Remote end closed connection without response
+http.client.RemoteDisconnected: Remote end closed connection without response
+http.client.RemoteDisconnected: Remote end closed connection without response
+Exception in thread Thread-19 (wr):
+Exception in thread Thread-18 (wr):
+Traceback (most recent call last):
+Exception in thread Thread-21 (wr):
+Traceback (most recent call last):
+Traceback (most recent call last):
+Exception in thread Thread-28 (wr):
+Exception in thread Thread-17 (wr):
+Traceback (most recent call last):
+Exception in thread Thread-16 (wr):
+Traceback (most recent call last):
+Exception in thread Thread-29 (wr):
+Traceback (most recent call last):
+Exception in thread Thread-14 (wr):
+Exception in thread Thread-22 (wr):
+Traceback (most recent call last):
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1075, in _bootstrap_inner
+Exception in thread Thread-24 (wr):
+Traceback (most recent call last):
+Exception in thread Thread-15 (wr):
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1075, in _bootstrap_inner
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1075, in _bootstrap_inner
+Traceback (most recent call last):
+Exception in thread Thread-26 (wr):
+Traceback (most recent call last):
+Exception in thread Thread-25 (wr):
+Traceback (most recent call last):
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1075, in _bootstrap_inner
+Traceback (most recent call last):
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1075, in _bootstrap_inner
+Exception in thread Thread-23 (wr):
+Traceback (most recent call last):
+    self.run()
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1075, in _bootstrap_inner
+Traceback (most recent call last):
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1075, in _bootstrap_inner
+Exception in thread Thread-20 (wr):
+Traceback (most recent call last):
+  File "/home/jared/.local/share/mise/installs/python/3.12.13/lib/python3.12/threading.py", line 1075, in _bootstrap_inner
+{
+ "0": {
+  "rss_kb_before": 5292,
+  "delta_3s_kb": 0,
+  "delta_13s_kb": 0,
+  "kb_per_writer": null
+ },
+ "1": {
+  "rss_kb_before": 5520,
+  "delta_3s_kb": 496,
+  "delta_13s_kb": 496,
+  "kb_per_writer": 496.0
+ },
+ "4": {
+  "rss_kb_before": 5328,
+  "delta_3s_kb": 2032,
+  "delta_13s_kb": 2032,
+  "kb_per_writer": 508.0
+ },
+ "8": {
+  "rss_kb_before": 5304,
+  "delta_3s_kb": 4180,
+  "delta_13s_kb": 4180,
+  "kb_per_writer": 522.5
+ },
+ "16": {
+  "rss_kb_before": 5356,
+  "delta_3s_kb": 8264,
+  "delta_13s_kb": 8264,
+  "kb_per_writer": 516.5
+ }
+}
+Fatal Python error: _enter_buffered_busy: could not acquire lock for <_io.BufferedWriter name='<stderr>'> at interpreter shutdown, possibly due to daemon threads
+Python runtime state: finalizing (tstate=0x00000000015a5808)
+
+Current thread 0x00007f0c52360740 (most recent call first):
+  <no Python frame>
+/home/jared/.cache/execd-build/perf2.sh: line 15: 3777653 Aborted                 python3 $HOME/.cache/wt/execd-build-ai/crates/execd/benches/jobs_stdin.py --p5 --bin $E/execd-new
+end load 16.01 20.81 17.79 2/2880 3782206 runnable 2
+done 0

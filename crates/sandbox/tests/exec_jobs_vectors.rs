@@ -4,9 +4,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use base64::Engine as _;
-use beyond_sandbox::exec_endpoint::jobs::{JobEnd, JobStatus};
+use beyond_sandbox::exec_endpoint::jobs::{JobEnd, JobStatus, Stream};
 use beyond_sandbox::exec_endpoint::jobs_native::{
-    Event, JobFrame, decode_job_frame, parse_list, parse_read, parse_survivors,
+    Event, JobFrame, decode_job_frame, parse_list, parse_read, parse_survivors, parse_written,
 };
 use serde_json::Value;
 
@@ -34,10 +34,17 @@ fn job_streams_decode_as_the_vectors_say() {
         let name = case["name"].as_str().unwrap();
         let (mut started, mut output, mut gap, mut shell) = (None, Vec::new(), 0, Vec::new());
         let (mut end, mut error) = (None, None);
+        let (mut stdin, mut streams) = (false, String::new());
         for line in case["lines"].as_array().unwrap() {
             match decode_job_frame(line.as_str().unwrap().as_bytes()).unwrap() {
-                JobFrame::Event(Event::Started(p)) => started = Some(p),
-                JobFrame::Event(Event::Output(b)) => output.extend(b),
+                JobFrame::Event(Event::Started(p, s)) => {
+                    started = Some(p);
+                    stdin = s;
+                }
+                JobFrame::Event(Event::Output(b, s)) => {
+                    output.extend(b);
+                    streams.push(if s == Stream::Stderr { 'e' } else { 'o' });
+                }
                 JobFrame::Event(Event::Gap(n)) => gap += n,
                 JobFrame::Event(Event::ShellExit(c)) => shell.push(c),
                 JobFrame::Heartbeat => {}
@@ -71,6 +78,10 @@ fn job_streams_decode_as_the_vectors_say() {
             "{name}"
         );
         assert_eq!(error.as_deref(), want["error"].as_str(), "{name}");
+        if let Some(s) = want["streams"].as_str() {
+            assert_eq!(streams, s, "{name}");
+            assert_eq!(stdin, want["stdin"].as_bool().unwrap(), "{name}");
+        }
     }
 }
 
@@ -88,6 +99,20 @@ fn job_answers_read_as_the_vectors_say() {
                 assert_eq!(r.offset, want["offset"].as_u64().unwrap());
                 assert_eq!(r.end, want["end"].as_u64().unwrap());
                 assert_eq!(r.data, b64(want["data_base64"].as_str().unwrap()));
+                let ranges: Vec<(u64, u64)> = want["stderr_ranges"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .map(|p| (p[0].as_u64().unwrap(), p[1].as_u64().unwrap()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                assert_eq!(r.stderr, ranges);
+            }
+            "write" => {
+                let w = parse_written(answer).unwrap();
+                assert_eq!(w.written, want["written"].as_u64().unwrap());
+                assert_eq!(w.closed, want["closed"].as_bool().unwrap());
             }
             "list" => {
                 let jobs = parse_list(answer).unwrap();

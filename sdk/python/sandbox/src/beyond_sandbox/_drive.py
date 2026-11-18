@@ -56,6 +56,7 @@ class Call:
     command: str = "true"
     args: Sequence[str] = ()
     cwd: str | None = None
+    env: dict[str, str] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,7 +135,10 @@ def drive_iter(op: Op[T], transport: Any) -> Iterator[Any]:
                     yield effect.item
                     answer = _NOTHING
                 elif isinstance(effect, Call):
-                    answer = transport.job_call(effect.job, effect.command, effect.args, effect.cwd)
+                    extra = (effect.env,) if effect.env else ()
+                    answer = transport.job_call(
+                        effect.job, effect.command, effect.args, effect.cwd, *extra
+                    )
                 elif isinstance(effect, Pipe):
                     frames = transport.stream(
                         effect.command, effect.args, timeout_ms=effect.timeout_ms
@@ -196,8 +200,9 @@ async def adrive_emit(
                         await emit(effect.item)
                     answer = _NOTHING
                 elif isinstance(effect, Call):
+                    extra = (effect.env,) if effect.env else ()
                     answer = await transport.job_call(
-                        effect.job, effect.command, effect.args, effect.cwd
+                        effect.job, effect.command, effect.args, effect.cwd, *extra
                     )
                 elif isinstance(effect, Pipe):
                     aframes = await transport.stream(

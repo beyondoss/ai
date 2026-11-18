@@ -44,11 +44,15 @@ class _Unsupported(SandboxError):
 
 # What a scenario's `requires.features` may name (sdk/conformance/DRIVER.md): this client reads the
 # raw stream, so it has all of them.
-FEATURES = ["frames", "unbounded_stream", "exit_signal"]
+FEATURES = [
+    "frames", "unbounded_stream", "exit_signal", "exec_env", "job_streams", "job_stdin",
+    "job_signal_op",
+]  # fmt: skip
 
 OPS = [
     "hello", "capabilities", "exec", "exec_stream",
     "job_start", "job_list", "job_read", "job_attach", "job_kill", "job_remove", "job_wipe",
+    "job_write", "job_signal",
     "stat", "read", "write", "write_if_unchanged", "mkdir", "list", "search",
     "upload", "download", "extract",
 ]  # fmt: skip
@@ -93,6 +97,15 @@ def _number(req: dict[str, Any], key: str) -> float | None:
     ):
         raise InvalidRequestError(f"`{key}` must be a non-negative number")
     return v
+
+
+def _env(req: dict[str, Any]) -> dict[str, str] | None:
+    v = req.get("env")
+    if v is None:
+        return None
+    if not isinstance(v, dict) or not all(isinstance(x, str) for x in v.values()):
+        raise InvalidRequestError("`env` must be an object of strings")
+    return dict(v)
 
 
 def _flag(req: dict[str, Any], key: str) -> bool:
@@ -161,6 +174,9 @@ def plan(op: str, req: dict[str, Any]) -> Plan:
         cwd, timeout = _opt_str(req, "cwd"), _count(req, "timeout_ms")
         stdin = _bytes(req, "stdin_b64") if req.get("stdin_b64") is not None else None
         kw: dict[str, Any] = {"cwd": cwd, "stdin": stdin}
+        env = _env(req)
+        if env:
+            kw["env"] = env
         if timeout is not None:
             kw["timeout_ms"] = timeout
         return (
@@ -183,6 +199,8 @@ def plan(op: str, req: dict[str, Any]) -> Plan:
         "job_kill",
         "job_remove",
         "job_wipe",
+        "job_write",
+        "job_signal",
     ):
         return _job_plan(op, req)
     if op == "stat":
@@ -268,6 +286,9 @@ def _job_plan(op: str, req: dict[str, Any]) -> Plan:
                 ]
             },
         )  # fmt: skip
+    if op == "job_signal":
+        ids, name = _strings(req, "jobs"), _str(req, "signal")
+        return (lambda sb: sb.jobs.signal(scope, ids, name), lambda sent: {"sent": sent})
     if op in ("job_kill", "job_remove"):
         ids = _strings(req, "jobs")
         if op == "job_remove":
@@ -278,11 +299,23 @@ def _job_plan(op: str, req: dict[str, Any]) -> Plan:
             lambda ss: {"survivors": [{"id": s.id, "detail": s.detail} for s in ss]},
         )
     job = _str(req, "job")
+    if op == "job_write":
+        at = _count(req, "at")
+        if at is None:
+            raise InvalidRequestError("`at` must be a count")
+        data, eof = _bytes(req, "data_b64"), _flag(req, "eof")
+        return (
+            lambda sb: sb.jobs.write_stdin(scope, job, at, data, eof),
+            lambda w: {"written": w.written, **({"closed": True} if w.closed else {})},
+        )
     if op == "job_start":
         command, args = _str(req, "command"), _strings(req, "args")
         cwd, label = _opt_str(req, "cwd"), _opt_str(req, "label") or ""
+        env, stdin_open = _env(req), _flag(req, "stdin_open")
         return (
-            lambda sb: sb.jobs.start(scope, job, command, args, cwd=cwd, label=label),
+            lambda sb: sb.jobs.start(
+                scope, job, command, args, cwd=cwd, label=label, env=env, stdin_open=stdin_open
+            ),
             lambda pgid: {"pgid": pgid},
         )
     offset = _count(req, "offset") or 0
@@ -295,6 +328,7 @@ def _job_plan(op: str, req: dict[str, Any]) -> Plan:
                 "state": r.state, "code": r.code, "offset": r.offset, "end": r.end,
                 "data_b64": _b64(r.data),
                 **({} if r.signal is None else {"signal": r.signal}),
+                **({"stderr_ranges": [list(p) for p in r.stderr_ranges]} if r.stderr_ranges else {}),
             },
         )  # fmt: skip
     return (  # job_attach
@@ -303,6 +337,7 @@ def _job_plan(op: str, req: dict[str, Any]) -> Plan:
         lambda a: {
             **({"exit_code": a.exit_code} if a.signal is None else {"signal": a.signal}),
             "output_b64": _b64(a.output),
+            **({"stderr_b64": _b64(a.stderr)} if a.stderr else {}),
             "gap": a.gap,
         },
     )

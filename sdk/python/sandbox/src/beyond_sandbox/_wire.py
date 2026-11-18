@@ -31,6 +31,7 @@ from .models import (
     ShellExit,
     Signal,
     Stderr,
+    StdinWritten,
     Stdout,
     Survivor,
     TimedOut,
@@ -59,6 +60,7 @@ def request_body(
     stdin: bytes | None = None,
     stream: bool = False,
     job: dict[str, Any] | None = None,
+    env: dict[str, str] | None = None,
 ) -> bytes:
     body: dict[str, Any] = {"command": command, "args": list(args)}
     if cwd is not None:
@@ -70,6 +72,8 @@ def request_body(
         body["stream"] = True
     if job is not None:
         body["job"] = job
+    if env:
+        body["env"] = dict(env)
     return json.dumps(body, separators=(",", ":")).encode("utf-8")
 
 
@@ -219,10 +223,10 @@ def decode_job_line(line: bytes) -> list[JobFrame]:
     if "error" in obj:
         raise TransportError(f"job stream: the endpoint failed mid-job: {obj['error']}")
     if isinstance(obj.get("started"), int):
-        return [JobStarted(obj["started"])]
+        return [JobStarted(obj["started"], obj.get("stdin") is True)]
     for key in ("stdout", "stderr"):
         if key in obj:
-            return [JobOutput(_b64(key, obj[key]))]
+            return [JobOutput(_b64(key, obj[key]), key == "stderr")]
     if isinstance(obj.get("gap"), int):
         return [JobGap(obj["gap"])]
     if isinstance(obj.get("shell_exit"), int):
@@ -273,7 +277,30 @@ def parse_read(v: Any) -> JobRead:
         _int(v, "end") or 0,
         _b64("data", v.get("data", "")),
         _signal(v, st[0]),
+        _ranges(v),
     )
+
+
+def _ranges(v: dict[str, Any]) -> tuple[tuple[int, int], ...]:
+    r = v.get("stderr_ranges")
+    if r is None:
+        return ()
+    ok = isinstance(r, list) and all(
+        isinstance(p, list)
+        and len(p) == 2
+        and all(isinstance(n, int) and not isinstance(n, bool) and n >= 0 for n in p)
+        for p in r
+    )
+    if not ok:
+        raise ProtocolError(f"unreadable job read: {v!r}"[:300])
+    return tuple((p[0], p[1]) for p in r)
+
+
+def parse_written(v: Any) -> StdinWritten:
+    n = _int(v, "written") if isinstance(v, dict) else None
+    if n is None:
+        raise ProtocolError(f"unreadable job write: {v!r}"[:300])
+    return StdinWritten(n, v.get("closed") is True)
 
 
 def parse_list(v: Any) -> list[JobInfo]:

@@ -103,9 +103,14 @@ class Sandbox:
         cwd: str | None = None,
         timeout_ms: int = DEFAULT_TIMEOUT_MS,
         stdin: bytes | None = None,
+        env: dict[str, str] | None = None,
     ) -> ExecResult:
-        """Run one command. A non-zero exit is a result; a transport failure raises."""
-        return self.transport.run(command, args, cwd=cwd, timeout_ms=timeout_ms, stdin=stdin)
+        """Run one command. A non-zero exit is a result; a transport failure raises. ``env`` is the
+        command's own environment (``NotOfferedError`` if the endpoint predates it)."""
+        extra = {"env": env} if env else {}
+        return self.transport.run(
+            command, args, cwd=cwd, timeout_ms=timeout_ms, stdin=stdin, **extra
+        )
 
     def stream(
         self,
@@ -195,8 +200,12 @@ class AsyncSandbox:
         cwd: str | None = None,
         timeout_ms: int = DEFAULT_TIMEOUT_MS,
         stdin: bytes | None = None,
+        env: dict[str, str] | None = None,
     ) -> ExecResult:
-        return await self.transport.run(command, args, cwd=cwd, timeout_ms=timeout_ms, stdin=stdin)
+        extra = {"env": env} if env else {}
+        return await self.transport.run(
+            command, args, cwd=cwd, timeout_ms=timeout_ms, stdin=stdin, **extra
+        )
 
     async def stream(
         self,

@@ -460,12 +460,14 @@ async fn a_sandbox_job_lives_in_the_target_and_outlives_its_hold_once_kept() {
         args: vec!["-c".into(), cmd.into()],
         cwd: None,
         label: cmd.into(),
+        env: Vec::new(),
+        stdin_open: false,
     };
     let started = Mutex::new(None::<u32>);
     let output = Mutex::new(Vec::<u8>::new());
     let events = |e: JobEvent<'_>| match e {
         JobEvent::Started(g) => *started.lock().unwrap() = Some(g),
-        JobEvent::Output(b) => output.lock().unwrap().extend_from_slice(b),
+        JobEvent::Output(b, _) => output.lock().unwrap().extend_from_slice(b),
         _ => {}
     };
 

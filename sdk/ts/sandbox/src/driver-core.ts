@@ -42,6 +42,8 @@ export const OPS = [
   "job_kill",
   "job_remove",
   "job_wipe",
+  "job_write",
+  "job_signal",
   "stat",
   "read",
   "write",
@@ -70,6 +72,21 @@ class Reject extends Error {
     super(err.detail);
     this.err = err;
   }
+}
+
+/** `env`: an object of strings, or nothing. */
+function optEnv(req: Json): Record<string, string> | undefined {
+  const v = req.env;
+  if (v === undefined || v === null) return undefined;
+  if (typeof v !== "object" || Array.isArray(v)) {
+    throw invalid("`env` must be an object");
+  }
+  const out: Record<string, string> = {};
+  for (const [k, x] of Object.entries(v)) {
+    if (typeof x !== "string") throw invalid("`env` must hold strings");
+    out[k] = x;
+  }
+  return out;
 }
 
 const invalid = (detail: string): Reject =>
@@ -185,7 +202,15 @@ export class Driver {
             driver: "beyond-sandbox-ts",
             protocol: 1,
             ops: [...OPS],
-            features: ["frames", "unbounded_stream", "exit_signal"],
+            features: [
+              "frames",
+              "unbounded_stream",
+              "exit_signal",
+              "exec_env",
+              "job_streams",
+              "job_stdin",
+              "job_signal_op",
+            ],
           },
         };
       }
@@ -215,6 +240,7 @@ export class Driver {
           ? undefined
           : bytes(req, "stdin_b64");
         const cwd = optStr(req, "cwd");
+        const env = optEnv(req);
         const r = await sb.exec(
           str(req, "command"),
           strings(req, "args"),
@@ -222,6 +248,7 @@ export class Driver {
             timeoutMs: optCount(req, "timeout_ms") ?? 120_000,
             ...(cwd !== undefined ? { cwd } : {}),
             ...(stdin !== undefined ? { stdin } : {}),
+            ...(env !== undefined ? { env } : {}),
           },
         );
         return {
@@ -255,11 +282,14 @@ export class Driver {
       case "job_start": {
         const cwd = optStr(req, "cwd");
         const label = optStr(req, "label");
+        const env = optEnv(req);
         const pgid = await jobs.start(str(req, "scope"), str(req, "job"), {
           command: str(req, "command"),
           args: strings(req, "args"),
           ...(cwd !== undefined ? { cwd } : {}),
           ...(label !== undefined ? { label } : {}),
+          ...(env !== undefined ? { env } : {}),
+          ...(flag(req, "stdin_open") ? { stdinOpen: true } : {}),
         });
         return { pgid };
       }
@@ -277,6 +307,7 @@ export class Driver {
           offset: c.offset,
           end: c.end,
           data_b64: b64(c.data),
+          ...(c.stderrRanges ? { stderr_ranges: c.stderrRanges } : {}),
         };
       }
       case "job_attach": {
@@ -289,7 +320,12 @@ export class Driver {
         const end = a.signal === undefined
           ? { exit_code: a.exitCode }
           : { signal: a.signal };
-        return { ...end, output_b64: b64(a.output), gap: a.gap };
+        return {
+          ...end,
+          output_b64: b64(a.output),
+          ...(a.stderr.length > 0 ? { stderr_b64: b64(a.stderr) } : {}),
+          gap: a.gap,
+        };
       }
       case "job_kill": {
         const s = await jobs.kill(str(req, "scope"), strings(req, "jobs"), {
@@ -299,6 +335,26 @@ export class Driver {
           survivors: s.map((x: Survivor) => ({ id: x.id, detail: x.detail })),
         };
       }
+      case "job_write": {
+        const at = optCount(req, "at");
+        if (at === undefined) throw invalid("`at` must be a count");
+        const w = await jobs.writeStdin(
+          str(req, "scope"),
+          str(req, "job"),
+          at,
+          bytes(req, "data_b64"),
+          flag(req, "eof"),
+        );
+        return { written: w.written, ...(w.closed ? { closed: true } : {}) };
+      }
+      case "job_signal":
+        return {
+          sent: await jobs.signal(
+            str(req, "scope"),
+            strings(req, "jobs"),
+            str(req, "signal"),
+          ),
+        };
       case "job_remove":
         await jobs.remove(str(req, "scope"), strings(req, "jobs"));
         return {};

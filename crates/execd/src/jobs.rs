@@ -36,6 +36,7 @@ use nix::sys::signal::Signal;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, watch};
+use tokio_util::sync::CancellationToken;
 
 use crate::exec::{self, AfterExit, Cut, PIPE_GRACE, Sink};
 use crate::frame::{self, FRAME_MAX};
@@ -65,6 +66,38 @@ pub(crate) struct Ring {
     /// The offset of the first byte held (a multiple of a chunk).
     base: u64,
     retain: usize,
+    /// One bit per byte of `tail`, set for a byte that came from stderr. Allocated at the first
+    /// stderr byte, so a job that never writes stderr pays nothing; may be shorter than `tail`
+    /// (a missing bit is stdout). A full chunk's bits go to `<chunk>.e` when any is set.
+    tail_e: Option<Vec<u8>>,
+}
+
+/// The most `stderr_ranges` one `read` answers: the window is shortened to fit, so an alternating
+/// writer cannot make an answer past the response cap.
+pub(crate) const RANGES_MAX: usize = 1024;
+
+/// Bytes of stderr bits for one chunk.
+const CHUNK_BITS: usize = FRAME_MAX / 8;
+
+/// Set bits `[a, b)` of `bits`, growing it with zeros as needed.
+fn set_bits(bits: &mut Vec<u8>, a: usize, b: usize) {
+    if bits.len() < b.div_ceil(8) {
+        bits.resize(b.div_ceil(8), 0);
+    }
+    let mut i = a;
+    while i < b {
+        if i.is_multiple_of(8) && i + 8 <= b {
+            bits[i / 8] = 0xFF;
+            i += 8;
+        } else {
+            bits[i / 8] |= 1 << (i % 8);
+            i += 1;
+        }
+    }
+}
+
+fn bit(bits: &[u8], i: usize) -> bool {
+    bits.get(i / 8).is_some_and(|b| b >> (i % 8) & 1 == 1)
 }
 
 impl Ring {
@@ -76,6 +109,7 @@ impl Ring {
             tail: Vec::new(),
             base: 0,
             retain,
+            tail_e: None,
         }
     }
 
@@ -92,12 +126,40 @@ impl Ring {
         self.dir.join(format!("{:010x}", offset / FRAME_MAX as u64))
     }
 
-    fn push(&mut self, data: &[u8]) {
+    /// The bits of the chunk that starts at `at`: the file beside it, if it has stderr.
+    fn chunk_bits_path(&self, at: u64) -> PathBuf {
+        self.dir.join(format!("{:010x}.e", at / FRAME_MAX as u64))
+    }
+
+    /// Append `data`, which came from stderr when `stderr`.
+    pub fn push(&mut self, data: &[u8], stderr: bool) {
+        if stderr && !data.is_empty() {
+            let at = self.tail.len();
+            set_bits(
+                self.tail_e.get_or_insert_with(Vec::new),
+                at,
+                at + data.len(),
+            );
+        }
         self.tail.extend_from_slice(data);
         while self.tail.len() >= FRAME_MAX {
             let at = self.base + (self.files * FRAME_MAX) as u64;
+            // This chunk's bits, taken off the front of the tail's.
+            let bits: Option<Vec<u8>> = self.tail_e.as_mut().and_then(|e| {
+                e.resize(e.len().max(CHUNK_BITS), 0);
+                let chunk: Vec<u8> = e.drain(..CHUNK_BITS).collect();
+                chunk.iter().any(|&b| b != 0).then_some(chunk)
+            });
             let wrote = (self.made || spool::make_job_dir(&self.dir).is_ok())
-                && spool::write_chunk(&self.chunk_path(at), &self.tail[..FRAME_MAX]).is_ok();
+                && spool::write_chunk(&self.chunk_path(at), &self.tail[..FRAME_MAX]).is_ok()
+                && bits.as_ref().is_none_or(|b| {
+                    let ok = spool::write_chunk(&self.chunk_bits_path(at), b).is_ok();
+                    if !ok {
+                        // Bytes without their labels would read back as stdout: a gap instead.
+                        let _ = std::fs::remove_file(self.chunk_path(at));
+                    }
+                    ok
+                });
             self.made |= wrote;
             self.tail.drain(..FRAME_MAX);
             if wrote {
@@ -110,6 +172,7 @@ impl Ring {
         }
         while self.files > 0 && self.held() - FRAME_MAX >= self.retain {
             let _ = std::fs::remove_file(self.chunk_path(self.base));
+            let _ = std::fs::remove_file(self.chunk_bits_path(self.base));
             self.base += FRAME_MAX as u64;
             self.files -= 1;
         }
@@ -117,37 +180,83 @@ impl Ring {
 
     fn forget_files(&mut self) {
         for i in 0..self.files {
-            let _ = std::fs::remove_file(self.chunk_path(self.base + (i * FRAME_MAX) as u64));
+            let at = self.base + (i * FRAME_MAX) as u64;
+            let _ = std::fs::remove_file(self.chunk_path(at));
+            let _ = std::fs::remove_file(self.chunk_bits_path(at));
         }
         self.files = 0;
     }
 
     /// Up to `max` bytes from `offset` (or from the oldest byte held, when that is later); where
-    /// they start.
-    fn read(&self, offset: u64, max: usize) -> (u64, Vec<u8>) {
+    /// they start, and the absolute `(from, len)` ranges of them that came from stderr: ascending,
+    /// disjoint, at most [`RANGES_MAX`] (the window is cut before the range that would exceed it).
+    pub fn read(&self, offset: u64, max: usize) -> (u64, Vec<u8>, Vec<(u64, u64)>) {
         let from = offset.max(self.base);
         let want = (self.end().saturating_sub(from) as usize).min(max);
         let mut out = vec![0u8; want];
+        let mut ranges: Vec<(u64, u64)> = Vec::new();
         let mut done = 0;
         let on_disk = self.base + (self.files * FRAME_MAX) as u64;
-        while done < want {
+        'window: while done < want {
             let at = from + done as u64;
-            if at >= on_disk {
+            let (n, bits): (usize, Option<std::borrow::Cow<[u8]>>) = if at >= on_disk {
                 let t = (at - on_disk) as usize;
                 let n = (want - done).min(self.tail.len() - t);
                 out[done..done + n].copy_from_slice(&self.tail[t..t + n]);
-                done += n;
+                (n, self.tail_e.as_deref().map(std::borrow::Cow::Borrowed))
             } else {
                 let pos = at % FRAME_MAX as u64;
                 let n = (want - done).min(FRAME_MAX - pos as usize);
                 match spool::read_chunk(&self.chunk_path(at), pos, &mut out[done..done + n]) {
-                    Ok(k) if k > 0 => done += k,
+                    Ok(k) if k > 0 => {
+                        let bits = std::fs::read(self.chunk_bits_path(at)).ok();
+                        (k, bits.map(std::borrow::Cow::Owned))
+                    }
                     _ => break,
                 }
+            };
+            if let Some(bits) = bits {
+                // `bits` is indexed from the chunk's (or the tail's) first byte.
+                let base_idx = if at >= on_disk {
+                    (at - on_disk) as usize
+                } else {
+                    (at % FRAME_MAX as u64) as usize
+                };
+                let mut i = 0;
+                while i < n {
+                    if !bit(&bits, base_idx + i) {
+                        // Skip a whole byte of zeros at once when aligned.
+                        if (base_idx + i) % 8 == 0 && bits.get((base_idx + i) / 8) == Some(&0) {
+                            i = (i + 8).min(n);
+                        } else {
+                            i += 1;
+                        }
+                        continue;
+                    }
+                    let start = from + (done + i) as u64;
+                    let mut j = i;
+                    while j < n && bit(&bits, base_idx + j) {
+                        j += 1;
+                    }
+                    let adjacent = ranges.last().is_some_and(|l| l.0 + l.1 == start);
+                    if adjacent {
+                        if let Some(last) = ranges.last_mut() {
+                            last.1 += (j - i) as u64;
+                        }
+                    } else if ranges.len() >= RANGES_MAX {
+                        out.truncate(done + i);
+                        done += i;
+                        break 'window;
+                    } else {
+                        ranges.push((start, (j - i) as u64));
+                    }
+                    i = j;
+                }
             }
+            done += n;
         }
         out.truncate(done);
-        (from, out)
+        (from, out, ranges)
     }
 }
 
@@ -183,6 +292,8 @@ pub(crate) struct Job {
     pub notifier: Notifier,
     /// Taken out of the table: its pumps and timers stop.
     pub removed: bool,
+    /// The job's open stdin, when it was started with `stdin_open`.
+    stdin: Option<Arc<JobStdin>>,
 }
 
 /// Every job, by `(scope, id)`, and a counter bumped on every change a stream may be waiting for.
@@ -265,6 +376,9 @@ impl Jobs {
             let mut j = locked(&cell);
             j.removed = true;
             j.notifier = Notifier::default();
+            if let Some(s) = &j.stdin {
+                s.close();
+            }
         }
         self.bump();
     }
@@ -337,7 +451,7 @@ async fn stop_jobs(jobs: &[(i32, String)], grace: Duration) {
 /// Fuzz seam: whether `job` is a well-formed job operation (and its `notify`, if it has one, passes
 /// the grammar). Never panics.
 pub(crate) fn fuzz_job(job: &Value) -> bool {
-    match serde_json::from_value::<JobReq>(job.clone()) {
+    match JobReq::deserialize(job) {
         Ok(j) => {
             j.op != "keep"
                 || j.notify
@@ -364,7 +478,7 @@ pub(crate) fn fuzz_ring(bytes: &[u8]) {
     let _cleanup = scopeguard_remove(dir.clone());
     let _ = std::fs::create_dir_all(&dir);
     let mut ring = Ring::new(retain, dir.join("ring"));
-    let mut all: Vec<u8> = Vec::new();
+    let mut all: Vec<(u8, bool)> = Vec::new();
     while let Some(op) = it.next() {
         let a = u16::from_le_bytes([it.next().unwrap_or(0), it.next().unwrap_or(0)]);
         if op % 2 == 0 {
@@ -372,8 +486,8 @@ pub(crate) fn fuzz_ring(bytes: &[u8]) {
             let data: Vec<u8> = (0..usize::from(a))
                 .map(|i| (i % 251) as u8 ^ seed)
                 .collect();
-            ring.push(&data);
-            all.extend_from_slice(&data);
+            ring.push(&data, op % 4 == 0);
+            all.extend(data.iter().map(|&b| (b, op % 4 == 0)));
             continue;
         }
         let end = ring.end();
@@ -391,12 +505,26 @@ pub(crate) fn fuzz_ring(bytes: &[u8]) {
             2 => usize::MAX - usize::from(a),
             _ => 1 << 20,
         };
-        let (from, data) = ring.read(offset, max);
+        let (from, data, ranges) = ring.read(offset, max);
         assert_eq!(from, offset.max(ring.base));
         let avail = end.saturating_sub(from).min(max as u64);
-        assert_eq!(data.len() as u64, avail);
-        if avail > 0 {
-            assert_eq!(&data[..], &all[from as usize..from as usize + data.len()]);
+        // A read with too many stderr runs is cut short, never longer.
+        assert!(data.len() as u64 <= avail);
+        assert!(ranges.len() <= RANGES_MAX);
+        if ranges.len() < RANGES_MAX {
+            assert_eq!(data.len() as u64, avail);
+        }
+        for (i, b) in data.iter().enumerate() {
+            let (want, e) = all[from as usize + i];
+            assert_eq!(*b, want);
+            let off = from + i as u64;
+            let in_range = ranges.iter().any(|&(a, n)| off >= a && off < a + n);
+            assert_eq!(in_range, e, "stderr flag at {off}");
+        }
+        let mut prev_end = from;
+        for &(a, n) in &ranges {
+            assert!(n > 0 && a >= prev_end && a + n <= from + data.len() as u64);
+            prev_end = a + n;
         }
         let kept = end - ring.base;
         assert!(kept >= (all.len().min(retain)) as u64);
@@ -435,21 +563,227 @@ struct JobReq {
     kind: Option<String>,
     seen: Option<u64>,
     notify: Option<Value>,
+    /// `start`: keep the job's stdin open for `write` (default: `/dev/null`).
+    stdin_open: bool,
+    /// `signal`: the signal's name.
+    signal: Option<String>,
+    /// `write`: the stream position of the data's first byte and whether to close
+    /// the job's stdin after them.
+    at: u64,
+    eof: bool,
+}
+
+/// The signals `signal` sends: names only, no `SIGSTOP` (it would freeze a sandbox's job beyond the
+/// reach of anything but another signal) and no real-time ones.
+fn parse_signal(name: &str) -> Option<Signal> {
+    Some(match name {
+        "SIGHUP" => Signal::SIGHUP,
+        "SIGINT" => Signal::SIGINT,
+        "SIGQUIT" => Signal::SIGQUIT,
+        "SIGUSR1" => Signal::SIGUSR1,
+        "SIGUSR2" => Signal::SIGUSR2,
+        "SIGTERM" => Signal::SIGTERM,
+        "SIGKILL" => Signal::SIGKILL,
+        _ => return None,
+    })
+}
+
+/// The most decoded bytes one `write` carries (symmetric with the client's `READ_MAX`).
+pub(crate) const WRITE_MAX: usize = 128 * 1024;
+/// The most writes waiting on one job's stdin (for the pipe, or for earlier bytes): each holds at
+/// most `WRITE_MAX` bytes plus its base64, so a job that never reads costs a bounded amount.
+pub(crate) const WAITERS_MAX: usize = 16;
+/// How long a write waits for earlier bytes (a gap) when the request names no `timeout_ms`.
+const GAP_WAIT: Duration = Duration::from_secs(30);
+
+/// A job's open stdin. Writes are positional: `written` counts the bytes of the stream applied so
+/// far, a write at `at` skips what is below it and waits for what is missing, so a retry, a replay
+/// and a reordering all land the same bytes once, in order.
+pub(crate) struct JobStdin {
+    /// `None` once closed (EOF written, the job ended or removed). The async mutex is FIFO, so
+    /// writes that are in position apply in the order they asked.
+    pipe: tokio::sync::Mutex<Option<tokio::process::ChildStdin>>,
+    written: watch::Sender<u64>,
+    /// Cancelled when the job ends or is removed: pending writes stop, the pipe is dropped.
+    dead: CancellationToken,
+    waiters: AtomicUsize,
+}
+
+impl JobStdin {
+    fn new(pipe: tokio::process::ChildStdin) -> Arc<Self> {
+        Arc::new(Self {
+            pipe: tokio::sync::Mutex::new(Some(pipe)),
+            written: watch::Sender::new(0),
+            dead: CancellationToken::new(),
+            waiters: AtomicUsize::new(0),
+        })
+    }
+
+    /// The job is over: no write lands again and the fd is released once any write in flight
+    /// has noticed.
+    fn close(self: &Arc<Self>) {
+        self.dead.cancel();
+        let me = self.clone();
+        tokio::spawn(async move {
+            me.pipe.lock().await.take();
+        });
+    }
+}
+
+struct Waiter<'a>(&'a AtomicUsize);
+
+impl Drop for Waiter<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// `write`: apply `data` at position `at` of the job's stdin. See the spec's "Job stdin".
+async fn write_stdin(ctx: &Arc<Ctx>, req: &Request, job: &JobReq, data: Vec<u8>) -> Resp {
+    use tokio::io::AsyncWriteExt as _;
+    let Some(cell) = ctx.jobs.get(&(job.scope.clone(), job.id.clone())) else {
+        return http::error_response(404, "no such job");
+    };
+    let Some(stdin) = locked(&cell).stdin.clone() else {
+        return http::error_response(409, "the job has no stdin");
+    };
+    if stdin.waiters.fetch_add(1, Ordering::Relaxed) >= WAITERS_MAX {
+        stdin.waiters.fetch_sub(1, Ordering::Relaxed);
+        return http::error_response(429, "too many writes waiting on this job");
+    }
+    let _waiting = Waiter(&stdin.waiters);
+    let state = |closed: bool| {
+        let mut b = json!({ "written": *stdin.written.borrow() });
+        if closed {
+            b["closed"] = json!(true);
+        }
+        b
+    };
+    let end = job.at.saturating_add(data.len() as u64);
+    let deadline = req
+        .timeout_ms
+        .map(|ms| tokio::time::Instant::now() + Duration::from_millis(ms));
+    // Earlier bytes first: wait (without holding the pipe) until the stream reaches `at`.
+    let mut rx = stdin.written.subscribe();
+    let gap_by = deadline.unwrap_or_else(|| tokio::time::Instant::now() + GAP_WAIT);
+    while *rx.borrow_and_update() < job.at {
+        tokio::select! {
+            _ = rx.changed() => {}
+            () = stdin.dead.cancelled() => break,
+            () = tokio::time::sleep_until(gap_by) => {
+                let mut b = state(false);
+                b["error"] = json!("gap");
+                return http::json_response(409, &b);
+            }
+        }
+    }
+    let mut pipe = tokio::select! {
+        p = stdin.pipe.lock() => p,
+        () = stdin.dead.cancelled() => {
+            // Over: bytes already applied are idempotent, anything else is refused.
+            return if end <= *stdin.written.borrow() {
+                http::json_response(200, &state(true))
+            } else {
+                closed(&state(true))
+            };
+        }
+    };
+    // Bytes below `written` are applied: skip them.
+    let skip = usize::try_from(stdin.written.borrow().saturating_sub(job.at))
+        .unwrap_or(usize::MAX)
+        .min(data.len());
+    let mut rest = &data[skip..];
+    if *stdin.written.borrow() < job.at {
+        // The job ended while this waited for the missing bytes.
+        return closed(&state(pipe.is_none()));
+    }
+    if !rest.is_empty() && pipe.is_none() {
+        return closed(&state(true));
+    }
+    while !rest.is_empty() {
+        let Some(p) = pipe.as_mut() else { break };
+        let step = async {
+            tokio::select! {
+                r = p.write(rest) => Some(r),
+                () = stdin.dead.cancelled() => None,
+                () = async {
+                    match deadline {
+                        Some(d) => tokio::time::sleep_until(d).await,
+                        None => std::future::pending().await,
+                    }
+                } => None,
+            }
+        };
+        match step.await {
+            Some(Ok(n)) if n > 0 => {
+                rest = &rest[n..];
+                stdin.written.send_modify(|w| *w += n as u64);
+            }
+            // The reader is gone (EPIPE) or the pipe broke: nothing more can land.
+            Some(_) => {
+                pipe.take();
+                return closed(&state(true));
+            }
+            // Cancelled or out of time: a short write, exact `written`.
+            None => {
+                let c = pipe.is_none() || stdin.dead.is_cancelled();
+                return if stdin.dead.is_cancelled() {
+                    closed(&state(c))
+                } else {
+                    http::json_response(200, &state(false))
+                };
+            }
+        }
+    }
+    if job.eof {
+        pipe.take();
+    }
+    http::json_response(200, &state(pipe.is_none()))
+}
+
+fn closed(state: &Value) -> Resp {
+    let mut b = state.clone();
+    b["error"] = json!("stdin is closed");
+    http::json_response(409, &b)
 }
 
 /// Answer a request carrying a `job` object.
-pub(crate) async fn serve(ctx: &Arc<Ctx>, req: &Request) -> Resp {
-    let job: JobReq = match req.job.clone().map(serde_json::from_value) {
+pub(crate) async fn serve(ctx: &Arc<Ctx>, mut req: Request) -> Resp {
+    // A write's bytes are decoded once, here, and the request's base64 text is dropped at once: a
+    // write that waits (for the pipe, or for earlier bytes) holds its decoded bytes and nothing of
+    // the request that carried them.
+    let mut data = Vec::new();
+    if let Some(Value::Object(o)) = req.job.as_mut()
+        && o.get("op").and_then(Value::as_str) == Some("write")
+        && let Some(d) = o.remove("data")
+    {
+        use base64::Engine as _;
+        let Value::String(text) = d else {
+            return http::error_response(400, "data is not base64");
+        };
+        if text.len() > WRITE_MAX.div_ceil(3) * 4 {
+            return http::error_response(413, "write too large");
+        }
+        data = match base64::engine::general_purpose::STANDARD.decode(&text) {
+            Ok(d) => d,
+            Err(_) => return http::error_response(400, "data is not base64"),
+        };
+        if data.len() > WRITE_MAX {
+            return http::error_response(413, "write too large");
+        }
+    }
+    let req = &req;
+    let job: JobReq = match req.job.as_ref().map(JobReq::deserialize) {
         Some(Ok(j)) => j,
         _ => return http::error_response(400, "bad job"),
     };
     let line = Line::new("job", &req.command);
-    let resp = serve_op(ctx, req, job).await;
+    let resp = serve_op(ctx, req, job, data).await;
     line.done(resp.status().as_u16(), "answered");
     resp
 }
 
-async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq) -> Resp {
+async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq, data: Vec<u8>) -> Resp {
     let jobs = &ctx.jobs;
     let key = |id: &str| (job.scope.clone(), id.to_string());
     match job.op.as_str() {
@@ -469,7 +803,7 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq) -> Resp {
                 Some(cell) => {
                     let j = locked(&cell);
                     let (state, code) = state_of(&j);
-                    let (from, data) = j
+                    let (from, data, ranges) = j
                         .out
                         .read(job.offset, usize::try_from(job.max).unwrap_or(usize::MAX));
                     let mut body = json!({
@@ -479,11 +813,48 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq) -> Resp {
                         "end": j.out.end(),
                         "data": frame::b64(&data),
                     });
+                    if !ranges.is_empty() {
+                        body["stderr_ranges"] =
+                            ranges.iter().map(|&(a, n)| json!([a, n])).collect();
+                    }
                     put_signal(&j, &mut body);
                     body
                 }
             };
             http::json_response(200, &body)
+        }
+        "write" => write_stdin(ctx, req, &job, data).await,
+        "signal" => {
+            let Some(sig) = job.signal.as_deref().and_then(parse_signal) else {
+                return http::error_response(400, "unsupported signal");
+            };
+            // Never a group whose job has ended: its number may be reused. No grace, no wait.
+            let mut seen = std::collections::HashSet::new();
+            let mut sent = Vec::new();
+            let mut targets = Vec::new();
+            for id in &job.ids {
+                if !seen.insert(id.as_str()) {
+                    continue;
+                }
+                let Some(cell) = jobs.get(&key(id)) else {
+                    continue;
+                };
+                let (running, pgid, mark) = {
+                    let j = locked(&cell);
+                    (j.end.is_none() && j.pgid != 0, j.pgid, j.mark.clone())
+                };
+                if running {
+                    sent.push(id.clone());
+                    targets.push((pgid, mark));
+                }
+            }
+            proc::off_runtime(move || {
+                for (g, m) in &targets {
+                    proc::signal_job(*g, m, sig);
+                }
+            })
+            .await;
+            http::json_response(200, &json!({ "sent": sent }))
         }
         "keep" | "seen" => keep_or_seen(ctx, &job),
         "kill" | "wipe" => {
@@ -656,12 +1027,17 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
             notify: None,
             notifier: Notifier::default(),
             removed: false,
+            stdin: None,
         }));
         map.insert(key.clone(), cell.clone());
         cell
     };
     let mut cmd = exec::command_for(ctx, req);
-    cmd.stdin(Stdio::null());
+    cmd.stdin(if job.stdin_open {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    });
     let mark = locked(&cell).mark.clone();
     cmd.env(proc::JOB_MARK_ENV, &mark);
     let mut proc = match proc::spawn(&mut cmd) {
@@ -673,7 +1049,12 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
         }
     };
     let pgid = proc.pgid;
-    locked(&cell).pgid = pgid;
+    let stdin = proc.stdin.take().map(JobStdin::new);
+    {
+        let mut j = locked(&cell);
+        j.pgid = pgid;
+        j.stdin = stdin;
+    }
     ctx.groups.insert(pgid);
     ctx.jobs.bump_activity();
 
@@ -687,13 +1068,27 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
         let n = proc::pipe_capacity(&p);
         cap += n;
         let after = AfterExit::new(&exited);
-        pipes.push(pump(ctx.clone(), cell.clone(), p, progress.clone(), after));
+        pipes.push(pump(
+            ctx.clone(),
+            cell.clone(),
+            false,
+            p,
+            progress.clone(),
+            after,
+        ));
     }
     if let Some(p) = proc.stderr.take() {
         let n = proc::pipe_capacity(&p);
         cap += n;
         let after = AfterExit::new(&exited);
-        pipes.push(pump(ctx.clone(), cell.clone(), p, progress.clone(), after));
+        pipes.push(pump(
+            ctx.clone(),
+            cell.clone(),
+            true,
+            p,
+            progress.clone(),
+            after,
+        ));
     }
     tokio::spawn(supervise(
         ctx.clone(),
@@ -706,6 +1101,7 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
         exited,
     ));
 
+    let opened = job.stdin_open;
     if job.hold {
         let (resp, out) = http::stream_response();
         let seq = ctx.next_seq.fetch_add(1, Ordering::Relaxed);
@@ -720,14 +1116,18 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
         }
         let ctx2 = ctx.clone();
         tokio::spawn(async move {
-            let end = stream_job(ctx2.clone(), key, 0, true, Some(pgid), out).await;
+            let end = stream_job(ctx2.clone(), key, 0, true, Some((pgid, opened)), out).await;
             if let Some(o) = &ctx2.opts.observer {
                 o.stream_ended(seq, end, std::time::Instant::now());
             }
         });
         resp
     } else {
-        http::json_response(200, &json!({ "started": pgid }))
+        let mut body = json!({ "started": pgid });
+        if opened {
+            body["stdin"] = json!(true);
+        }
+        http::json_response(200, &body)
     }
 }
 
@@ -735,6 +1135,7 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
 fn pump<R: tokio::io::AsyncRead + std::os::fd::AsFd + Unpin + Send + 'static>(
     ctx: Arc<Ctx>,
     cell: JobCell,
+    stderr: bool,
     mut pipe: R,
     progress: Arc<AtomicUsize>,
     mut after: AfterExit,
@@ -747,7 +1148,7 @@ fn pump<R: tokio::io::AsyncRead + std::os::fd::AsFd + Unpin + Send + 'static>(
                 if j.removed {
                     return;
                 }
-                j.out.push(&buf[..n]);
+                j.out.push(&buf[..n], stderr);
             }
             progress.fetch_add(n, Ordering::Relaxed);
             ctx.jobs.bump();
@@ -846,6 +1247,9 @@ async fn supervise(
         j.end = Some(code);
         j.signal = signal;
         j.ended = epoch();
+        if let Some(s) = &j.stdin {
+            s.close();
+        }
         if !j.removed {
             notify::change(&ctx, &cell, &key, &mut j);
         }
@@ -861,7 +1265,7 @@ async fn stream_job(
     key: Key,
     offset: u64,
     hold: bool,
-    started: Option<i32>,
+    started: Option<(i32, bool)>,
     out: mpsc::Sender<Bytes>,
 ) -> StreamEnd {
     // A job stream has no deadline of its own: it lives as long as the job or the connection.
@@ -888,11 +1292,15 @@ async fn follow(
     ctx: &Arc<Ctx>,
     key: &Key,
     offset: u64,
-    started: Option<i32>,
+    started: Option<(i32, bool)>,
     sink: &mut Sink,
 ) -> Result<StreamEnd, Cut> {
-    if let Some(pgid) = started {
-        sink.put(frame::json(&json!({ "started": pgid }))).await?;
+    if let Some((pgid, opened)) = started {
+        let mut first = json!({ "started": pgid });
+        if opened {
+            first["stdin"] = json!(true);
+        }
+        sink.put(frame::json(&first)).await?;
     }
     let mut changed = ctx.jobs.changed.subscribe();
     let mut sent = offset;
@@ -915,7 +1323,18 @@ async fn follow(
                     sent = j.out.base;
                     Next::Frame(frame::json(&json!({ "gap": n })))
                 } else if sent < total {
-                    let (_, piece) = j.out.read(sent, FRAME_MAX);
+                    let (_, mut piece, ranges) = j.out.read(sent, FRAME_MAX);
+                    // A frame never spans a stream change: it is the stderr run at its start, or
+                    // the stdout before the first stderr run.
+                    let mut key = "stdout";
+                    if let Some(&(a, n)) = ranges.first() {
+                        if a == sent {
+                            key = "stderr";
+                            piece.truncate(usize::try_from(n).unwrap_or(usize::MAX));
+                        } else {
+                            piece.truncate(usize::try_from(a - sent).unwrap_or(usize::MAX));
+                        }
+                    }
                     if piece.is_empty() {
                         // The chunk went away under us: the rest is a gap.
                         let n = total - sent;
@@ -923,7 +1342,7 @@ async fn follow(
                         Next::Frame(frame::json(&json!({ "gap": n })))
                     } else {
                         sent += piece.len() as u64;
-                        Next::Frame(frame::output("stdout", &piece))
+                        Next::Frame(frame::output(key, &piece))
                     }
                 } else if let (Some(c), false) = (j.shell_exit, shell_told) {
                     shell_told = true;
@@ -982,7 +1401,7 @@ mod tests {
         while at < n {
             let k = (n - at).min(10_000);
             let piece: Vec<u8> = (at..at + k).map(|i| (i % 251) as u8).collect();
-            ring.push(&piece);
+            ring.push(&piece, false);
             at += k;
         }
     }
@@ -999,7 +1418,7 @@ mod tests {
         );
         assert_eq!(ring.held() as u64, kept);
         // The oldest bytes are gone: a read from 0 starts where the ring does.
-        let (from, data) = ring.read(0, 5);
+        let (from, data, _) = ring.read(0, 5);
         assert_eq!(from, ring.base);
         assert_eq!(data.len(), 5);
         // Evicted chunks are deleted: only what is held is on disk.
@@ -1008,10 +1427,47 @@ mod tests {
     }
 
     #[test]
+    fn stderr_bits_survive_chunks_and_go_with_their_chunk_on_eviction() {
+        let (mut ring, _d) = ring(100_000);
+        // A stderr byte early in every chunk, stdout elsewhere, over many chunks.
+        for _ in 0..8 {
+            ring.push(b"e", true);
+            ring.push(&vec![b'o'; FRAME_MAX - 1], false);
+        }
+        let (from, data, ranges) = ring.read(0, 1 << 20);
+        assert_eq!(from, ring.base);
+        assert!(
+            ranges
+                .iter()
+                .all(|&(a, n)| n == 1 && a % FRAME_MAX as u64 == 0)
+        );
+        for (i, b) in data.iter().enumerate() {
+            let off = from + i as u64;
+            assert_eq!(*b == b'e', ranges.iter().any(|&(a, _)| a == off), "{off}");
+        }
+        // Only the chunks held have sidecars: evicted ones took theirs along.
+        let sidecars = std::fs::read_dir(&ring.dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".e")
+            })
+            .count();
+        assert!(
+            ring.files > 0 && sidecars == ring.files,
+            "{sidecars} sidecars, {} chunks",
+            ring.files
+        );
+    }
+
+    #[test]
     fn a_read_spans_chunks_and_matches_what_was_written() {
         let (mut ring, _d) = ring(10_000_000);
         fill(&mut ring, 300_000);
-        let (from, data) = ring.read(70_000, 200_000);
+        let (from, data, _) = ring.read(70_000, 200_000);
         assert_eq!(from, 70_000);
         let expect: Vec<u8> = (70_000..270_000usize).map(|i| (i % 251) as u8).collect();
         assert_eq!(data, expect);
@@ -1025,7 +1481,7 @@ mod tests {
         let (mut ring, _d) = ring(10_000_000);
         fill(&mut ring, 1000);
         for offset in [0, 1, 500, 999, 1000, 5000, u64::MAX] {
-            let (from, data) = ring.read(offset, usize::MAX);
+            let (from, data, _) = ring.read(offset, usize::MAX);
             assert_eq!(from, offset, "{offset}");
             assert_eq!(
                 data.len() as u64,
@@ -1039,12 +1495,12 @@ mod tests {
     fn tiny_writes_do_not_make_tiny_chunks_and_a_small_job_touches_no_disk() {
         let (mut ring, d) = ring(10_000_000);
         for _ in 0..100_000 {
-            ring.push(b"x");
+            ring.push(b"x", false);
         }
         assert_eq!(ring.files, 1);
         assert_eq!(ring.tail.len(), 100_000 - FRAME_MAX);
         let (mut small, d2) = self::ring(10_000_000);
-        small.push(b"hello");
+        small.push(b"hello", false);
         assert!(!d2.path().join("job").exists());
         drop((small, d2));
         // Dropping the ring removes its directory.
@@ -1059,7 +1515,7 @@ mod tests {
     fn files_are_private_and_never_follow_a_link() {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
         let (mut ring, _d) = ring(10_000_000);
-        ring.push(&vec![7u8; FRAME_MAX]);
+        ring.push(&vec![7u8; FRAME_MAX], false);
         let dir_mode = std::fs::metadata(&ring.dir).unwrap().mode() & 0o777;
         let file_mode = std::fs::metadata(ring.chunk_path(0))
             .unwrap()
@@ -1070,7 +1526,7 @@ mod tests {
         // A link planted where the next chunk goes is refused, and the bytes read back as a gap.
         let target = ring.dir.join("elsewhere");
         std::os::unix::fs::symlink(&target, ring.chunk_path(FRAME_MAX as u64)).unwrap();
-        ring.push(&vec![8u8; FRAME_MAX]);
+        ring.push(&vec![8u8; FRAME_MAX], false);
         assert!(!target.exists());
         assert_eq!(ring.base, 2 * FRAME_MAX as u64);
     }

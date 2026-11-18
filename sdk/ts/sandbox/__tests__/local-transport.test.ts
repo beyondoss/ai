@@ -31,6 +31,8 @@ class LocalTransport implements Transport {
     kill: refuse("jobs"),
     remove: refuse("jobs"),
     wipe: refuse("jobs"),
+    writeStdin: refuse("jobs"),
+    signal: refuse("jobs"),
   };
 
   stream(): AsyncIterable<Frame> {

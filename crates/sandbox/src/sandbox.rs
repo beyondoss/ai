@@ -62,6 +62,8 @@ impl Jobs {
                 args: args.into_iter().map(Into::into).collect(),
                 cwd: None,
                 label: String::new(),
+                env: Vec::new(),
+                stdin_open: false,
             },
         }
     }
@@ -160,6 +162,7 @@ impl Sandbox {
             cwd: None,
             timeout: DEFAULT_COMMAND_TIMEOUT,
             stdin: None,
+            env: Vec::new(),
         }
     }
 
@@ -214,9 +217,20 @@ pub struct Command<'a> {
     cwd: Option<String>,
     timeout: Duration,
     stdin: Option<Vec<u8>>,
+    env: Vec<(String, String)>,
 }
 
 impl Command<'_> {
+    /// Run with this variable set, over the sandbox's own environment (the endpoint's rules apply:
+    /// a name is `[A-Za-z_][A-Za-z0-9_]*` and not `EXECD_*`, at most 128 variables and 32 KiB in
+    /// all). An exec that cannot set one, or an endpoint that predates it, is
+    /// [`std::io::ErrorKind::Unsupported`]: the command is never run without it. Not combinable
+    /// with [`stdin`](Self::stdin) or [`stream`](Self::stream).
+    pub fn env(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env.push((name.into(), value.into()));
+        self
+    }
+
     /// Run in this directory.
     pub fn cwd(mut self, cwd: impl Into<String>) -> Self {
         self.cwd = Some(cwd.into());
@@ -243,6 +257,24 @@ impl Command<'_> {
     }
 
     async fn run_result(self) -> std::io::Result<ExecResult> {
+        if !self.env.is_empty() {
+            if self.stdin.is_some() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "a command with an environment and stdin is not offered",
+                ));
+            }
+            return self
+                .exec
+                .run_with_env(
+                    &self.program,
+                    &self.args,
+                    self.cwd.as_deref(),
+                    self.timeout,
+                    &self.env,
+                )
+                .await;
+        }
         match self.stdin.as_deref() {
             Some(stdin) => {
                 self.exec
@@ -270,10 +302,10 @@ impl Command<'_> {
     /// [`std::io::ErrorKind::Unsupported`] — use [`run`](Self::run) instead, so silence on the
     /// sink is never mistaken for a live empty stream.
     pub async fn stream(self, on_chunk: ChunkSink<'_>) -> std::io::Result<ExecResult> {
-        if self.stdin.is_some() {
+        if self.stdin.is_some() || !self.env.is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
-                "streaming a command with stdin is not offered; call run() instead",
+                "streaming a command with stdin or env is not offered; call run() instead",
             ));
         }
         self.exec

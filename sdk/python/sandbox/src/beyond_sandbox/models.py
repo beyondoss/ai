@@ -141,6 +141,9 @@ class JobRead:
     end: int  # the end of the job's output so far
     data: bytes
     signal: int | None = None  # the signal that killed the shell; None for a shell that exited
+    #: Absolute ``(from, len)`` offsets of the bytes of ``data`` that came from stderr (the rest is
+    #: stdout); empty when the window holds none.
+    stderr_ranges: tuple[tuple[int, int], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,9 +154,10 @@ class Survivor:
 
 @dataclass(frozen=True, slots=True)
 class JobOutput:
-    """Output of a job, in order."""
+    """Output of a job, in order. ``stderr`` is the pipe it came from."""
 
     data: bytes
+    stderr: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,6 +175,15 @@ class JobShellExit:
 @dataclass(frozen=True, slots=True)
 class JobStarted:
     pgid: int
+    stdin: bool = False  # the job was started with its stdin open (the echo of ``stdin_open``)
+
+
+@dataclass(frozen=True, slots=True)
+class StdinWritten:
+    """What a ``write`` left: bytes of the stdin stream applied in all, and whether it is closed."""
+
+    written: int
+    closed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,6 +205,7 @@ class Attached:
 
     exit_code: int  # the shell's status: 128 + ``signal`` when a signal killed it
     output: bytes = b""
+    stderr: bytes = b""  # the part of ``output`` that came from stderr frames
     gap: int = 0
     shell_exit: int | None = field(default=None)
     signal: int | None = None  # the signal that killed the shell; None for a shell that exited

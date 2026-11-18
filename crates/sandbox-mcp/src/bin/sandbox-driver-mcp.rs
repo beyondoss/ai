@@ -56,6 +56,8 @@ const OPS: &[&str] = &[
     "job_list",
     "job_read",
     "job_attach",
+    "job_write",
+    "job_signal",
     "job_kill",
     "job_remove",
     "job_wipe",
@@ -265,6 +267,8 @@ impl PrivateSandbox {
 /// What following a job to its end found.
 struct Followed {
     output: Vec<u8>,
+    /// The bytes of `output` that came from stderr (`job_output`'s `stderr_ranges`).
+    stderr: Vec<u8>,
     /// Bytes the sandbox no longer had (a jump in the offset).
     gap: u64,
     code: Option<i64>,
@@ -416,6 +420,7 @@ impl Mcp {
                             ("cwd", json!(opt_str(req, "cwd")?)),
                             ("timeout_ms", json!(u64_arg(req, "timeout_ms")?)),
                             ("stdin_base64", json!(opt_str(req, "stdin_b64")?)),
+                            ("env", req["env"].clone()),
                         ]),
                     )
                     .await?;
@@ -444,10 +449,44 @@ impl Mcp {
                             ("command", json!(command_line(req)?)),
                             ("cwd", json!(opt_str(req, "cwd")?)),
                             ("label", json!(opt_str(req, "label")?)),
+                            ("env", req["env"].clone()),
+                            ("stdin_open", req["stdin_open"].clone()),
                         ]),
                     )
                     .await?;
                 Ok(json!({ "pgid": r["pgid"] }))
+            }
+            "job_write" => {
+                let r = self
+                    .tool(
+                        "job_write",
+                        args(vec![
+                            ("scope", json!(str_arg(req, "scope")?)),
+                            ("id", json!(str_arg(req, "job")?)),
+                            ("at", json!(u64_arg(req, "at")?)),
+                            ("content_base64", json!(str_arg(req, "data_b64")?)),
+                            ("eof", req["eof"].clone()),
+                        ]),
+                    )
+                    .await?;
+                let mut out = json!({ "written": r["written"] });
+                if r["closed"] == json!(true) {
+                    out["closed"] = json!(true);
+                }
+                Ok(out)
+            }
+            "job_signal" => {
+                let r = self
+                    .tool(
+                        "job_signal",
+                        args(vec![
+                            ("scope", json!(str_arg(req, "scope")?)),
+                            ("ids", json!(strings(req, "jobs")?)),
+                            ("signal", json!(str_arg(req, "signal")?)),
+                        ]),
+                    )
+                    .await?;
+                Ok(json!({ "sent": r["sent"] }))
             }
             "job_list" => {
                 let r = self
@@ -477,6 +516,9 @@ impl Mcp {
                 });
                 if let Some(s) = r.get("signal").filter(|s| !s.is_null()) {
                     out["signal"] = s.clone();
+                }
+                if let Some(s) = r.get("stderr_ranges").filter(|s| !s.is_null()) {
+                    out["stderr_ranges"] = s.clone();
                 }
                 Ok(out)
             }
@@ -792,6 +834,9 @@ impl Mcp {
             )
             .await?;
         let mut out = json!({ "output_b64": b64(&f.output), "gap": f.gap });
+        if !f.stderr.is_empty() {
+            out["stderr_b64"] = json!(b64(&f.stderr));
+        }
         // As `exec_stream` ends: `signal` in place of `exit_code` for a death by signal.
         match f.signal {
             Some(s) => out["signal"] = json!(s),
@@ -812,6 +857,7 @@ impl Mcp {
     ) -> Result<Followed, Value> {
         let started = std::time::Instant::now();
         let (mut out, mut gap, mut timed_out) = (Vec::new(), 0u64, false);
+        let mut stderr: Vec<u8> = Vec::new();
         let mut wait = Duration::from_millis(25);
         loop {
             let r = self
@@ -838,6 +884,16 @@ impl Mcp {
                 .map_err(|e| err("protocol", format!("job_output: {e}")))?;
             let end = r["end"].as_u64().unwrap_or(0);
             if !chunk.is_empty() {
+                for r in r["stderr_ranges"].as_array().into_iter().flatten() {
+                    let (from, len) = (r[0].as_u64().unwrap_or(0), r[1].as_u64().unwrap_or(0));
+                    let lo = usize::try_from(from.saturating_sub(offset)).unwrap_or(usize::MAX);
+                    let hi = usize::try_from((from + len).saturating_sub(offset))
+                        .unwrap_or(usize::MAX)
+                        .min(chunk.len());
+                    if lo < hi {
+                        stderr.extend_from_slice(&chunk[lo..hi]);
+                    }
+                }
                 offset += chunk.len() as u64;
                 out.extend_from_slice(&chunk);
                 wait = Duration::from_millis(25);
@@ -849,6 +905,7 @@ impl Mcp {
                 Some("ended") if offset >= end || chunk.is_empty() => {
                     return Ok(Followed {
                         output: out,
+                        stderr,
                         gap,
                         code: r["code"].as_i64(),
                         signal: r["signal"].as_i64(),
@@ -921,7 +978,7 @@ async fn main() {
                 let result = if op == "hello" {
                     Ok(json!({
                         "driver": DRIVER, "protocol": 1, "ops": OPS,
-                        "features": ["exit_signal"], "missing": missing_features(),
+                        "features": ["exit_signal", "exec_env", "job_streams", "job_stdin", "job_signal_op"], "missing": missing_features(),
                     }))
                 } else if !OPS.contains(&op.as_str()) {
                     Err(err("unsupported", "no such op"))

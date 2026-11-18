@@ -36,13 +36,18 @@
         "started": null,
         "output_base64": "dGFpbApsYXRlcgo=",
         "gap": 1048576,
-        "shell_exits": [0],
+        "shell_exits": [
+          0
+        ],
         "end": 0
       }
     },
     {
       "name": "a job killed by a signal",
-      "lines": ["{\"started\":7}", "{\"signal\":9}"],
+      "lines": [
+        "{\"started\":7}",
+        "{\"signal\":9}"
+      ],
       "expect": {
         "started": 7,
         "output_base64": "",
@@ -69,13 +74,35 @@
     },
     {
       "name": "the endpoint failed after answering",
-      "lines": ["{\"started\":9}", "{\"error\":\"lost the sandbox\"}"],
+      "lines": [
+        "{\"started\":9}",
+        "{\"error\":\"lost the sandbox\"}"
+      ],
       "expect": {
         "started": 9,
         "output_base64": "",
         "gap": 0,
         "shell_exits": [],
         "error": "lost the sandbox"
+      }
+    },
+    {
+      "name": "stderr frames keyed by their pipe, a started frame echoing stdin",
+      "lines": [
+        "{\"started\":77,\"stdin\":true}",
+        "{\"stdout\":\"QUFB\"}",
+        "{\"stderr\":\"QkJC\"}",
+        "{\"stdout\":\"Q0ND\"}",
+        "{\"exit_code\":0}"
+      ],
+      "expect": {
+        "started": 77,
+        "output_base64": "QUFBQkJCQ0ND",
+        "gap": 0,
+        "shell_exits": [],
+        "end": 0,
+        "stdin": true,
+        "streams": "oeo"
       }
     }
   ],
@@ -228,7 +255,12 @@
     },
     {
       "op": "read",
-      "answer": { "state": "gone", "offset": 0, "end": 0, "data": "" },
+      "answer": {
+        "state": "gone",
+        "offset": 0,
+        "end": 0,
+        "data": ""
+      },
       "expect": {
         "state": "gone",
         "code": null,
@@ -302,11 +334,92 @@
     },
     {
       "op": "kill",
-      "answer": { "survivors": [{ "id": "00ff", "pids": [12, 34] }] },
+      "answer": {
+        "survivors": [
+          {
+            "id": "00ff",
+            "pids": [
+              12,
+              34
+            ]
+          }
+        ]
+      },
       "expect": {
         "survivors": [
-          { "id": "00ff", "described": "processes 12, 34 in the sandbox" }
+          {
+            "id": "00ff",
+            "described": "processes 12, 34 in the sandbox"
+          }
         ]
+      }
+    },
+    {
+      "op": "read",
+      "answer": {
+        "state": "ended",
+        "code": 0,
+        "offset": 0,
+        "end": 9,
+        "data": "QUFBQkJCQ0ND",
+        "stderr_ranges": [
+          [
+            3,
+            3
+          ]
+        ]
+      },
+      "expect": {
+        "state": "ended",
+        "code": 0,
+        "offset": 0,
+        "end": 9,
+        "data_base64": "QUFBQkJCQ0ND",
+        "stderr_ranges": [
+          [
+            3,
+            3
+          ]
+        ]
+      }
+    },
+    {
+      "op": "read",
+      "answer": {
+        "state": "running",
+        "code": null,
+        "offset": 0,
+        "end": 3,
+        "data": "QUFB"
+      },
+      "expect": {
+        "state": "running",
+        "code": null,
+        "offset": 0,
+        "end": 3,
+        "data_base64": "QUFB",
+        "stderr_ranges": []
+      }
+    },
+    {
+      "op": "write",
+      "answer": {
+        "written": 12
+      },
+      "expect": {
+        "written": 12,
+        "closed": false
+      }
+    },
+    {
+      "op": "write",
+      "answer": {
+        "written": 19,
+        "closed": true
+      },
+      "expect": {
+        "written": 19,
+        "closed": true
       }
     }
   ]

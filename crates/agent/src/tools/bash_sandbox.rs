@@ -105,7 +105,7 @@ pub(crate) fn on_event(shared: &JobShared, link: &SandboxLink, event: JobEvent<'
     match event {
         // Started means the output is live from here: what `bash`'s idle window measures.
         JobEvent::Started(_) => shared.track(kill_hook(link)),
-        JobEvent::Output(bytes) => shared.append(bytes),
+        JobEvent::Output(bytes, _) => shared.append(bytes),
         JobEvent::Gap(n) => shared.append_gap(n),
         JobEvent::ShellExit(code) => shared.orphaned(
             &ExecResult {
@@ -849,6 +849,8 @@ mod notify_tests {
             args: vec!["-c".into(), "sleep 1".into()],
             cwd: None,
             label: "sleep 1".into(),
+            env: Vec::new(),
+            stdin_open: false,
         };
         let job = link.id.as_str().to_string();
         let task = {
