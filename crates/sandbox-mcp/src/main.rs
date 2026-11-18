@@ -55,7 +55,13 @@ async fn run(config: Config) -> Result<(), String> {
         }
         None => {
             let service = server
-                .serve(rmcp::transport::stdio())
+                .serve(
+                    rmcp::transport::async_rw::AsyncRwTransport::new_server(
+                        tokio::io::stdin(),
+                        tokio::io::stdout(),
+                    )
+                    .with_max_line_length(sandbox_mcp::MAX_LINE),
+                )
                 .await
                 .map_err(|e| format!("MCP handshake failed: {e}"))?;
             tokio::select! {

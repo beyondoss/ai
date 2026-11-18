@@ -3263,11 +3263,9 @@ async fn connect_sandbox_stdio(
     )
     .await
     .map_err(|e| format!("could not start the server in the sandbox: {e}"))?;
-    let transport = crate::tools::mcp_handshake::Guard::new(rmcp::transport::IntoTransport::<
-        rmcp::RoleClient,
-        std::io::Error,
-        _,
-    >::into_transport((read, write)));
+    let transport = crate::tools::mcp_handshake::Guard::new(
+        crate::tools::mcp_stdio::client_transport(read, write),
+    );
     McpHandler::for_dial(&config.name, dial)
         .serve_with_lifecycle(transport, client_lifecycle())
         .await
@@ -3329,19 +3327,16 @@ async fn connect_stdio(
         cmd.process_group(0);
     });
     // Spawned here rather than by rmcp's `TokioChildProcess` — for every stdio server — so its
-    // stdout passes through `mcp_stdio::stdio_transport`, which keeps rmcp 3.x from silently dropping
-    // custom results (see `mcp_stdio::rescue`). When the transport or the connection goes away,
+    // stdout passes through `mcp_stdio::stdio_transport` (size caps). When the transport or the connection goes away,
     // `mcp_stdio::retire` closes the server's stdin, gives it `mcp_stdio::SHUTDOWN_GRACE` to exit,
     // and then kills what is left of its group.
     let (proc, transport) = crate::tools::mcp_stdio::stdio_transport(cmd)
         .map_err(|e| format!("failed to spawn `{command}`: {e}"))?;
 
     // A slow server's late discover answer must not fail the handshake — see `mcp_handshake`.
-    let transport = crate::tools::mcp_handshake::Guard::new(rmcp::transport::IntoTransport::<
-        rmcp::RoleClient,
-        std::io::Error,
-        _,
-    >::into_transport(transport));
+    let transport = crate::tools::mcp_handshake::Guard::new(
+        crate::tools::mcp_stdio::client_transport(transport.0, transport.1),
+    );
     let client = McpHandler::for_dial(&config.name, dial)
         .serve_with_lifecycle(transport, client_lifecycle())
         .await
@@ -3919,9 +3914,7 @@ impl McpCatalog {
     /// - **stdio**, and a pre-`2026-07-28` (session-bound) HTTP server: rmcp's own connection. The handle keeps the process alive (the reaper never
     ///   reaps a client somebody holds), so an open push stream pins its server while it is open.
     /// - **streamable HTTP**: the URL, credential headers and negotiated protocol version, for
-    ///   direct stateless requests — rmcp's typed result union would drop a custom result that
-    ///   carries `_meta` (see `mcp_stdio::rescue`), and over HTTP there is no byte stream of
-    ///   ours to repair it on.
+    ///   direct stateless requests.
     pub(crate) async fn events_peer(&self, server: &str) -> Result<EventsPeer, String> {
         let entry = self
             .snapshot()

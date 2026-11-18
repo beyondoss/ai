@@ -305,8 +305,8 @@ fn canonical_args(params: &Value) -> String {
 type RpcErr = (i64, String, Option<Value>);
 
 /// Every `2026-07-28` server (the official Python SDK included) attaches `resultType` and
-/// `_meta.serverInfo` to every result. Mirrored here because that is exactly what broke rmcp's
-/// decoding of custom results (see `mcp_stdio::rescue`) — a fixture without it hid the bug.
+/// `_meta.serverInfo` to every result. Mirrored here so the client is exercised against what a
+/// real server sends.
 fn like_a_2026_server(mut result: Value) -> Value {
     // A legacy (pre-2026) server predates per-result `serverInfo`.
     if env_flag("MCP_FIXTURE_LEGACY_SESSION") {

@@ -223,10 +223,9 @@ fn mcp_connect_to_an_oauth_protected_server_without_ever_logging_in_fails_naming
 #[test]
 fn mcp_get_access_token_transparently_refreshes_an_expired_token_on_the_next_connect() {
     let home = tempfile::tempdir().unwrap();
-    // A short (1s) expiry: `rmcp`'s own `AuthorizationManager::get_access_token` refreshes proactively
-    // whenever fewer than 30 seconds remain (`REFRESH_BUFFER_SECS`), so any token issued with a
-    // sub-30s lifetime is *always* treated as due for refresh on the very next call — no need to
-    // actually sleep past the expiry for this to trigger.
+    // A short (1s) expiry, slept past below: `rmcp`'s `AuthorizationManager::get_access_token`
+    // refreshes once fewer than `min(30, expires_in / 2)` seconds remain (at least one), so a token
+    // is due only when it has really (all but) expired.
     let (url, seen_auth_headers) = spawn_oauth_protected_mcp_fixture(1);
     write_global_settings(
         home.path(),
@@ -248,6 +247,8 @@ fn mcp_get_access_token_transparently_refreshes_an_expired_token_on_the_next_con
         "sanity: mcp-login itself never calls tools/call, so no MCP request (and thus no \
          Authorization header) should have reached the server yet"
     );
+
+    std::thread::sleep(std::time::Duration::from_millis(1500));
 
     let turn1 = turn_tool_use(
         "toolu_1",
