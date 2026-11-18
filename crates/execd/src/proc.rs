@@ -63,6 +63,39 @@ fn children() -> std::sync::MutexGuard<'static, Option<HashMap<u32, oneshot::Sen
     g
 }
 
+/// The signals whose dispositions [`release_signals`] takes out of a command's hands to execd's.
+const RELEASED: [tokio::signal::unix::SignalKind; 7] = [
+    tokio::signal::unix::SignalKind::hangup(),
+    tokio::signal::unix::SignalKind::interrupt(),
+    tokio::signal::unix::SignalKind::quit(),
+    tokio::signal::unix::SignalKind::terminate(),
+    tokio::signal::unix::SignalKind::user_defined1(),
+    tokio::signal::unix::SignalKind::user_defined2(),
+    tokio::signal::unix::SignalKind::alarm(),
+];
+
+static HELD: Mutex<Vec<tokio::signal::unix::Signal>> = Mutex::new(Vec::new());
+
+/// Give every command the default disposition of the signals a user sends a job (`Ctrl-C` is
+/// `SIGINT`). A process the launcher started with `cmd &` or `nohup` has `SIGINT`, `SIGQUIT` or
+/// `SIGHUP` set to `SIG_IGN`, and an ignored disposition survives `exec`: every command and job
+/// would inherit it, a shell could not even `trap` it, and a signal sent to the job would do nothing.
+/// A disposition that is a *handler* is reset to the default by `exec`, so installing one here (the
+/// safe way: tokio's signal driver) is what hands the children `SIG_DFL`. The handlers do nothing:
+/// execd itself no longer dies of a stray `SIGHUP`/`SIGUSR1`/`SIGQUIT` (it stops on `SIGTERM` and
+/// `SIGINT` where it waits for them, as before). Call inside a runtime; idempotent.
+pub(crate) fn release_signals() {
+    let mut held = locked(&HELD);
+    if !held.is_empty() {
+        return;
+    }
+    for kind in RELEASED {
+        if let Ok(sig) = tokio::signal::unix::signal(kind) {
+            held.push(sig);
+        }
+    }
+}
+
 /// A spawned command, leading a process group of its own.
 pub(crate) struct Proc {
     pub stdin: Option<tokio::process::ChildStdin>,
