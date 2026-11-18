@@ -303,11 +303,7 @@ async fn custom_request_typed(
         (format!("`{method}` failed: {e}"), invalid)
     })?;
     match response {
-        // `mcp_stdio::rescue` (stdio transport and `mcp_wire::HttpClient` alike) wrapped a
-        // `_meta`-carrying result so rmcp's untagged union could not shadow it; undo that here.
-        ServerResult::CustomResult(CustomResult(value)) => {
-            Ok(crate::tools::mcp_stdio::unwrap_rescued(value))
-        }
+        ServerResult::CustomResult(CustomResult(value)) => Ok(value),
         // The result union is untagged; should a known shape ever claim an extension result, its
         // re-serialization still carries the fields we read, or the parse below says what's missing.
         other => serde_json::to_value(other).map_err(|e| (format!("`{method}`: {e}"), false)),

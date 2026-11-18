@@ -1,12 +1,6 @@
 //! The streamable-HTTP half of keeping extension results intact on their way through `rmcp`.
 //!
-//! `rmcp` (3.2 through at least 3.5.1) decodes every server result into an *untagged* union, and
-//! `CallToolResult` matches any object carrying `_meta` — which every `2026-07-28` server puts on
-//! every result — so a `skills/list` answer would arrive as an empty tool result (upstream:
-//! modelcontextprotocol/rust-sdk#1197). The workaround is one boundary,
-//! [`crate::tools::mcp_stdio::rescue`] / [`crate::tools::mcp_stdio::unwrap_rescued`], applied to the
-//! raw bytes before `rmcp` parses them. For stdio that is the one stdio transport
-//! ([`crate::tools::mcp_stdio`]); for streamable HTTP it is [`HttpClient`] here, which wraps the
+//! Streamable HTTP for `rmcp`: [`HttpClient`] here wraps the
 //! `reqwest` client `rmcp` drives and answers every POST itself (with the exact URI, session, auth
 //! and standard headers the transport handed it). The same request path
 //! ([`HttpClient::post_bounded`]) serves `mcp_view_http`'s capped MCP App view reads.
@@ -32,9 +26,9 @@ use serde_json::Value;
 
 /// The `reqwest` client `rmcp`'s streamable-HTTP transport drives, answering **every** POST itself
 /// ([`HttpClient::post_bounded`]; rmcp's own `post_message` is never called) so results are
-/// [rescued](crate::tools::mcp_stdio::rescue) and size-capped before `rmcp` parses them, and so a
-/// 401's status is always visible: rmcp turns a 401 whose body is a JSON-RPC error into an ordinary
-/// error *response*, the status lost before `mcp_oauth` could see it and refresh. Here any 401 is
+/// size-capped before `rmcp` parses them, and so a
+/// 401's status is always visible to `mcp_oauth` (which refreshes on it), and a server's message
+/// reaches the model fenced as untrusted. Here any 401 is
 /// `AuthRequired`, for every server.
 #[derive(Clone)]
 pub(crate) struct HttpClient {
@@ -335,8 +329,8 @@ impl HttpClient {
     /// (`mcp_view_http`) — built and its status interpreted the way `rmcp`'s own `reqwest` client
     /// does: reserved headers refused, 401/403 with a `WWW-Authenticate` surfaced as the
     /// `AuthRequired`/`InsufficientScope` errors `rmcp` and its callers act on, a 404 on a session as
-    /// `SessionExpired` so it re-initializes. The result is rescued before `rmcp` parses it. An SSE
-    /// response is handed back **as a stream**, each event rescued as it arrives: `rmcp` reads it
+    /// `SessionExpired` so it re-initializes. The result is size-capped before `rmcp` parses it. An SSE
+    /// response is handed back **as a stream**: `rmcp` reads it
     /// incrementally, routes every server→client message on it (progress, requests, logs), and stops
     /// at the response, so a server that keeps the stream open costs nothing.
     ///
@@ -450,17 +444,7 @@ impl HttpClient {
                 response.bytes_stream(),
                 max,
                 overflowed.clone(),
-            ))
-            .map(|event| {
-                event.map(|mut event| {
-                    if let Some(data) = &event.data
-                        && let Some(rescued) = crate::tools::mcp_stdio::rescue(data.as_bytes())
-                    {
-                        event.data = Some(String::from_utf8_lossy(&rescued).into_owned());
-                    }
-                    event
-                })
-            });
+            ));
             let events = match over {
                 OverLimit::Fail => events.boxed(),
                 // The event over the limit becomes the refusal, and the stream ends there.
@@ -511,10 +495,6 @@ impl HttpClient {
                     ))
                 }
             };
-        };
-        let body = match crate::tools::mcp_stdio::rescue(body.as_bytes()) {
-            Some(rescued) => String::from_utf8_lossy(&rescued).into_owned(),
-            None => body,
         };
         let parsed = serde_json::from_str::<Value>(&body).ok();
         let Some(value) = parsed.filter(|v| v.get("result").is_some() || v.get("error").is_some())
@@ -692,35 +672,7 @@ impl StreamableHttpClient for HttpClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rmcp::model::{CustomResult, ServerResult};
     use serde_json::json;
-
-    /// The bug this module exists for, pinned: if `rmcp` ever stops shadowing, this fails and the
-    /// module (and `mcp_stdio::rescue`) can go. A rescued skills result reaches us whole.
-    #[test]
-    fn rmcp_still_shadows_a_skills_result_that_carries_meta() {
-        let raw = json!({
-            "resultType": "complete",
-            "skills": [],
-            "_meta": { "io.modelcontextprotocol/serverInfo": { "name": "s", "version": "" } },
-        });
-        let parsed: ServerResult = serde_json::from_value(raw.clone()).unwrap();
-        assert!(!matches!(parsed, ServerResult::CustomResult(_)));
-
-        let line = json!({ "jsonrpc": "2.0", "id": 1, "result": raw }).to_string();
-        let rescued =
-            crate::tools::mcp_stdio::rescue(line.as_bytes()).expect("a skills result is lossy");
-        let message: Value = serde_json::from_slice(&rescued).unwrap();
-        let parsed: ServerResult = serde_json::from_value(message["result"].clone()).unwrap();
-        let ServerResult::CustomResult(CustomResult(value)) = parsed else {
-            panic!("a rescued skills result must reach us as a custom result");
-        };
-        let value = crate::tools::mcp_stdio::unwrap_rescued(value);
-        assert!(
-            value["skills"].is_array() && value["_meta"].is_object(),
-            "{value}"
-        );
-    }
 
     #[test]
     fn the_scope_comes_out_of_www_authenticate_quoted_or_not() {
@@ -777,7 +729,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_sse_response_is_streamed_rescued_and_does_not_wait_for_the_server_to_close() {
+    async fn an_sse_response_is_streamed_and_does_not_wait_for_the_server_to_close() {
         use futures::StreamExt as _;
         // A notification first (routed by rmcp, not dropped), then the response, then nothing — the
         // server holds the stream open.
@@ -802,10 +754,7 @@ mod tests {
         let ServerJsonRpcMessage::Response(response) = serde_json::from_value(data).unwrap() else {
             panic!("the second event is the response");
         };
-        let ServerResult::CustomResult(CustomResult(value)) = response.result else {
-            panic!("the rescued result must reach rmcp's catch-all");
-        };
-        let value = crate::tools::mcp_stdio::unwrap_rescued(value);
+        let value = serde_json::to_value(response.result).unwrap();
         assert!(value["skills"].is_array(), "{value}");
     }
 
@@ -928,9 +877,8 @@ mod tests {
             }
         }
         // The deliberate divergence: a 401 with no `WWW-Authenticate` whose body is a JSON-RPC
-        // error. rmcp hands that back as an ordinary error *response*, losing the status; here it
-        // is the 401 it is (rmcp's own bare-401 shape, `HTTP 401 …`), so `mcp_oauth` can refresh —
-        // carrying the server's message, so its caller still sees why.
+        // error. Here it is the 401 it is (rmcp's bare-401 shape, `HTTP 401 …`), so `mcp_oauth` can
+        // refresh — carrying the server's message fenced as untrusted, so its caller still sees why.
         let raw: &[u8] = b"HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: 69\r\nConnection: close\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":7,\"error\":{\"code\":-32001,\"message\":\"no token\"}}";
         let ours = HttpClient::new(reqwest::Client::new())
             .post_message(
@@ -954,8 +902,9 @@ mod tests {
             shape(&ours),
             "other: unexpected server response: HTTP 401 Unauthorized: <mcp_server_message untrusted>no token</mcp_server_message> (JSON-RPC error -32001)"
         );
+        // rmcp's own client now keeps the status too, but hands the server's body back unfenced.
         assert!(
-            !shape(&theirs).contains("HTTP 401"),
+            shape(&theirs).contains("HTTP 401") && !shape(&theirs).contains("mcp_server_message"),
             "rmcp's own client: {}",
             shape(&theirs)
         );

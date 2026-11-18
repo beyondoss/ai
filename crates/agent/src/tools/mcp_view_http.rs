@@ -30,7 +30,7 @@ use crate::tools::mcp_wire::{Limit, OverLimit};
 /// `reqwest`, with view reads capped. See the module doc.
 #[derive(Clone)]
 pub(crate) struct ViewCappedHttp {
-    /// Everything that is not a view read goes here (which itself rescues extension results).
+    /// Everything that is not a view read goes here.
     inner: crate::tools::mcp_wire::HttpClient,
     cap: usize,
 }
