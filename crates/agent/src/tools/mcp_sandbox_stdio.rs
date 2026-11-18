@@ -8,7 +8,7 @@
 //!
 //! - **server → host**: [`SandboxJobs::follow`] streams the job's output, which is the server's
 //!   stdout (its stderr goes to `<fifo>.log`, never into the JSON-RPC stream). The bytes go through
-//!   [`mcp_stdio::pump`], the same line reader, size caps and `rescue` every stdio server uses.
+//!   [`mcp_stdio::pump`], the same line reader and size caps every stdio server uses.
 //! - **host → server**: one plain exec, `cat >> <fifo>` with the bytes as `stdin_base64`.
 //!
 //! **Writes are serialized.** Two `cat >> fifo` running at once interleave once a message passes

@@ -499,10 +499,8 @@ impl Conn {
                     .await_response()
                     .await
                     .map_err(RpcError::from_service)?;
-                // Untagged union: re-serialize whichever variant matched, then undo a rescue.
-                serde_json::to_value(result)
-                    .map(crate::tools::mcp_stdio::unwrap_rescued)
-                    .map_err(|e| RpcError::local(e.to_string()))
+                // Untagged union: re-serialize whichever variant matched.
+                serde_json::to_value(result).map_err(|e| RpcError::local(e.to_string()))
             }
             crate::tools::mcp::EventsPeer::Http {
                 url,

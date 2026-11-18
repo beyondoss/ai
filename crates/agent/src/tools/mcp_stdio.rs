@@ -24,11 +24,6 @@
 //! descendant that also cleared its environment is still known after its parent exits. Under the
 //! agent binary the server is also started with a parent-death signal and orphans re-parent to the
 //! agent (see [`crate::subreaper`]), so a SIGKILLed agent still takes its servers down.
-//!
-//! **One boundary.** [`rescue`] / [`unwrap_rescued`] are the whole workaround, for events and skills
-//! results alike: this transport applies [`rescue`] to every stdio line, and `tools/mcp_wire.rs`'s
-//! `HttpClient` applies it to `skills/*` responses over streamable HTTP; each custom-request caller
-//! undoes it with [`unwrap_rescued`].
 
 use serde_json::{Value, json};
 
@@ -186,69 +181,8 @@ pub fn retire_all() -> Vec<std::sync::Arc<ServerProcess>> {
     live
 }
 
-/// The key a rescued result is wrapped under on its way through rmcp; see [`rescue`].
-const RESCUE_KEY: &str = "x-beyond-raw-result";
-
-/// Undo [`rescue`]'s wrapping, if it happened.
-pub(crate) fn unwrap_rescued(v: Value) -> Value {
-    match v {
-        Value::Object(mut m) if m.len() == 1 && m.contains_key(RESCUE_KEY) => {
-            m.remove(RESCUE_KEY).unwrap_or(Value::Null)
-        }
-        other => other,
-    }
-}
-
 fn contains(hay: &[u8], needle: &[u8]) -> bool {
     hay.windows(needle.len()).any(|w| w == needle)
-}
-
-/// The cheap byte test that decides whether a line is parsed at all. A line can only be lossy if it
-/// is a response carrying `_meta`; and an ordinary tool result (it always has a `content` array) is
-/// skipped without parsing unless it also carries one of the events extension's own result keys.
-pub(crate) fn needs_check(line: &[u8]) -> bool {
-    if !contains(line, b"\"result\"") || !contains(line, b"\"_meta\"") {
-        return false;
-    }
-    if !contains(line, b"\"content\":[") && !contains(line, b"\"content\": [") {
-        return true;
-    }
-    [
-        &b"\"events\""[..],
-        b"\"nextPollMs\"",
-        b"\"refreshBefore\"",
-        b"\"hasMore\"",
-    ]
-    .iter()
-    .any(|k| contains(line, k))
-}
-
-/// Keep rmcp 3.x from silently dropping a custom request's result: `Some(rewritten)` for exactly
-/// the lossy case — a response whose result rmcp would read as a `CallToolResult` yet carries none
-/// of that type's own fields and does carry others — wrapped as `{"x-beyond-raw-result": <result>}`,
-/// which only rmcp's catch-all can match. `None` leaves the line untouched (the common case,
-/// decided by [`needs_check`] without parsing).
-pub(crate) fn rescue(line: &[u8]) -> Option<Vec<u8>> {
-    if !needs_check(line) {
-        return None;
-    }
-    let mut msg = serde_json::from_slice::<Value>(line).ok()?;
-    let result = msg.get("result")?.as_object()?;
-    msg.get("id")?;
-    let lossy = !["content", "structuredContent", "isError"]
-        .iter()
-        .any(|k| result.contains_key(*k))
-        && result.keys().any(|k| k != "_meta" && k != "resultType")
-        && matches!(
-            serde_json::from_value::<rmcp::model::ServerResult>(Value::Object(result.clone())),
-            Ok(rmcp::model::ServerResult::CallToolResult(_))
-        );
-    if !lossy {
-        return None;
-    }
-    let inner = msg["result"].take();
-    msg["result"] = json!({ RESCUE_KEY: inner });
-    Some(msg.to_string().into_bytes())
 }
 
 // ---- per-message caps -------------------------------------------------------------------------------
@@ -768,7 +702,7 @@ impl tokio::io::AsyncWrite for StdinGuard {
 }
 
 /// Pump a server's stdout into the in-memory pipe rmcp reads, a line at a time through
-/// [`read_capped`] and [`rescue`]: the read half of every stdio transport, whether the server is a
+/// [`read_capped`]: the read half of every stdio transport, whether the server is a
 /// child of this process or a job in a sandbox. Returns rmcp's end and the [`MessageCaps`] the write
 /// half must tell about every request it sends (`MessageCaps::wrote`). The task ends when the
 /// stream ends or rmcp stops reading.
@@ -829,7 +763,7 @@ pub(crate) fn pump(
             }
             let body = line.strip_suffix(b"\n").unwrap_or(&line);
             let body = body.strip_suffix(b"\r").unwrap_or(body);
-            let mut out = rescue(body).unwrap_or_else(|| body.to_vec());
+            let mut out = body.to_vec();
             out.push(b'\n');
             if pump_side.write_all(&out).await.is_err() {
                 break;
@@ -839,8 +773,7 @@ pub(crate) fn pump(
     (rmcp_side, caps)
 }
 
-/// Spawn a stdio MCP server; return it and an rmcp transport whose inbound lines pass through
-/// [`rescue`].
+/// Spawn a stdio MCP server; return it and an rmcp transport whose inbound lines are the server's stdout.
 ///
 /// One small task per server pumps its stdout into an in-memory pipe rmcp reads; it ends when the
 /// server closes stdout or rmcp stops reading. Ending the server is [`retire`]'s, called when the
@@ -1150,57 +1083,6 @@ mod tests {
         assert_eq!(head(r#"{"id":{"n":1},"result":"#).reply_to(), None);
         // Not an object at all.
         assert_eq!(head(r#"["id",1]"#), Head::default());
-    }
-
-    #[test]
-    fn rescue_keeps_a_meta_carrying_custom_result_and_leaves_typed_results_alone() {
-        // What a 2026-07-28 server sends for `events/list`: rmcp alone reads this as an empty
-        // `CallToolResult` and the events are gone.
-        let line = json!({"jsonrpc": "2.0", "id": 7, "result": {
-            "events": [{"name": "a"}], "resultType": "complete",
-            "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "x", "version": ""}}
-        }})
-        .to_string();
-        let lossy: rmcp::model::ServerJsonRpcMessage = serde_json::from_str(&line).unwrap();
-        assert!(
-            !serde_json::to_string(&lossy).unwrap().contains("events"),
-            "the rmcp behaviour this works around has changed; revisit rescue"
-        );
-        let rescued: rmcp::model::ServerJsonRpcMessage =
-            serde_json::from_slice(&rescue(line.as_bytes()).unwrap()).unwrap();
-        let rmcp::model::ServerJsonRpcMessage::Response(r) = rescued else {
-            panic!("not a response")
-        };
-        let back = unwrap_rescued(serde_json::to_value(r.result).unwrap());
-        assert_eq!(back["events"][0]["name"], "a");
-
-        for untouched in [
-            json!({"jsonrpc": "2.0", "id": 1, "result": {"content": [], "_meta": {}}}),
-            json!({"jsonrpc": "2.0", "id": 2, "result": {"tools": [], "_meta": {}}}),
-            json!({"jsonrpc": "2.0", "id": 3, "result": {"resultType": "complete", "_meta": {}}}),
-            json!({"jsonrpc": "2.0", "method": "notifications/x", "params": {"result": 1, "_meta": {}}}),
-        ] {
-            assert!(rescue(untouched.to_string().as_bytes()).is_none());
-        }
-    }
-
-    #[test]
-    fn an_ordinary_meta_carrying_tool_result_is_not_even_parsed() {
-        let tool = json!({"jsonrpc": "2.0", "id": 1, "result": {
-            "content": [{"type": "text", "text": "hi"}], "_meta": {"x": 1}
-        }})
-        .to_string();
-        assert!(!needs_check(tool.as_bytes()));
-        // No `_meta`: never parsed either.
-        assert!(!needs_check(
-            br#"{"jsonrpc":"2.0","id":1,"result":{"events":[]}}"#
-        ));
-        // An events result that happens to mention `content`: still checked.
-        let events = json!({"jsonrpc": "2.0", "id": 1, "result": {
-            "events": [{"data": {"content": [1]}}], "_meta": {}
-        }})
-        .to_string();
-        assert!(needs_check(events.as_bytes()));
     }
 
     /// `retire_all` and the pending-kill registry are process-wide: tests that use them take turns.

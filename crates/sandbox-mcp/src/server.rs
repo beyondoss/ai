@@ -18,7 +18,7 @@ use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, ListResourcesResult, ReadResourceRequestParams,
-    ReadResourceResponse, ReadResourceResult, ResourceContents, ServerCapabilities, ServerInfo,
+    ReadResourceResponse, ReadResourceResult, ResourceContents, ServerCapabilities, ServerConfig,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler, schemars, tool, tool_handler, tool_router};
@@ -1104,8 +1104,8 @@ impl SandboxMcp {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for SandboxMcp {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
