@@ -424,7 +424,7 @@ impl ExecMock {
         url: String,
         opts: MockOptions,
     ) -> Self {
-        let inner_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let inner_listener = crate::ports::listener();
         inner_listener.set_nonblocking(true).expect("nonblocking");
         let inner_url = format!("http://{}/exec", inner_listener.local_addr().expect("addr"));
         let inner = Self::delegate(

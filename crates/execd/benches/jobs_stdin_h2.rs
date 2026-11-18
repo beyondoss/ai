@@ -41,7 +41,7 @@ async fn main() {
     let inflight: usize = args.get(3).and_then(|a| a.parse().ok()).unwrap_or(8);
     let dir = tempfile::tempdir().unwrap();
     let port = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let l = beyond_test_support::ports::listener();
         l.local_addr().unwrap().port()
     };
     let mut child = std::process::Command::new(bin)
