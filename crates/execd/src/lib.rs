@@ -375,6 +375,8 @@ pub fn serve(listener: tokio::net::TcpListener, opts: Options) -> std::io::Resul
             "Options::bearer and Options::authorizer are both set: choose one way to authenticate",
         ));
     }
+    // Before any command can be spawned: see `proc::release_signals`.
+    proc::release_signals();
     let spool = spool::JobsDir::open(opts.jobs_dir.as_deref())?;
     // Fail closed: no authentication is only for a listener that only this host can reach.
     if opts.bearer.is_none()

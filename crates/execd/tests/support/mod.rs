@@ -72,8 +72,30 @@ impl Execd {
 
     /// [`Self::start`], listening on `listen` (a port-0 address, read back from the socket).
     pub fn start_on(listen: &str, settings: &[(&str, &str)], env: &[(&str, &str)]) -> Self {
+        Self::start_launched(None, listen, settings, env)
+    }
+
+    /// [`Self::start`], launched the way `cmd &` or `nohup` launches it: the signals named in
+    /// `ignoring` (`HUP INT QUIT ...`) are `SIG_IGN` in the process execd starts as.
+    pub fn start_ignoring(ignoring: &str) -> Self {
+        Self::start_launched(Some(ignoring), ports::CHILD_LISTEN, &[], &[])
+    }
+
+    fn start_launched(
+        ignoring: Option<&str>,
+        listen: &str,
+        settings: &[(&str, &str)],
+        env: &[(&str, &str)],
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let mut cmd = Command::new(BIN);
+        let mut cmd = match ignoring {
+            None => Command::new(BIN),
+            Some(sigs) => {
+                let mut c = Command::new("sh");
+                c.args(["-c", &format!("trap '' {sigs}; exec \"$0\""), BIN]);
+                c
+            }
+        };
         cmd.env("EXECD_LISTEN", listen)
             .env("EXECD_ROOT", dir.path())
             .stdin(Stdio::null())
