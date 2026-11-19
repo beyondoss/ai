@@ -41,7 +41,7 @@
 //! `watch_prefix`, i.e. `DeliverPolicy::New`. We can't stop that degradation, so we refuse to treat
 //! it as seeded (see `is_resumable`): the watch runs replay-less for this connection, and the *next*
 //! connect rescans instead of latching a replay-less watch for the life of the process. Same for
-//! `CursorExpired` (the backend compacted past the cursor) — we drop back to a fresh scan, which
+//! `CursorExpired` (the backend compacted past the cursor) or `ForeignCursor` (the bucket was recreated) — we drop back to a fresh scan, which
 //! re-establishes a valid baseline.
 //!
 //! Runs as a Pingora `BackgroundService` so the NATS client is created on the serving runtime
@@ -969,10 +969,14 @@ async fn watch_set<W: WatchedSet>(
     // cursor forces a fresh scan on the next connect instead of resuming from a dead revision.
     match watch.await {
         Ok(Ok(())) => {}
-        Ok(Err(KvError::CursorExpired)) => {
+        Ok(Err(e @ (KvError::CursorExpired | KvError::ForeignCursor))) => {
+            // `ForeignCursor`: the bucket was deleted and recreated, so the cursor (and the
+            // snapshot it came from) belongs to another stream. Same recovery as an expiry: the
+            // rescan rebuilds the snapshot from the live set, never resumes from the old one.
             warn!(
                 set = W::NOUN,
-                "resume cursor expired (history compacted past it); will rescan"
+                error = %e,
+                "resume cursor unusable (history compacted past it, or the bucket was recreated); will rescan"
             );
             *seeded = false;
             *cursor = WatchCursor::none();
@@ -1571,6 +1575,130 @@ mod tests {
         const {
             assert!(Deny::SEED_FROM_CURSORLESS_SNAPSHOT);
             assert!(!Allowance::SEED_FROM_CURSORLESS_SNAPSHOT);
+        }
+    }
+
+    /// A store whose `scan` returns one live deny entry and whose resume watch fails with `watch`.
+    struct FakeStore {
+        scans: std::sync::atomic::AtomicUsize,
+        watch: Option<KvError>,
+    }
+
+    #[async_trait]
+    impl store::KvReader for FakeStore {
+        async fn get(&self, _: &str) -> Result<Option<KvEntry>, KvError> {
+            Ok(None)
+        }
+        async fn keys(&self, _: &str) -> Result<Vec<String>, KvError> {
+            Ok(Vec::new())
+        }
+        async fn scan(&self, _: &str) -> Result<Vec<KvEntry>, KvError> {
+            self.scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![entry("blackhole.7", b"1")])
+        }
+        async fn entry(&self, _: &str) -> Result<Option<KvEntry>, KvError> {
+            Ok(None)
+        }
+    }
+
+    #[async_trait]
+    impl store::KvWatcher for FakeStore {
+        async fn watch_all(&self, _: tokio::sync::mpsc::Sender<KvUpdate>) -> Result<(), KvError> {
+            Ok(())
+        }
+        async fn watch_prefix(
+            &self,
+            _: &str,
+            _: tokio::sync::mpsc::Sender<KvUpdate>,
+        ) -> Result<(), KvError> {
+            Ok(())
+        }
+        async fn watch_prefixes(
+            &self,
+            _: &[&str],
+            _: tokio::sync::mpsc::Sender<KvUpdate>,
+        ) -> Result<(), KvError> {
+            Ok(())
+        }
+        async fn watch_prefix_from(
+            &self,
+            _: &str,
+            _: &WatchCursor,
+            _: tokio::sync::mpsc::Sender<KvUpdate>,
+        ) -> Result<(), KvError> {
+            match &self.watch {
+                Some(KvError::ForeignCursor) => Err(KvError::ForeignCursor),
+                Some(KvError::CursorExpired) => Err(KvError::CursorExpired),
+                _ => Ok(()),
+            }
+        }
+    }
+
+    struct FakeHandle(Arc<FakeStore>);
+
+    impl KvStore for FakeHandle {
+        fn name(&self) -> &str {
+            "fake"
+        }
+        fn reader(&self) -> Arc<dyn store::KvReader> {
+            self.0.clone()
+        }
+        fn watcher(&self) -> Option<Arc<dyn store::KvWatcher>> {
+            Some(self.0.clone())
+        }
+    }
+
+    /// A resume cursor that slipstream refuses as another incarnation's (the bucket was deleted and
+    /// recreated) must drop the watcher back to a fresh scan, exactly as an expired cursor does, and
+    /// not leave it resuming from the dead cursor on every reconnect.
+    #[tokio::test]
+    async fn a_foreign_or_expired_cursor_forces_a_rescan() {
+        for err in [KvError::ForeignCursor, KvError::CursorExpired] {
+            let state = Arc::new(
+                GatewayState::new(
+                    crate::config::AiConfig::default().validate().unwrap(),
+                    crate::state::test_metrics(),
+                )
+                .unwrap(),
+            );
+            let fake = Arc::new(FakeStore {
+                scans: Default::default(),
+                watch: Some(err),
+            });
+            let (_tx, mut shutdown) = tokio::sync::watch::channel(false);
+            let mut cursor = WatchCursor::from_u64(5);
+            let mut writer = None;
+            let mut seeded = true;
+
+            let exited = watch_set::<Deny>(
+                &state,
+                Arc::new(FakeHandle(fake.clone())),
+                &mut cursor,
+                &mut writer,
+                &mut seeded,
+                &mut shutdown,
+            )
+            .await;
+            assert!(!exited);
+            assert!(!seeded, "the next connect must rescan, not resume");
+            assert!(cursor.is_none(), "the dead cursor must be discarded");
+
+            // The reconnect: the scan runs and its live set replaces whatever was held.
+            let ok = Arc::new(FakeStore {
+                scans: Default::default(),
+                watch: None,
+            });
+            watch_set::<Deny>(
+                &state,
+                Arc::new(FakeHandle(ok.clone())),
+                &mut cursor,
+                &mut writer,
+                &mut seeded,
+                &mut shutdown,
+            )
+            .await;
+            assert_eq!(ok.scans.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert!(seeded && is_resumable(&cursor));
         }
     }
 }
