@@ -994,11 +994,17 @@ async fn watch_set<W: WatchedSet>(
 /// where the batch left off. `compact` reads+rewrites the whole file, so it's offloaded off the
 /// serving runtime when the log crosses its threshold.
 ///
-/// Checkpointing once per batch only ever errs in the safe direction: a crash after some records
-/// reached the file but before the cursor record leaves a cursor *older* than the data, so the next
-/// boot resumes early and re-applies those deltas — idempotent, since a `Put`/`Delete` of the same
-/// key lands the same set. The dangerous direction (a cursor ahead of its data, which would skip
-/// deltas) can't happen: the checkpoint is written last.
+/// The file's cursor is only ever *behind* its data, never ahead of it, so a restart replays and
+/// never skips. Two things keep that true:
+/// - The checkpoint is written last, so a crash after some records but before the cursor record
+///   leaves a cursor older than the data; the next boot resumes early and re-applies those deltas
+///   (idempotent: a `Put`/`Delete` of the same key lands the same set).
+/// - If any `write_update` or the checkpoint fails, the batch's cursor is not recorded and the
+///   writer is dropped (`None`). The file keeps its last good cursor, which is older than the lost
+///   delta, so the next boot resumes from it and re-applies the delta (or rescans if that cursor
+///   has expired). Appending past the gap would let a later checkpoint cover it. Nothing re-creates
+///   the writer for the life of the process: the gateway runs snapshot-less until restart, and the
+///   in-memory set (fed by NATS) is unaffected.
 async fn persist_batch(
     writer: &mut Option<SnapshotWriter>,
     updates: &[KvUpdate],
@@ -1006,15 +1012,12 @@ async fn persist_batch(
 ) {
     let needs_compact = match writer.as_mut() {
         Some(w) => {
-            for update in updates {
-                if let Err(e) = w.write_update(update) {
-                    warn!(error = %e, "snapshot write failed");
-                }
-            }
-            match w.checkpoint(cursor) {
+            let result = updates.iter().try_for_each(|u| w.write_update(u));
+            match result.and_then(|()| w.checkpoint(cursor)) {
                 Ok(b) => b,
                 Err(e) => {
-                    warn!(error = %e, "snapshot checkpoint failed");
+                    warn!(error = %e, "snapshot write failed; disabling snapshot writer so the cursor never passes the lost delta");
+                    *writer = None;
                     false
                 }
             }
@@ -1566,6 +1569,34 @@ mod tests {
         let snap = store::snapshot::load(&path).unwrap().unwrap();
         assert_eq!(keys(&snap), ["allowance.1", "allowance.2"]);
         assert_eq!(snap.cursor.as_u64(), Some(4));
+    }
+
+    /// A batch whose delta did not reach the file must not be checkpointed: the cursor would then
+    /// sit past a lost `Put` (a deny or blackhole key), and the next boot would resume after it and
+    /// never apply it. The writer is dropped too, so nothing later is appended to the gapped file.
+    #[tokio::test]
+    async fn a_failed_snapshot_write_leaves_no_cursor_past_the_lost_delta() {
+        let dir = ScratchDir::new("lostdelta");
+        let path = dir.0.join("snap.log");
+        let mut writer = Some(full_rebuild(&path, vec![put("blackhole.1", 1)], 1));
+
+        // A key past the record format's u16 length: `write_update` refuses it, no I/O involved.
+        let too_long = "k".repeat(usize::from(u16::MAX) + 1);
+        let batch = [
+            KvUpdate::Put(put("blackhole.2", 2)),
+            KvUpdate::Put(put(&too_long, 3)),
+            KvUpdate::Put(put("blackhole.3", 4)),
+        ];
+        persist_batch(&mut writer, &batch, &WatchCursor::from_u64(4)).await;
+        assert!(writer.is_none(), "a gapped file takes no further appends");
+        drop(writer);
+
+        let snap = store::snapshot::load(&path).unwrap().unwrap();
+        assert_eq!(
+            snap.cursor.as_u64(),
+            Some(1),
+            "the cursor must stay before the lost delta so the next boot replays it"
+        );
     }
 
     /// The trait's policy, pinned: only the fail-closed set refuses a cursorless snapshot.
