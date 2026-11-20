@@ -36,7 +36,12 @@ impl AiProxy {
             None
         };
         let facts = body_rules::Facts {
-            refused_input: route::refused_input(route, &body).map(|kind| (route.model, kind)),
+            refused_input: route::refused_input(
+                route,
+                route::implied_endpoint(session.req_header().uri.path()),
+                &body,
+            )
+            .map(|kind| (route.model, kind)),
             background: route::is_responses_path(session.req_header().uri.path())
                 && requests_background(&body),
             ..body_rules::Facts::default()

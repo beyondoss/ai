@@ -1269,6 +1269,46 @@ pub fn has_typed_member(b: &[u8], span: (usize, usize), types: &[&str]) -> bool 
     })
 }
 
+/// Whether a member keyed one of `quoted_keys` (each spelled with its quotes), anywhere inside `span`, names a URL for which `bad` holds:
+/// the member's value is a string (`"image_url": "file:///x"`) or an object whose `url` is
+/// (`"image_url": {"url": ...}`, `"source": {"type": "url", "url": ...}`). A value of any other
+/// shape names no URL and is skipped.
+///
+/// Found as [`has_typed_member`] finds a type: the bytes `"key"`, `:`, then the value, with an
+/// unescaped opening quote, by one `memmem` pass per key and O(1) per hit, without a walk of the
+/// structure.
+pub fn has_url_member(
+    b: &[u8],
+    span: (usize, usize),
+    quoted_keys: &[&[u8]],
+    bad: impl Fn(&str) -> bool,
+) -> bool {
+    let Some(region) = b.get(span.0..span.1) else {
+        return false;
+    };
+    quoted_keys.iter().any(|quoted| {
+        memchr::memmem::find_iter(region, quoted).any(|at| {
+            let at = span.0.saturating_add(at);
+            if escaped_at(b, at) {
+                return false;
+            }
+            let colon = skip_ws(b, at.saturating_add(quoted.len()));
+            if b.get(colon) != Some(&b':') {
+                return false;
+            }
+            let value = skip_ws(b, colon.saturating_add(1));
+            let url = match b.get(value) {
+                Some(b'"') => string_end(b, value).map(|end| (value, end)),
+                Some(b'{') => last_member(b, value, "url").flatten().map(|m| m.value),
+                _ => None,
+            };
+            url.filter(|&(_, end)| end <= span.1)
+                .and_then(|u| str_value(b, u))
+                .is_some_and(|u| bad(&u))
+        })
+    })
+}
+
 /// Whether the byte at `at` is escaped: preceded by an odd run of backslashes.
 fn escaped_at(b: &[u8], at: usize) -> bool {
     let before = b.get(..at).unwrap_or_default();
@@ -1564,6 +1604,23 @@ mod tests {
         assert!(!hit(br#"[{"type":"images"}]"#));
         // A string ending in an escaped backslash leaves the next quote unescaped.
         assert!(hit(br#"[{"text":"a\\","type":"image"}]"#));
+    }
+
+    /// A URL member is read as a string or as the `url` of an object, at any depth, and only a real
+    /// member: not prose that mentions one, not an object with no string `url`.
+    #[test]
+    fn has_url_member_reads_only_real_url_members() {
+        let keys: &[&[u8]] = &[b"\"image_url\"", b"\"source\""];
+        let bad = |u: &str| !u.starts_with("https://");
+        let hit = |b: &[u8]| has_url_member(b, (0, b.len()), keys, bad);
+        assert!(hit(br#"[{"image_url":{"url":"file:///x"}}]"#));
+        assert!(hit(br#"[{"image_url" : "gs://b/x"}]"#));
+        assert!(hit(br#"[{"c":[{"source":{"type":"url","url":"x.png"}}]}]"#));
+        assert!(hit(br#"[{"image_url":{"url":"file:\/\/\/x"}}]"#));
+        assert!(!hit(br#"[{"image_url":{"url":"https://a/x"}}]"#));
+        assert!(!hit(br#"[{"source":{"type":"base64","data":"AAAA"}}]"#));
+        assert!(!hit(br#"[{"image_url":{"type":"string"}}]"#));
+        assert!(!hit(br#"[{"text":"\"image_url\": \"file:///x\""}]"#));
     }
 
     /// The one root-member splice behind `store_false`, `force_stream` and

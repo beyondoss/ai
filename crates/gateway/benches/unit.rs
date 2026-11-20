@@ -1796,9 +1796,13 @@ mod body_gates {
     fn refused_input_prose_500k(bencher: Bencher) {
         let body = prose_body(500 * 1024);
         let row = no_image_row();
-        bencher
-            .counter(BytesCount::of_slice(&body))
-            .bench(|| route::refused_input(black_box(row), black_box(&body)));
+        bencher.counter(BytesCount::of_slice(&body)).bench(|| {
+            route::refused_input(
+                black_box(row),
+                black_box(Some(route::Endpoint::ChatCompletions)),
+                black_box(&body),
+            )
+        });
     }
 
     #[divan::bench]

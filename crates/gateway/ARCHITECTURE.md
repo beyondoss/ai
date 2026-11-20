@@ -481,6 +481,15 @@ does. Then:
   any upstream: o3-mini ignored the image and billed an answer about nothing, gpt-4 answered
   500 (both rows since removed, D243). PDFs on a row without file input are not refused: OpenRouter extracts a PDF's text
   for most models.
+- A request that will be **translated** (the client's dialect is not the walk's arm: Chat to a
+  Messages candidate, Responses to a Chat row, Messages to a Chat row) and names an image or file
+  by a URL translation never forwards (`file://`, `gs://`, a bare path; anything but `http(s)` or
+  inline `data:`) is a 400 ("... does not accept an image or file URL that is not http(s) or
+  inline data", the same `modality` reason), before any upstream. Translation runs after the
+  headers went upstream and cannot answer 400, and dropping the part would bill an answer about
+  a picture the model never saw. `route::carries_unforwardable_url` reads it by span with the
+  rule translation uses (`translate::is_forwardable_url`); a header-won translated walk reads
+  the body for it (`route::walk_reads_urls`). A byte relay forwards the URL as sent.
 - A non-empty root `tools` array (any dialect) on a row whose card lists no tools is a 400 naming
   the row ("... does not accept tools", the same `modality` reason), before any upstream. A card
   drops tools when no candidate calls them reliably (GLM 5.3 Flash: junk in a forced call's
@@ -778,7 +787,8 @@ fields (`store`, `previous_response_id`, `include`, `truncation`, …) are dropp
 Responses; they are **not** dropped when the walk stays on `/v1/responses`. Images convert both
 ways: base64 data URIs ↔ Anthropic `base64` sources, and `http(s)` URLs ↔ Anthropic `url` sources
 (passed through unchanged between Chat Completions and Responses). The gateway fetches nothing —
-each upstream downloads the URL itself. Amazon Bedrock rejects `url` sources, so a URL image that
+each upstream downloads the URL itself; any other URL scheme never crosses, and the request is
+refused before translation (see "The card holds the request"). Amazon Bedrock rejects `url` sources, so a URL image that
 fails over onto a Bedrock candidate gets Bedrock's 400 rather than an answer about a picture the
 model never saw (the walk leaves Bedrock out only for structured outputs, above). `thinking` / `redacted_thinking` blocks, `cache_control`,
 `parallel_tool_calls: false` ↔ `tool_choice.disable_parallel_tool_use`, and `user` ↔

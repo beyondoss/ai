@@ -25,14 +25,20 @@
 //!   `is_hosted_web_search`). Thinking in the assistant messages of a Claude request that does
 //!   not think (see `drop_thinking_when_off`).
 //! - **Forwarded for the provider to reject:** input and options that change what the client gets
-//!   back and have no equivalent on the target (`input_audio`, a `file_id` or URL document or
+//!   back and have no equivalent on the target (`input_audio`, a `file_id` document or
 //!   image, a non-base64 data URI, `n` > 1, `logprobs`, audio output, `stop` onto Responses or a
 //!   model that rejects it, hosted / server / `custom` tools, `mcp_servers`, a Responses `prompt`
 //!   template and `top_logprobs`, a Responses input item with no Chat Completions shape such as
 //!   `computer_call_output`; records of a hosted tool the provider ran are dropped). An explicit
 //!   `null` is "not set" and is never forwarded. Translation runs after the request headers went upstream, so the gateway cannot 400
 //!   here; passing the field through gets the provider's 400 naming it, instead of an answer about
-//!   input the model never saw or without a tool the client offered.
+//!   input the model never saw or without a tool the client offered. `input_audio` is forwarded
+//!   in every direction, never dropped.
+//! - **Refused before translation:** an image or file URL that is not `http(s)` or inline `data:`
+//!   (`file://`, `gs://`, a bare path) names something on the client's machine and is never
+//!   forwarded in any shape. `route::refused_input` answers 400 for it before any upstream
+//!   (`route::carries_unforwardable_url`, by the rule of [`is_forwardable_url`]), so the `None`
+//!   arms below that drop one are unreachable from the proxy.
 //! - **Images, both ways:** base64 data-URI images convert to Anthropic `base64` sources and back;
 //!   `http(s)` image URLs become Anthropic `url` sources and back, and pass through between Chat
 //!   Completions and Responses. Nothing is fetched: every one of those upstreams downloads the URL
@@ -2562,6 +2568,7 @@ fn openai_user_content(m: &Value) -> Value {
                         }
                     }
                     Some("image_url") => {
+                        // `None` only for a URL `route::refused_input` refuses before any translation.
                         if let Some(mut b) = openai_image_part_to_anthropic(p) {
                             if let Some(obj) = b.as_object_mut() {
                                 copy_cache_control(obj, p);
@@ -2678,7 +2685,7 @@ fn is_http_url(url: &str) -> bool {
 /// Whether a translated image or file URL may go upstream at all: an http(s) URL the upstream
 /// fetches, or inline data. Any other scheme (`file://`) names something on the client's machine
 /// and is never forwarded in any shape, on any wire pair.
-fn is_forwardable_url(url: &str) -> bool {
+pub(crate) fn is_forwardable_url(url: &str) -> bool {
     is_http_url(url) || url.starts_with("data:")
 }
 
@@ -4435,6 +4442,7 @@ fn chat_image_to_responses(p: &Value) -> Option<Value> {
     let Some(url) = p.pointer("/image_url/url").and_then(Value::as_str) else {
         return Some(p.clone());
     };
+    // Unreachable from the proxy: `route::refused_input` refused the request first.
     if !is_forwardable_url(url) {
         return None;
     }
@@ -5289,6 +5297,7 @@ fn responses_part_to_openai(part: &Value) -> Option<Value> {
                 // for the provider to reject by name, not answered without the picture.
                 _ => return Some(part.clone()),
             };
+            // Unreachable from the proxy: `route::refused_input` refused the request first.
             if !is_forwardable_url(url) {
                 return None;
             }
@@ -5317,6 +5326,9 @@ fn responses_part_to_openai(part: &Value) -> Option<Value> {
             Some(json!({ "type": "file", "file": file }))
         }
         "thinking" | "redacted_thinking" => Some(part.clone()),
+        // Chat Completions' own audio part, forwarded for the provider to reject by name rather
+        // than answered without the audio.
+        "input_audio" => Some(part.clone()),
         _ => None,
     }
 }
@@ -10154,6 +10166,22 @@ mod tests {
 
     /// No Messages equivalent: forwarded so the provider names the problem. Dropping them would
     /// answer a question about input the model never saw.
+    #[test]
+    fn responses_input_audio_is_forwarded_to_chat_completions() {
+        let audio =
+            json!({"type": "input_audio", "input_audio": {"data": "UklG", "format": "wav"}});
+        let resp = json!({"model": "m", "store": false, "input": [{"role": "user", "content": [
+            {"type": "input_text", "text": "what is this"}, audio.clone()]}]});
+        let chat: Value = serde_json::from_slice(&request(
+            Endpoint::Responses,
+            Endpoint::ChatCompletions,
+            &serde_json::to_vec(&resp).unwrap(),
+            OPUS,
+        ))
+        .unwrap();
+        assert_eq!(chat["messages"][0]["content"][1], audio, "{chat}");
+    }
+
     #[test]
     fn unmappable_input_is_forwarded_for_the_provider_to_reject() {
         let audio =
