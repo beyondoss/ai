@@ -242,6 +242,13 @@ NATS (blackhole.*)     NATS (allowance.*)      NATS (aicapture.*)
                               first successful read
 ```
 
+**The cursor never runs ahead of its data.** `persist_batch` appends a batch's deltas and then
+checkpoints once. If any append or the checkpoint fails, the cursor is not recorded and the snapshot
+writer is dropped, so nothing is appended past the gap. The file keeps its last good cursor, older
+than the lost delta, and the next boot resumes from it and replays the delta (or rescans, if NATS
+has compacted past it). Nothing re-creates the writer within a process: the gateway runs
+snapshot-less until restart, while the in-memory set, fed by NATS, is unaffected.
+
 **One service per set, hence one NATS connection per set.** The extra connections buy independent
 failure domains: a capture-set scan that keeps failing backs off on its own schedule and cannot
 slow, stall, or reseed deny or allowance enforcement.
