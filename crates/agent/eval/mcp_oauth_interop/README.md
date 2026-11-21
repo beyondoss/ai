@@ -38,14 +38,14 @@ expected to do. It uses a throwaway `HOME` per case, so `~/.beyond` is never rea
 
 ## Assertions
 
-| id | what | expected main | expected binding change |
-|---|---|---|---|
-| A1 | `mcp-login` succeeds, a `run` calls a tool with the token; the stored entry records the URL (A1c) | works; no URL recorded | works; URL recorded |
-| A2 | login meets the RS's 401 challenge and fetches PRM from its `resource_metadata` URL | yes | yes |
-| A3 | same server name re-pointed at another URL B: is the token sent to B? | sent | not sent; refusal names `mcp-login` (specific text with `RUST_LOG=warn`); back at the original URL it works |
-| A4 | credential written by `main`'s binary used by the new binary | n/a | refused (re-login hint); re-login then works |
-| A5 | AS metadata omits `code_challenge_methods_supported` | login proceeds | login refused, names PKCE |
-| A6 | access token expired (3 s), refresh token held | refreshes | refreshes (bound credential) |
+| id | what                                                                                              | expected main          | expected binding change                                                                                     |
+| -- | ------------------------------------------------------------------------------------------------- | ---------------------- | ----------------------------------------------------------------------------------------------------------- |
+| A1 | `mcp-login` succeeds, a `run` calls a tool with the token; the stored entry records the URL (A1c) | works; no URL recorded | works; URL recorded                                                                                         |
+| A2 | login meets the RS's 401 challenge and fetches PRM from its `resource_metadata` URL               | yes                    | yes                                                                                                         |
+| A3 | same server name re-pointed at another URL B: is the token sent to B?                             | sent                   | not sent; refusal names `mcp-login` (specific text with `RUST_LOG=warn`); back at the original URL it works |
+| A4 | credential written by `main`'s binary used by the new binary                                      | n/a                    | refused (re-login hint); re-login then works                                                                |
+| A5 | AS metadata omits `code_challenge_methods_supported`                                              | login proceeds         | login refused, names PKCE                                                                                   |
+| A6 | access token expired (3 s), refresh token held                                                    | refreshes              | refreshes (bound credential)                                                                                |
 
 simple-auth advertises PRM both ways (the 401 `WWW-Authenticate` challenge's `resource_metadata`
 and the well-known URI, at the same path-suffixed URL), so A2 cannot tell the two discovery paths
