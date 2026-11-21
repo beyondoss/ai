@@ -29,15 +29,7 @@ pub(in crate::translate) fn responses_req_to_openai(
     {
         out.insert(openai.max_tokens_key().into(), t.clone());
     }
-    let effort = v
-        .get("reasoning_effort")
-        .and_then(Value::as_str)
-        .or_else(|| v.pointer("/reasoning/effort").and_then(Value::as_str))
-        .and_then(|e| openai.effort(e));
-    if openai.keeps_sampling(effort.as_deref()) {
-        copy_if(&mut out, v, "temperature");
-        copy_if(&mut out, v, "top_p");
-    }
+    let effort = openai.fit_effort_and_sampling(&mut out, v);
     if let Some(effort) = effort {
         out.insert("reasoning_effort".into(), json!(effort));
     }
@@ -51,15 +43,11 @@ pub(in crate::translate) fn responses_req_to_openai(
                 continue;
             }
             if t.get("type").and_then(Value::as_str) == Some("namespace") {
-                let ns = t.get("name").and_then(Value::as_str).unwrap_or("");
                 let about = non_empty_str(t, "description");
-                for m in namespace_members(t) {
-                    let Some(name) = m.get("name").and_then(Value::as_str) else {
-                        continue;
-                    };
-                    let mut m = m.clone();
+                for member in namespace_members(t) {
+                    let mut m = member.tool.clone();
                     if let Some(obj) = m.as_object_mut() {
-                        obj.insert("name".into(), json!(namespaced_name(ns, name)));
+                        obj.insert("name".into(), json!(member.flat));
                         if let Some(about) = about {
                             // The namespace's description is shown to the model once on
                             // Responses; flat, each member carries it.

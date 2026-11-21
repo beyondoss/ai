@@ -76,12 +76,16 @@ pub(crate) async fn mcp_login(name: String) -> Result<(), Box<dyn std::error::Er
         .await
         .map_err(|e| format!("failed to start MCP OAuth for `{name}`: {e}"))?;
     let auth_store = beyond_agent::mcp_auth_store::McpAuthStore::open_default();
-    manager.set_credential_store(auth_store.scoped(&name));
-    // rmcp 3.x: discovery is `resolve_metadata` (no longer `discover_metadata`).
+    manager.set_credential_store(auth_store.scoped(&name, &url));
+    // The spec's two PRM discovery paths: the `resource_metadata` of the server's own 401
+    // challenge, then the well-known URI. A server that answers 401 is asked first; rmcp tries
+    // the well-known URIs itself when there is no challenge or it names nothing usable.
+    let challenge = probe_challenge(&url).await;
     let resolution = manager
-        .resolve_metadata()
+        .resolve_metadata_from_challenge(challenge.as_deref())
         .await
         .map_err(|e| format!("`{name}` does not support MCP OAuth (or discovery failed): {e}"))?;
+    check_discovered(&name, &url, &resolution)?;
     manager.set_metadata(resolution.metadata);
 
     // Dynamic client registration means we choose our own redirect URI (unlike `agent
@@ -140,6 +144,70 @@ pub(crate) fn mcp_logout(name: String) -> Result<(), Box<dyn std::error::Error>>
         println!("logged out: {name}");
     } else {
         println!("not logged in: {name}");
+    }
+    Ok(())
+}
+
+/// The `WWW-Authenticate` challenge of the server's answer to an unauthenticated request, when
+/// that answer is a 401 (`None`: anything else, or the probe failed — discovery then goes by the
+/// well-known URIs alone). The request is the one a client opens with, `initialize`.
+async fn probe_challenge(url: &str) -> Option<String> {
+    agent_core::ensure_provider();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .ok()?;
+    let response = client
+        .post(url)
+        .header("accept", "application/json, text/event-stream")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18", "capabilities": {},
+                "clientInfo": { "name": "beyond-agent", "version": env!("CARGO_PKG_VERSION") }
+            }
+        }))
+        .send()
+        .await
+        .ok()?;
+    if response.status() != reqwest::StatusCode::UNAUTHORIZED {
+        return None;
+    }
+    response
+        .headers()
+        .get_all(reqwest::header::WWW_AUTHENTICATE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find(|v| v.trim_start().to_ascii_lowercase().starts_with("bearer"))
+        .map(str::to_owned)
+}
+
+/// Refuse to log in on what the server did not publish: endpoints rmcp guessed (`/authorize`,
+/// `/token`, `/register` on the base URL, with no issuer to check an `iss` against), and an
+/// authorization server that does not advertise PKCE `S256` — the spec's "Authorization Code
+/// Protection": a client MUST refuse to proceed without it. rmcp only warns on the latter.
+fn check_discovered(
+    name: &str,
+    url: &str,
+    resolution: &rmcp::transport::auth::AuthorizationMetadataResolution,
+) -> Result<(), String> {
+    if !resolution.source.is_discovered() {
+        return Err(format!(
+            "`{name}` published no OAuth metadata: neither its 401 challenge's \
+             `resource_metadata` nor {url}'s well-known protected-resource or \
+             authorization-server metadata could be fetched; not guessing endpoints"
+        ));
+    }
+    let pkce = resolution
+        .metadata
+        .code_challenge_methods_supported
+        .as_deref();
+    if !pkce.is_some_and(|m| m.iter().any(|m| m == "S256")) {
+        return Err(format!(
+            "`{name}`'s authorization server does not advertise PKCE (`S256` in \
+             `code_challenge_methods_supported`); refusing to log in without it"
+        ));
     }
     Ok(())
 }

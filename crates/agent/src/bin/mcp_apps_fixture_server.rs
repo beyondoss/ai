@@ -40,6 +40,10 @@
 //!   creates `<path>` and exits, so a host's first apps dial fails and its retry succeeds.
 //! - `MCP_APPS_FIXTURE_UI_DELAY_MS` — answer `tools/list` that late when the extension was
 //!   advertised (a slow apps dial).
+//! - `MCP_APPS_FIXTURE_UI_META` — where the view's `_meta.ui` lives: `content` (default: the
+//!   `resources/read` item only), `listing` (the `resources/list` entry only, as the official SDK's
+//!   `registerAppResource` puts it), `both` (listing and a different content item: the content item
+//!   must win) or `none` (neither: the host's restrictive default).
 //! - `MCP_APPS_FIXTURE_VIEW_DELAY_MS` — answer `resources/read` of the view that late.
 
 use std::io::Write as _;
@@ -150,6 +154,20 @@ fn log_request(method: &str, ui: bool, uri: Option<&str>) {
     }
 }
 
+/// Where the view's `_meta.ui` is put (see `MCP_APPS_FIXTURE_UI_META`).
+fn ui_meta_at(place: &str) -> bool {
+    let mode = std::env::var("MCP_APPS_FIXTURE_UI_META").unwrap_or_else(|_| "content".into());
+    mode == place || mode == "both"
+}
+
+fn listing_view_ui() -> Value {
+    json!({
+        "csp": { "connectDomains": ["https://listing.example.test"] },
+        "permissions": { "camera": {} },
+        "prefersBorder": false,
+    })
+}
+
 fn env_ms(name: &str) -> Option<u64> {
     std::env::var(name).ok().and_then(|v| v.parse().ok())
 }
@@ -167,6 +185,14 @@ fn ui_meta(resource_uri: Option<&str>, visibility: Option<&[&str]>) -> Value {
         ui.insert("visibility".into(), json!(v));
     }
     json!({ "ui": ui })
+}
+
+fn listing_entry() -> Value {
+    let mut entry = json!({ "uri": VIEW_URI, "name": "weather_view", "mimeType": MIME });
+    if ui_meta_at("listing") {
+        entry["_meta"] = json!({ "ui": listing_view_ui() });
+    }
+    entry
 }
 
 fn city_schema() -> Value {
@@ -357,7 +383,7 @@ async fn handle(method: &str, params: &Value) -> Result<Value, (i64, String)> {
         }
         "tools/call" => Ok(call_tool(params).await),
         "resources/list" => Ok(json!({ "resources": [
-            { "uri": VIEW_URI, "name": "weather_view", "mimeType": MIME },
+            listing_entry(),
             { "uri": "fixture://notes", "name": "notes", "mimeType": "text/plain" },
             { "uri": "ui://apps-fixture/huge", "name": "huge_view", "mimeType": MIME,
               "size": 5 * 1024 * 1024 + 64 },
@@ -374,15 +400,18 @@ async fn handle(method: &str, params: &Value) -> Result<Value, (i64, String)> {
                 if let Some(ms) = env_ms("MCP_APPS_FIXTURE_VIEW_DELAY_MS") {
                     tokio::time::sleep(Duration::from_millis(ms)).await;
                 }
-                Ok(json!({ "contents": [{
-                "uri": VIEW_URI,
-                "mimeType": MIME,
-                "text": view_html(),
-                "_meta": { "ui": {
-                    "csp": { "connectDomains": ["https://api.example.test"] },
-                    "prefersBorder": true,
-                } },
-            }] }))
+                let mut item = json!({
+                    "uri": VIEW_URI,
+                    "mimeType": MIME,
+                    "text": view_html(),
+                });
+                if ui_meta_at("content") {
+                    item["_meta"] = json!({ "ui": {
+                        "csp": { "connectDomains": ["https://api.example.test"] },
+                        "prefersBorder": true,
+                    } });
+                }
+                Ok(json!({ "contents": [item] }))
             }
             Some("fixture://notes") => Ok(json!({ "contents": [{
                 "uri": "fixture://notes", "mimeType": "text/plain", "text": "notes-body",

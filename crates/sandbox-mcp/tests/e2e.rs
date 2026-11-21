@@ -766,29 +766,34 @@ async fn a_token_command_supplies_the_bearer_and_both_token_variables_together_a
     .unwrap();
 }
 
+/// The server over streamable HTTP on a port it picked: its process and the `/mcp` URL it announced.
+async fn spawn_http(mock_url: &str) -> (tokio::process::Child, String) {
+    use tokio::io::{AsyncBufReadExt as _, BufReader};
+    let mut cmd = server_command(mock_url);
+    // port-0: the child binds it, keeps it, and announces the port it got on stderr.
+    cmd.env("SANDBOX_MCP_LISTEN", "127.0.0.1:0")
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    let mut lines = BufReader::new(child.stderr.take().unwrap()).lines();
+    let first = lines.next_line().await.unwrap().unwrap();
+    let url = first
+        .split("listening on ")
+        .nth(1)
+        .unwrap()
+        .trim()
+        .to_string();
+    (child, url)
+}
+
 #[tokio::test]
 async fn streamable_http_serves_the_same_tools_on_loopback_and_refuses_a_public_address() {
     tokio::time::timeout(DEADLINE, async {
         use rmcp::transport::StreamableHttpClientTransport;
-        use tokio::io::{AsyncBufReadExt as _, BufReader};
 
         let _ = rustls::crypto::ring::default_provider().install_default();
         let (_dir, mock) = sandbox().await;
 
-        let mut cmd = server_command(&mock.url);
-        // port-0: the child binds it, keeps it, and announces the port it got on stderr.
-        cmd.env("SANDBOX_MCP_LISTEN", "127.0.0.1:0")
-            .stderr(std::process::Stdio::piped());
-        let mut child = cmd.spawn().unwrap();
-        let mut lines = BufReader::new(child.stderr.take().unwrap()).lines();
-        let first = lines.next_line().await.unwrap().unwrap();
-        let url = first
-            .split("listening on ")
-            .nth(1)
-            .unwrap()
-            .trim()
-            .to_string();
-
+        let (mut child, url) = spawn_http(&mock.url).await;
         let client = ().serve(StreamableHttpClientTransport::from_uri(url)).await.unwrap();
         assert_eq!(client.peer().list_all_tools().await.unwrap().len(), 14);
         let r = call(client.peer(), "exec", json!({"command": "echo over http"})).await;
@@ -803,6 +808,78 @@ async fn streamable_http_serves_the_same_tools_on_loopback_and_refuses_a_public_
             .unwrap();
         assert!(!out.status.success());
         assert!(String::from_utf8_lossy(&out.stderr).contains("not a loopback address"));
+    })
+    .await
+    .unwrap();
+}
+
+/// One raw `initialize` POST to the HTTP server, with an optional `Origin`; returns the status line.
+async fn post_initialize(addr: &str, origin: Option<&str>) -> String {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#;
+    let origin = origin
+        .map(|o| format!("Origin: {o}\r\n"))
+        .unwrap_or_default();
+    let req = format!(
+        "POST /mcp HTTP/1.1\r\nHost: {addr}\r\n{origin}Content-Type: application/json\r\n\
+         Accept: application/json, text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+    s.write_all(req.as_bytes()).await.unwrap();
+    let mut out = String::new();
+    // The SSE body may stay open; the status line is all that is read.
+    let mut buf = [0u8; 256];
+    let n = s.read(&mut buf).await.unwrap();
+    out.push_str(&String::from_utf8_lossy(&buf[..n]));
+    out.lines().next().unwrap_or_default().to_string()
+}
+
+#[tokio::test]
+async fn streamable_http_refuses_a_foreign_origin_and_allows_none_or_loopback() {
+    tokio::time::timeout(DEADLINE, async {
+        let (_dir, mock) = sandbox().await;
+        let (mut child, url) = spawn_http(&mock.url).await;
+        let addr = url
+            .trim_start_matches("http://")
+            .split('/')
+            .next()
+            .unwrap()
+            .to_string();
+
+        let evil = post_initialize(&addr, Some("https://evil.example")).await;
+        assert!(evil.contains(" 403"), "{evil}");
+        let none = post_initialize(&addr, None).await;
+        assert!(none.contains(" 200"), "{none}");
+        let local = post_initialize(&addr, Some("http://localhost:5173")).await;
+        assert!(local.contains(" 200"), "{local}");
+        child.kill().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn an_unknown_tool_is_a_jsonrpc_error_and_bad_arguments_are_an_error_result() {
+    tokio::time::timeout(DEADLINE, async {
+        let (_dir, mock) = sandbox().await;
+        let client = connect(&mock.url).await;
+        let peer = client.peer();
+
+        let params = CallToolRequestParams::new("no_such_tool".to_string())
+            .with_arguments(serde_json::Map::new());
+        match peer.call_tool(params).await {
+            Err(rmcp::ServiceError::McpError(e)) => {
+                assert_eq!(e.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{e:?}");
+            }
+            other => panic!("unknown tool must be a protocol error, got {other:?}"),
+        }
+
+        // Arguments that do not fit stay a tool result the agent can read.
+        let r = call(peer, "exec", json!({"command": 5})).await;
+        assert_eq!(r.is_error, Some(true));
+        assert_eq!(error_kind(&r), "invalid_request");
+        client.cancel().await.unwrap();
     })
     .await
     .unwrap();

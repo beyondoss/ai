@@ -41,7 +41,7 @@ use crate::settings::{McpServerConfig, McpTransport};
 
 /// Bumped whenever the cached shape changes. Part of the key, so an older manifest is simply a miss
 /// rather than something that has to be migrated.
-const MANIFEST_VERSION: u32 = 3;
+const MANIFEST_VERSION: u32 = 4;
 
 /// One server's advertised tools / resources / prompts, as they were when last discovered.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -91,6 +91,10 @@ pub struct CachedResource {
     /// without reading it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
+    /// A `ui://` resource's listing-level `_meta.ui` (CSP, permissions): the default a view opens
+    /// with when its content item carries none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

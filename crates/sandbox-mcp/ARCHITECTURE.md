@@ -88,7 +88,16 @@ hyper). The choice is an environment variable, not a flag, as in execd: the serv
 block, and flags would be a second place to say the same thing. The server holds the sandbox's token, so a listener that is
 not loopback is refused unless `SANDBOX_MCP_INSECURE_NO_AUTH=1` (an authenticating proxy is then the caller's job), and
 rmcp's default `Host` check (loopback names only) stays on for a loopback listener, which stops DNS rebinding from a
-browser.
+browser. `Origin` is validated too (the streamable-http MUST): a request with no `Origin` (a non-browser client) or a
+loopback one passes, any other gets 403. `SANDBOX_MCP_INSECURE_NO_AUTH` lifts only the `Host` check, never the `Origin`
+one.
+
+HTTP mode has no client authentication (the spec says SHOULD). Loopback binding and the `Origin` check are the only
+protection; anything that can open a loopback connection can run commands in the sandbox. A non-loopback listener
+relies entirely on the authenticating proxy in front of it.
+
+An unknown tool name is a JSON-RPC `-32602` error, as the tools spec says; arguments that do not fit a tool's schema stay
+`isError` results with `invalid_request`.
 
 ## The conformance driver
 

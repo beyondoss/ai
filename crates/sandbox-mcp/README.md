@@ -88,3 +88,5 @@ fails with `conflict` and nothing is written. `create_only` is the same guard fo
 
 More: [ARCHITECTURE.md](ARCHITECTURE.md), the file helpers' spec
 [FILES-OVER-EXEC.md](../../sdk/conformance/FILES-OVER-EXEC.md).
+
+HTTP mode (`SANDBOX_MCP_LISTEN`) has no client authentication. Only loopback binding and the `Origin` check (no `Origin` or a loopback one passes, any other gets 403) protect it.
