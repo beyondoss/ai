@@ -190,6 +190,10 @@ impl CredentialSource for DirectRoutedCredentialSource {
         let credential = self.inner.credential().await?;
         Ok(credential.with_direct_routing(self.routing.clone()))
     }
+
+    fn rejected(&self, token: &str) {
+        self.inner.rejected(token);
+    }
 }
 
 /// A [`CredentialSource`] for a `models.json` `base_url` override (Fix 9 — pi-parity feature: pi's own
