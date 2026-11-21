@@ -7172,6 +7172,12 @@ that is not there (404/405/410), or no refresh token, classified from the endpoi
 OAuth HTTP goes through `RecordingOAuthHttp`, since rmcp's refresh error keeps neither status nor
 code); a _transient_ one (the authorization server unreachable, a 5xx, a 429) for a backoff of 30 s
 doubling to 5 min, after which a rejection refreshes again. A reload clears a remembered failure
+only when the stored token actually changed. Tested in
+`tests/mcp_oauth_refresh.rs` (a token revoked between two tool calls of one run, a failing refresh,
+three concurrent 401s) against the shared fixture in `tests/common/mcp_oauth_fixture.rs`, and by unit
+tests in `mcp_oauth.rs` and `mcp_events/wire.rs` (backoff, the reload race, a bare 401, a 403, the
+events path's current token).
+
 **The token's decisions are a pure kernel** (`tools/mcp_oauth_kernel.rs`): `step(&mut State, &Config, Event)
 -> Action`. No I/O, no async, no clock: time arrives in the events. `ServerAuth` takes its tokio `Mutex`
 (held across the AS call, which is what keeps a refresh single flight), feeds the kernel an `Event`
@@ -7202,12 +7208,6 @@ mcp_oauth_model::the_mutation` passes only when the named property is red:
 | `mut_backoff_never_ends`  | L1                     |
 | `mut_reload_keeps_failed` | L2                     |
 | `mut_unlocked`            | S1                     |
-
-only when the stored token actually changed. Tested in
-`tests/mcp_oauth_refresh.rs` (a token revoked between two tool calls of one run, a failing refresh,
-three concurrent 401s) against the shared fixture in `tests/common/mcp_oauth_fixture.rs`, and by unit
-tests in `mcp_oauth.rs` and `mcp_events/wire.rs` (backoff, the reload race, a bare 401, a 403, the
-events path's current token).
 
 Tested end to end in `tests/mcp_oauth.rs` against a real, hand-rolled OAuth-protected MCP fixture
 (metadata discovery, dynamic client registration, a real authorize-then-redirect exchange, a token
