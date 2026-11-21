@@ -32,18 +32,15 @@ impl ToolNames {
         {
             match t.get("type").and_then(Value::as_str) {
                 Some("namespace") => {
-                    let ns = t.get("name").and_then(Value::as_str).unwrap_or("");
                     for m in namespace_members(t) {
-                        let Some(name) = m.get("name").and_then(Value::as_str) else {
-                            continue;
-                        };
-                        let flat = namespaced_name(ns, name);
-                        if wrap_custom && m.get("type").and_then(Value::as_str) == Some("custom") {
-                            names.wrapped.push(flat.clone());
+                        if wrap_custom
+                            && m.tool.get("type").and_then(Value::as_str) == Some("custom")
+                        {
+                            names.wrapped.push(m.flat.clone());
                         }
                         names
                             .namespaced
-                            .push((flat, ns.to_owned(), name.to_owned()));
+                            .push((m.flat, m.namespace.to_owned(), m.name.to_owned()));
                     }
                 }
                 Some("custom") if wrap_custom => {
@@ -91,11 +88,32 @@ pub(super) fn namespaced_name(namespace: &str, name: &str) -> String {
     }
 }
 
-pub(super) fn namespace_members(t: &Value) -> &[Value] {
+/// One named member of a `namespace` tool.
+pub(super) struct NamespaceMember<'a> {
+    pub namespace: &'a str,
+    pub name: &'a str,
+    /// [`namespaced_name`] of the two.
+    pub flat: String,
+    pub tool: &'a Value,
+}
+
+/// The members of a `namespace` tool, skipping nameless ones: the one walk of a namespace.
+pub(super) fn namespace_members(t: &Value) -> impl Iterator<Item = NamespaceMember<'_>> {
+    let namespace = t.get("name").and_then(Value::as_str).unwrap_or("");
     t.get("tools")
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or_default()
+        .iter()
+        .filter_map(move |tool| {
+            let name = tool.get("name").and_then(Value::as_str)?;
+            Some(NamespaceMember {
+                namespace,
+                name,
+                flat: namespaced_name(namespace, name),
+                tool,
+            })
+        })
 }
 
 pub(super) fn openai_tool_to_anthropic(t: &Value) -> Option<Value> {
