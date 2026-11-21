@@ -507,8 +507,14 @@ fn tool_count(body: &[u8]) -> usize {
 /// before its row left), or fail with a 500 (gpt-4, likewise). Tools would be called with junk arguments by a model the card dropped
 /// them from for that (GLM 5.3 Flash), or refused upstream in each provider's own words. A
 /// PDF on a row without file input is left to the candidate, because OpenRouter extracts a PDF's
-/// text for any model.
-pub fn refused_input(row: &ModelRoute, body: &[u8]) -> Option<&'static str> {
+/// text for any model. `Some(URL_KIND)` for a request that will be translated to another dialect
+/// and names an image or file by a URL translation never forwards (see [`carries_unforwardable_url`]);
+/// a byte relay forwards it as sent, and the provider answers.
+pub fn refused_input(
+    row: &ModelRoute,
+    client: Option<Endpoint>,
+    body: &[u8],
+) -> Option<&'static str> {
     if Endpoint::of_row(row) == Endpoint::Embeddings {
         return None;
     }
@@ -518,8 +524,14 @@ pub fn refused_input(row: &ModelRoute, body: &[u8]) -> Option<&'static str> {
     if row.card.features & providers::catalog::TOOLS == 0 && tool_count(body) > 0 {
         return Some("tools");
     }
+    if translates(row, client) && carries_unforwardable_url(body) {
+        return Some(URL_KIND);
+    }
     None
 }
+
+/// What [`refused_input`] names a URL translation would drop.
+const URL_KIND: &str = "an image or file URL that is not http(s) or inline data";
 
 /// An image content part anywhere in the conversation: Chat Completions `image_url`, Messages
 /// `image` (tool results included), Responses `input_image`.
@@ -549,25 +561,90 @@ fn carries_part(body: &[u8], types: &[&str], quoted: &[&[u8]], keys: &[&str]) ->
     {
         return false;
     }
-    let Some(open) = crate::peek::root_open(body) else {
-        return false;
-    };
-    // At most three keys: the last span of each.
+    root_spans(body, keys).is_some_and(|spans| {
+        spans
+            .iter()
+            .flatten()
+            .any(|&span| crate::peek::has_typed_member(body, span, types))
+    })
+}
+
+/// The last value span of each root member in `keys` (at most three), as a provider's parser keeps
+/// it. `None` when the root is not one well-formed object.
+fn root_spans(body: &[u8], keys: &[&str]) -> Option<[Option<(usize, usize)>; 3]> {
+    let open = crate::peek::root_open(body)?;
     let mut spans = [None; 3];
     for m in crate::peek::members(body, open) {
-        let Some(m) = m else {
-            return false;
-        };
+        let m = m?;
         for (span, key) in spans.iter_mut().zip(keys) {
             if m.key_is(body, key) {
                 *span = Some(m.value);
             }
         }
     }
-    spans
+    Some(spans)
+}
+
+/// Whether the walk may send `body` from `client` to an arm of another dialect, which translates
+/// it. A Responses client walks the row's Responses arm when it has one (a byte relay); every
+/// other walk is over the candidates. A request from no known endpoint (a sub-resource) is never
+/// translated.
+fn translates(row: &ModelRoute, client: Option<Endpoint>) -> bool {
+    let Some(client) = client else {
+        return false;
+    };
+    let arms = if client == Endpoint::Responses && !row.responses.is_empty() {
+        row.responses
+    } else {
+        row.candidates
+    };
+    arms.iter()
+        .any(|c| Endpoint::of_upstream_path(c.path) != client)
+}
+
+/// Whether a header-won walk on `row` from a client on `path` reads the body to look for a URL
+/// translation would drop ([`carries_unforwardable_url`]).
+pub fn walk_reads_urls(row: &ModelRoute, path: &str) -> bool {
+    translates(row, implied_endpoint(path))
+}
+
+/// A URL part, in any of the three APIs, that translation cannot forward: Chat Completions and
+/// Responses `image_url`, Messages `source` (`url` image or document), Responses `file_url`.
+/// [`translate`](crate::translate) forwards only http(s) and data URLs
+/// ([`is_forwardable_url`](crate::translate::is_forwardable_url)): any other (`file://`, `gs://`,
+/// a bare path) names something on the client's machine, and is dropped there, so the model would
+/// answer without the picture or document it was sent. Translation runs after the headers went
+/// upstream and cannot answer 400, so the walk does, here. Read by span, as [`carries_part`] is.
+fn carries_unforwardable_url(body: &[u8]) -> bool {
+    use crate::peek::UrlKey;
+    // A Messages `source` is always an object, and names a URL only typed `url`.
+    const KEYS: &[UrlKey] = &[
+        UrlKey {
+            quoted: b"\"image_url\"",
+            typed: false,
+        },
+        UrlKey {
+            quoted: b"\"source\"",
+            typed: true,
+        },
+        UrlKey {
+            quoted: b"\"file_url\"",
+            typed: false,
+        },
+    ];
+    if !KEYS
         .iter()
-        .flatten()
-        .any(|&span| crate::peek::has_typed_member(body, span, types))
+        .any(|k| memchr::memmem::find(body, k.quoted).is_some())
+    {
+        return false;
+    }
+    root_spans(body, &["messages", "input", "system"]).is_some_and(|spans| {
+        spans.iter().flatten().any(|&span| {
+            crate::peek::has_url_member(body, span, KEYS, |u| {
+                !crate::translate::is_forwardable_url(u)
+            })
+        })
+    })
 }
 
 /// Catalog indices (bit per index) of `arms` that cannot serve `body`: Bedrock candidates when the
@@ -1668,6 +1745,49 @@ mod tests {
         ] {
             assert_eq!(walk_reads_body(&row), want, "{what}");
         }
+    }
+
+    /// A request that will be translated is refused for a URL translation drops, from each client;
+    /// the same body on a byte relay, or with a forwardable URL, is not.
+    /// claim: CAT-5
+    #[test]
+    fn a_translated_request_with_an_unforwardable_url_is_refused() {
+        let claude = catalog_row("claude-opus-4-8");
+        let gpt = catalog_row("gpt-4o");
+        let chat = Some(Endpoint::ChatCompletions);
+        let img = |url: &str| {
+            format!(
+                r#"{{"messages":[{{"content":[{{"type":"image_url","image_url":{{"url":"{url}"}}}}]}}]}}"#
+            )
+        };
+        assert_eq!(
+            refused_input(&claude, chat, img("file:///x").as_bytes()),
+            Some(URL_KIND)
+        );
+        assert_eq!(
+            refused_input(&claude, chat, img("https://a/x").as_bytes()),
+            None
+        );
+        assert_eq!(
+            refused_input(&claude, chat, img("data:image/png;base64,AA").as_bytes()),
+            None
+        );
+        // Chat Completions to a Chat Completions candidate is a relay, and so is Responses to a
+        // row's Responses arm.
+        assert_eq!(refused_input(&gpt, chat, img("file:///x").as_bytes()), None);
+        let resp = br#"{"input":[{"content":[{"type":"input_image","image_url":"gs://b/x"}]}]}"#;
+        assert_eq!(refused_input(&gpt, Some(Endpoint::Responses), resp), None);
+        // A Messages client to a Chat row: a tool call's input holding a `source` is not a URL,
+        // a `url` source is.
+        let msgs = Some(Endpoint::Messages);
+        let tool = br#"{"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"git_log","input":{"source":"main"}}]}]}"#;
+        assert_eq!(refused_input(&gpt, msgs, tool), None);
+        let b64 = br#"{"messages":[{"content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA"}}]}]}"#;
+        assert_eq!(refused_input(&gpt, msgs, b64), None);
+        let gs = br#"{"messages":[{"content":[{"type":"image","source":{"type":"url","url":"gs://b/x"}}]}]}"#;
+        assert_eq!(refused_input(&gpt, msgs, gs), Some(URL_KIND));
+        assert!(!walk_reads_urls(&gpt, "/v1/chat/completions"));
+        assert!(walk_reads_urls(&claude, "/v1/chat/completions"));
     }
 
     /// A row with a fast-mode candidate reads the body on a header-won walk, which may ask for

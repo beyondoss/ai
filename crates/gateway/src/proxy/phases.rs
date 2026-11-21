@@ -605,7 +605,8 @@ impl AiProxy {
             && (responses
                 || large
                 || route::walk_reads_body(w.row)
-                || route::walk_reads_tools(w.row, session.req_header().uri.path()))
+                || route::walk_reads_tools(w.row, session.req_header().uri.path())
+                || route::walk_reads_urls(w.row, session.req_header().uri.path()))
         {
             let peek = self
                 .read_whole(session, held, &w.id, arrival, early_slot)
@@ -1037,7 +1038,13 @@ impl AiProxy {
         // passed, so the order is still `body_rules::Rule::ORDER`.
         let facts = body_rules::Facts {
             refused_input: body_complete
-                .and_then(|b| route::refused_input(row, b))
+                .and_then(|b| {
+                    route::refused_input(
+                        row,
+                        route::implied_endpoint(session.req_header().uri.path()),
+                        b,
+                    )
+                })
                 .map(|kind| (row.model, kind)),
             background: inbound_responses && body_complete.is_some_and(requests_background),
             ..shape

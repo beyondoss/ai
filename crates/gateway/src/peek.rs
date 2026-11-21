@@ -1269,6 +1269,64 @@ pub fn has_typed_member(b: &[u8], span: (usize, usize), types: &[&str]) -> bool 
     })
 }
 
+/// A member key [`has_url_member`] reads, spelled with its quotes, and the shapes it accepts.
+#[derive(Clone, Copy)]
+pub struct UrlKey {
+    pub quoted: &'static [u8],
+    /// Only an object with `"type": "url"` names a URL (a Messages `source`); otherwise a string,
+    /// or an object whose `url` is one, does. A key that is also an ordinary word (`source`) must
+    /// be typed, or a tool call's `input` that holds one reads as a URL.
+    pub typed: bool,
+}
+
+/// Whether a member keyed one of `keys`, anywhere inside `span`, names a URL for which `bad` holds:
+/// the member's value is a string (`"image_url": "file:///x"`) or an object whose `url` is
+/// (`"image_url": {"url": ...}`, `"source": {"type": "url", "url": ...}`), as the key allows. A
+/// value of any other shape names no URL and is skipped.
+///
+/// Found as [`has_typed_member`] finds a type: the bytes `"key"`, `:`, then the value, with an
+/// unescaped opening quote, by one `memmem` pass per key and O(1) per hit, without a walk of the
+/// structure.
+pub fn has_url_member(
+    b: &[u8],
+    span: (usize, usize),
+    keys: &[UrlKey],
+    bad: impl Fn(&str) -> bool,
+) -> bool {
+    let Some(region) = b.get(span.0..span.1) else {
+        return false;
+    };
+    keys.iter().any(|key| {
+        let quoted = key.quoted;
+        memchr::memmem::find_iter(region, quoted).any(|at| {
+            let at = span.0.saturating_add(at);
+            if escaped_at(b, at) {
+                return false;
+            }
+            let colon = skip_ws(b, at.saturating_add(quoted.len()));
+            if b.get(colon) != Some(&b':') {
+                return false;
+            }
+            let value = skip_ws(b, colon.saturating_add(1));
+            let url = match b.get(value) {
+                Some(b'"') if !key.typed => string_end(b, value).map(|end| (value, end)),
+                Some(b'{')
+                    if !key.typed
+                        || last_member(b, value, "type")
+                            .flatten()
+                            .is_some_and(|m| str_is(b, m.value, "url")) =>
+                {
+                    last_member(b, value, "url").flatten().map(|m| m.value)
+                }
+                _ => None,
+            };
+            url.filter(|&(_, end)| end <= span.1)
+                .and_then(|u| str_value(b, u))
+                .is_some_and(|u| bad(&u))
+        })
+    })
+}
+
 /// Whether the byte at `at` is escaped: preceded by an odd run of backslashes.
 fn escaped_at(b: &[u8], at: usize) -> bool {
     let before = b.get(..at).unwrap_or_default();
@@ -1564,6 +1622,36 @@ mod tests {
         assert!(!hit(br#"[{"type":"images"}]"#));
         // A string ending in an escaped backslash leaves the next quote unescaped.
         assert!(hit(br#"[{"text":"a\\","type":"image"}]"#));
+    }
+
+    /// A URL member is read as a string or as the `url` of an object, at any depth, and only a real
+    /// member: not prose that mentions one, not an object with no string `url`.
+    #[test]
+    fn has_url_member_reads_only_real_url_members() {
+        let keys = &[
+            UrlKey {
+                quoted: b"\"image_url\"",
+                typed: false,
+            },
+            UrlKey {
+                quoted: b"\"source\"",
+                typed: true,
+            },
+        ];
+        let bad = |u: &str| !u.starts_with("https://");
+        let hit = |b: &[u8]| has_url_member(b, (0, b.len()), keys, bad);
+        assert!(hit(br#"[{"image_url":{"url":"file:///x"}}]"#));
+        assert!(hit(br#"[{"image_url" : "gs://b/x"}]"#));
+        assert!(hit(br#"[{"c":[{"source":{"type":"url","url":"x.png"}}]}]"#));
+        assert!(hit(br#"[{"image_url":{"url":"file:\/\/\/x"}}]"#));
+        assert!(!hit(br#"[{"image_url":{"url":"https://a/x"}}]"#));
+        assert!(!hit(br#"[{"source":{"type":"base64","data":"AAAA"}}]"#));
+        // A tool call's `input` may hold any key: a `source` that is a string, or an object with
+        // a `url` and no `"type": "url"`, is not a Messages source.
+        assert!(!hit(br#"[{"type":"tool_use","input":{"source":"main"}}]"#));
+        assert!(!hit(br#"[{"input":{"source":{"url":"x"}}}]"#));
+        assert!(!hit(br#"[{"image_url":{"type":"string"}}]"#));
+        assert!(!hit(br#"[{"text":"\"image_url\": \"file:///x\""}]"#));
     }
 
     /// The one root-member splice behind `store_false`, `force_stream` and
