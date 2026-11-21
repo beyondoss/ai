@@ -4159,7 +4159,7 @@ other.
   the user) to resolve; a policy refusal rejects the whole patch (all-or-nothing).
   The preserved path rides every mode's result — `single` and a stopped `chain` included, success or
   failure — not just `parallel`'s sections: it is the only pointer to the child's work.
-- **Cleanup.** `Drop` (a cancelled child) removes a *clean* worktree best-effort and keeps one with changes
+- **Cleanup.** `Drop` (a cancelled child) removes a _clean_ worktree best-effort and keeps one with changes
   (an edit, an untracked file, a commit past the baseline) under the `kept-` name below; the sandbox's owner
   sweep applies the same rule to what a previous incarnation left. But a `process::exit`/SIGKILL runs no destructors,
   so worktrees live under `$XDG_CACHE_HOME/beyond-agent/worktrees/<repo-id>/<pid>-<label>-<seq>` (on
