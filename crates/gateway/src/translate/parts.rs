@@ -36,18 +36,20 @@ pub(super) fn openai_image_part_to_anthropic(p: &Value) -> Option<Value> {
     if let Some(b) = openai_image_to_anthropic(p) {
         return Some(b);
     }
-    p.pointer("/image_url/url")
-        .or_else(|| p.get("url"))
-        .and_then(Value::as_str)
+    chat_image_url(p)
         .is_some_and(|u| u.starts_with("data:"))
         .then(|| p.clone())
 }
 
-fn openai_image_to_anthropic(part: &Value) -> Option<Value> {
-    let url = part
-        .pointer("/image_url/url")
+/// The URL of a Chat Completions image part: `{image_url: {url}}`, or a bare `url`.
+fn chat_image_url(p: &Value) -> Option<&str> {
+    p.pointer("/image_url/url")
+        .or_else(|| p.get("url"))
         .and_then(Value::as_str)
-        .or_else(|| part.get("url").and_then(Value::as_str))?;
+}
+
+fn openai_image_to_anthropic(part: &Value) -> Option<Value> {
+    let url = chat_image_url(part)?;
     if is_http_url(url) {
         return Some(json!({
             "type": "image",
