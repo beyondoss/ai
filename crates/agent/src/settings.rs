@@ -1494,7 +1494,159 @@ pub enum McpTransport {
         /// via [`McpServerConfig::resolved_headers`].
         #[serde(default)]
         headers: std::collections::BTreeMap<String, String>,
+        /// Authenticate to this server with the OAuth client-credentials extension
+        /// (`io.modelcontextprotocol/oauth-client-credentials`): no human, no `mcp-login`. See
+        /// [`McpClientCredentials`]. Only a settings-configured server ever uses it; a grant
+        /// connector (service mode) never does.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_credentials: Option<McpClientCredentials>,
     },
+}
+
+/// How a configured `http` MCP server is authenticated without a human present: the OAuth
+/// client-credentials extension (`io.modelcontextprotocol/oauth-client-credentials`, ext-auth
+/// `specification/stable/oauth-client-credentials/2026-07-28`).
+///
+/// ```json
+/// "client_credentials": { "issuer": "https://auth.example.com/realms/mcp", "client_id": "my-agent",
+///                         "client_secret": "$MCP_CLIENT_SECRET", "scopes": ["mcp:read"] }
+/// "client_credentials": { "issuer": "https://auth.example.com/realms/mcp", "client_id": "my-agent",
+///                         "private_key": "!cat /run/secrets/mcp.pem", "signing_algorithm": "RS256" }
+/// ```
+///
+/// Exactly one of `client_secret` and `private_key` (an RFC 7523 `private_key_jwt`, the spec's
+/// recommended method) is set. **Neither is ever an inline literal**: each must be a `$VAR` /
+/// `${VAR}` reference or a `!command`, resolved through [`resolve_config_value`] each time a token
+/// is requested (so a rotated secret is picked up and none is held in memory). A literal is
+/// refused. The token is requested for this server's own `url` (RFC 8707 `resource`).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpClientCredentials {
+    /// The authorization server's issuer, **pinned**: credentials are sent only if the server's
+    /// discovered authorization server metadata has exactly this `issuer` (RFC 8414), so a server
+    /// cannot name an authorization server of its own and collect the secret. Required; `https`
+    /// (or loopback `http`).
+    pub issuer: String,
+    pub client_id: String,
+    /// `$VAR` / `!command` yielding the client secret (`client_secret_post`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<String>,
+    /// `$VAR` / `!command` yielding the client's private key, PEM (`private_key_jwt`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_key: Option<String>,
+    /// The JWT signing algorithm for `private_key`: `RS256` (default), `RS384`, `RS512`, `ES256`,
+    /// `ES384`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing_algorithm: Option<String>,
+    /// The scopes to request first. A `403 insufficient_scope` later widens them (see
+    /// `tools::mcp_oauth`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<String>,
+}
+
+impl std::fmt::Debug for McpClientCredentials {
+    /// The secret references are redacted (a reference names where a secret lives).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpClientCredentials")
+            .field("issuer", &self.issuer)
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "private_key",
+                &self.private_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("signing_algorithm", &self.signing_algorithm)
+            .field("scopes", &self.scopes)
+            .finish()
+    }
+}
+
+/// A credential as a method of authenticating to the authorization server, secrets resolved.
+pub enum ResolvedClientCredential {
+    Secret(String),
+    PrivateKey { pem: String, algorithm: String },
+}
+
+impl McpClientCredentials {
+    /// `Err` (naming the server and the field, never a value) when the settings cannot work:
+    /// neither or both of `client_secret`/`private_key`, an inline literal, or an unknown algorithm.
+    pub fn validate(&self, server: &str) -> Result<(), String> {
+        let bad = |why: &str| Err(format!("mcp server `{server}` client_credentials: {why}"));
+        if self.client_id.trim().is_empty() {
+            return bad("`client_id` is empty");
+        }
+        if !crate::tools::mcp_client_credentials::endpoint_allowed(&self.issuer) {
+            return bad("`issuer` is required and must be an https URL (or loopback http)");
+        }
+        match (&self.client_secret, &self.private_key) {
+            (Some(_), Some(_)) => return bad("set only one of `client_secret` and `private_key`"),
+            (None, None) => return bad("set `client_secret` or `private_key`"),
+            (Some(r), None) => check_secret_reference(r, "client_secret", server)?,
+            (None, Some(r)) => check_secret_reference(r, "private_key", server)?,
+        }
+        if self.signing_algorithm.is_some() && self.private_key.is_none() {
+            return bad("`signing_algorithm` applies only to `private_key`");
+        }
+        if let Some(a) = &self.signing_algorithm
+            && !["RS256", "RS384", "RS512", "ES256", "ES384"].contains(&a.as_str())
+        {
+            return bad("`signing_algorithm` must be RS256, RS384, RS512, ES256 or ES384");
+        }
+        Ok(())
+    }
+
+    /// The secret or key, resolved now. `Err` never carries a value.
+    pub fn resolve(&self, server: &str) -> Result<ResolvedClientCredential, String> {
+        self.resolve_with_env(server, None)
+    }
+
+    fn resolve_with_env(
+        &self,
+        server: &str,
+        env: Option<&std::collections::HashMap<String, String>>,
+    ) -> Result<ResolvedClientCredential, String> {
+        self.validate(server)?;
+        let unresolved = |field: &str| {
+            format!(
+                "mcp server `{server}` client_credentials: `{field}` did not resolve (unset \
+                 variable, or a failing or empty command)"
+            )
+        };
+        if let Some(r) = &self.client_secret {
+            return resolve_config_value(r, env)
+                .filter(|v| !v.is_empty())
+                .map(ResolvedClientCredential::Secret)
+                .ok_or_else(|| unresolved("client_secret"));
+        }
+        let r = self.private_key.as_deref().unwrap_or_default();
+        resolve_config_value(r, env)
+            .filter(|v| !v.is_empty())
+            .map(|pem| ResolvedClientCredential::PrivateKey {
+                pem,
+                algorithm: self
+                    .signing_algorithm
+                    .clone()
+                    .unwrap_or_else(|| "RS256".into()),
+            })
+            .ok_or_else(|| unresolved("private_key"))
+    }
+}
+
+/// A secret reference is `$VAR`, `${VAR}` or `!command`: not a literal, and not an escaped `$$`/`$!`
+/// (which resolve to literal text).
+fn check_secret_reference(value: &str, field: &str, server: &str) -> Result<(), String> {
+    let reference = value.starts_with('!')
+        || (value.starts_with('$') && !value.starts_with("$$") && !value.starts_with("$!"));
+    if reference {
+        return Ok(());
+    }
+    Err(format!(
+        "mcp server `{server}` client_credentials: `{field}` must be a `$VAR` reference or a \
+         `!command`, never an inline secret"
+    ))
 }
 
 impl McpServerConfig {
@@ -3132,7 +3284,7 @@ mod tests {
         let cfg: McpServerConfig = serde_json::from_value(json.clone()).unwrap();
         assert_eq!(cfg.name, "remote");
         match &cfg.transport {
-            McpTransport::Http { url, headers } => {
+            McpTransport::Http { url, headers, .. } => {
                 assert_eq!(url, "https://example.com/mcp");
                 assert_eq!(
                     headers.get("Authorization").map(String::as_str),
@@ -3142,6 +3294,90 @@ mod tests {
             other => panic!("expected Http, got {other:?}"),
         }
         assert_eq!(serde_json::to_value(&cfg).unwrap(), json);
+    }
+
+    fn cc(json: serde_json::Value) -> McpClientCredentials {
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn client_credentials_round_trip_and_reject_unknown_fields() {
+        let json = serde_json::json!({
+            "name": "r", "transport": "http", "url": "https://example.com/mcp", "headers": {},
+            "client_credentials": { "issuer": "https://as.example.com", "client_id": "a", "client_secret": "$S", "scopes": ["x"] },
+        });
+        let cfg: McpServerConfig = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&cfg).unwrap(), json);
+        assert!(
+            serde_json::from_value::<McpClientCredentials>(
+                serde_json::json!({ "issuer": "https://as.example.com", "client_id": "a", "client_secret": "$S", "secret": "x" })
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn client_credentials_secrets_are_references_never_inline_literals() {
+        for ok in ["$S", "${S}", "!cat /run/secrets/x"] {
+            assert!(
+                cc(serde_json::json!({"issuer":"https://as.example.com","client_id":"a","client_secret":ok}))
+                    .validate("s")
+                    .is_ok(),
+                "{ok}"
+            );
+        }
+        for bad in ["hunter2", "$$literal", "$!literal", ""] {
+            let e = cc(serde_json::json!({"issuer":"https://as.example.com","client_id":"a","client_secret":bad}))
+                .validate("s")
+                .unwrap_err();
+            assert!(
+                e.contains("never an inline secret") && !e.contains("hunter2"),
+                "{e}"
+            );
+        }
+        let e =
+            cc(serde_json::json!({"issuer":"https://as.example.com","client_id":"a","private_key":"-----BEGIN PRIVATE KEY-----x"}))
+                .validate("s")
+                .unwrap_err();
+        assert!(e.contains("private_key") && !e.contains("BEGIN"), "{e}");
+    }
+
+    #[test]
+    fn client_credentials_need_exactly_one_method_and_a_known_algorithm() {
+        let v = |j: serde_json::Value| cc(j).validate("s");
+        assert!(v(serde_json::json!({"issuer":"https://as.example.com","client_id":"a"})).is_err());
+        assert!(
+            v(serde_json::json!({"issuer":"https://as.example.com","client_id":"a","client_secret":"$S","private_key":"$K"}))
+                .is_err()
+        );
+        assert!(v(serde_json::json!({"issuer":"https://as.example.com","client_id":"a","client_secret":"$S","signing_algorithm":"RS256"})).is_err());
+        assert!(
+            v(serde_json::json!({"issuer":"https://as.example.com","client_id":"a","private_key":"$K","signing_algorithm":"HS256"}))
+                .is_err()
+        );
+        assert!(
+            v(serde_json::json!({"issuer":"https://as.example.com","client_id":"a","private_key":"$K","signing_algorithm":"ES256"}))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn client_credentials_resolve_through_the_env_and_debug_hides_them() {
+        let c = cc(
+            serde_json::json!({"issuer":"https://as.example.com","client_id":"a","client_secret":"$S"}),
+        );
+        let env = [("S".to_string(), "the-secret".to_string())].into();
+        match c.resolve_with_env("s", Some(&env)).unwrap() {
+            ResolvedClientCredential::Secret(v) => assert_eq!(v, "the-secret"),
+            _ => panic!("expected a secret"),
+        }
+        let unset = c.resolve_with_env("s", Some(&std::collections::HashMap::new()));
+        assert!(unset.is_err() || std::env::var("S").is_ok());
+        let debug = format!("{c:?}");
+        assert!(
+            debug.contains("<redacted>") && !debug.contains("$S"),
+            "{debug}"
+        );
     }
 
     #[test]
@@ -3204,6 +3440,7 @@ mod tests {
             transport: McpTransport::Http {
                 url: "https://example.com".into(),
                 headers: std::collections::BTreeMap::new(),
+                client_credentials: None,
             },
         };
         assert!(cfg.resolved_env().is_empty());
@@ -3217,6 +3454,7 @@ mod tests {
             transport: McpTransport::Http {
                 url: "https://example.com".into(),
                 headers: [("Authorization".to_string(), "Bearer $TOKEN".to_string())].into(),
+                client_credentials: None,
             },
         };
         let overrides = [("TOKEN".to_string(), "abc123".to_string())].into();

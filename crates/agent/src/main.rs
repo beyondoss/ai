@@ -926,6 +926,11 @@ enum Command {
     McpLogin {
         /// The server's `name` in `mcp_servers`.
         name: String,
+        /// Scopes to request on top of those the stored login already has (the login is for their
+        /// union). Repeat the flag or separate scopes with spaces. This is what a server's `403
+        /// insufficient_scope` error tells you to run.
+        #[usage(long = "scope", value_name = "SCOPE")]
+        scope: Vec<String>,
     },
     /// Remove an MCP server's stored login.
     McpLogout {
@@ -1642,7 +1647,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Login { provider } => Box::pin(commands::auth::login(provider)).await?,
         Command::Logout { provider } => commands::auth::logout(provider)?,
         Command::AuthStatus { provider } => commands::auth::auth_status(provider)?,
-        Command::McpLogin { name } => Box::pin(commands::auth::mcp_login(name)).await?,
+        Command::McpLogin { name, scope } => {
+            Box::pin(commands::auth::mcp_login(name, scope)).await?
+        }
         Command::McpLogout { name } => commands::auth::mcp_logout(name)?,
         cmd @ Command::Settings { .. } => commands::settings::settings(cmd)?,
         Command::Export { session, output } => commands::inspect::export(session, output)?,

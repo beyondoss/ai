@@ -107,7 +107,7 @@ echo '{"id":"1","type":"get_state"}' \
 
 Around the tools:
 
-- **MCP client.** stdio and HTTP servers, OAuth (`mcp-login <name>`), tool
+- **MCP client.** stdio and HTTP servers, OAuth (`mcp-login <name>`, or client credentials for unattended runs), tool
   search for large catalogs, MCP Apps, MCP Events. See
   [MCP tool names](ARCHITECTURE.md#mcp-tool-names) and
   [`.mcp.json`](ARCHITECTURE.md#mcpjson).

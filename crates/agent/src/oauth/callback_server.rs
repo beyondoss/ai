@@ -97,6 +97,19 @@ impl CallbackServer {
         expected_state: String,
         cancel: CancellationToken,
     ) -> Option<String> {
+        self.wait_for_callback_with_issuer(expected_path, expected_state, cancel)
+            .await
+            .map(|(code, _issuer)| code)
+    }
+
+    /// [`Self::wait_for_callback`], also returning the callback's `iss` parameter (RFC 9207), which
+    /// an authorization server that advertises it sends and a client must check.
+    pub async fn wait_for_callback_with_issuer(
+        &self,
+        expected_path: &'static str,
+        expected_state: String,
+        cancel: CancellationToken,
+    ) -> Option<(String, Option<String>)> {
         let server = self.server.clone();
         let blocking_cancel = cancel.clone();
 
@@ -123,9 +136,9 @@ impl CallbackServer {
                 match server.recv_timeout(POLL_INTERVAL) {
                     Ok(Some(request)) => {
                         match handle_one(&request, expected_path, &expected_state) {
-                            Some(code) => {
+                            Some(got) => {
                                 respond(request, true);
-                                return Some(code);
+                                return Some(got);
                             }
                             None => {
                                 respond(request, false);
@@ -183,16 +196,18 @@ fn handle_one(
     request: &tiny_http::Request,
     expected_path: &str,
     expected_state: &str,
-) -> Option<String> {
+) -> Option<(String, Option<String>)> {
     let url = url::Url::parse(&format!("http://localhost{}", request.url())).ok()?;
     if url.path() != expected_path {
         return None;
     }
     let mut code = None;
     let mut state = None;
+    let mut issuer = None;
     let mut saw_error = false;
     for (k, v) in url.query_pairs() {
         match &*k {
+            "iss" => issuer = Some(v.into_owned()),
             "code" => code = Some(v.into_owned()),
             "state" => state = Some(v.into_owned()),
             "error" => saw_error = true,
@@ -206,7 +221,7 @@ fn handle_one(
     if state != expected_state {
         return None;
     }
-    Some(code)
+    Some((code, issuer))
 }
 
 fn respond(request: tiny_http::Request, success: bool) {

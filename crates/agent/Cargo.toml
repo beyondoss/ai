@@ -156,6 +156,10 @@ base64 = "0.22"
 # false` drops the `rayon`/AVIF/EXR/etc. formats we never decode; only the four raster formats `read`
 # actually accepts are enabled.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+# `mcp_client_credentials` signs the `private_key_jwt` client assertion (RFC 7523). `ring`, already in
+# the graph under rustls, rather than rmcp's `auth-client-credentials-jwt` feature, whose
+# `jsonwebtoken` pulls the aws-lc-rs/aws-lc-sys C blob the comment on `rmcp` below keeps out.
+ring = "0.17"
 
 # The `web` tool's `markdown` mode: HTML→markdown, so the model reads a page's prose rather than its
 # HTML. See `tools/web/markdown.rs`.
