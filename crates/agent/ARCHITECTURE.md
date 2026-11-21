@@ -7074,7 +7074,7 @@ the server still answers 401, by the single-flight rejection path above.
 `OAuthHttp`). A client-credentials server requests a token for the union of the scopes it already
 asked for and the challenge's `scope` (`mcp_client_credentials::step_up`, a pure decision) and the
 request is retried **once**: at most one step-up per request, never a loop; a scope set the
-authorization server refused is remembered and not asked for again, and the held token is untouched.
+authorization server refused is remembered and not asked for again, one that failed transiently waits out the same doubling backoff as a 401 refresh (a 403 for it makes no authorization-server call meanwhile), and the held token is untouched.
 An `mcp-login` server cannot ask anyone mid-run: the error names the scope and the command
 (`agent mcp-login <name> --scope "<scope>"`). A 403 never refreshes.
 
