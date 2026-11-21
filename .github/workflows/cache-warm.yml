@@ -9,7 +9,7 @@ name: Cache warm
 # budget, so the repo was over budget and entries churned. Now only a push to main saves (`save-if` in
 # ci.yml is false everywhere else), and pull_request and merge_group runs restore main's entries.
 #
-# The bound: one entry per shared key, so five (`tests`, `clippy`, `code-mode`, `release`, `execd-arm64`). The key
+# The bound: one entry per shared key, so six (`tests`, `clippy`, `code-mode`, `release`, `execd-arm64`, `mcp-events`). The key
 # rotates when Cargo.lock, the toolchain or RUSTFLAGS change; the older entry is not used again and
 # is evicted after 7 days unused. Restore falls back to the newest entry of the same shared key, so
 # a PR that changes the lock still starts from a near-complete cache. rust-cache saves only
@@ -130,3 +130,19 @@ jobs:
           tool: nextest
       - if: steps.cache.outputs.cache-hit != 'true'
         run: cargo nextest run -p beyond-execd --locked --profile ci --no-run
+  # ci.yml's `mcp events conformance` job: a dev build of the agent (`mise run eval:mcp-events-conformance`
+  # runs `cargo build -p beyond-agent`).
+  mcp-events:
+    name: warm (mcp events conformance)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+      - uses: Swatinem/rust-cache@v2
+        id: cache
+        with:
+          shared-key: mcp-events
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - if: steps.cache.outputs.cache-hit != 'true'
+        run: cargo build -p beyond-agent

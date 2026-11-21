@@ -494,6 +494,32 @@ jobs:
       # The authority on "no test seam ships": the release binaries themselves, scanned for the
       # seam prefix (a grep over what was just built; seconds).
       - run: mise check:release-seams
+  # MCP Events (SEP-3415), end to end. The real `agent serve` against crates/agent/eval/mcp_events_conformance:
+  # a strict server written independently from the spec text, over Streamable HTTP and stdio, in poll,
+  # push and webhook mode, with a mock model gateway. The agent's own tests run against a fixture server
+  # written to the same draft as the client, so only this job can see spec drift. Only when the change
+  # touches the agent's MCP client or serve paths or the kit (the `changes` job). Estimated 12 minutes (about 7 of dev build
+  # on a warm dependency cache, about 5 for the 14 scenarios, 4 at a time).
+  mcp-events-conformance:
+    name: mcp events conformance
+    needs: changes
+    if: needs.changes.outputs.agent == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+      # Restore-only here: cache-warm.yml writes this key on main.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: mcp-events
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: conformance (HTTP and stdio)
+        run: mise run eval:mcp-events-conformance all
+        timeout-minutes: 20
+      - name: what was left running
+        if: always()
+        run: ps -eo pid,etime,rss,args | grep -E "agent serve|mcp_events_conformance" | grep -v grep || echo "  none"
   # Dependency advisories are checked only on a PR that touches dependencies. An advisory is
   # published on its own schedule, so an unrelated PR must never turn red because one landed since
   # main last changed; advisories.yml bumps main's lockfile daily instead. `deps` is true when the
@@ -512,6 +538,7 @@ jobs:
       execd: ${{ steps.diff.outputs.execd }}
       clients: ${{ steps.diff.outputs.clients }}
       mcpapps: ${{ steps.diff.outputs.mcpapps }}
+      agent: ${{ steps.diff.outputs.agent }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -525,6 +552,7 @@ jobs:
           execd=false
           clients=false
           mcpapps=false
+          agent=false
           if [ "$EVENT" = pull_request ] || [ "$EVENT" = workflow_dispatch ] || [ "$EVENT" = merge_group ]; then
             base=${BASE_SHA:-$(git rev-parse origin/main)}
             if git diff --name-only "$base"...HEAD | grep -qE '(^|/)Cargo\.toml$|^Cargo\.lock$|^\.cargo/(audit\.toml|config(\.toml)?)$|(^|/)rust-toolchain(\.toml)?$|(^|/)Dockerfile[^/]*$'; then
@@ -545,10 +573,15 @@ jobs:
           if git diff --name-only "$base"...HEAD | grep -qE '^crates/agent/src/(tools/mcp|serve/)|^crates/agent/eval/mcp_apps_interop/|^\.github/workflows/ci\.yml$'; then
             mcpapps=true
           fi
+          # The agent's MCP client and serve paths (tools/mcp*, tools/mcp_events/, serve/), the MCP Events conformance kit, and this workflow.
+          if git diff --name-only "$base"...HEAD | grep -qE '^crates/agent/src/(tools/mcp|serve/)|^crates/agent/eval/mcp_events_conformance/|^mise\.toml$|^\.github/workflows/ci\.yml$'; then
+            agent=true
+          fi
           echo "deps=$deps" >>"$GITHUB_OUTPUT"
           echo "execd=$execd" >>"$GITHUB_OUTPUT"
           echo "clients=$clients" >>"$GITHUB_OUTPUT"
           echo "mcpapps=$mcpapps" >>"$GITHUB_OUTPUT"
+          echo "agent=$agent" >>"$GITHUB_OUTPUT"
   # execd on a native arm64 machine. execd ships for arm64 (release-execd.yml) and is Linux-syscall
   # code (subreaper, process groups, /proc, waits) whose struct layouts and syscall numbers differ
   # per arch, so x86 green says nothing about it. The suite runs here as on amd64, including the
@@ -714,21 +747,21 @@ jobs:
   # Mutation testing is not a PR check: a missed mutant is a test gap, not a bug, and the per-PR
   # run added about an hour to every gateway change. The full mutation sweep is weekly (deep.yml).
   # Single required status check. Branch protection can require just `Check`; it stays green only if
-  # every parallel job above did. Two kinds of skip are allowed: `advisories`, `execd-arm64`, `clients` and `mcp-apps-interop` may be
+  # every parallel job above did. Two kinds of skip are allowed: `advisories`, `execd-arm64`, `clients`, `mcp-apps-interop` and `mcp-events-conformance` may be
   # skipped on any event (each must pass only when it ran: the change touched dependencies / execd), and `gateway-stress` and
   # `build` may be skipped on a pull_request only (they run in the merge queue, so every commit that
   # reaches main passed them). Cheap (no build), and keeps the required-check name stable.
   Check:
     name: Check
     runs-on: ubuntu-24.04
-    needs: [fmt, clippy, archive, test, gateway-stress, build, changes, advisories, execd-arm64, clients, mcp-apps-interop, sdk-ts, sdk-python]
+    needs: [fmt, clippy, archive, test, gateway-stress, build, changes, advisories, execd-arm64, clients, mcp-apps-interop, sdk-ts, sdk-python, mcp-events-conformance]
     if: always()
     steps:
       - name: Gate on all checks
         env:
           EVENT: ${{ github.event_name }}
         run: |
-          echo "event=$EVENT fmt=${{ needs.fmt.result }} clippy=${{ needs.clippy.result }} archive=${{ needs.archive.result }} test=${{ needs.test.result }} gateway-stress=${{ needs.gateway-stress.result }} build=${{ needs.build.result }} changes=${{ needs.changes.result }} advisories=${{ needs.advisories.result }} execd-arm64=${{ needs.execd-arm64.result }} clients=${{ needs.clients.result }} mcp-apps-interop=${{ needs.mcp-apps-interop.result }} sdk-ts=${{ needs.sdk-ts.result }} sdk-python=${{ needs.sdk-python.result }}"
+          echo "event=$EVENT fmt=${{ needs.fmt.result }} clippy=${{ needs.clippy.result }} archive=${{ needs.archive.result }} test=${{ needs.test.result }} gateway-stress=${{ needs.gateway-stress.result }} build=${{ needs.build.result }} changes=${{ needs.changes.result }} advisories=${{ needs.advisories.result }} execd-arm64=${{ needs.execd-arm64.result }} clients=${{ needs.clients.result }} mcp-apps-interop=${{ needs.mcp-apps-interop.result }} sdk-ts=${{ needs.sdk-ts.result }} sdk-python=${{ needs.sdk-python.result }} mcp-events-conformance=${{ needs.mcp-events-conformance.result }}"
           # gateway-stress and build are skipped on a pull_request and nowhere else: a skip on the
           # merge queue or a dispatch is a job that never ran, which must not read as green.
           pr_only() { [ "$1" = "success" ] || { [ "$EVENT" = pull_request ] && [ "$1" = "skipped" ]; }; }
@@ -744,4 +777,5 @@ jobs:
             && { [ "${{ needs.advisories.result }}" = "success" ] || [ "${{ needs.advisories.result }}" = "skipped" ]; } \
             && { [ "${{ needs.execd-arm64.result }}" = "success" ] || [ "${{ needs.execd-arm64.result }}" = "skipped" ]; } \
             && { [ "${{ needs.clients.result }}" = "success" ] || [ "${{ needs.clients.result }}" = "skipped" ]; } \
-            && { [ "${{ needs.mcp-apps-interop.result }}" = "success" ] || [ "${{ needs.mcp-apps-interop.result }}" = "skipped" ]; }
+            && { [ "${{ needs.mcp-apps-interop.result }}" = "success" ] || [ "${{ needs.mcp-apps-interop.result }}" = "skipped" ]; } \
+            && { [ "${{ needs.mcp-events-conformance.result }}" = "success" ] || [ "${{ needs.mcp-events-conformance.result }}" = "skipped" ]; }

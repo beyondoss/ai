@@ -51,6 +51,19 @@ python3 crates/agent/eval/longctx/run.py --bin target/release/agent "$@"
 python3 crates/agent/eval/longctx/report.py
 """
 
+[tasks."eval:mcp-events-conformance"]
+description = "MCP Events (SEP-3415) end to end: the real `agent serve` against an independent, strict server (crates/agent/eval/mcp_events_conformance/server.py) over Streamable HTTP and stdio, in poll, push and webhook mode. Builds the agent, installs the pinned Python env into target/. Args: http | stdio | all (default), --only SUBSTRING. Needs no model: a mock gateway records the prompts."
+run = """
+set -e
+cargo build -q -p beyond-agent
+dir=crates/agent/eval/mcp_events_conformance
+venv=target/mcp-events-conformance-venv
+python3 -m venv "$venv"
+"$venv/bin/pip" install -q -r "$dir/requirements.txt"
+"$venv/bin/python" "$dir/selftest.py"
+AGENT_BIN="${AGENT_BIN:-target/debug/agent}" "$venv/bin/python" "$dir/check.py" "$@"
+"""
+
 [tasks."eval:validate"]
 description = "Check the long-context eval's integrity before trusting an A/B (local, no model calls): build every task (no compiled/packaged artifact, no removed body left verbatim in the tree), the pristine tree passes 100% in the grading env with stable test ids, the perfect answer grades as solved in every run-dir layout with identical results (path-independent), the stubbed tree fails, and the agent's sandbox reaches no pristine tree, other run or installed copy of a package under test; then the eight background-process tasks set up at once: each untouched task fails and its reference solution passes (three times each), ports distinct and released, the real build matches, the sandbox leftover report and the bg metrics. Args go to validate.py (--repos, --jobs, --bg-only, --real-run)."
 run = 'python3 crates/agent/eval/longctx/validate.py "$@"'
