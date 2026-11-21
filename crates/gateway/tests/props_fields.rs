@@ -1,6 +1,6 @@
 //! Property test: no request field that changes what the client gets back is silently dropped.
 //!
-//! translate.rs's contract: hints with no equivalent and no effect on the response's shape may be
+//! The translate module's contract: hints with no equivalent and no effect on the response's shape may be
 //! dropped (`seed`, penalties, `logit_bias`, …); everything that changes the answer either maps
 //! onto the target or is forwarded for the provider to reject by name; Responses session state is
 //! never stripped (it relays to a Responses arm or is refused). Here each such field, with a

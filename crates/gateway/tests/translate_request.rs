@@ -1,6 +1,6 @@
 //! End-to-end: what a translated request looks like when it reaches the upstream.
 //!
-//! `translate.rs`'s unit tests pin each mapping; these drive the stock-SDK flows those mappings
+//! `translate/`'s unit tests pin each mapping; these drive the stock-SDK flows those mappings
 //! exist for through the real proxy, and read what the mock upstream received (body *and* headers,
 //! which leave before the body is translated) — including a client's next turn built from what the
 //! gateway streamed it, and signed thinking bound for OpenRouter.

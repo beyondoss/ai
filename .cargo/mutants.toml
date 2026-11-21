@@ -10,7 +10,7 @@ examine_globs = [
   "crates/gateway/src/usage.rs",
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/proxy/*.rs",
-  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/translate/**/*.rs",
   "crates/gateway/src/circuit_breaker.rs",
   "crates/gateway/src/peek.rs",
   # The verifier: a surviving mutant here is a forged or wrongly refused key, deny entry or

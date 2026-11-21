@@ -50,7 +50,7 @@ jobs:
           CARGO_PROFILE_TEST_DEBUG: 0
         run: |
           # An array, so the proxy module's glob reaches cargo-mutants unexpanded.
-          FILES=(--file crates/gateway/src/usage.rs --file crates/gateway/src/translate.rs
+          FILES=(--file crates/gateway/src/usage.rs --file 'crates/gateway/src/translate/**/*.rs'
             --file crates/gateway/src/proxy.rs --file 'crates/gateway/src/proxy/*.rs'
             --file crates/gateway/src/peek.rs
             --file crates/gateway/src/circuit_breaker.rs --file crates/gateway/src/route.rs

@@ -1363,6 +1363,34 @@ mod input_tally {
         include_str!("../src/proxy/upstream.rs"),
     ];
 
+    /// The translate module's source, one text.
+    const TRANSLATE_SRC: [&str; 24] = [
+        include_str!("../src/translate/errors.rs"),
+        include_str!("../src/translate.rs"),
+        include_str!("../src/translate/model.rs"),
+        include_str!("../src/translate/parts.rs"),
+        include_str!("../src/translate/request/from_messages.rs"),
+        include_str!("../src/translate/request/from_responses.rs"),
+        include_str!("../src/translate/request.rs"),
+        include_str!("../src/translate/request/to_messages.rs"),
+        include_str!("../src/translate/request/to_responses.rs"),
+        include_str!("../src/translate/response/chat_messages.rs"),
+        include_str!("../src/translate/response.rs"),
+        include_str!("../src/translate/response/responses.rs"),
+        include_str!("../src/translate/same_wire.rs"),
+        include_str!("../src/translate/stop.rs"),
+        include_str!("../src/translate/stream/ant_to_oai.rs"),
+        include_str!("../src/translate/stream.rs"),
+        include_str!("../src/translate/stream/oai_to_ant.rs"),
+        include_str!("../src/translate/stream/oai_to_resp.rs"),
+        include_str!("../src/translate/stream/resp_to_oai.rs"),
+        include_str!("../src/translate/stream/tool_calls.rs"),
+        include_str!("../src/translate/thinking.rs"),
+        include_str!("../src/translate/tools.rs"),
+        include_str!("../src/translate/usage_map.rs"),
+        include_str!("../src/translate/wire.rs"),
+    ];
+
     /// A coding agent's prompt: ~100 KiB of source as message content.
     fn code_body() -> Vec<u8> {
         let src = PROXY_SRC.concat();
@@ -1403,11 +1431,7 @@ mod input_tally {
     /// ~1 MiB of source (a large agent turn): a `\n` escape every ~40 bytes.
     #[divan::bench]
     fn code_1mb(bencher: Bencher) {
-        let src = [
-            PROXY_SRC.concat().as_str(),
-            include_str!("../src/translate.rs"),
-        ]
-        .concat();
+        let src = [PROXY_SRC.concat().as_str(), TRANSLATE_SRC.concat().as_str()].concat();
         let mut end = src.len().min(1024 * 1024);
         while !src.is_char_boundary(end) {
             end -= 1;
