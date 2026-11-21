@@ -415,8 +415,13 @@ fn extension_declared() -> bool {
     std::env::var("MCP_SKILLS_FIXTURE_NO_EXTENSION").as_deref() != Ok("1")
 }
 
+/// Whether a `subscriptions/listen` stream asked for `resourcesListChanged`, and whether the client
+/// fell back to the legacy `initialize` handshake (where `list_changed` is unrequested).
+static LISTEN_RESOURCES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static LEGACY_SESSION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn capabilities() -> Value {
-    let mut caps = json!({ "tools": {}, "resources": {} });
+    let mut caps = json!({ "tools": {}, "resources": { "listChanged": true } });
     if extension_declared() {
         caps["extensions"] = json!({ (SKILLS_EXTENSION_ID): {} });
     }
@@ -642,6 +647,31 @@ async fn main() {
         let Ok(request) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
+        let method = request.get("method").and_then(Value::as_str);
+        if method == Some("initialize") {
+            LEGACY_SESSION.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        // A `2026-07-28` server sends `list_changed` only to a client that asked for it on a
+        // `subscriptions/listen` stream: acknowledge what it agrees to, leave the stream open.
+        if method == Some("subscriptions/listen") {
+            let wants =
+                request.pointer("/params/notifications/resourcesListChanged") == Some(&json!(true));
+            LISTEN_RESOURCES.store(wants, std::sync::atomic::Ordering::SeqCst);
+            let id = request.get("id").cloned().unwrap_or(Value::Null);
+            let agreed = if wants {
+                json!({ "resourcesListChanged": true })
+            } else {
+                json!({})
+            };
+            let ack = json!({ "jsonrpc": "2.0", "method": "notifications/subscriptions/acknowledged",
+                "params": { "_meta": { "io.modelcontextprotocol/subscriptionId": id }, "notifications": agreed } });
+            let mut bytes = serde_json::to_vec(&ack).unwrap_or_default();
+            bytes.push(b'\n');
+            let mut stdout = stdout.lock().await;
+            let _ = stdout.write_all(&bytes).await;
+            let _ = stdout.flush().await;
+            continue;
+        }
         let Some(reply) = reply(&request) else {
             continue;
         };
@@ -716,7 +746,10 @@ async fn main() {
             let _ = stdout.write_all(b"\x80\x81\x82\n").await;
         }
         // `publish_late` changes the listing; say so before answering, as a server would.
-        if request.pointer("/params/name").and_then(Value::as_str) == Some("publish_late") {
+        if request.pointer("/params/name").and_then(Value::as_str) == Some("publish_late")
+            && (LEGACY_SESSION.load(std::sync::atomic::Ordering::SeqCst)
+                || LISTEN_RESOURCES.load(std::sync::atomic::Ordering::SeqCst))
+        {
             let note =
                 json!({ "jsonrpc": "2.0", "method": "notifications/resources/list_changed" });
             let mut bytes = serde_json::to_vec(&note).unwrap_or_default();

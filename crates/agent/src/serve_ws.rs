@@ -2392,7 +2392,7 @@ where
         return Ok(());
     }
 
-    // MCP Events webhook deliveries (draft extension). Ahead of the grant check: the caller is an
+    // MCP Events webhook deliveries (SEP-3415). Ahead of the grant check: the caller is an
     // MCP server, not a tenant, and it authenticates with the subscription's HMAC signature, which
     // `mcp_events::receive_webhook` verifies over the raw body. Not routed at all in service mode,
     // which has no MCP Events (and so no subscription a delivery could belong to).

@@ -1,4 +1,4 @@
-//! MCP Events (draft) across a session's life: background triggers survive a disconnected client
+//! MCP Events across a session's life: background triggers survive a disconnected client
 //! (the idle reaper leaves a session with live subscriptions alone, unless
 //! `--mcp-events-reapable`), and cursors + the dedup window persist with the session, so a
 //! restarted `serve` resumes from where it was — events emitted while it was down are delivered,

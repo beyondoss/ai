@@ -82,6 +82,7 @@ mod mcp_events_push;
 mod mcp_events_receiver;
 mod mcp_events_redial;
 mod mcp_events_routing;
+mod mcp_events_sep;
 mod mcp_events_v1a;
 mod mcp_events_webhook;
 mod mcp_handshake_timeout;

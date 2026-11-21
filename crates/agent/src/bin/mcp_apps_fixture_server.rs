@@ -128,6 +128,11 @@ fn request_has_ui(params: &Value) -> bool {
     }
 }
 
+/// Whether a `subscriptions/listen` stream asked for `resourcesListChanged`, and whether the client
+/// used the legacy `initialize` handshake.
+static LISTEN_RESOURCES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static LEGACY_SESSION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// The view's version, bumped by `change_view`; the served HTML names it.
 static VIEW_VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
@@ -162,7 +167,7 @@ fn ui_meta_at(place: &str) -> bool {
 
 fn listing_view_ui() -> Value {
     json!({
-        "csp": { "connectDomains": ["https://listing.example.test"] },
+        "csp": { "connectDomains": [format!("https://listing-v{}.example.test", VIEW_VERSION.load(Ordering::Relaxed))] },
         "permissions": { "camera": {} },
         "prefersBorder": false,
     })
@@ -462,6 +467,27 @@ async fn main() {
             write_atomically(&marker, "failed once");
             std::process::exit(3);
         }
+        // A `2026-07-28` server sends `list_changed` only to a client that asked on a
+        // `subscriptions/listen` stream; a legacy (`initialize`) one sends it unrequested.
+        if method == "initialize" {
+            LEGACY_SESSION.store(true, Ordering::Relaxed);
+        }
+        if method == "subscriptions/listen" {
+            let wants = params.pointer("/notifications/resourcesListChanged") == Some(&json!(true));
+            LISTEN_RESOURCES.store(wants, Ordering::Relaxed);
+            let agreed = if wants {
+                json!({ "resourcesListChanged": true })
+            } else {
+                json!({})
+            };
+            let ack = json!({ "jsonrpc": "2.0", "method": "notifications/subscriptions/acknowledged",
+                "params": { "_meta": { "io.modelcontextprotocol/subscriptionId": request.get("id").cloned().unwrap_or(Value::Null) },
+                            "notifications": agreed } });
+            let mut out = stdout.lock().await;
+            let _ = out.write_all(format!("{ack}\n").as_bytes()).await;
+            let _ = out.flush().await;
+            continue;
+        }
         let changes_view = method == "tools/call"
             && params.get("name").and_then(Value::as_str) == Some("change_view");
         // Notifications get no answer.
@@ -478,7 +504,10 @@ async fn main() {
                                                 "error": { "code": code, "message": message } }),
             };
             let mut out = stdout.lock().await;
-            if changes_view {
+            if changes_view
+                && (LEGACY_SESSION.load(Ordering::Relaxed)
+                    || LISTEN_RESOURCES.load(Ordering::Relaxed))
+            {
                 let note =
                     json!({ "jsonrpc": "2.0", "method": "notifications/resources/list_changed" });
                 let _ = out.write_all(format!("{note}\n").as_bytes()).await;

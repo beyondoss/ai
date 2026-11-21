@@ -129,10 +129,7 @@ impl SessionLoop {
         .filter(|n| n.starts_with("mcp__"))
         .collect();
         let catalogs = self.cfg.mcp_catalog.filter_enabled(&self.mcp_enabled);
-        let resources: Vec<_> = catalogs
-            .iter()
-            .flat_map(|s| s.resources.iter().cloned())
-            .collect();
+        let resources: Vec<_> = catalogs.iter().flat_map(|s| s.resources()).collect();
         let prompts: Vec<_> = catalogs
             .iter()
             .flat_map(|s| s.prompts.iter().cloned())
@@ -143,7 +140,7 @@ impl SessionLoop {
                 json!({
                     "name": s.name,
                     "protocol_version": s.protocol_version,
-                    "resources": s.resources.len(),
+                    "resources": s.resources().len(),
                     "prompts": s.prompts.len(),
                 })
             })

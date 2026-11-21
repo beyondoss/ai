@@ -702,6 +702,12 @@ impl ServerSkills {
         }
     }
 
+    /// Whether `uri` belongs to this server's skills (its listing says so), so it is not also a
+    /// generic resource tool.
+    pub(crate) fn hides(&self, uri: &str) -> bool {
+        lock(&self.listing).hides(uri)
+    }
+
     pub(crate) fn listed(&self) -> Vec<SkillEntry> {
         lock(&self.listing).entries.clone()
     }

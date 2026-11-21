@@ -1,4 +1,4 @@
-//! MCP Events (draft) delivery is durable end to end — to the *model*, not just to the frame:
+//! MCP Events delivery is durable end to end — to the *model*, not just to the frame:
 //!
 //! - an event a server was told we received, but the model had not yet seen (held because a run
 //!   was in flight), survives a SIGTERM and reaches the model exactly once after the restart;

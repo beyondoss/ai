@@ -446,6 +446,81 @@ async fn view_html_is_cached_per_connection_until_the_server_says_resources_chan
     assert_eq!(home.reads_of(VIEW_URI), 3);
 }
 
+/// A `resources/list_changed` (the server sends it only to a connection that asked on
+/// `subscriptions/listen`) makes the next view open read `resources/list` again: the listing-level
+/// `_meta.ui` default (here, the CSP's connect domain) is the new one, not the connect-time snapshot.
+#[tokio::test]
+async fn a_views_listing_default_is_read_again_after_resources_changed() {
+    let home = home_with_fixture(json!({ "MCP_APPS_FIXTURE_UI_META": "listing" }));
+    let call = |id: &str| {
+        turn_tool_use(
+            id,
+            "mcp__wx__show_weather",
+            &json!({ "city": "Oslo" }).to_string(),
+        )
+    };
+    let (base, _) = spawn_model_server_routed(
+        vec![
+            ("Title:".into(), turn_text("title")),
+            ("toolu_2".into(), turn_text("done")),
+            ("zq2x".into(), call("toolu_2")),
+            ("toolu_1".into(), turn_text("done")),
+        ],
+        call("toolu_1"),
+    );
+    let sessions = tempfile::tempdir().unwrap();
+    let log = sessions.path().join("serve.stderr");
+    let daemon = daemon_opts(
+        &home.home,
+        &base,
+        sessions.path(),
+        "0",
+        &[],
+        &[("RUST_LOG", "beyond_agent::tools::mcp=debug")],
+        Some(&log),
+    )
+    .await;
+    let mut ws = daemon.connect("listing").await;
+    declare_apps(&mut ws).await;
+    let domain = |frames: &[Value]| {
+        of_type(frames, "mcp_app_open")
+            .first()
+            .unwrap_or_else(|| panic!("no view: {frames:#?}"))["resource"]["_meta"]["ui"]["csp"]
+            ["connectDomains"][0]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    assert_eq!(
+        domain(&prompt(&mut ws, "zq1x").await),
+        "https://listing-v1.example.test"
+    );
+    let r = app_request(
+        &mut ws,
+        "wx",
+        "toolu_1",
+        "tools/call",
+        json!({ "name": "change_view" }),
+    )
+    .await;
+    assert_eq!(r["data"]["result"]["content"][0]["text"], "view-v2", "{r}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !std::fs::read_to_string(&log)
+        .unwrap_or_default()
+        .contains("resources/list_changed handled")
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "list_changed was never handled"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        domain(&prompt(&mut ws, "zq2x").await),
+        "https://listing-v2.example.test"
+    );
+}
+
 #[tokio::test]
 async fn a_views_context_rides_its_turn_across_a_restart_and_a_session_switch() {
     let home = home_with_fixture(json!({}));

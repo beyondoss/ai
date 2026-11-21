@@ -295,6 +295,18 @@ pub(crate) struct McpHandler {
     skills_changed: Arc<std::sync::atomic::AtomicU64>,
     /// What a `notifications/tools/list_changed` re-lists into — see [`Dial::relist`].
     relist: Relist,
+    /// The connection's `subscriptions/listen` stream (see [`Self::start_listening`]); ends with the
+    /// connection, whose service holds the last handle to this.
+    listen: Arc<std::sync::Mutex<Option<ListenGuard>>>,
+}
+
+/// Aborts the connection's listen task when the connection (its handler) goes away.
+struct ListenGuard(tokio::task::JoinHandle<()>);
+
+impl Drop for ListenGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// One request in flight on a connection, and the session (host) it belongs to.
@@ -317,6 +329,113 @@ impl McpHandler {
             apps: false,
             views: Arc::default(),
             relist: Relist::default(),
+            listen: Arc::default(),
+        }
+    }
+
+    /// Under `2026-07-28` a server sends a `list_changed` notification only to a client that asked
+    /// for it on a `subscriptions/listen` stream (and says what it agreed to in
+    /// `notifications/subscriptions/acknowledged`). So: one stream per connection, requesting
+    /// exactly what the server declared `listChanged` for — tools, resources, prompts, and the
+    /// events extension's own `eventsListChanged` — held open until the connection ends and
+    /// reopened after any other end. The notifications arrive on rmcp's own connection and reach
+    /// the handlers below (`on_tool_list_changed`, `on_resource_list_changed`) and the events
+    /// router like any other. A server on an earlier revision sends them unrequested, so it gets no
+    /// stream. After a reopen, whatever changed while it was down is unknown, so everything a
+    /// notification would have refreshed is refreshed.
+    fn start_listening(&self, peer: Peer<RoleClient>, info: &rmcp::model::ServerPeerInfo) {
+        if info.protocol_version < ProtocolVersion::V_2026_07_28 {
+            return;
+        }
+        let caps = &info.capabilities;
+        let mut filter = Map::new();
+        let mut want = |key: &str, declared: bool| {
+            if declared {
+                filter.insert(key.into(), Value::Bool(true));
+            }
+        };
+        want(
+            "toolsListChanged",
+            caps.tools.as_ref().and_then(|t| t.list_changed) == Some(true),
+        );
+        want(
+            "resourcesListChanged",
+            caps.resources.as_ref().and_then(|r| r.list_changed) == Some(true),
+        );
+        want(
+            "promptsListChanged",
+            caps.prompts.as_ref().and_then(|p| p.list_changed) == Some(true),
+        );
+        want(
+            "eventsListChanged",
+            caps.extensions
+                .as_ref()
+                .and_then(|e| e.get(crate::tools::mcp_events::EVENTS_EXTENSION_ID))
+                .and_then(|s| s.get("listChanged"))
+                == Some(&Value::Bool(true)),
+        );
+        if filter.is_empty() {
+            return;
+        }
+        let params = json!({ "notifications": filter });
+        // Pieces, not `self`: the guard lives in this handler, so a task holding the handler would
+        // keep it (and the connection) alive forever.
+        let (events, views, skills, relist, server) = (
+            self.events.clone(),
+            self.views.clone(),
+            self.skills_changed.clone(),
+            self.relist.clone(),
+            self.server_name.clone(),
+        );
+        let task = tokio::spawn(async move {
+            let mut failures = 0u32;
+            let mut first = true;
+            loop {
+                if !first {
+                    events.bump();
+                    if let Ok(mut v) = views.lock() {
+                        v.clear();
+                    }
+                    skills.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    relist.run(&peer).await;
+                    relist.run_resources(&peer).await;
+                }
+                first = false;
+                let up = std::time::Instant::now();
+                let request = ClientRequest::CustomRequest(rmcp::model::CustomRequest::new(
+                    "subscriptions/listen",
+                    Some(params.clone()),
+                ));
+                let ended = match peer
+                    .send_request_with_option(request, PeerRequestOptions::no_options())
+                    .await
+                {
+                    Ok(handle) => handle.await_response().await.map(|_| ()),
+                    Err(e) => Err(e),
+                };
+                match ended {
+                    Err(ServiceError::TransportClosed) => return,
+                    Err(ServiceError::McpError(e)) if e.code.0 == -32601 => {
+                        tracing::debug!(%server, "no subscriptions/listen on this server");
+                        return;
+                    }
+                    other => {
+                        tracing::debug!(%server, ended = ?other, "subscriptions/listen ended; reopening");
+                    }
+                }
+                failures = if up.elapsed() >= Duration::from_secs(5) {
+                    0
+                } else {
+                    failures + 1
+                };
+                tokio::time::sleep(
+                    Duration::from_secs(1u64 << failures.min(5)).min(Duration::from_secs(30)),
+                )
+                .await;
+            }
+        });
+        if let Ok(mut slot) = self.listen.lock() {
+            *slot = Some(ListenGuard(task));
         }
     }
 
@@ -491,7 +610,7 @@ impl ClientHandler for McpHandler {
     // that changes its catalog says so with `notifications/resources/list_changed`); a
     // `notifications/skills/list_changed` (the first-class-primitive design the working group did not
     // adopt) is honoured too, since it can only mean one thing.
-    async fn on_resource_list_changed(&self, _context: NotificationContext<RoleClient>) {
+    async fn on_resource_list_changed(&self, context: NotificationContext<RoleClient>) {
         if let Ok(mut views) = self.views.lock() {
             views.clear();
         }
@@ -500,6 +619,7 @@ impl ClientHandler for McpHandler {
         // rmcp runs this on a task of its own, after (or before) the response that followed the
         // notification on the wire; this line is how an operator — or a test — knows it has run.
         tracing::debug!(server = %self.server_name, "resources/list_changed handled: view cache cleared");
+        self.relist.run_resources(&context.peer).await;
     }
 
     // The server's tools changed: list them again and advertise what exists now. rmcp runs this on
@@ -716,8 +836,14 @@ struct RelistTarget {
     listed: Vec<crate::tools::mcp_manifest::CachedTool>,
     /// The registered names its tools hold in the live set.
     names: HashSet<String>,
-    /// Names its resources, prompts and skill tool hold, which a tool cannot take from them.
+    /// Names its prompts and skill tool hold, which a tool or a resource cannot take from them.
     reserved: HashSet<String>,
+    /// The registered names its resources hold in the live set.
+    resource_names: HashSet<String>,
+    /// What `get_mcp` reports for its resources; replaced with the live set's.
+    catalog: SharedResources,
+    /// Its skills, whose listing decides which resources are theirs (see [`Relist::run_resources`]).
+    skills: Option<std::sync::Weak<crate::tools::mcp_skills::ServerSkills>>,
 }
 
 /// How long one re-listing may take before it is abandoned (and the advertised tools kept).
@@ -734,11 +860,21 @@ impl Relist {
         listed: Vec<crate::tools::mcp_manifest::CachedTool>,
         tools: &[Arc<dyn Tool>],
         names: HashSet<String>,
+        (resources, skills): (
+            &SharedResources,
+            Option<&Arc<crate::tools::mcp_skills::ServerSkills>>,
+        ),
     ) {
+        let resource_names: HashSet<String> = resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|r| r.tool.clone())
+            .collect();
         let reserved = tools
             .iter()
             .map(|t| t.name().to_string())
-            .filter(|n| !names.contains(n))
+            .filter(|n| !names.contains(n) && !resource_names.contains(n))
             .collect();
         if let Ok(mut target) = self.0.target.lock() {
             *target = Some(RelistTarget {
@@ -748,6 +884,9 @@ impl Relist {
                 listed,
                 names,
                 reserved,
+                resource_names,
+                catalog: resources.clone(),
+                skills: skills.map(Arc::downgrade),
             });
         }
     }
@@ -768,6 +907,146 @@ impl Relist {
 
     /// List the server's tools through `peer` and apply the answer. Fail-soft: a server that cannot
     /// answer keeps the tools it was advertising.
+    /// The server's resources changed (`notifications/resources/list_changed`): list them again and,
+    /// if the answer differs from what is advertised, swap its resource tools in the live set (the
+    /// same swap [`Self::run`] makes for tools, so the next request offers them) and in the catalog
+    /// `get_mcp` reads. Resources are filtered as at connect: `ui://` views are a renderer's, and
+    /// the server's skills (by the listing as it stands, which a turn re-reads when due — a skill's
+    /// `SKILL.md` and the files under its root are recognised by their URIs alone) are reached
+    /// through the skill tool, never as generic resource tools.
+    async fn run_resources(&self, peer: &Peer<RoleClient>) {
+        let _one_at_a_time = self.0.running.lock().await;
+        let skills = {
+            let Ok(guard) = self.0.target.lock() else {
+                return;
+            };
+            let Some(target) = guard.as_ref() else {
+                return;
+            };
+            target.skills.as_ref().and_then(std::sync::Weak::upgrade)
+        };
+        if peer
+            .peer_info()
+            .is_none_or(|i| i.capabilities.resources.is_none())
+        {
+            return;
+        }
+        let mut listed = match tokio::time::timeout(RELIST_TIMEOUT, peer.list_all_resources()).await
+        {
+            Ok(Ok(resources)) => resources,
+            Ok(Err(e)) => {
+                tracing::debug!(error = %e, "MCP resources/list re-listing failed; keeping the advertised resources");
+                return;
+            }
+            Err(_) => {
+                tracing::debug!(
+                    "MCP resources/list re-listing timed out; keeping the advertised resources"
+                );
+                return;
+            }
+        };
+        if let Some(skills) = &skills {
+            let roots =
+                crate::tools::mcp_skills::skill_roots_among(listed.iter().map(|r| r.uri.as_str()));
+            listed.retain(|r| {
+                !skills.hides(&r.uri)
+                    && !roots.iter().any(|root| {
+                        r.uri
+                            .strip_prefix(root.as_str())
+                            .is_some_and(|rest| rest.starts_with('/'))
+                    })
+            });
+        }
+        listed.retain(|r| !crate::tools::mcp_apps::is_ui_uri(&r.uri));
+        let (conn, live, retired, added, infos) = {
+            let Ok(mut guard) = self.0.target.lock() else {
+                return;
+            };
+            let Some(target) = guard.as_mut() else {
+                return;
+            };
+            let Some(conn) = target.conn.upgrade() else {
+                return;
+            };
+            let mut names = RegisteredNames {
+                server: &conn.config.name,
+                taken: target.reserved.union(&target.names).cloned().collect(),
+            };
+            let mut added: Vec<Arc<dyn Tool>> = Vec::new();
+            let mut infos = Vec::new();
+            for resource in &listed {
+                let Some(tool_name) = names.claim(
+                    registered_resource_name(&conn.config.name, &resource.name),
+                    &resource.name,
+                ) else {
+                    continue;
+                };
+                infos.push(McpResourceInfo {
+                    uri: resource.uri.clone(),
+                    name: resource.name.clone(),
+                    description: resource.description.clone(),
+                    tool: tool_name.clone(),
+                });
+                added.push(Arc::new(McpResourceTool {
+                    name: tool_name,
+                    description: resource
+                        .description
+                        .clone()
+                        .filter(|d| !d.is_empty())
+                        .unwrap_or_else(|| {
+                            format!(
+                                "MCP resource `{}` ({}) from server `{}`",
+                                resource.name, resource.uri, conn.config.name
+                            )
+                        }),
+                    server_name: conn.config.name.clone(),
+                    uri: resource.uri.clone(),
+                    conn: conn.clone(),
+                }));
+            }
+            let same = {
+                let current = target
+                    .catalog
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                current.len() == infos.len()
+                    && current.iter().zip(&infos).all(|(a, b)| {
+                        (&a.uri, &a.name, &a.description) == (&b.uri, &b.name, &b.description)
+                    })
+            };
+            if same {
+                return;
+            }
+            let retired = std::mem::replace(
+                &mut target.resource_names,
+                added.iter().map(|t| t.name().to_string()).collect(),
+            );
+            (
+                conn.clone(),
+                target.live.upgrade().map(McpTools),
+                retired,
+                added,
+                infos,
+            )
+        };
+        if let Ok(mut guard) = self.0.target.lock()
+            && let Some(target) = guard.as_mut()
+        {
+            *target
+                .catalog
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = infos;
+        }
+        tracing::info!(
+            server = %conn.config.name,
+            resources = added.len(),
+            "MCP server's resource list changed; advertising the new list from the next request"
+        );
+        if let Some(live) = live {
+            live.replace(&retired, added);
+        }
+    }
+
     async fn run(&self, peer: &Peer<RoleClient>) {
         let _one_at_a_time = self.0.running.lock().await;
         if !self.0.target.lock().is_ok_and(|t| t.is_some()) {
@@ -803,7 +1082,11 @@ impl Relist {
             };
             let mut names = RegisteredNames {
                 server: &conn.config.name,
-                taken: target.reserved.clone(),
+                taken: target
+                    .reserved
+                    .union(&target.resource_names)
+                    .cloned()
+                    .collect(),
             };
             let added: Vec<Arc<dyn Tool>> = fresh
                 .iter()
@@ -1705,6 +1988,33 @@ impl McpServerHandle {
     /// An MCP App view's `resources/read`, served from this connection's cache when it can be — the
     /// spec lets a host cache view templates, and a view is re-read on every call of its tool
     /// otherwise. Invalidated by the server's `resources/list_changed` and by any redial.
+    /// How many `resources/list_changed` this connection has seen (see
+    /// `McpHandler::on_resource_list_changed`).
+    pub(crate) fn resources_changed(&self) -> u64 {
+        self.conn
+            .skills_changed()
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The server's `resources/list` again, as the apps host reads it.
+    pub(crate) async fn list_resources(
+        &self,
+    ) -> Result<Vec<crate::tools::mcp_apps::ListedResource>, String> {
+        let client = self.conn.client().await?;
+        let listed = client
+            .list_all_resources()
+            .await
+            .map_err(|e| format!("mcp server `{}` resources/list failed: {e}", self.name))?;
+        Ok(listed
+            .iter()
+            .map(|r| crate::tools::mcp_apps::ListedResource {
+                uri: r.uri.clone(),
+                size: r.size,
+                ui: listing_ui(r),
+            })
+            .collect())
+    }
+
     pub(crate) async fn read_view(
         &self,
         uri: &str,
@@ -3049,7 +3359,7 @@ async fn connect_one_client(
             }
         }
     };
-    tokio::time::timeout(limit, dialing).await.map_err(|_| {
+    let dialed = tokio::time::timeout(limit, dialing).await.map_err(|_| {
         let target = match &config.transport {
             McpTransport::Stdio { command, .. } => format!("`{command}`"),
             McpTransport::Http { url, .. } => redact_url(url),
@@ -3058,7 +3368,14 @@ async fn connect_one_client(
             "MCP handshake to {target} timed out after {}s",
             limit.as_secs()
         )
-    })?
+    })??;
+    if let Some(info) = dialed.0.peer_info() {
+        dialed
+            .0
+            .service()
+            .start_listening(dialed.0.peer().clone(), &info);
+    }
+    Ok(dialed)
 }
 
 /// How long a grant connector gets to finish a handshake. Generous for a round trip to a service
@@ -3197,14 +3514,21 @@ fn tools_from_manifest(
             manifest_dir,
         )
     });
+    let resources: SharedResources = Arc::new(std::sync::Mutex::new(resource_infos));
     if let Some(listed) = listed {
-        dial.relist
-            .bind(&conn, manifest_dir, listed, &tools, tool_names);
+        dial.relist.bind(
+            &conn,
+            manifest_dir,
+            listed,
+            &tools,
+            tool_names,
+            (&resources, skills.as_ref()),
+        );
     }
     let catalog = McpServerCatalog {
         name: config.name.clone(),
         conn: Arc::downgrade(&conn),
-        resources: resource_infos,
+        resources,
         prompts: prompt_infos,
         protocol_version: None,
         apps,
@@ -3811,7 +4135,9 @@ pub struct McpServerCatalog {
     pub name: String,
     /// Weak so a catalog snapshot cannot keep a reaped server's process alive after its tools drop.
     conn: std::sync::Weak<McpConnection>,
-    pub resources: Vec<McpResourceInfo>,
+    /// Shared with the connection's [`Relist`], which replaces it when the server says its
+    /// resources changed — read it through [`Self::resources`].
+    resources: SharedResources,
     pub prompts: Vec<McpPromptInfo>,
     /// Negotiated peer protocol version, when known.
     pub protocol_version: Option<String>,
@@ -3821,6 +4147,18 @@ pub struct McpServerCatalog {
     /// The server's SEP-2640 skills, when it declares the extension — see
     /// [`crate::tools::mcp_skills`].
     pub(crate) skills: Option<Arc<crate::tools::mcp_skills::ServerSkills>>,
+}
+
+type SharedResources = Arc<std::sync::Mutex<Vec<McpResourceInfo>>>;
+
+impl McpServerCatalog {
+    /// The resources this server offers as tools, as of the last listing.
+    pub fn resources(&self) -> Vec<McpResourceInfo> {
+        self.resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -3943,6 +4281,13 @@ impl McpCatalog {
             .upgrade()
             .ok_or_else(|| format!("mcp server `{server}` is no longer connected"))?;
         let client = conn.client().await?;
+        // What the server advertised under `capabilities.extensions` for MCP Events (SEP-3415).
+        let events = client.peer_info().and_then(|i| {
+            i.capabilities
+                .extensions
+                .clone()?
+                .remove(crate::tools::mcp_events::EVENTS_EXTENSION_ID)
+        });
         // Direct requests only for a stateless (`2026-07-28`) server. An older streamable-HTTP
         // server may bind requests to the `Mcp-Session-Id` rmcp negotiated — only rmcp's own
         // connection carries it — and it does not attach `_meta` to results, so rmcp's own path
@@ -3956,6 +4301,7 @@ impl McpCatalog {
                 router: client.service().events.clone(),
                 host: self.request_host(&client),
                 live: ClientHold(client),
+                events,
             });
         };
         let mut headers: Vec<(HeaderName, HeaderValue)> = Vec::new();
@@ -3989,6 +4335,7 @@ impl McpCatalog {
             router: client.service().events.clone(),
             headers,
             auth,
+            events,
             protocol_version: client
                 .peer_info()
                 .map(|i| i.protocol_version.to_string())
@@ -4033,6 +4380,9 @@ pub(crate) enum EventsPeer {
         /// The session the requests belong to (see [`EventsPeer::track_request`]).
         host: Arc<McpHost>,
         live: ClientHold,
+        /// The server's `io.modelcontextprotocol/events` capability settings; `None` when it did
+        /// not advertise the extension.
+        events: Option<rmcp::model::JsonObject>,
     },
     /// Streamable HTTP: where and how to POST `events/*` directly. `router` still carries
     /// `notifications/events/list_changed`, which arrives on rmcp's own connection.
@@ -4044,10 +4394,19 @@ pub(crate) enum EventsPeer {
         /// (see `mcp_oauth`).
         auth: Option<Arc<crate::tools::mcp_oauth::ServerAuth>>,
         protocol_version: String,
+        /// As on [`EventsPeer::Rmcp`].
+        events: Option<rmcp::model::JsonObject>,
     },
 }
 
 impl EventsPeer {
+    /// The server's advertised events capability settings (see the variants' `events`).
+    pub(crate) fn events_capability(&self) -> Option<&rmcp::model::JsonObject> {
+        match self {
+            Self::Rmcp { events, .. } | Self::Http { events, .. } => events.as_ref(),
+        }
+    }
+
     /// Register one `events/*` request as in flight for its session, for as long as the returned
     /// guard lives, so a nested request the server raises during it is attributed or refused like
     /// one raised during a `tools/call` (see `McpHandler::route`). `None` over direct HTTP, where
@@ -4289,16 +4648,23 @@ async fn tools_from_client(
     let skills = skill_listing.map(|listing| {
         crate::tools::mcp_skills::attach(&config.name, &conn, listing, &mut tools, manifest_dir)
     });
+    let resources: SharedResources = Arc::new(std::sync::Mutex::new(resource_infos));
     if !dial.apps {
-        dial.relist
-            .bind(&conn, manifest_dir, listed, &tools, tool_names);
+        dial.relist.bind(
+            &conn,
+            manifest_dir,
+            listed,
+            &tools,
+            tool_names,
+            (&resources, skills.as_ref()),
+        );
     }
     Ok((
         tools,
         McpServerCatalog {
             name: config.name.clone(),
             conn: Arc::downgrade(&conn),
-            resources: resource_infos,
+            resources,
             prompts: prompt_infos,
             protocol_version,
             apps,

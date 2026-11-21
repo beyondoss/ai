@@ -1,4 +1,4 @@
-//! MCP Events (draft) webhook receiving under pressure and failure, end to end: the pending queue
+//! MCP Events webhook receiving under pressure and failure, end to end: the pending queue
 //! is bounded in bytes (a `503` past it), a delivery that cannot be made durable is not
 //! acknowledged (`503`, and it lands on the server's retry), a body that never finishes does not
 //! hold the connection, and the callback survives a crash so deliveries the server retries while

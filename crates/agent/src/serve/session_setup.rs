@@ -299,7 +299,7 @@ async fn setup_exec(
     // This session's view of the shared catalog: its non-tool MCP requests are registered under
     // its own host (see `McpCatalog::for_session`).
     cfg.mcp_catalog = cfg.mcp_catalog.for_session(mcp_host.clone());
-    // MCP Events (draft extension): only when a server is connected at all, and never in service
+    // MCP Events (SEP-3415): only when a server is connected at all, and never in service
     // mode — a grant connector has no `events` configuration, and the `mcp_events_*` commands are
     // refused there outright (`service::refused_command`). The hub interposes on `input_rx` so an
     // arriving event can be injected as an ordinary `prompt` command; with no servers there is

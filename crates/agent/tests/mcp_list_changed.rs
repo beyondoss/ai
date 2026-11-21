@@ -85,6 +85,52 @@ async fn a_tool_the_server_adds_after_connect_becomes_callable() {
     );
 }
 
+/// `notifications/resources/list_changed` (the fixture sends it only to a listen stream that asked
+/// for it) re-lists the server's resources: the one it published after connect is a tool the next
+/// request offers and a resource `get_mcp` reports, and the call that caused the change returns
+/// only once the listing has been read.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resource_the_server_publishes_after_connect_becomes_a_tool_and_a_catalog_entry() {
+    let (live, catalog, warnings) = mcp::connect_all(&[fixture(true)], Duration::ZERO, None).await;
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let resources = |c: &mcp::McpCatalog| -> Vec<String> {
+        c.snapshot()
+            .iter()
+            .flat_map(|s| s.resources())
+            .map(|r| r.name)
+            .collect()
+    };
+    assert_eq!(resources(&catalog), ["doc"]);
+    assert!(!names(&live).contains(&"mcp__fixture__resource__published".to_string()));
+    let before = live.generation();
+
+    let out = tool(&live, "mcp__fixture__publish_doc")
+        .run(json!({}))
+        .await
+        .unwrap();
+    assert_eq!(out.text, "published");
+
+    assert!(
+        eventually(|| names(&live).contains(&"mcp__fixture__resource__published".to_string()))
+            .await,
+        "{:?}",
+        names(&live)
+    );
+    assert!(live.generation() > before);
+    assert!(
+        eventually(|| resources(&catalog).contains(&"published".to_string())).await,
+        "{:?}",
+        resources(&catalog)
+    );
+    assert!(
+        names(&live).contains(&"mcp__fixture__resource__doc".to_string()),
+        "the others stay: {:?}",
+        names(&live)
+    );
+    let published = tool(&live, "mcp__fixture__resource__published");
+    assert!(published.description().contains("Published after connect"));
+}
+
 /// Poll until `f` holds or 10 s pass.
 async fn eventually(mut f: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + Duration::from_secs(10);
