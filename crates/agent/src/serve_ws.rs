@@ -1501,7 +1501,9 @@ impl Supervisor {
 
     /// Is any session still executing a prompt (or a host `bash` or `compact`)?
     ///
-    /// Reads each session's `running` flag — true exactly while one is executing. Deliberately
+    /// Reads each session's `running` flag — true exactly while one is executing — and whether a
+    /// command the client sent is still queued on its input (see [`has_queued_input`]): a prompt
+    /// accepted but not yet started is work the client was told was taken. Deliberately
     /// **not** `is_reapable`, which additionally requires `attached == 0`: a client watching its own
     /// run holds a socket open throughout, so a drain gated on that would burn its whole grace every
     /// time and then cut the run anyway.
@@ -1509,7 +1511,7 @@ impl Supervisor {
         lock_ignoring_poison(&self.table)
             .sessions
             .values()
-            .any(|h| h.running.load(Ordering::Relaxed))
+            .any(|h| h.running.load(Ordering::Relaxed) || has_queued_input(h))
     }
 
     /// Graceful shutdown: close the table to new attachments, stop every session (dropping each
@@ -1627,6 +1629,16 @@ impl Supervisor {
 ///
 /// A `Stopping` session is already on its way out: nothing to do.
 ///
+/// A command is sitting on the session's input channel, not yet taken by its loop. `running` flips
+/// only once the loop starts a command, so a prompt a reconnect sent while the drain was on (a
+/// `Draining` replica still accepts them) is invisible to it until then; the channel is where it
+/// already shows. Without this the drain would skip its grace and stop the session under it.
+fn has_queued_input(h: &SessionHandle) -> bool {
+    h.phase
+        .input()
+        .is_some_and(|tx| tx.capacity() < tx.max_capacity())
+}
+
 /// A **closed input** is the strongest reason of all: the session's loop is already gone (it returned
 /// early — no credential, an unwritable session dir — or hit an internal error), so nothing will ever
 /// read its input again. Stop it whatever its attach state or clock says — a live connection still
@@ -3890,6 +3902,41 @@ mod tests {
                 },
             ),
         })
+    }
+
+    /// A prompt a client sent that the session loop has not yet started is not "idle": the drain must
+    /// give it its grace rather than stop the session and drop the retained input under it.
+    #[tokio::test]
+    async fn a_queued_prompt_counts_as_in_flight_for_the_drain() {
+        // A session body that has not taken its input yet (it holds the receiver, reads nothing).
+        let sup = Arc::new(Supervisor {
+            metrics: None,
+            table: Arc::default(),
+            session_dir: None,
+            service: None,
+            panicked: tokio::sync::mpsc::unbounded_channel().0,
+            body: Box::new(
+                move |_id, _service, input_rx, _out, _running, _keep_alive| {
+                    Box::pin(async move {
+                        let _held = input_rx;
+                        std::future::pending::<()>().await
+                    })
+                },
+            ),
+        });
+        let p = sup.pin(Some("s1".into()), None).await.unwrap();
+        assert!(
+            !sup.any_run_in_flight(),
+            "idle: nothing queued, nothing running"
+        );
+        p.input_tx
+            .send(r#"{"type":"prompt","message":"hi"}"#.into())
+            .await
+            .unwrap();
+        assert!(
+            sup.any_run_in_flight(),
+            "a prompt accepted but not yet started is work in flight, not an idle session"
+        );
     }
 
     /// Yield (on the test's current-thread runtime, so every other ready task runs) until `cond` holds.

@@ -176,7 +176,8 @@ The harness layers several capabilities over the bare tools + loop:
   plus those with no attached connection, idle past the timeout, and not mid-run (a per-session
   `running` flag `serve_session` sets around a `prompt`, a host `bash` command and a manual `compact`
   — so a client that starts a long one and detaches, or an HTTP POST past its reply timeout, does
-  not lose it; the drain waits on the same flag). Stopping is the same transition graceful
+  not lose it; the drain waits on the same flag, and on a command still queued on the session's
+  input, which `running` does not show until the loop starts it). Stopping is the same transition graceful
   shutdown makes per entry: the retained input is dropped so the session persists and exits, and the
   entry stays in the map, `Stopping`, until the task itself has gone (see
   [the daemon session state machine](#state-machine--daemon-session-slot-starting--live--stopping)) —
