@@ -92,6 +92,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 zstd = "0.14"
 
 [dev-dependencies]
+# Exhaustive model checking of the end-of-turn kernel (`tests/stop_kernel_model.rs`); same pin as `crates/agent`.
+stateright = "0.31.0"
 # Loopback listeners for the socket tests (`ports`): the one place a test binds port 0.
 beyond-test-support = { path = "../test-support" }
 # Bench harness for the streaming decode hot path. `divan` (the workspace's `bench:unit` pin, matching
@@ -108,6 +110,12 @@ mimalloc = "0.1"
 # Install mimalloc as the global allocator in `decode_concurrent` — the allocator-contention control
 # run: `cargo bench -p beyond-agent-core --bench decode_concurrent --features bench-mimalloc`.
 bench-mimalloc = []
+# Mutations of `stop_kernel` for `tests/stop_kernel_model.rs`: each compiles out one guard, and the
+# model must go red. Never enabled outside that run.
+mut_drain_at_limit = []
+mut_no_reminder_latch = []
+mut_no_notice_delivery = []
+mut_no_limit_check = []
 
 [[bench]]
 name = "decode"

@@ -1363,6 +1363,39 @@ in `benches/decode.rs` (framing is ~4× faster on coalesced chunks: ~2 allocatio
 | turn pushed       | complete `tool_use` blocks present      | dispatching tools     | `!calls.is_empty()`, regardless of `stop_reason` — e.g. still dispatches under `MaxTokens` if the calls themselves finished | `ToolStart` sunk per call, in call order; the `tool_use` turn is checkpointed here too — _before_ any tool runs — so a crash mid-dispatch never loses the record of which calls the model asked for. A cut-off call is answered with an error at its gate, never run                                                              |
 | dispatching tools | all groups resolve (`buffer_unordered`) | (loop top, next iter) | —                                                                                                                           | `ToolEnd` sunk per call as each resolves (finish order); one `tool_results` user message pushed, in call order (carrying any tool images + mid-run steer text); checkpointed again here; ends the run early instead if every call set `terminate`                                                                                 |
 
+### The end-of-turn kernel
+
+When the model ends its turn without tools, `stop_kernel::step(state, event) -> (state, action)`
+(pure, no I/O) decides whether the run ends or continues; `Agent::run_events_steered` only performs
+the effects it asks for through `stop_kernel::decide`. The top-of-loop `MaxSteps` check uses the same
+`stop_kernel::limit_reached`, so the two cannot disagree.
+
+- Inputs: steps taken this call and the current limit (the wrap-up grant included); the drain's
+  count; whether a finish notice was pending; whether work still runs; the per-run reminder latch
+  (`StopState::reminded`).
+- Effects it asks for, in order: `Drain`, `TakeNotices`, then `AskReminder` only if neither
+  delivered and no reminder was given. At the limit it asks for none and ends, so queued messages
+  and notices stay for the next run (the #693 fix).
+- Outcomes: `End` (emit `AgentEnd`) or `Continue { followups, note }`; `Outcome::steered()` and
+  `Outcome::background()` give the events owed (`Steered` count, `Background` reason).
+
+`tests/stop_kernel_model.rs` model-checks the same kernel (the environment is the queue, notices
+and background work; limits 1 to 3 and none, at most 2 follow-ups, 2 notices, 2 work starts).
+Properties: S0 the limit holds; S1 no continue at the limit; S2 no end below the limit with a
+delivery pending; S3 nothing consumed at the limit; S4 at most one reminder; S5 every delivery
+reported; L1 every continue strictly decreases (pending follow-ups + pending notices + reminder
+still owed), so with no new input the run ends in at most 5 continues. Not modelled: the wrap-up
+grant itself and the tool-results path's own notice delivery.
+
+```sh
+cargo test -p beyond-agent-core --test stop_kernel_model
+# Each mutation compiles out one guard and must fail the named properties:
+cargo test -p beyond-agent-core --test stop_kernel_model --features mut_drain_at_limit        # S1, S3
+cargo test -p beyond-agent-core --test stop_kernel_model --features mut_no_reminder_latch     # S4, L1
+cargo test -p beyond-agent-core --test stop_kernel_model --features mut_no_notice_delivery    # S2
+cargo test -p beyond-agent-core --test stop_kernel_model --features mut_no_limit_check        # S0, S1, S3
+```
+
 ### Per-block accumulation (`Accumulator`)
 
 | From          | Event              | To        | What Actually Happens                                                                                                                                                                                                                                                                                |

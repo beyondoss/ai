@@ -446,6 +446,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "stateright",
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite",
