@@ -15,6 +15,9 @@
 //!   that answers as the connected user, so two users get different answers. The checks that need a
 //!   call are skipped without it.
 //! - `AGENT_CONFORMANCE_BROKER_HOOK`: the operator hook, below.
+//! - `AGENT_CONFORMANCE_BROKER_CC=1`: the broker serves client-credentials connections (a tenant's
+//!   machine identity, MCP OAuth Client Credentials extension). Turns on the three `client-credentials`
+//!   checks, which need the hook's `connect-cc` op; without it they are skipped.
 //!
 //! `bmc_v1` is this repo's contract (`managed_mcp_token`), so the kit knows the token's vectors, but
 //! the broker's live key is its own: the kit asks the hook for tokens.
@@ -29,6 +32,7 @@
 //! | `connect <tenant> <user>` | the id of a new active connection for that user (the whole consent) | isolation, revocation |
 //! | `bind <tenant> <session> <connection>` | nothing | every call |
 //! | `revoke <connection>` | nothing | revocation |
+//! | `connect-cc <tenant>` | the id of a new active client-credentials connection of that tenant: the tenant's own machine identity (no user), proven against its authorization server, whose tool answers the same to every session of the tenant | the three `client-credentials` checks |
 //! | `delete-session <tenant> <session>` | nothing: the session ended, so its bindings go | deleted session |
 //! | `secrets <connection>` | strings (a whole upstream token, or its tail) that must never reach the agent, one per line | no upstream token |
 
@@ -47,8 +51,14 @@ pub const EXPIRED: &str = "an expired token is refused";
 pub const CACHE: &str = "a tool list cached for one tenant is not served to another";
 pub const NO_UPSTREAM_TOKEN: &str = "no upstream user token reaches the agent";
 
+pub const CC_TENANT: &str =
+    "a client-credentials connection serves its own tenant's sessions and no other tenant's";
+pub const CC_REVOKED: &str = "a revoked client-credentials connection is refused at once";
+pub const CC_NO_CREDENTIAL: &str =
+    "no client secret, key or upstream token of a client-credentials connection reaches the agent";
+
 /// Every check, in run order.
-pub const CHECKS: [&str; 7] = [
+pub const CHECKS: [&str; 10] = [
     FIXTURE,
     ISOLATION,
     REVOKED,
@@ -56,6 +66,9 @@ pub const CHECKS: [&str; 7] = [
     EXPIRED,
     CACHE,
     NO_UPSTREAM_TOKEN,
+    CC_TENANT,
+    CC_REVOKED,
+    CC_NO_CREDENTIAL,
 ];
 
 /// The golden vectors the broker's minter must reproduce.
@@ -74,6 +87,12 @@ pub trait Hooks {
         exp: u64,
     ) -> Result<String, String>;
     async fn connect(&self, tenant: &str, user: &str) -> Result<String, String>;
+    /// A new client-credentials connection of the tenant (its machine identity; see the module doc).
+    /// A hook that has no client-credentials connections says so; the checks are skipped unless the
+    /// target declares them.
+    async fn connect_cc(&self, _tenant: &str) -> Result<String, String> {
+        Err("this hook does not implement connect-cc".into())
+    }
     async fn bind(&self, tenant: &str, session: &str, connection: &str) -> Result<(), String>;
     async fn revoke(&self, connection: &str) -> Result<(), String>;
     async fn delete_session(&self, tenant: &str, session: &str) -> Result<(), String>;
@@ -105,6 +124,10 @@ impl Hooks for CommandHook {
             .await?
             .trim()
             .to_string())
+    }
+
+    async fn connect_cc(&self, tenant: &str) -> Result<String, String> {
+        Ok(self.run("connect-cc", &[tenant]).await?.trim().to_string())
     }
 
     async fn bind(&self, tenant: &str, session: &str, connection: &str) -> Result<(), String> {
@@ -141,6 +164,8 @@ pub struct BrokerTarget {
     pub url: String,
     /// A tool that answers as the connected user, and its arguments.
     pub tool: Option<(String, Value)>,
+    /// The broker serves client-credentials connections: run the `client-credentials` checks.
+    pub cc: bool,
 }
 
 impl BrokerTarget {
@@ -212,6 +237,7 @@ pub async fn verify<H: Hooks>(target: &BrokerTarget, hooks: &H) -> Report {
         seen: Default::default(),
     };
     let mut connections = Vec::new();
+    let mut cc_connections = Vec::new();
     let checks = vec![
         kit.fixture().await,
         kit.isolation(&mut connections).await,
@@ -220,6 +246,9 @@ pub async fn verify<H: Hooks>(target: &BrokerTarget, hooks: &H) -> Report {
         kit.expired().await,
         kit.cache().await,
         kit.no_upstream_token(&connections).await,
+        kit.cc_tenant(&mut cc_connections).await,
+        kit.cc_revoked(&mut cc_connections).await,
+        kit.cc_no_credential(&cc_connections).await,
     ];
     Report {
         kit: "connector broker",
@@ -588,6 +617,142 @@ impl<H: Hooks> Kit<'_, H> {
                 NO_UPSTREAM_TOKEN,
                 format!(
                     "{} upstream strings, {} bytes of answers searched",
+                    secrets.len(),
+                    seen.len()
+                ),
+            ),
+        }
+    }
+
+    /// A tenant's client-credentials connection and one session bound to it; returns the session and
+    /// its token. The connection is the tenant's, not a user's.
+    async fn cc_session(&self, tenant: &str, connection: &str) -> Result<(String, String), String> {
+        let session = self.fresh("s.cc");
+        self.hooks.bind(tenant, &session, connection).await?;
+        let token = self.token(tenant, &session, now() + 600).await?;
+        Ok((session, token))
+    }
+
+    fn cc_unavailable(&self, name: &'static str) -> Option<Check> {
+        if !self.target.cc {
+            Some(skip(name, "AGENT_CONFORMANCE_BROKER_CC is not set"))
+        } else if self.target.tool.is_none() {
+            Some(skip(name, "AGENT_CONFORMANCE_BROKER_TOOL is not set"))
+        } else {
+            None
+        }
+    }
+
+    /// A client-credentials connection is the tenant's: every session of the tenant bound to it gets
+    /// the same answer from it, and another tenant's token for one of those sessions' ids reaches
+    /// nothing.
+    async fn cc_tenant(&self, connections: &mut Vec<String>) -> Check {
+        if let Some(skip) = self.cc_unavailable(CC_TENANT) {
+            return skip;
+        }
+        let tenant = self.fresh("acme");
+        let run = async {
+            let conn = self.hooks.connect_cc(&tenant).await?;
+            connections.push(conn.clone());
+            let (session_a, token_a) = self.cc_session(&tenant, &conn).await?;
+            let (_, token_b) = self.cc_session(&tenant, &conn).await?;
+            let a = self.call_tool(&token_a).await?;
+            let b = self.call_tool(&token_b).await?;
+            let other = self
+                .token(&self.fresh("globex"), &session_a, now() + 600)
+                .await?;
+            let c = self.call_tool(&other).await?;
+            Ok::<_, String>((a, b, c))
+        };
+        match run.await {
+            Err(e) => fail(CC_TENANT, e),
+            Ok((a, b, _)) if a.answer().is_none() || b.answer().is_none() => fail(
+                CC_TENANT,
+                format!(
+                    "setup: a session of the owning tenant got {} / {}",
+                    a.describe(),
+                    b.describe()
+                ),
+            ),
+            Ok((a, b, _)) if a.answer() != b.answer() => fail(
+                CC_TENANT,
+                "two sessions of one tenant got different answers from its machine identity",
+            ),
+            Ok((.., c)) if c.answer().is_some() => fail(
+                CC_TENANT,
+                format!(
+                    "another tenant's token for the same session id was answered: {}",
+                    c.describe()
+                ),
+            ),
+            Ok(_) => pass(
+                CC_TENANT,
+                "every session of the tenant, and no other tenant's",
+            ),
+        }
+    }
+
+    /// Withdrawing the connection refuses the very next call, whichever session makes it.
+    async fn cc_revoked(&self, connections: &mut Vec<String>) -> Check {
+        if let Some(skip) = self.cc_unavailable(CC_REVOKED) {
+            return skip;
+        }
+        let tenant = self.fresh("acme");
+        let run = async {
+            let conn = self.hooks.connect_cc(&tenant).await?;
+            connections.push(conn.clone());
+            let (_, token) = self.cc_session(&tenant, &conn).await?;
+            let before = self.call_tool(&token).await?;
+            self.hooks.revoke(&conn).await?;
+            let after = self.call_tool(&token).await?;
+            Ok::<_, String>((before, after))
+        };
+        match run.await {
+            Err(e) => fail(CC_REVOKED, e),
+            Ok((before, _)) if before.answer().is_none() => fail(
+                CC_REVOKED,
+                format!("setup: the call before revoking got: {}", before.describe()),
+            ),
+            Ok((_, after)) if after.answer().is_some() => fail(
+                CC_REVOKED,
+                "the call right after the revoke was still answered",
+            ),
+            Ok(_) => pass(CC_REVOKED, "refused on the next call"),
+        }
+    }
+
+    /// The agent never sees the client's secret or key, nor a token the authorization server issued
+    /// for it: the hook names them, and everything the earlier checks saw is searched.
+    async fn cc_no_credential(&self, connections: &[String]) -> Check {
+        if let Some(skip) = self.cc_unavailable(CC_NO_CREDENTIAL) {
+            return skip;
+        }
+        let mut secrets = Vec::new();
+        for c in connections {
+            match self.hooks.secrets(c).await {
+                Ok(s) => secrets.extend(s),
+                Err(e) => return fail(CC_NO_CREDENTIAL, e),
+            }
+        }
+        if secrets.is_empty() {
+            return fail(
+                CC_NO_CREDENTIAL,
+                "the hook gave no credential to look for, so nothing was proved",
+            );
+        }
+        let seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        match secrets.iter().find(|s| seen.contains(s.as_str())) {
+            Some(s) => fail(
+                CC_NO_CREDENTIAL,
+                format!(
+                    "a credential (…{}) reached the agent",
+                    &s[s.len().saturating_sub(6)..]
+                ),
+            ),
+            None => pass(
+                CC_NO_CREDENTIAL,
+                format!(
+                    "{} strings, {} bytes of answers searched",
                     secrets.len(),
                     seen.len()
                 ),

@@ -29,6 +29,7 @@ async fn run(fault: Fault) -> Report {
     let target = BrokerTarget {
         url: mock.url(),
         tool: Some(("whoami".into(), json!({}))),
+        cc: true,
     };
     let report = verify(&target, &mock).await;
     println!("{fault:?}\n{}", report.render());
@@ -58,12 +59,42 @@ async fn each_broken_broker_fails_its_check_by_name() {
         (Fault::DeleteKeepsBinding, broker::SESSION_DELETED),
         (Fault::SharedCache, broker::CACHE),
         (Fault::LeaksUpstreamToken, broker::NO_UPSTREAM_TOKEN),
+        (Fault::CcServesAnyTenant, broker::CC_TENANT),
+        (Fault::CcRevokeLags, broker::CC_REVOKED),
+        (Fault::CcLeaksClientSecret, broker::CC_NO_CREDENTIAL),
     ];
     let reports = futures::future::join_all(cases.iter().map(|(f, _)| run(*f))).await;
     for ((fault, name), report) in cases.iter().zip(reports) {
         assert!(
             report.failed().contains(name),
             "{fault:?} must fail {name:?}:\n{}",
+            report.render()
+        );
+    }
+}
+
+/// Without client-credentials support declared, those checks say so instead of passing.
+#[tokio::test]
+async fn client_credentials_checks_are_skipped_unless_declared() {
+    let mock = BrokerMock::start(Fault::None).await;
+    let report = verify(
+        &BrokerTarget {
+            url: mock.url(),
+            tool: Some(("whoami".into(), json!({}))),
+            cc: false,
+        },
+        &mock,
+    )
+    .await;
+    for name in [
+        broker::CC_TENANT,
+        broker::CC_REVOKED,
+        broker::CC_NO_CREDENTIAL,
+    ] {
+        assert_eq!(
+            report.check(name).unwrap().verdict,
+            Verdict::Skip,
+            "{}",
             report.render()
         );
     }
@@ -77,11 +108,19 @@ async fn checks_that_need_the_user_tool_are_skipped_without_it() {
         &BrokerTarget {
             url: mock.url(),
             tool: None,
+            cc: true,
         },
         &mock,
     )
     .await;
-    for name in [broker::ISOLATION, broker::REVOKED, broker::SESSION_DELETED] {
+    for name in [
+        broker::ISOLATION,
+        broker::REVOKED,
+        broker::SESSION_DELETED,
+        broker::CC_TENANT,
+        broker::CC_REVOKED,
+        broker::CC_NO_CREDENTIAL,
+    ] {
         assert_eq!(
             report.check(name).unwrap().verdict,
             Verdict::Skip,
@@ -110,7 +149,8 @@ async fn the_configured_broker_conforms() {
                 .unwrap_or(json!({}));
             (name, args)
         });
-    let report = verify(&BrokerTarget { url, tool }, &CommandHook(hook)).await;
+    let cc = std::env::var("AGENT_CONFORMANCE_BROKER_CC").is_ok_and(|v| v == "1");
+    let report = verify(&BrokerTarget { url, tool, cc }, &CommandHook(hook)).await;
     println!("{}", report.render());
     assert!(report.passed(), "{}", report.render());
 }

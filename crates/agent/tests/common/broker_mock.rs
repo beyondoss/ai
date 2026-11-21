@@ -32,12 +32,18 @@ pub enum Fault {
     SharedCache,
     /// The upstream token is echoed to the agent.
     LeaksUpstreamToken,
+    /// A client-credentials connection is served to a session of any tenant that shares a session id.
+    CcServesAnyTenant,
+    /// A client-credentials revoke takes effect one call late.
+    CcRevokeLags,
+    /// The client secret of a client-credentials connection is echoed to the agent.
+    CcLeaksClientSecret,
 }
 
 #[derive(Default)]
 struct Inner {
-    /// connection -> (tenant, user, revoked, calls left before a lagging revoke bites)
-    conns: HashMap<String, (String, String, bool, u32)>,
+    /// connection -> (tenant, user, revoked, calls left before a lagging revoke bites, client-credentials)
+    conns: HashMap<String, (String, String, bool, u32, bool)>,
     bindings: HashMap<(String, String), String>,
     cache: Vec<String>, // tenants whose tool list is cached ("*" for the shared one)
     n: u32,
@@ -74,6 +80,10 @@ impl BrokerMock {
 
 fn secret(connection: &str) -> String {
     format!("upstream-access-token-{connection}-0123456789abcdef")
+}
+
+fn client_secret(connection: &str) -> String {
+    format!("client-secret-{connection}-fedcba9876543210")
 }
 
 impl Hooks for BrokerMock {
@@ -113,7 +123,16 @@ impl Hooks for BrokerMock {
         i.n += 1;
         let id = format!("conn_{}", i.n);
         i.conns
-            .insert(id.clone(), (tenant.into(), user.into(), false, 0));
+            .insert(id.clone(), (tenant.into(), user.into(), false, 0, false));
+        Ok(id)
+    }
+
+    async fn connect_cc(&self, tenant: &str) -> Result<String, String> {
+        let mut i = self.inner.lock().unwrap();
+        i.n += 1;
+        let id = format!("conn_{}", i.n);
+        i.conns
+            .insert(id.clone(), (tenant.into(), "svc".into(), false, 0, true));
         Ok(id)
     }
 
@@ -127,9 +146,9 @@ impl Hooks for BrokerMock {
     }
 
     async fn revoke(&self, connection: &str) -> Result<(), String> {
-        let lag = self.fault == Fault::RevokeLags;
         let mut i = self.inner.lock().unwrap();
         let c = i.conns.get_mut(connection).ok_or("no such connection")?;
+        let lag = self.fault == Fault::RevokeLags || self.fault == Fault::CcRevokeLags && c.4;
         if lag {
             c.3 = 1; // one more call goes through
         }
@@ -149,7 +168,18 @@ impl Hooks for BrokerMock {
     }
 
     async fn secrets(&self, connection: &str) -> Result<Vec<String>, String> {
-        Ok(vec![secret(connection)])
+        let cc = self
+            .inner
+            .lock()
+            .unwrap()
+            .conns
+            .get(connection)
+            .is_some_and(|c| c.4);
+        let mut out = vec![secret(connection)];
+        if cc {
+            out.push(client_secret(connection));
+        }
+        Ok(out)
     }
 }
 
@@ -247,7 +277,17 @@ async fn serve(mut sock: tokio::net::TcpStream, inner: Arc<Mutex<Inner>>, fault:
         .or_else(|| path.split_once("?connection=").map(|(_, c)| c.to_string()));
     let (status, answer) = 'locked: {
         let mut i = inner.lock().unwrap();
-        let bound_tenant = if fault == Fault::IgnoresTenant {
+        let by_session = |i: &Inner, only_cc: bool| {
+            i.bindings
+                .iter()
+                .find(|((_, s), c)| {
+                    *s == claims.session_id && (!only_cc || i.conns.get(*c).is_some_and(|c| c.4))
+                })
+                .map(|((t, _), _)| t.clone())
+        };
+        let bound_tenant = if fault == Fault::CcServesAnyTenant {
+            by_session(&i, true).unwrap_or(claims.tenant.clone())
+        } else if fault == Fault::IgnoresTenant {
             i.bindings
                 .iter()
                 .find(|((_, s), _)| *s == claims.session_id)
@@ -269,20 +309,18 @@ async fn serve(mut sock: tokio::net::TcpStream, inner: Arc<Mutex<Inner>>, fault:
         let using = named
             .filter(|_| fault == Fault::HonoursNamedConnection)
             .or(bound.clone());
-        let active =
-            using
-                .as_ref()
-                .and_then(|c| i.conns.get_mut(c))
-                .and_then(|(_, user, revoked, lag)| {
-                    if *revoked && *lag > 0 {
-                        *lag -= 1;
-                        Some(user.clone())
-                    } else if *revoked {
-                        None
-                    } else {
-                        Some(user.clone())
-                    }
-                });
+        let active = using.as_ref().and_then(|c| i.conns.get_mut(c)).and_then(
+            |(_, user, revoked, lag, _)| {
+                if *revoked && *lag > 0 {
+                    *lag -= 1;
+                    Some(user.clone())
+                } else if *revoked {
+                    None
+                } else {
+                    Some(user.clone())
+                }
+            },
+        );
         let shared = if fault == Fault::SharedCache {
             "*".to_string()
         } else {
@@ -301,8 +339,11 @@ async fn serve(mut sock: tokio::net::TcpStream, inner: Arc<Mutex<Inner>>, fault:
             }
             _ => match (using, active) {
                 (Some(conn), Some(user)) => {
+                    let cc = i.conns.get(&conn).is_some_and(|c| c.4);
                     let leak = if fault == Fault::LeaksUpstreamToken {
                         format!(" (via {})", secret(&conn))
+                    } else if fault == Fault::CcLeaksClientSecret && cc {
+                        format!(" (as {})", client_secret(&conn))
                     } else {
                         String::new()
                     };

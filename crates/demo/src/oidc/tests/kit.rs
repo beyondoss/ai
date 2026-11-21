@@ -98,12 +98,20 @@ async fn the_demo_broker_passes_the_broker_kit() {
     let target = BrokerTarget {
         url: format!("http://{}/managed/notes/mcp", h.oidc.managed_addr),
         tool: Some(("my_notes".into(), json!({}))),
+        cc: false, // the demo broker has no client-credentials connections
     };
     let report = verify(&target, &h).await;
     println!("{}", report.render());
     assert_eq!(report.checks.len(), broker::CHECKS.len());
     assert!(
-        report.checks.iter().all(|c| c.verdict == Verdict::Pass),
+        report.checks.iter().all(|c| c.verdict == Verdict::Pass
+            || [
+                broker::CC_TENANT,
+                broker::CC_REVOKED,
+                broker::CC_NO_CREDENTIAL
+            ]
+            .contains(&c.name)
+                && c.verdict == Verdict::Skip),
         "{}",
         report.render()
     );
