@@ -1,0 +1,15 @@
+{
+  "name": "mcp-apps-interop",
+  "private": true,
+  "type": "module",
+  "description": "Interop check: the agent's MCP Apps host against the official ext-apps SDK and example servers.",
+  "dependencies": {
+    "@modelcontextprotocol/client": "2.0.0",
+    "@modelcontextprotocol/ext-apps": "2.1.0",
+    "@modelcontextprotocol/server": "2.0.0",
+    "@modelcontextprotocol/server-map": "2.1.0",
+    "@modelcontextprotocol/server-system-monitor": "2.1.0",
+    "ws": "8.18.3",
+    "zod": "4.2.1"
+  }
+}
