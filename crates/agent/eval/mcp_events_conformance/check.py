@@ -427,8 +427,8 @@ async def scenario_core(transport):
             ok = await f.until(lambda: listen() and f.st()["listeners"] >= 1, 20)
             f.say(ok, "(iii) the client opens subscriptions/listen", "no subscriptions/listen request (the client never listens)")
             asked = {k for r in listen() for k, v in (r.get("notifications") or {}).items() if v}
-            f.say(bool(asked) and asked <= {"toolsListChanged", "resourcesListChanged", "eventsListChanged", "promptsListChanged"},
-                  "(iii, beyond SEP: SHOULD-level) the filter asks only for list-changed types", f"asked {sorted(asked)}")
+            f.say(bool(asked) and asked <= {"toolsListChanged", "resourcesListChanged", "eventsListChanged"},
+                  "(iii, beyond SEP: SHOULD-level) the filter asks only for list-changed types the server declared", f"asked {sorted(asked)}")
 
             async def mcp():
                 await f.ws.send(json.dumps({"type": "get_mcp", "id": f"g{time.time()}"}))
@@ -440,15 +440,19 @@ async def scenario_core(transport):
                 before = time.time()
                 name = ctl(f.sp, {"op": op})["name"]
                 relist = await f.until(lambda: f.reqs(before, list_m), 8)
-                f.say(relist, f"(i/ii) {kind}: after a runtime change the client re-lists ({list_m})",
-                      f"no {list_m} in 8s; requested {nfilter}={nfilter in asked}")
+                if kind == "tools":  # strict: tools are model-visible state, refreshed on the notification
+                    f.say(relist, f"(i) tools: after a runtime change the client re-lists ({list_m})",
+                          f"no {list_m} in 8s; requested {nfilter}={nfilter in asked}")
+                else:  # the spec does not mandate an immediate resources/list: informational only
+                    f.out.append(f"INFO [{f.name}] (ii) resources: immediate resources/list after the notification: {'yes' if relist else 'no (lazy refresh allowed)'}")
                 seen = False
                 for _ in range(6):
                     d = await mcp()
                     seen = any(name in t for t in d.get("tools", [])) or any(name in json.dumps(r) for r in d.get("resources", []))
                     if seen:
                         break
-                f.say(seen, f"(i/ii) {kind}: the new {kind[:-1]} `{name}` appears in the agent session (get_mcp)", f"get_mcp: {json.dumps(d)[:300]}")
+                f.say(seen, f"({'i' if kind == 'tools' else 'ii'}) {kind}: the new {kind[:-1]} `{name}` is in the agent session by next use (get_mcp)",
+                      f"get_mcp: {json.dumps(d)[:300]}")
             f.finish_common()
     finally:
         await f.stop()

@@ -572,10 +572,10 @@ jobs:
           # The agent's MCP client and its apps bridge, the interop check itself, and this workflow.
           if git diff --name-only "$base"...HEAD | grep -qE '^crates/agent/src/(tools/mcp|serve/)|^crates/agent/eval/mcp_apps_interop/|^\.github/workflows/ci\.yml$'; then
             mcpapps=true
-            # The agent's MCP client and serve paths (tools/mcp*, tools/mcp_events/, serve/), the MCP Events conformance kit, and this workflow.
-            if git diff --name-only "$base"...HEAD | grep -qE '^crates/agent/src/(tools/mcp|serve/)|^crates/agent/eval/mcp_events_conformance/|^mise\.toml$|^\.github/workflows/ci\.yml$'; then
-              agent=true
-            fi
+          fi
+          # The agent's MCP client and serve paths (tools/mcp*, tools/mcp_events/, serve/), the MCP Events conformance kit, and this workflow.
+          if git diff --name-only "$base"...HEAD | grep -qE '^crates/agent/src/(tools/mcp|serve/)|^crates/agent/eval/mcp_events_conformance/|^mise\.toml$|^\.github/workflows/ci\.yml$'; then
+            agent=true
           fi
           echo "deps=$deps" >>"$GITHUB_OUTPUT"
           echo "execd=$execd" >>"$GITHUB_OUTPUT"

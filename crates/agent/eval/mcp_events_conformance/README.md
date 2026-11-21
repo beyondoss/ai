@@ -69,7 +69,7 @@ Each scenario is a fresh server, agent and WebSocket. `{http,stdio} x {poll,push
 | (f) a server without the capability receives zero `events/*` | `*/no-capability` |
 | (g) a delivery with `v1` and a `v1a` signed by the Server Card key is delivered; the agent fetched the card; a correct `v1` with a `v1a` from another key is rejected 401 | `http/webhook-v1a` |
 | (h) after the server is killed and restarted with an event emitted while it was down, the client resumes from its persisted cursor, gets the event once, and nothing twice | `http/*-restart` |
-| (i) after `add_tool` the client re-lists (`tools/list`) and the tool is in the agent session's own tool list (`get_mcp` frame); (ii) the same for resources | `*/core-list-changed` |
+| (i) after `add_tool` the client re-lists (`tools/list`) and the tool is in the agent session's own tool list (`get_mcp` frame); (ii) the new resource is in the agent session by next use (the spec does not mandate an immediate `resources/list`; the check prints it as `INFO`) | `*/core-list-changed` |
 | (iii) the client opens `subscriptions/listen` and asks only for list-changed types the server advertised (a request for an undeclared type is logged; SHOULD-level, the spec has no MUST here); the server never sends a type that was not requested (`selftest.py`) | `*/core-list-changed` |
 | poll honours `nextPollMs` | poll flows |
 | `violations.log` is empty | every flow |
