@@ -2041,6 +2041,12 @@ impl Agent {
                                 cancelled_mid_dispatch = true;
                             }
                         }
+                        // Dropping `drain` ran every in-flight tool's destructors, and a tool may report
+                        // from one (a cancelled subagent marks itself `cancelled` and names the worktree
+                        // it kept). Forward those too, as the completion path above does.
+                        while let Ok(u) = prog_rx.try_recv() {
+                            emit_tool_update(&mut sink, u, delegated_ref);
+                        }
                         // Harvest every result that was published before this point — on both paths.
                         // On the cancelled one that's precisely the set of calls that really did finish,
                         // which is what keeps their genuine outcome (and its side effects) in the
@@ -12496,6 +12502,75 @@ data: {"type":"response.completed","response":{"status":"completed","usage":{"in
         .await
         .expect("cancellation must abort the hung tool, not hang the run");
         assert!(matches!(result, Err(Error::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn a_progress_update_sent_from_a_cancelled_tools_destructor_reaches_the_sink() {
+        use std::time::Duration;
+
+        // A tool that reports from `Drop` (a cancelled subagent saying it was cancelled). The loop
+        // drops its future on cancel, so the update lands in the progress channel after the drain
+        // loop has stopped reading it: it must still be forwarded.
+        struct SayOnDrop(crate::tool::ToolProgress);
+        impl Drop for SayOnDrop {
+            fn drop(&mut self) {
+                self.0.emit("cancelled", None);
+            }
+        }
+        struct Tool1;
+        #[async_trait]
+        impl Tool for Tool1 {
+            fn name(&self) -> &str {
+                "say"
+            }
+            fn description(&self) -> &str {
+                "reports when dropped"
+            }
+            fn input_schema(&self) -> Value {
+                json!({ "type": "object" })
+            }
+            async fn run(
+                &self,
+                _: Value,
+            ) -> std::result::Result<crate::tool::ToolOutput, crate::error::ToolError> {
+                unreachable!()
+            }
+            async fn run_streaming(
+                &self,
+                _: Value,
+                progress: &crate::tool::ToolProgress,
+            ) -> std::result::Result<crate::tool::ToolOutput, crate::error::ToolError> {
+                let _say = SayOnDrop(progress.clone());
+                futures::future::pending::<()>().await;
+                unreachable!()
+            }
+        }
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(Tool1));
+        let (agent, _mock) = agent_with(vec![turn::tool_call("t", "say", "{}")], tools);
+        let mut session = Session::new();
+        session.user("go");
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            trigger.cancel();
+        });
+        let seen = std::sync::Mutex::new(Vec::new());
+        let result = agent
+            .run_events_cancellable(
+                &mut session,
+                |e| {
+                    if let AgentEvent::ToolProgress { snapshot, .. } = e {
+                        seen.lock().unwrap().push(snapshot);
+                    }
+                },
+                cancel,
+            )
+            .await;
+        assert!(matches!(result, Err(Error::Cancelled)));
+        assert_eq!(*seen.lock().unwrap(), vec!["cancelled".to_string()]);
     }
 
     #[tokio::test]

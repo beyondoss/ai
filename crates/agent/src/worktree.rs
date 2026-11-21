@@ -1043,26 +1043,32 @@ impl Worktree {
     }
 }
 
-impl Drop for Worktree {
-    fn drop(&mut self) {
+impl Worktree {
+    /// Settle a worktree whose child was cancelled, once: a clean one is removed, one with the child's
+    /// changes is moved to its `kept-` name. Returns where the child's work now lives, `None` when
+    /// nothing of it remains (removed, or already settled). The single place that decides keep or
+    /// remove on a cancel: [`Drop`] calls it, and so does the subagent's cancel guard, which needs the
+    /// answer to report it.
+    ///
+    /// Synchronous and best-effort, and deliberately blocking: this runs when the parent's agent loop
+    /// *drops* a cancelled subagent's future, and a detached cleanup thread would not survive
+    /// `process::exit` (PR #13). `git worktree remove` is a fast local operation; the alternative,
+    /// leaking until the next `sweep`, is strictly worse for the common Ctrl-C case.
+    ///
+    /// A sandbox worktree cannot be settled here at all: every step is a round trip to the exec
+    /// endpoint and this cannot await one. That is what `sweep` is for, and why a remote owner is keyed
+    /// to this incarnation rather than to a PID. The result is `None`: the path is not known to survive.
+    pub fn release_on_cancel(&mut self) -> Option<PathBuf> {
         if self.detached {
-            return;
+            return None;
         }
-        // Best-effort, and deliberately blocking: this runs when the parent's agent loop *drops* a
-        // cancelled subagent's future, and a detached cleanup thread would not survive `process::exit`
-        // (PR #13). `git worktree remove` is a fast local operation; the alternative — leaking until the
-        // next `sweep` — is strictly worse for the common Ctrl-C case.
-        //
-        // A sandbox worktree cannot be removed here at all: every step is a round trip to the exec
-        // endpoint and `Drop` cannot await one. That is what `sweep` is for, and why a remote owner is
-        // keyed to this incarnation rather than to a PID — the next session to use the sandbox reaps
-        // whatever this one left. `Worktree::remove` on the ordinary paths still cleans up promptly.
+        self.detached = true;
         if self.git.is_remote() {
             tracing::debug!(
                 worktree = %self.path.display(),
                 "leaving a sandbox worktree for the next sweep: Drop cannot await its removal"
             );
-            return;
+            return None;
         }
         // A cancelled child's edits are the only copy of its work (see [`Worktree::preserve`]): a
         // worktree with changes is kept, as `git worktree remove` itself would refuse to remove it;
@@ -1077,14 +1083,21 @@ impl Drop for Worktree {
                     c.args(["worktree", "move"]).arg(&self.path).arg(&kept)
                 }) {
                     tracing::info!(worktree = %kept.display(), "kept a cancelled subagent's worktree: it has changes");
-                    return;
+                    return Some(kept);
                 }
             }
             // Could not move it: leave it where it is rather than delete the only copy.
             tracing::warn!(worktree = %self.path.display(), "left a cancelled subagent's worktree in place: it has changes");
-            return;
+            return Some(self.path.clone());
         }
         remove_worktree_blocking(&self.repo_root, &self.path);
+        None
+    }
+}
+
+impl Drop for Worktree {
+    fn drop(&mut self) {
+        self.release_on_cancel();
     }
 }
 

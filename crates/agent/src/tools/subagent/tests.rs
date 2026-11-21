@@ -969,3 +969,127 @@ fn a_failed_result_keeps_its_note() {
         "{rendered}"
     );
 }
+
+// ---- a cancelled child is reported ----
+
+/// A model that connects and then never answers: the child is mid-run until the parent drops it.
+struct Silent;
+
+#[async_trait]
+impl ModelTransport for Silent {
+    async fn stream(
+        &self,
+        _req: agent_core::ModelRequest,
+    ) -> agent_core::Result<agent_core::transport::EventStream> {
+        futures::future::pending().await
+    }
+}
+
+/// Run a worktree child until its model is being waited on, optionally let it edit its checkout, then
+/// drop the call as the parent's cancel does. Returns the board's last snapshot for the one task.
+async fn cancel_a_worktree_child(edit: bool) -> Value {
+    let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = reached.clone();
+    let (mut ctx, dir) = ctx(
+        vec![def("writer", None, None, Isolation::Worktree)],
+        Factory::default(),
+    );
+    Arc::get_mut(&mut ctx).unwrap().factory = Arc::new(move |_| {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(Arc::new(Silent) as Arc<dyn ModelTransport>)
+    });
+    let repo = dir.path();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    git(&["init", "--quiet", "-b", "main"]);
+    std::fs::write(repo.join("tracked.txt"), "original\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "--quiet", "-m", "init"]);
+
+    let tool = Subagent::new(ctx);
+    let (tx, mut rx) = futures::channel::mpsc::unbounded();
+    let progress = ToolProgress::new(
+        tx,
+        "call".into(),
+        NAME.to_string(),
+        agent_core::CancellationToken::new(),
+    );
+    let mut fut =
+        Box::pin(tool.run_streaming(json!({ "agent": "writer", "task": "x" }), &progress));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !reached.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the child never started"
+        );
+        tokio::select! {
+            _ = &mut fut => panic!("the child finished on its own"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+        }
+    }
+    if edit {
+        // `git worktree list --porcelain`: the main checkout first, then the child's.
+        let listing = git(&["worktree", "list", "--porcelain"]);
+        let child = listing
+            .lines()
+            .filter_map(|l| l.strip_prefix("worktree "))
+            .nth(1)
+            .expect("the child's worktree")
+            .to_string();
+        std::fs::write(std::path::Path::new(&child).join("child.txt"), "work\n").unwrap();
+    }
+    drop(fut);
+
+    let mut last = None;
+    while let Ok(update) = rx.try_recv() {
+        if let agent_core::ToolUpdate::Progress {
+            details: Some(d), ..
+        } = update
+        {
+            last = Some(d);
+        }
+    }
+    let task = last.expect("a snapshot")["tasks"][0].clone();
+    if let Some(kept) = task["kept"].as_str() {
+        // Tidy the kept checkout out of the shared cache directory.
+        let _ = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["worktree", "remove", "--force", kept])
+            .status();
+    }
+    task
+}
+
+#[tokio::test]
+async fn a_cancelled_worktree_child_with_an_edit_is_reported_cancelled_with_its_kept_path() {
+    let task = cancel_a_worktree_child(true).await;
+    assert_eq!(task["status"], "cancelled", "{task}");
+    let kept = task["kept"]
+        .as_str()
+        .expect("the kept path is on the board");
+    assert!(
+        std::path::Path::new(kept)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("kept-"),
+        "{kept}"
+    );
+}
+
+#[tokio::test]
+async fn a_cancelled_clean_worktree_child_is_reported_cancelled_with_no_path() {
+    let task = cancel_a_worktree_child(false).await;
+    assert_eq!(task["status"], "cancelled", "{task}");
+    assert!(task["kept"].is_null(), "{task}");
+}

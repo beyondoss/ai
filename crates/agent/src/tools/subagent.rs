@@ -373,9 +373,35 @@ impl agent_core::AgentHooks for ChildHooks {
 #[derive(Clone)]
 struct TaskState {
     agent: String,
-    status: &'static str,
+    status: TaskStatus,
     step: u32,
     last_tool: Option<String>,
+    /// Where a cancelled worktree child's work was kept (see `Worktree::release_on_cancel`). `None`
+    /// for every other state, and for a cancelled child that had no work to keep.
+    kept: Option<std::path::PathBuf>,
+}
+
+/// Where one task is, as the board reports it. The wire form (`as_str`) is what a client reads.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TaskStatus {
+    Queued,
+    Running,
+    Done,
+    Failed,
+    /// The parent dropped the child mid-run (Ctrl-C, abort).
+    Cancelled,
+}
+
+impl TaskStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
 }
 
 /// Shared progress board for one `subagent` call.
@@ -399,9 +425,10 @@ impl Board {
                     .iter()
                     .map(|s| TaskState {
                         agent: s.agent.clone(),
-                        status: "queued",
+                        status: TaskStatus::Queued,
                         step: 0,
                         last_tool: None,
+                        kept: None,
                     })
                     .collect(),
             ),
@@ -441,19 +468,61 @@ impl Board {
             .iter()
             .map(|s| {
                 let tool = s.last_tool.as_deref().unwrap_or("-");
-                format!("[{}] {} step {} ({tool})", s.agent, s.status, s.step)
+                let kept = s
+                    .kept
+                    .as_ref()
+                    .map(|p| format!(", worktree kept at {}", p.display()))
+                    .unwrap_or_default();
+                format!(
+                    "[{}] {} step {} ({tool}){kept}",
+                    s.agent,
+                    s.status.as_str(),
+                    s.step
+                )
             })
             .collect::<Vec<_>>()
             .join("\n");
         let details = json!({
             "tasks": states.iter().map(|s| json!({
                 "agent": s.agent,
-                "status": s.status,
+                "status": s.status.as_str(),
                 "step": s.step,
                 "last_tool": s.last_tool,
+                "kept": s.kept,
             })).collect::<Vec<_>>()
         });
         self.progress.emit(snapshot, Some(details));
+    }
+}
+
+/// Owns a child's worktree while it runs, and speaks for the child if the parent drops it mid-run.
+/// Settling the worktree and the board entry live here so one place decides keep-or-remove
+/// (`Worktree::release_on_cancel`) and reports what it decided.
+struct CancelGuard<'a> {
+    board: &'a Board,
+    index: usize,
+    worktree: Option<(Worktree, PathBuf)>,
+    /// Cleared once `run_child` has its own result; a guard dropped armed means the child was cancelled.
+    armed: bool,
+}
+
+impl Drop for CancelGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let kept = self
+            .worktree
+            .take()
+            .and_then(|(mut wt, _)| wt.release_on_cancel());
+        self.board.update(
+            self.index,
+            |s| {
+                s.status = TaskStatus::Cancelled;
+                s.kept = kept;
+            },
+            true,
+        );
     }
 }
 
@@ -825,15 +894,31 @@ impl Subagent {
         board: &Board,
         shared: Option<&SharedChildSetup>,
     ) -> ChildOutcome {
-        board.update(index, |s| s.status = "running", true);
-        match self.try_run_child(spec, index, board, shared).await {
+        board.update(index, |s| s.status = TaskStatus::Running, true);
+        // Armed until the child finishes either way. If the parent drops this future first, the guard's
+        // `Drop` is all that runs: it settles the worktree and puts the result on the board.
+        let mut guard = CancelGuard {
+            board,
+            index,
+            worktree: None,
+            armed: true,
+        };
+        let result = self
+            .try_run_child(spec, index, board, shared, &mut guard)
+            .await;
+        guard.armed = false;
+        match result {
             Ok(outcome) => {
-                let status = if outcome.ok { "done" } else { "failed" };
+                let status = if outcome.ok {
+                    TaskStatus::Done
+                } else {
+                    TaskStatus::Failed
+                };
                 board.update(index, |s| s.status = status, true);
                 outcome
             }
             Err(message) => {
-                board.update(index, |s| s.status = "failed", true);
+                board.update(index, |s| s.status = TaskStatus::Failed, true);
                 ChildOutcome::failed(spec, message)
             }
         }
@@ -845,6 +930,7 @@ impl Subagent {
         index: usize,
         board: &Board,
         shared: Option<&SharedChildSetup>,
+        guard: &mut CancelGuard<'_>,
     ) -> Result<ChildOutcome, String> {
         let def = find_by_name(&self.ctx.agents, &spec.agent).ok_or_else(|| {
             format!(
@@ -854,10 +940,11 @@ impl Subagent {
             )
         })?;
 
-        // A worktree, when asked for. Held for the whole call: dropping it removes the checkout, which is
-        // exactly what should happen if the parent cancels us mid-run.
-        let (root, worktree) = match def.isolation {
-            Isolation::None => (self.ctx.cwd.clone(), None),
+        // A worktree, when asked for. Held by `guard` for the whole call: if the parent cancels us
+        // mid-run, the guard settles it (removed when clean, kept when the child left work) and reports
+        // which on the board.
+        let root = match def.isolation {
+            Isolation::None => self.ctx.cwd.clone(),
             // Every step of worktree isolation — `git worktree add`, the diff, `git apply` on the
             // way back — has to run *where the child's files are*. That used to mean this machine,
             // full stop, so a remote filesystem was refused: running them here would either fail
@@ -870,7 +957,9 @@ impl Subagent {
                 let repo_root = worktree::preflight(&git, &self.ctx.cwd).await?;
                 let wt =
                     Worktree::create(&git, &repo_root, &format!("{}-{index}", def.name)).await?;
-                (wt.path().to_path_buf(), Some((wt, repo_root)))
+                let root = wt.path().to_path_buf();
+                guard.worktree = Some((wt, repo_root));
+                root
             }
         };
 
@@ -1075,7 +1164,7 @@ impl Subagent {
             (Err(e), _) => ChildOutcome::failed(spec, format!("agent run failed: {e}")),
         };
 
-        if let Some((wt, repo_root)) = worktree {
+        if let Some((wt, repo_root)) = guard.worktree.take() {
             self.merge_back(wt, &repo_root, &policy, &mut outcome).await;
         }
         Ok(outcome)
