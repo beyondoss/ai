@@ -2,20 +2,22 @@
 //! Webhooks signatures (`v1,` HMAC and `v1a,` Ed25519 server identity), and the per-subscription
 //! subscribe/refresh/rotate/unsubscribe loop.
 //!
-//! **Key policy (`v1a`), fail closed.** The pinned draft lets a server add an Ed25519 `v1a,`
-//! signature, with its key discovered from an origin the client already authenticates — this client
-//! uses the standalone JWKS at `<MCP server origin>/.well-known/mcp-webhook-jwks.json`.
+//! **Key policy (`v1a`), fail closed.** SEP-3415 lets a server add an Ed25519 `v1a,` signature,
+//! with its key discovered from an origin the client already authenticates: the JWK set at
+//! `remotes[].extensionsInfo["io.modelcontextprotocol/events"].webhooks.signingKeys` on the
+//! Server Card, fetched from `<MCP URL>/server-card` (see `Conn::server_signing_keys`).
 //!
 //! - Every Ed25519 key ever published at an origin is remembered — in the session's state file and
 //!   process-wide — and the set only grows. While it is non-empty, every delivery to a subscription
 //!   on that origin (the verification challenge included) must carry a `v1a,` signature one of those
 //!   keys verifies.
-//! - A later `404`/`410`, an empty document, or a failed fetch never removes a key: there is no
-//!   signal in the draft that could prove a server meant to stop signing, so none is trusted.
+//! - A later `404`/`410`, a card with no keys, or a failed fetch never removes a key: there is no
+//!   signal in the SEP that could prove a server meant to stop signing, so none is trusted.
 //! - On a subscription's *first* subscribe, a failed fetch (timeout, connection error, `5xx`,
 //!   oversized or unparseable body) with no keys known for the origin is retried; if it still fails
 //!   the subscription is refused rather than started without knowing whether to enforce identity.
-//!   Only a clear `404`/`410` means "this server does not sign", and then `v1a,` is ignored.
+//!   Only a clear `404`/`410`, or a card that lists no signing keys for the endpoint, means "this
+//!   server does not sign", and then `v1a,` is ignored.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -38,7 +40,7 @@ use super::{
 
 /// Standard Webhooks' replay window, in seconds, either side of now.
 const TIMESTAMP_TOLERANCE_SECS: u64 = 300;
-/// Most bytes one delivery body may be. The draft: servers SHOULD keep bodies at or under
+/// Most bytes one delivery body may be. SEP-3415: servers SHOULD keep bodies at or under
 /// 256 KiB, and receivers MAY refuse larger ones with `413`.
 pub const MAX_WEBHOOK_BODY: usize = 1024 * 1024;
 /// How long a delivery waits for its event to be made durable before answering `503`.
@@ -92,7 +94,7 @@ fn routes() -> std::sync::MutexGuard<'static, HashMap<String, Arc<Route>>> {
 
 /// Callback tokens persisted by an earlier run of this process whose subscription has not
 /// re-registered its route yet, each until when it is held. A delivery the server retried across
-/// the restart then gets `503` (retry) rather than `410` (which the draft treats as "stop").
+/// the restart then gets `503` (retry) rather than `410` (which Standard Webhooks senders treat as "stop").
 static RESERVED: LazyLock<Mutex<HashMap<String, std::time::Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -199,7 +201,7 @@ fn random_bytes<const N: usize>() -> Result<[u8; N], String> {
     Ok(b)
 }
 
-/// A Standard Webhooks symmetric secret: `whsec_` + base64 of 32 CSPRNG bytes (the draft allows
+/// A Standard Webhooks symmetric secret: `whsec_` + base64 of 32 CSPRNG bytes (the SEP allows
 /// 24–64). Returns the wire string and the raw key.
 fn new_secret() -> Result<(String, Vec<u8>), String> {
     let raw = random_bytes::<32>()?;
@@ -332,7 +334,7 @@ pub(super) fn timestamp_fresh(ts_secs: i64, now: i64) -> bool {
 /// Handle one POST to [`WEBHOOK_PATH_PREFIX`]`<token>`. Called by `serve`'s listener with the raw
 /// body bytes — the signature is over them exactly as received, never over re-serialized JSON.
 ///
-/// - unknown token → **410 Gone** (the draft's "do not retry this delivery"): the subscription is
+/// - unknown token → **410 Gone** (Standard Webhooks' "do not retry this delivery"): the subscription is
 ///   over. Tokens are registered *before* `events/subscribe` is sent, so there is no window in
 ///   which a legitimate first delivery finds nothing.
 /// - missing Standard Webhooks headers → 400; a timestamp more than five minutes off, in either
@@ -341,7 +343,7 @@ pub(super) fn timestamp_fresh(ts_secs: i64, now: i64) -> bool {
 ///   mismatched `X-MCP-Subscription-Id` once the subscription id is known → 401.
 /// - `verification` → 200 echoing `{"challenge"}`.
 /// - an event → **200 only once it is durably stored** with the session's state (and so will reach
-///   the model, across a restart if need be — the draft's "SHOULD NOT 2xx before durably
+///   the model, across a restart if need be — the SEP's "SHOULD NOT 2xx before durably
 ///   persisted"); a duplicate → 200 once the record of it is durable too; **503** (retryable)
 ///   when the session's pending queue is full, the store cannot be written, or it does not answer
 ///   in time.
@@ -454,7 +456,7 @@ impl Drop for RouteGuard {
 }
 
 /// When to refresh a grant: three quarters of the way to `refreshBefore`, never sooner than
-/// 500 ms. `null` (no expiry) still refreshes hourly — the draft recommends it, since the refresh is
+/// 500 ms. `null` (no expiry) still refreshes hourly — the SEP recommends it, since the refresh is
 /// where the cursor advances and `deliveryStatus` is reported. A `refreshBefore` that cannot be
 /// parsed refreshes after [`UNPARSEABLE_REFRESH`] (and the caller warns), never later.
 pub(super) fn refresh_delay(refresh_before: Option<&str>) -> Result<Duration, Duration> {
@@ -515,7 +517,7 @@ async fn update_server_keys(
             KeyFetch::Keys(_) | KeyFetch::NotPublished => break,
             KeyFetch::Failed(e) => {
                 if !known(hub).is_empty() || !first {
-                    tracing::debug!(error = %e, "JWKS fetch failed; keeping the keys already known");
+                    tracing::debug!(error = %e, "Server Card fetch failed; keeping the keys already known");
                     break;
                 }
                 if attempts >= 3 {
@@ -784,7 +786,7 @@ pub(super) async fn run_webhook(
                     let _ = tx.send(Err(SubError::from_rpc(&e)));
                     return;
                 }
-                if e.is_terminal() && e.code != Some(-32015) {
+                if e.is_terminal() {
                     hub.ended(&spec, &state, e);
                     return;
                 }
@@ -807,12 +809,12 @@ async fn webhook_unsubscribe(hub: &Hub, spec: &SubSpec, url: &str) {
     let params = json!({
         "name": spec.sub.name,
         "arguments": spec.arguments(),
-        "delivery": { "mode": "webhook", "url": url },
+        "delivery": { "url": url },
     });
     if let Err(e) = conn
         .call("events/unsubscribe", params, Duration::from_secs(3))
         .await
-        && e.code != Some(-32011)
+        && e.code != Some(-32023)
     {
         tracing::debug!(error = %e, "events/unsubscribe failed; the subscription will lapse at its TTL");
     }

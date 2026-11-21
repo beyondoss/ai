@@ -1,4 +1,4 @@
-//! A hand-rolled MCP server implementing the **server** side of the MCP Events draft extension — a
+//! A hand-rolled MCP server implementing the **server** side of the MCP Events extension (SEP-3415, Final) — a
 //! test fixture, not a product. It exists so `crates/agent/tests/mcp_events_*.rs` can drive the real
 //! `tools::mcp_events` client inside a real `serve` against a real process speaking the real wire:
 //! `events/list`, `events/poll`, `events/stream` (push, with heartbeats), and webhook
@@ -25,9 +25,17 @@
 //! The control address (`http://127.0.0.1:<port>`) is written to `$MCP_FIXTURE_CONTROL_FILE` and,
 //! in HTTP mode, printed as the first stdout line together with the MCP URL.
 //!
-//! Env: `MCP_FIXTURE_ALLOW_HTTP_CALLBACK=1` (accept `http://` callback URLs — the draft requires
+//! Env: `MCP_FIXTURE_ALLOW_HTTP_CALLBACK=1` (accept `http://` callback URLs — the SEP requires
 //! https), `MCP_FIXTURE_MAX_TTL_MS` (cap on granted webhook TTLs), `MCP_FIXTURE_HEARTBEAT_MS`,
-//! `MCP_FIXTURE_NEXT_POLL_MS`, `MCP_FIXTURE_NO_EVENTS=1` (behave as a server without the extension).
+//! `MCP_FIXTURE_NEXT_POLL_MS`, `MCP_FIXTURE_NO_EVENTS=1` (behave as a server without the extension),
+//! `MCP_FIXTURE_DRAFT_CAPABILITY=1` (advertise the pre-SEP top-level `events` capability only),
+//! `MCP_FIXTURE_NO_LIST_CHANGED=1`, `MCP_FIXTURE_BAD_ANNOTATION=1`, `MCP_FIXTURE_STALE_LIST_ONCE=1` (listings omit the annotations until a request has been rejected for them).
+//!
+//! Over `2026-07-28` HTTP it validates what the transport requires of a server: `Mcp-Method`, and on
+//! `events/poll|stream|subscribe|unsubscribe` the `Mcp-Name` and `Mcp-Param-*` headers against the
+//! body (`400` + `-32020` on a mismatch). It serves `subscriptions/listen` (acknowledging only what
+//! it agrees to) and `POST /control/list_changed {add_event?}`, which notifies the streams that
+//! opted in with `eventsListChanged`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stdout)]
 
@@ -99,14 +107,14 @@ struct State {
     /// `/control/truncate_next`: the next poll answers `truncated: true`.
     truncate_next: bool,
     /// `/control/jwks {status}` (initially `MCP_FIXTURE_JWKS_STATUS`, else 200 when a key is
-    /// configured and 404 when not): what the JWKS endpoint answers.
+    /// configured and 404 when not): what the Server Card endpoint answers.
     jwks_status: Option<u16>,
     /// `/control/events_down {down}` (initially `MCP_FIXTURE_EVENTS_DOWN=1`): every `events/*`
     /// request fails with an internal error — a server that is briefly broken.
     events_down: bool,
-    /// `/control/jwks {stall: true}`: the JWKS endpoint sends its headers and then stalls.
+    /// `/control/jwks {stall: true}`: the Server Card endpoint sends its headers and then stalls.
     jwks_stall: bool,
-    /// How many JWKS requests are stalled right now (they hold their connection open).
+    /// How many Server Card requests are stalled right now (they hold their connection open).
     jwks_stalled: u64,
     /// `MCP_FIXTURE_NESTED_DURING=poll|stream`: the client's answers to the nested
     /// `elicitation/create` raised during that `events/*` request.
@@ -116,8 +124,11 @@ struct State {
     /// than guessing a delay.
     nested_released: bool,
     /// `MCP_FIXTURE_FORBID_FIRST=<n>`: the first `n` `events/poll`/`events/subscribe` requests are
-    /// refused with `-32012` (forbidden) — credentials that are refreshed and then work.
+    /// refused with `-32024` (forbidden) — credentials that are refreshed and then work.
     forbid_left: u64,
+    /// `MCP_FIXTURE_EXHAUST_FIRST=<n>`: the first `n` `events/poll`/`events/subscribe` requests are
+    /// refused with `-32025` (`ResourceExhausted`, `data.limit: "subscriptions"`).
+    exhaust_left: u64,
     /// Answers the client POSTed to requests this server raised over HTTP (`id` and no `method`).
     client_answers: Vec<Value>,
     /// Answer POSTs being handled right now, and the most at once (`MCP_FIXTURE_ANSWER_DELAY_MS`
@@ -126,6 +137,47 @@ struct State {
     answers_max_in_flight: u64,
     /// Whether the HTTP nested request (`MCP_FIXTURE_NESTED_DURING`) has been raised.
     http_nested_done: bool,
+    /// Open `subscriptions/listen` streams.
+    listens: HashMap<u64, ListenSub>,
+    next_listen: u64,
+    /// Every `subscriptions/listen` request seen: the filter asked for and the one acknowledged.
+    listen_log: Vec<Value>,
+    /// `events/list` requests answered.
+    list_calls: u64,
+    /// Requests refused `400 HeaderMismatch` for their routing headers.
+    header_rejections: u64,
+    /// The `Mcp-Name` / `Mcp-Param-*` headers of every `events/*` request that carried a name.
+    routing_log: Vec<Value>,
+}
+
+/// One `subscriptions/listen` stream: gets `notifications/events/list_changed` only if it asked
+/// for `eventsListChanged` and this server agreed.
+struct ListenSub {
+    request_id: Value,
+    honored: bool,
+    tx: mpsc::UnboundedSender<Value>,
+}
+
+/// The extra event type `/control/add_event` publishes.
+static EXTRA_EVENTS: Mutex<Vec<Value>> = Mutex::new(Vec::new());
+
+/// The capabilities this server advertises (`MCP_FIXTURE_NO_EVENTS=1`: none for events;
+/// `MCP_FIXTURE_DRAFT_CAPABILITY=1`: the pre-SEP top-level `events` key instead of
+/// `extensions["io.modelcontextprotocol/events"]`; `MCP_FIXTURE_NO_LIST_CHANGED=1`: the
+/// extension without `listChanged`).
+fn capabilities() -> Value {
+    if env_flag("MCP_FIXTURE_NO_EVENTS") {
+        json!({ "tools": {} })
+    } else if env_flag("MCP_FIXTURE_DRAFT_CAPABILITY") {
+        json!({ "tools": {}, "events": { "listChanged": true } })
+    } else {
+        let settings = if env_flag("MCP_FIXTURE_NO_LIST_CHANGED") {
+            json!({})
+        } else {
+            json!({ "listChanged": true })
+        };
+        json!({ "tools": {}, "extensions": { "io.modelcontextprotocol/events": settings } })
+    }
 }
 
 /// The nested `elicitation/create` this server raises toward the client during an `events/*`
@@ -215,6 +267,25 @@ fn iso(ms: i64) -> String {
 }
 
 fn event_types() -> Value {
+    let mut all = base_event_types();
+    let list = all.as_array_mut().unwrap();
+    list.extend(EXTRA_EVENTS.lock().unwrap().iter().cloned());
+    // `MCP_FIXTURE_BAD_ANNOTATION=1`: an event type whose `x-mcp-header` breaks the transport's
+    // rules (a client over HTTP must leave it out of `events/list`).
+    if env_flag("MCP_FIXTURE_BAD_ANNOTATION") {
+        list.push(json!({
+            "name": "bad.annotation",
+            "description": "Its x-mcp-header is not a token.",
+            "delivery": ["poll"],
+            "inputSchema": { "type": "object", "properties": {
+                "region": { "type": "string", "x-mcp-header": "Bad Name" } } },
+            "payloadSchema": { "type": "object" }
+        }));
+    }
+    all
+}
+
+fn base_event_types() -> Value {
     json!([
         {
             "name": "ticket.updated",
@@ -222,7 +293,7 @@ fn event_types() -> Value {
             "delivery": ["webhook", "push", "poll"],
             "inputSchema": {
                 "type": "object",
-                "properties": { "project": { "type": "string" } }
+                "properties": { "project": { "type": "string", "x-mcp-header": "Project" } }
             },
             "payloadSchema": {
                 "type": "object",
@@ -333,7 +404,7 @@ fn sign(secret: &[u8], id: &str, ts: &str, body: &[u8]) -> String {
 }
 
 /// The server's Ed25519 webhook-signing key, when `MCP_FIXTURE_ED25519_SEED` (64 hex chars) is
-/// set: published at `/.well-known/mcp-webhook-jwks.json`, and used to add a Standard Webhooks
+/// set: published on the Server Card at `/mcp/server-card` (`remotes[].extensionsInfo[...].webhooks.signingKeys`), and used to add a Standard Webhooks
 /// `v1a,` signature to every delivery.
 fn server_key() -> Option<ed25519_dalek::SigningKey> {
     let seed = hex::decode(std::env::var("MCP_FIXTURE_ED25519_SEED").ok()?).ok()?;
@@ -504,12 +575,17 @@ async fn rpc(
     params: Value,
     principal: Option<String>,
 ) -> Result<Value, RpcErr> {
-    let (events_down, forbidden) = {
+    let (events_down, forbidden, exhausted) = {
         let mut st = state.lock().unwrap();
         st.methods.push(method.to_owned());
-        let forbidden = matches!(method, "events/poll" | "events/subscribe") && st.forbid_left > 0;
+        let named = matches!(method, "events/poll" | "events/subscribe");
+        let forbidden = named && st.forbid_left > 0;
         if forbidden {
             st.forbid_left -= 1;
+        }
+        let exhausted = named && !forbidden && st.exhaust_left > 0;
+        if exhausted {
+            st.exhaust_left -= 1;
         }
         if params
             .pointer("/_meta/io.modelcontextprotocol~1clientCapabilities/extensions/io.modelcontextprotocol~1ui")
@@ -517,14 +593,10 @@ async fn rpc(
         {
             st.ui_methods.push(method.to_owned());
         }
-        (st.events_down, forbidden)
+        (st.events_down, forbidden, exhausted)
     };
     let no_events = env_flag("MCP_FIXTURE_NO_EVENTS");
-    let capabilities = if no_events {
-        json!({ "tools": {} })
-    } else {
-        json!({ "tools": {}, "events": { "listChanged": true } })
-    };
+    let capabilities = capabilities();
     match method {
         "server/discover" => Ok(json!({
             "resultType": "complete",
@@ -568,7 +640,12 @@ async fn rpc(
         m if m.starts_with("events/") && events_down => {
             Err(err(-32603, &format!("temporarily unavailable: {m}")))
         }
-        m if forbidden => Err(err(-32012, &format!("forbidden: {m}"))),
+        m if forbidden => Err(err(-32024, &format!("forbidden: {m}"))),
+        _ if exhausted => Err((
+            -32025,
+            "ResourceExhausted".into(),
+            Some(json!({"limit": "subscriptions", "max": 1})),
+        )),
         "events/list" => {
             // `MCP_FIXTURE_LIST_DELAY_MS`: a slow server, for concurrency tests.
             let delay = env_u64("MCP_FIXTURE_LIST_DELAY_MS", 0);
@@ -581,16 +658,38 @@ async fn rpc(
             if pad > 0 {
                 return Ok(json!({ "events": event_types(), "pad": "x".repeat(pad) }));
             }
-            Ok(json!({ "events": event_types() }))
+            // `MCP_FIXTURE_STALE_LIST_ONCE=1`: listings predate the `x-mcp-header` annotations
+            // that every request is validated against, until one request has been rejected for it.
+            let stale = {
+                let mut st = state.lock().unwrap();
+                st.list_calls += 1;
+                st.header_rejections == 0
+            };
+            let mut events = event_types();
+            if env_flag("MCP_FIXTURE_STALE_LIST_ONCE") && stale {
+                for e in events.as_array_mut().unwrap() {
+                    if let Some(props) = e
+                        .pointer_mut("/inputSchema/properties")
+                        .and_then(Value::as_object_mut)
+                    {
+                        for p in props.values_mut() {
+                            if let Some(o) = p.as_object_mut() {
+                                o.remove("x-mcp-header");
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(json!({ "events": events }))
         }
         "events/poll" => {
             let name = params["name"].as_str().unwrap_or("").to_owned();
             if !known_event(&name) {
-                return Err((-32011, "NotFound".into(), Some(json!({"kind": "event"}))));
+                return Err((-32023, "NotFound".into(), Some(json!({"kind": "event"}))));
             }
             if !offers(&name, "poll") {
                 return Err((
-                    -32014,
+                    -32026,
                     "Unsupported".into(),
                     Some(json!({"feature": "deliveryMode", "value": "poll"})),
                 ));
@@ -650,7 +749,7 @@ async fn rpc(
         "events/unsubscribe" => {
             let Some(principal) = principal else {
                 return Err((
-                    -32012,
+                    -32024,
                     "Forbidden".into(),
                     Some(json!({"reason": "webhook requires an authenticated principal"})),
                 ));
@@ -669,7 +768,7 @@ async fn rpc(
             st.unsubscribes.push(params.clone());
             if st.hooks.remove(&key).is_none() {
                 return Err((
-                    -32011,
+                    -32023,
                     "NotFound".into(),
                     Some(json!({"kind": "subscription"})),
                 ));
@@ -687,18 +786,18 @@ async fn subscribe(
 ) -> Result<Value, RpcErr> {
     let Some(principal) = principal else {
         return Err((
-            -32012,
+            -32024,
             "Forbidden".into(),
             Some(json!({"reason": "webhook requires an authenticated principal"})),
         ));
     };
     let name = params["name"].as_str().unwrap_or("").to_owned();
     if !known_event(&name) {
-        return Err((-32011, "NotFound".into(), Some(json!({"kind": "event"}))));
+        return Err((-32023, "NotFound".into(), Some(json!({"kind": "event"}))));
     }
     if !offers(&name, "webhook") {
         return Err((
-            -32014,
+            -32026,
             "Unsupported".into(),
             Some(json!({"feature": "deliveryMode", "value": "webhook"})),
         ));
@@ -758,7 +857,7 @@ async fn subscribe(
             .push(json!({"url": url, "status": status, "ok": covered, "via": "well-known"}));
         if !covered {
             return Err((
-                -32015,
+                -32027,
                 "CallbackEndpointError".into(),
                 Some(json!({"reason": "challenge_failed"})),
             ));
@@ -802,7 +901,7 @@ async fn subscribe(
                 "challenge_failed"
             };
             return Err((
-                -32015,
+                -32027,
                 "CallbackEndpointError".into(),
                 Some(json!({"reason": reason})),
             ));
@@ -923,11 +1022,11 @@ fn open_stream(
     state.lock().unwrap().methods.push("events/stream".into());
     let name = params["name"].as_str().unwrap_or("").to_owned();
     if !known_event(&name) {
-        return Err((-32011, "NotFound".into(), Some(json!({"kind": "event"}))));
+        return Err((-32023, "NotFound".into(), Some(json!({"kind": "event"}))));
     }
     if !offers(&name, "push") {
         return Err((
-            -32014,
+            -32026,
             "Unsupported".into(),
             Some(json!({"feature": "deliveryMode", "value": "push"})),
         ));
@@ -991,6 +1090,150 @@ fn cancel_stream(state: &Shared, request_id: &Value) {
     let mut st = state.lock().unwrap();
     st.cancelled.push(request_id.clone());
     st.streams.retain(|_, s| &s.request_id != request_id);
+    st.listens.retain(|_, l| &l.request_id != request_id);
+}
+
+/// Open a `subscriptions/listen` stream: the acknowledgment first, naming what this server agrees
+/// to send. Only `eventsListChanged` is offered, and only when the server declared `listChanged`.
+fn open_listen(
+    state: &Shared,
+    params: &Value,
+    request_id: Value,
+) -> (u64, mpsc::UnboundedReceiver<Value>) {
+    let requested = params.get("notifications").cloned().unwrap_or(json!({}));
+    let declared = capabilities()
+        .pointer("/extensions/io.modelcontextprotocol~1events/listChanged")
+        .is_some_and(|v| v == &json!(true));
+    let honored = requested["eventsListChanged"] == json!(true) && declared;
+    let agreed = if honored {
+        json!({ "eventsListChanged": true })
+    } else {
+        json!({})
+    };
+    let (tx, rx) = mpsc::unbounded_channel();
+    let _ = tx.send(json!({"jsonrpc": "2.0", "method": "notifications/subscriptions/acknowledged",
+        "params": { "_meta": { "io.modelcontextprotocol/subscriptionId": request_id }, "notifications": agreed }}));
+    let mut st = state.lock().unwrap();
+    st.methods.push("subscriptions/listen".into());
+    st.listen_log
+        .push(json!({ "requested": requested, "acknowledged": agreed }));
+    st.next_listen += 1;
+    let key = st.next_listen;
+    st.listens.insert(
+        key,
+        ListenSub {
+            request_id,
+            honored,
+            tx,
+        },
+    );
+    (key, rx)
+}
+
+/// `notifications/events/list_changed` to every listen stream that opted in. Returns how many.
+fn send_list_changed(state: &Shared) -> usize {
+    let st = state.lock().unwrap();
+    let mut n = 0;
+    for l in st.listens.values().filter(|l| l.honored) {
+        let sent = l.tx.send(
+            json!({"jsonrpc": "2.0", "method": "notifications/events/list_changed",
+            "params": { "_meta": { "io.modelcontextprotocol/subscriptionId": l.request_id } }}),
+        );
+        n += usize::from(sent.is_ok());
+    }
+    n
+}
+
+fn decode_header(v: &str) -> Option<String> {
+    match v
+        .strip_prefix("=?base64?")
+        .and_then(|r| r.strip_suffix("?="))
+    {
+        Some(inner) => String::from_utf8(
+            base64::engine::general_purpose::STANDARD
+                .decode(inner)
+                .ok()?,
+        )
+        .ok(),
+        None => Some(v.to_owned()),
+    }
+}
+
+/// The transport's server validation for `events/*`: `Mcp-Name` must be present and equal
+/// `params.name`; each `x-mcp-header` property of the event's *current* schema that has a value in
+/// `params.arguments` needs its `Mcp-Param-*` header, equal to that value.
+fn validate_routing(
+    headers: &HashMap<String, String>,
+    method: &str,
+    params: &Value,
+) -> Result<(), String> {
+    if !matches!(
+        method,
+        "events/poll" | "events/stream" | "events/subscribe" | "events/unsubscribe"
+    ) {
+        return Ok(());
+    }
+    let name = params["name"].as_str().unwrap_or("");
+    let got = headers.get("mcp-name").ok_or("missing Mcp-Name")?;
+    if decode_header(got).as_deref() != Some(name) {
+        return Err("Mcp-Name does not match params.name".into());
+    }
+    let types = event_types();
+    let Some(props) = types
+        .as_array()
+        .and_then(|a| a.iter().find(|e| e["name"] == name))
+        .and_then(|e| e.pointer("/inputSchema/properties"))
+        .and_then(Value::as_object)
+    else {
+        return Ok(());
+    };
+    for (prop, schema) in props {
+        let Some(header) = schema["x-mcp-header"].as_str() else {
+            continue;
+        };
+        let want = match params.pointer(&format!("/arguments/{prop}")) {
+            Some(Value::String(s)) => Some(s.clone()),
+            Some(Value::Bool(b)) => Some(b.to_string()),
+            Some(Value::Number(n)) => Some(n.to_string()),
+            _ => None,
+        };
+        let key = format!("mcp-param-{}", header.to_ascii_lowercase());
+        match (want, headers.get(&key)) {
+            (Some(w), Some(g)) if decode_header(g).as_deref() == Some(w.as_str()) => {}
+            (Some(_), _) => {
+                return Err(format!(
+                    "Mcp-Param-{header} missing or not equal to the argument"
+                ));
+            }
+            (None, Some(_)) => return Err(format!("Mcp-Param-{header} sent without an argument")),
+            (None, None) => {}
+        }
+    }
+    Ok(())
+}
+
+/// The Server Card (SEP-2127) at `<MCP URL>/server-card`: the remote for `mcp_url` carries the
+/// events extension's webhook signing keys, when a key is configured. A card for another endpoint
+/// first (`MCP_FIXTURE_CARD_OTHER_REMOTE_KEYS=1`) holds the keys on the wrong remote instead.
+fn server_card(mcp_url: &str) -> Value {
+    let keys = jwks();
+    let ext = |keys: &Value| json!({ "io.modelcontextprotocol/events": { "webhooks": { "signingKeys": keys } } });
+    let mut remotes = vec![];
+    if env_flag("MCP_FIXTURE_CARD_OTHER_REMOTE_KEYS") {
+        remotes.push(
+            json!({ "type": "streamable-http", "url": "https://elsewhere.invalid/mcp",
+            "extensionsInfo": ext(&keys) }),
+        );
+        remotes.push(json!({ "type": "streamable-http", "url": mcp_url }));
+    } else if keys.is_null() {
+        remotes.push(json!({ "type": "streamable-http", "url": mcp_url }));
+    } else {
+        remotes.push(
+            json!({ "type": "streamable-http", "url": mcp_url, "extensionsInfo": ext(&keys) }),
+        );
+    }
+    json!({ "name": "io.example/mcp-fixture-events-server", "description": "fixture",
+        "version": "0.0.0", "remotes": remotes })
 }
 
 async fn control(state: &Shared, method: &str, path: &str, body: &[u8]) -> (u16, Value) {
@@ -1012,6 +1255,8 @@ async fn control(state: &Shared, method: &str, path: &str, body: &[u8]) -> (u16,
                 "requests": st.requests, "sessionless_rejections": st.sessionless_rejections,
                 "jwks_stalled": st.jwks_stalled, "nested_answers": st.nested_answers,
                 "client_answers": st.client_answers.len(), "answers_max_in_flight": st.answers_max_in_flight,
+                "listen_log": st.listen_log, "listens": st.listens.len(), "list_calls": st.list_calls,
+                "header_rejections": st.header_rejections, "routing_log": st.routing_log,
                 }),
             )
         }
@@ -1061,6 +1306,22 @@ async fn control(state: &Shared, method: &str, path: &str, body: &[u8]) -> (u16,
                 ),
                 None => (404, json!({"error": "no such event"})),
             }
+        }
+        // The set of event types changed: publish `dynamic.added` (when asked) and tell every
+        // listen stream that opted in.
+        ("POST", "/control/list_changed") => {
+            if req["add_event"] == json!(true) {
+                let mut extra = EXTRA_EVENTS.lock().unwrap();
+                if extra.is_empty() {
+                    extra.push(json!({
+                        "name": "dynamic.added", "description": "Added at runtime.",
+                        "delivery": ["poll"],
+                        "inputSchema": { "type": "object", "properties": {} },
+                        "payloadSchema": { "type": "object" }
+                    }));
+                }
+            }
+            (200, json!({ "sent": send_list_changed(state) }))
         }
         ("POST", "/control/raise_nested") => {
             state.lock().unwrap().nested_released = true;
@@ -1112,7 +1373,7 @@ async fn control(state: &Shared, method: &str, path: &str, body: &[u8]) -> (u16,
         }
         ("POST", "/control/schema_change") => {
             // The event type changed in place: end every push stream with the draft's
-            // `-32014 Unsupported {reason: schema_changed}`.
+            // `-32026 Unsupported {reason: schema_changed}`.
             let streams: Vec<StreamSub> = state
                 .lock()
                 .unwrap()
@@ -1120,7 +1381,7 @@ async fn control(state: &Shared, method: &str, path: &str, body: &[u8]) -> (u16,
                 .drain()
                 .map(|(_, s)| s)
                 .collect();
-            let error = json!({"code": -32014, "message": "Unsupported", "data": {"feature": "payloadSchema", "reason": "schema_changed"}});
+            let error = json!({"code": -32026, "message": "Unsupported", "data": {"feature": "payloadSchema", "reason": "schema_changed"}});
             let n = streams.len();
             for s in streams {
                 let _ = s.tx.send(json!({"jsonrpc": "2.0", "method": "notifications/events/terminated", "params": {"error": error, "_meta": {"io.modelcontextprotocol/subscriptionId": s.request_id}}}));
@@ -1134,7 +1395,7 @@ async fn control(state: &Shared, method: &str, path: &str, body: &[u8]) -> (u16,
                 let hooks: Vec<Hook> = st.hooks.drain().map(|(_, h)| h).collect();
                 (streams, hooks)
             };
-            let error = json!({"code": -32012, "message": "Forbidden", "data": {"reason": "Access revoked"}});
+            let error = json!({"code": -32024, "message": "Forbidden", "data": {"reason": "Access revoked"}});
             for s in streams {
                 let _ = s.tx.send(json!({"jsonrpc": "2.0", "method": "notifications/events/terminated", "params": {"error": error, "_meta": {"io.modelcontextprotocol/subscriptionId": s.request_id}}}));
             }
@@ -1296,7 +1557,7 @@ async fn handle_http(state: Shared, mut stream: TcpStream) {
         .await;
         return;
     }
-    if req.path == "/.well-known/mcp-webhook-jwks.json" {
+    if req.path == "/mcp/server-card" {
         if state.lock().unwrap().jwks_stall {
             state.lock().unwrap().jwks_stalled += 1;
             let _ = stream
@@ -1315,20 +1576,22 @@ async fn handle_http(state: Shared, mut stream: TcpStream) {
             state.lock().unwrap().jwks_stalled -= 1;
             return;
         }
-        let doc = jwks();
+        let host = req.headers.get("host").cloned().unwrap_or_default();
+        let doc = server_card(&format!("http://{host}/mcp"));
+        let keyless = jwks().is_null();
         let forced = state.lock().unwrap().jwks_status.or_else(|| {
             std::env::var("MCP_FIXTURE_JWKS_STATUS")
                 .ok()
                 .and_then(|v| v.parse().ok())
         });
-        let status = forced.unwrap_or(if doc.is_null() { 404 } else { 200 });
-        if status != 200 || doc.is_null() {
-            return respond(&mut stream, status, "text/plain", b"no keys").await;
+        let status = forced.unwrap_or(if keyless { 404 } else { 200 });
+        if status != 200 || (keyless && forced.is_none()) {
+            return respond(&mut stream, status, "text/plain", b"no card").await;
         }
         return respond(
             &mut stream,
             200,
-            "application/json",
+            "application/mcp-server-card+json",
             doc.to_string().as_bytes(),
         )
         .await;
@@ -1354,7 +1617,7 @@ async fn handle_http(state: Shared, mut stream: TcpStream) {
             let id = msg.get("id").cloned().unwrap_or(Value::Null);
             let body = json!({"jsonrpc": "2.0", "id": id, "result": {
                 "protocolVersion": "2025-11-25",
-                "capabilities": { "tools": {}, "events": { "listChanged": true } },
+                "capabilities": capabilities(),
                 "serverInfo": { "name": "mcp-fixture-events-server", "version": "0.0.0" }
             }});
             return respond_with(
@@ -1428,6 +1691,30 @@ async fn handle_http(state: Shared, mut stream: TcpStream) {
         )
         .await;
     }
+    if !legacy && method.starts_with("events/") {
+        let seen: Vec<(String, String)> = req
+            .headers
+            .iter()
+            .filter(|(k, _)| k.starts_with("mcp-param-") || *k == "mcp-name")
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        state
+            .lock()
+            .unwrap()
+            .routing_log
+            .push(json!({ "method": method, "headers": seen }));
+        if let Err(why) = validate_routing(&req.headers, &method, &params) {
+            state.lock().unwrap().header_rejections += 1;
+            let body = json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32020, "message": "HeaderMismatch", "data": {"reason": why}}});
+            return respond(
+                &mut stream,
+                400,
+                "application/json",
+                body.to_string().as_bytes(),
+            )
+            .await;
+        }
+    }
     let principal = req
         .headers
         .get("authorization")
@@ -1470,6 +1757,25 @@ async fn handle_http(state: Shared, mut stream: TcpStream) {
         let _ = stream
             .write_all(format!("data: {body}\n\n").as_bytes())
             .await;
+        return;
+    }
+    if method == "subscriptions/listen" {
+        let (key, mut rx) = open_listen(&state, &params, id.clone());
+        let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+        if stream.write_all(head.as_bytes()).await.is_err() {
+            state.lock().unwrap().listens.remove(&key);
+            return;
+        }
+        while let Some(frame) = rx.recv().await {
+            let line = format!("data: {frame}\n\n");
+            if stream.write_all(line.as_bytes()).await.is_err() || stream.flush().await.is_err() {
+                break;
+            }
+            if !state.lock().unwrap().listens.contains_key(&key) {
+                break;
+            }
+        }
+        state.lock().unwrap().listens.remove(&key);
         return;
     }
     if method == "events/stream" {
@@ -1708,6 +2014,21 @@ async fn run_stdio(state: Shared) {
             });
             continue;
         }
+        if method == "subscriptions/listen" {
+            let (key, mut rx) = open_listen(&state, &params, id.clone());
+            let (out, state) = (out.clone(), state.clone());
+            tokio::spawn(async move {
+                while let Some(frame) = rx.recv().await {
+                    if !write_line(&out, &frame).await
+                        || !state.lock().unwrap().listens.contains_key(&key)
+                    {
+                        break;
+                    }
+                }
+                state.lock().unwrap().listens.remove(&key);
+            });
+            continue;
+        }
         if method == "events/stream" {
             if nested_during == "stream"
                 && !nested_done.swap(true, std::sync::atomic::Ordering::SeqCst)
@@ -1763,6 +2084,7 @@ async fn main() {
     let state: Shared = Arc::new(Mutex::new(State {
         events_down: env_flag("MCP_FIXTURE_EVENTS_DOWN"),
         forbid_left: env_u64("MCP_FIXTURE_FORBID_FIRST", 0),
+        exhaust_left: env_u64("MCP_FIXTURE_EXHAUST_FIRST", 0),
         ..State::default()
     }));
     // port-0: held for the server's life; the address is announced through the control file.

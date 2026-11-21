@@ -1,17 +1,23 @@
-//! MCP **Events** — the client side of the Triggers & Events Working Group's *draft* extension.
-//!
-//! **Draft status.** There is no SEP yet. This implements the WG's design sketch at
-//! [`SPEC_COMMIT`] of <https://github.com/modelcontextprotocol/experimental-ext-triggers-events>
-//! (`docs/design-sketch-proposal.md`), cross-checked against OpenAI's MCP Events guide (ChatGPT
-//! shipped a webhook-only client on 2026-09-29). The wire may change; everything here is behind
+//! MCP **Events** — the client side of the Events extension, SEP-3415 (Final), pinned at
+//! [`SPEC_COMMIT`] of <https://github.com/modelcontextprotocol/modelcontextprotocol>
+//! (`seps/3415-events-extension.md`; protocol revision `2026-07-28`, whose per-request `_meta`,
+//! `server/discover` and `subscriptions/listen` it builds on). Everything here is behind
 //! configuration, and a server that never sees an `events` entry is never asked about events.
 //!
+//! **Capability gate.** `events/*` goes only to a server that advertised
+//! `capabilities.extensions["io.modelcontextprotocol/events"]` ([`EVENTS_EXTENSION_ID`]); a
+//! subscription to any other server is `refused`, with that reason, and nothing is sent.
+//!
 //! **Shape.** A server emits, this agent subscribes. Discovery is `events/list` (cached per server,
-//! invalidated by `notifications/events/list_changed`). Each subscription runs in one of three
+//! invalidated by `notifications/events/list_changed`, which a server that declared
+//! `listChanged: true` delivers on the connection's `subscriptions/listen` stream — opened by
+//! `tools::mcp`, which asks for it with `eventsListChanged`). Each subscription runs in one of three
 //! delivery modes, negotiated from what the event type offers and what this process can receive
 //! (webhook > push > poll, or forced per subscription): **poll** (`events/poll` with the cursor),
 //! **push** (one long-lived `events/stream`, notifications routed by [`NotificationRouter`]) and
 //! **webhook** (`events/subscribe` with a callback on `serve`'s own listener — see [`webhook`]).
+//! Over Streamable HTTP every named request carries `Mcp-Name` and the `Mcp-Param-*` headers for
+//! the event's `x-mcp-header` annotations ([`headers`]).
 //!
 //! **Who subscribes.** Subscriptions configured in `mcp_servers[].events` are owned by exactly one
 //! session per process: the stdio `serve`'s only session, or the daemon's events session
@@ -37,6 +43,7 @@
 //! the session is busy with a non-prompt command is deferred, never refused ([`is_injection`]);
 //! `mcp_events_*` commands run as spawned tasks ([`McpEventsCommands`]).
 
+mod headers;
 mod state;
 pub mod webhook;
 mod wire;
@@ -58,8 +65,12 @@ pub use webhook::{MAX_WEBHOOK_BODY, WebhookReply, receive_webhook, restore_pendi
 pub use wire::NotificationRouter;
 use wire::{Conn, RpcError, StreamMsg};
 
-/// The design-sketch commit this client implements.
-pub const SPEC_COMMIT: &str = "6682596d65eec778fe0b8b1f43b4e89d2fe2c546";
+/// The commit of `modelcontextprotocol/modelcontextprotocol` whose SEP-3415 (and
+/// `docs/specification/2026-07-28`) this client implements.
+pub const SPEC_COMMIT: &str = "bbc31f8ded5762eae4df115b93942f5e71c8b3a7";
+
+/// The extension's identifier: the key under `capabilities.extensions` a server advertises it by.
+pub const EVENTS_EXTENSION_ID: &str = "io.modelcontextprotocol/events";
 
 /// Where webhook deliveries land on `serve`'s HTTP listener: `<prefix><token>`, one token per
 /// subscription. The token routes; the HMAC authenticates.
@@ -68,7 +79,7 @@ pub const WEBHOOK_PATH_PREFIX: &str = "/_beyond/mcp-events/";
 /// The daemon session that owns configured subscriptions when `--mcp-events-session` is not given.
 pub const DEFAULT_EVENTS_SESSION: &str = "mcp-events";
 
-/// The receiver-published verification document (the draft's endpoint-verification path (d)):
+/// The receiver-published verification document (the SEP's endpoint-verification path 4):
 /// `{"receivers": ["<callback base path>/_beyond/mcp-events/"]}`, served by `serve`'s listener at
 /// [`RECEIVER_DOCUMENT_PATH`] once [`enable_receiver_document`] has run. A server that supports
 /// this path may then verify the callback without a challenge POST.
@@ -122,7 +133,7 @@ fn env_ms(name: &str, default_ms: u64) -> Duration {
     Duration::from_millis(env_u64(name, default_ms))
 }
 
-/// The client-side floor on `nextPollMs` (the draft: "configurable floor, default 1000 ms"). Also
+/// The client-side floor on `nextPollMs` (SEP-3415: "configurable floor, default 1000 ms"). Also
 /// the wait after a `hasMore: true` page that carried no events, so a server cannot spin us.
 fn poll_floor() -> Duration {
     env_ms("BEYOND_AI_AGENT_MCP_EVENTS_POLL_FLOOR_MS", 1_000)
@@ -134,7 +145,7 @@ fn coalesce_window() -> Duration {
 }
 
 /// Silence on a push stream (no event, no heartbeat) after which it is presumed dead: twice the
-/// draft's 30 s heartbeat ceiling, plus slack.
+/// spec's 30 s default heartbeat, plus slack.
 fn stream_idle_limit() -> Duration {
     env_ms("BEYOND_AI_AGENT_MCP_EVENTS_STREAM_IDLE_MS", 70_000)
 }
@@ -166,7 +177,7 @@ fn healthy_for() -> Duration {
 /// Longest wait between attempts to (re)establish a configured subscription.
 const CONFIGURED_RETRY_CAP: Duration = Duration::from_secs(60);
 
-/// How many times in a row a server may answer "forbidden" (`-32012`) — each attempt with
+/// How many times in a row a server may answer `Forbidden` (`-32024`) — each attempt with
 /// credentials resolved afresh — before the subscription is treated as refused for good.
 const MAX_FORBIDDEN_RETRIES: u32 = 5;
 
@@ -190,7 +201,7 @@ fn now_unix_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Sort object keys recursively so `arguments` compare by canonical-JSON equality, as the draft's
+/// Sort object keys recursively so `arguments` compare by canonical-JSON equality, as the SEP's
 /// subscription key does — whatever key order a client or a settings file happened to use.
 fn canonical(v: &Value) -> String {
     fn sorted(v: &Value) -> Value {
@@ -239,7 +250,7 @@ struct SubSpec {
 }
 
 impl SubSpec {
-    /// `(server, name, canonical arguments)`. The rest of the draft's key — principal and callback
+    /// `(server, name, canonical arguments)`. The rest of the SEP's key — principal and callback
     /// URL — is fixed per server connection and per subscription task respectively.
     fn key(&self) -> String {
         format!(
@@ -351,7 +362,7 @@ impl SubState {
         self.with(|s| s.cursor.clone())
     }
 
-    /// Absent means `null` (the draft is explicit), so any response that carries the field —
+    /// Absent means `null` (the SEP is explicit), so any response that carries the field —
     /// present or not — replaces the persisted cursor; `null` means "no replay, start from now".
     fn set_cursor_from(&self, v: &Value) {
         let cursor = v.get("cursor").and_then(Value::as_str).map(str::to_owned);
@@ -1130,12 +1141,25 @@ impl Hub {
             }),
             crate::tools::mcp::EventsPeer::Rmcp { .. } => None,
         };
-        Ok(Conn { peer, http })
+        let descriptors = self
+            .discovery
+            .lock()
+            .ok()
+            .and_then(|d| d.get(server).map(|(_, events)| events.clone()));
+        Ok(Conn::new(peer, http, descriptors))
     }
 
-    /// `events/list`, all pages, cached until the server says `list_changed`.
+    /// `events/list`, all pages, cached until the server says `list_changed`. A server that did
+    /// not advertise the extension is refused without a request: `events/*` goes only to a server
+    /// that declared `capabilities.extensions["io.modelcontextprotocol/events"]`.
     async fn discover(&self, server: &str) -> Result<Arc<Vec<Value>>, SubError> {
         let conn = self.conn(server).await?;
+        if conn.capability().is_none() {
+            return Err(SubError::permanent(format!(
+                "server `{server}` did not advertise the MCP Events extension \
+                 (capabilities.extensions[\"{EVENTS_EXTENSION_ID}\"]); no events request was sent"
+            )));
+        }
         let generation = conn.generation();
         if let Some((g, events)) = self
             .discovery
@@ -1146,33 +1170,12 @@ impl Hub {
         {
             return Ok(events);
         }
-        let mut events = Vec::new();
-        let mut cursor: Option<String> = None;
-        for _page in 0..20 {
-            let params = match &cursor {
-                Some(c) => json!({ "cursor": c }),
-                None => json!({}),
-            };
-            let page = conn
-                .call("events/list", params, RPC_TIMEOUT)
-                .await
-                .map_err(|e| match e.code {
-                    Some(-32601) => SubError::permanent(format!(
-                        "server `{server}` does not support the MCP Events extension (events/list: method not found)"
-                    )),
-                    _ => SubError::from_rpc(&e).context(&format!("events/list on `{server}` failed")),
-                })?;
-            if let Some(list) = page.get("events").and_then(Value::as_array) {
-                events.extend(list.iter().cloned());
-            }
-            cursor = page
-                .get("nextCursor")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            if cursor.is_none() {
-                break;
-            }
-        }
+        let events = conn.list_events().await.map_err(|e| match e.code {
+            Some(-32601) => SubError::permanent(format!(
+                "server `{server}` does not support the MCP Events extension (events/list: method not found)"
+            )),
+            _ => SubError::from_rpc(&e).context(&format!("events/list on `{server}` failed")),
+        })?;
         let events = Arc::new(events);
         if let Ok(mut d) = self.discovery.lock() {
             d.insert(server.to_owned(), (generation, events.clone()));
@@ -1677,7 +1680,7 @@ impl Hub {
 
     /// The server ended a subscription. A configured one is kept up ([`Self::keep_subscribed`]).
     /// Otherwise, if the server says the event type was removed or changed in place, re-discover
-    /// and resubscribe — the draft's SHOULD — up to [`MAX_REDISCOVERIES`] times per
+    /// and resubscribe — the SEP's SHOULD — up to [`MAX_REDISCOVERIES`] times per
     /// [`healthy_for`]; the model is told about the possible gap once it is back.
     fn ended(self: &Arc<Self>, spec: &SubSpec, state: &SubState, error: RpcError) {
         state.with(|s| {
@@ -1802,7 +1805,7 @@ async fn stop_task(task: tokio::task::JoinHandle<()>) {
 struct SubError {
     pub(super) message: String,
     pub(super) permanent: bool,
-    /// Access refused (`-32012`): retried, with credentials re-resolved, until it has failed
+    /// Access refused (`-32024`): retried, with credentials re-resolved, until it has failed
     /// [`MAX_FORBIDDEN_RETRIES`] times in a row.
     pub(super) forbidden: bool,
 }

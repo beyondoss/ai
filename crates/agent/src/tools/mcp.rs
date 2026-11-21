@@ -295,6 +295,18 @@ pub(crate) struct McpHandler {
     skills_changed: Arc<std::sync::atomic::AtomicU64>,
     /// What a `notifications/tools/list_changed` re-lists into — see [`Dial::relist`].
     relist: Relist,
+    /// The connection's `subscriptions/listen` stream (see [`Self::start_listening`]); ends with the
+    /// connection, whose service holds the last handle to this.
+    listen: Arc<std::sync::Mutex<Option<ListenGuard>>>,
+}
+
+/// Aborts the connection's listen task when the connection (its handler) goes away.
+struct ListenGuard(tokio::task::JoinHandle<()>);
+
+impl Drop for ListenGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// One request in flight on a connection, and the session (host) it belongs to.
@@ -317,6 +329,112 @@ impl McpHandler {
             apps: false,
             views: Arc::default(),
             relist: Relist::default(),
+            listen: Arc::default(),
+        }
+    }
+
+    /// Under `2026-07-28` a server sends a `list_changed` notification only to a client that asked
+    /// for it on a `subscriptions/listen` stream (and says what it agreed to in
+    /// `notifications/subscriptions/acknowledged`). So: one stream per connection, requesting
+    /// exactly what the server declared `listChanged` for — tools, resources, prompts, and the
+    /// events extension's own `eventsListChanged` — held open until the connection ends and
+    /// reopened after any other end. The notifications arrive on rmcp's own connection and reach
+    /// the handlers below (`on_tool_list_changed`, `on_resource_list_changed`) and the events
+    /// router like any other. A server on an earlier revision sends them unrequested, so it gets no
+    /// stream. After a reopen, whatever changed while it was down is unknown, so everything a
+    /// notification would have refreshed is refreshed.
+    fn start_listening(&self, peer: Peer<RoleClient>, info: &rmcp::model::ServerPeerInfo) {
+        if info.protocol_version < ProtocolVersion::V_2026_07_28 {
+            return;
+        }
+        let caps = &info.capabilities;
+        let mut filter = Map::new();
+        let mut want = |key: &str, declared: bool| {
+            if declared {
+                filter.insert(key.into(), Value::Bool(true));
+            }
+        };
+        want(
+            "toolsListChanged",
+            caps.tools.as_ref().and_then(|t| t.list_changed) == Some(true),
+        );
+        want(
+            "resourcesListChanged",
+            caps.resources.as_ref().and_then(|r| r.list_changed) == Some(true),
+        );
+        want(
+            "promptsListChanged",
+            caps.prompts.as_ref().and_then(|p| p.list_changed) == Some(true),
+        );
+        want(
+            "eventsListChanged",
+            caps.extensions
+                .as_ref()
+                .and_then(|e| e.get(crate::tools::mcp_events::EVENTS_EXTENSION_ID))
+                .and_then(|s| s.get("listChanged"))
+                == Some(&Value::Bool(true)),
+        );
+        if filter.is_empty() {
+            return;
+        }
+        let params = json!({ "notifications": filter });
+        // Pieces, not `self`: the guard lives in this handler, so a task holding the handler would
+        // keep it (and the connection) alive forever.
+        let (events, views, skills, relist, server) = (
+            self.events.clone(),
+            self.views.clone(),
+            self.skills_changed.clone(),
+            self.relist.clone(),
+            self.server_name.clone(),
+        );
+        let task = tokio::spawn(async move {
+            let mut failures = 0u32;
+            let mut first = true;
+            loop {
+                if !first {
+                    events.bump();
+                    if let Ok(mut v) = views.lock() {
+                        v.clear();
+                    }
+                    skills.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    relist.run(&peer).await;
+                }
+                first = false;
+                let up = std::time::Instant::now();
+                let request = ClientRequest::CustomRequest(rmcp::model::CustomRequest::new(
+                    "subscriptions/listen",
+                    Some(params.clone()),
+                ));
+                let ended = match peer
+                    .send_request_with_option(request, PeerRequestOptions::no_options())
+                    .await
+                {
+                    Ok(handle) => handle.await_response().await.map(|_| ()),
+                    Err(e) => Err(e),
+                };
+                match ended {
+                    Err(ServiceError::TransportClosed) => return,
+                    Err(ServiceError::McpError(e)) if e.code.0 == -32601 => {
+                        tracing::debug!(%server, "no subscriptions/listen on this server");
+                        return;
+                    }
+                    other => {
+                        tracing::debug!(%server, ended = ?other, "subscriptions/listen ended; reopening");
+                    }
+                }
+                failures = if up.elapsed() >= Duration::from_secs(5) {
+                    0
+                } else {
+                    failures + 1
+                };
+                tokio::time::sleep(
+                    Duration::from_secs(1u64 << failures.min(5)).min(Duration::from_secs(30)),
+                )
+                .await;
+            }
+        });
+        if let Ok(mut slot) = self.listen.lock() {
+            *slot = Some(ListenGuard(task));
         }
     }
 
@@ -3041,7 +3159,7 @@ async fn connect_one_client(
             }
         }
     };
-    tokio::time::timeout(limit, dialing).await.map_err(|_| {
+    let dialed = tokio::time::timeout(limit, dialing).await.map_err(|_| {
         let target = match &config.transport {
             McpTransport::Stdio { command, .. } => format!("`{command}`"),
             McpTransport::Http { url, .. } => redact_url(url),
@@ -3050,7 +3168,14 @@ async fn connect_one_client(
             "MCP handshake to {target} timed out after {}s",
             limit.as_secs()
         )
-    })?
+    })??;
+    if let Some(info) = dialed.0.peer_info() {
+        dialed
+            .0
+            .service()
+            .start_listening(dialed.0.peer().clone(), &info);
+    }
+    Ok(dialed)
 }
 
 /// How long a grant connector gets to finish a handshake. Generous for a round trip to a service
@@ -3926,6 +4051,13 @@ impl McpCatalog {
             .upgrade()
             .ok_or_else(|| format!("mcp server `{server}` is no longer connected"))?;
         let client = conn.client().await?;
+        // What the server advertised under `capabilities.extensions` for MCP Events (SEP-3415).
+        let events = client.peer_info().and_then(|i| {
+            i.capabilities
+                .extensions
+                .clone()?
+                .remove(crate::tools::mcp_events::EVENTS_EXTENSION_ID)
+        });
         // Direct requests only for a stateless (`2026-07-28`) server. An older streamable-HTTP
         // server may bind requests to the `Mcp-Session-Id` rmcp negotiated — only rmcp's own
         // connection carries it — and it does not attach `_meta` to results, so rmcp's own path
@@ -3939,6 +4071,7 @@ impl McpCatalog {
                 router: client.service().events.clone(),
                 host: self.request_host(&client),
                 live: ClientHold(client),
+                events,
             });
         };
         let mut headers: Vec<(HeaderName, HeaderValue)> = Vec::new();
@@ -3972,6 +4105,7 @@ impl McpCatalog {
             router: client.service().events.clone(),
             headers,
             auth,
+            events,
             protocol_version: client
                 .peer_info()
                 .map(|i| i.protocol_version.to_string())
@@ -4016,6 +4150,9 @@ pub(crate) enum EventsPeer {
         /// The session the requests belong to (see [`EventsPeer::track_request`]).
         host: Arc<McpHost>,
         live: ClientHold,
+        /// The server's `io.modelcontextprotocol/events` capability settings; `None` when it did
+        /// not advertise the extension.
+        events: Option<rmcp::model::JsonObject>,
     },
     /// Streamable HTTP: where and how to POST `events/*` directly. `router` still carries
     /// `notifications/events/list_changed`, which arrives on rmcp's own connection.
@@ -4027,10 +4164,19 @@ pub(crate) enum EventsPeer {
         /// (see `mcp_oauth`).
         auth: Option<Arc<crate::tools::mcp_oauth::ServerAuth>>,
         protocol_version: String,
+        /// As on [`EventsPeer::Rmcp`].
+        events: Option<rmcp::model::JsonObject>,
     },
 }
 
 impl EventsPeer {
+    /// The server's advertised events capability settings (see the variants' `events`).
+    pub(crate) fn events_capability(&self) -> Option<&rmcp::model::JsonObject> {
+        match self {
+            Self::Rmcp { events, .. } | Self::Http { events, .. } => events.as_ref(),
+        }
+    }
+
     /// Register one `events/*` request as in flight for its session, for as long as the returned
     /// guard lives, so a nested request the server raises during it is attributed or refused like
     /// one raised during a `tools/call` (see `McpHandler::route`). `None` over direct HTTP, where

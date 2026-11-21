@@ -1,4 +1,4 @@
-//! MCP Events (draft): a stdio events server that crashes is dialed again by its poll subscription.
+//! MCP Events: a stdio events server that crashes is dialed again by its poll subscription.
 //! The subscription's next poll asks for the server's connection; handing back the dead client
 //! would leave a configured trigger silently dead until `serve` restarts.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

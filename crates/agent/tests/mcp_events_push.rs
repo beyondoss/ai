@@ -1,4 +1,4 @@
-//! MCP Events (draft) over **push** (`events/stream`), end to end, on both MCP transports: stdio
+//! MCP Events over **push** (`events/stream`), end to end, on both MCP transports: stdio
 //! (notifications interleaved on the server's stdout) and streamable HTTP (an SSE response that
 //! stays open). Also: `eventId` dedup under redelivery, explicit unsubscribe cancelling the stream,
 //! server-initiated termination, and what an event does while a run is busy.
@@ -199,7 +199,7 @@ fn push_over_streamable_http_reconnects_from_its_cursor_after_idle_and_honours_t
         .wait(Duration::from_secs(20), "the terminated status", |f| {
             f["type"] == "mcp_event_status" && f["kind"] == "terminated"
         });
-    assert_eq!(t["error"]["code"], -32012);
+    assert_eq!(t["error"]["code"], -32024);
     send(
         &mut s.stdin,
         json!({ "type": "mcp_events_list", "id": "l" }),
@@ -327,7 +327,7 @@ fn a_burst_that_overflows_the_stream_buffer_loses_nothing() {
 }
 
 /// The server changes the event type's schema in place and ends the stream with the draft's
-/// `-32014 {reason: schema_changed}`: the client re-fetches `events/list`, resubscribes, and
+/// `-32026 {reason: schema_changed}`: the client re-fetches `events/list`, resubscribes, and
 /// delivery continues.
 #[test]
 fn a_schema_change_termination_rediscovers_and_resubscribes() {
