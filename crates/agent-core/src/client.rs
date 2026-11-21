@@ -262,6 +262,35 @@ impl Credential {
 #[async_trait]
 pub trait CredentialSource: Send + Sync {
     async fn credential(&self) -> Result<Credential>;
+
+    /// The provider answered a request made with `token` (the key [`credential`](Self::credential)
+    /// returned) with a 401. A source that caches a token drops it here if it still holds `token`, and
+    /// makes the next `credential()` refresh it if the store still holds it too; the client then asks
+    /// for a credential once more and retries the request once with it (see `GatewayClient::stream`).
+    /// The default does nothing: a static key has nothing to refresh, and a retry with the same key is
+    /// skipped. A wrapper source must forward this to the source it wraps.
+    fn rejected(&self, _token: &str) {}
+}
+
+/// Why `send_with_retry` gave up: a 401 is told apart so the caller can ask the credential source for
+/// a fresh token and retry once; every other failure is final.
+enum SendError {
+    Unauthorized(Error),
+    Other(Error),
+}
+
+impl From<Error> for SendError {
+    fn from(e: Error) -> Self {
+        SendError::Other(e)
+    }
+}
+
+impl SendError {
+    fn into_error(self) -> Error {
+        match self {
+            SendError::Unauthorized(e) | SendError::Other(e) => e,
+        }
+    }
 }
 
 /// The default source: a single string fixed for the client's lifetime — what
@@ -826,6 +855,7 @@ impl GatewayClient {
 
         let tools_for_decoder = req.tools.clone();
         let http = self.http.clone();
+        let credential_source = self.credential_source.clone();
         let max_retries = self.max_retries;
         let base_backoff = self.base_backoff;
         let max_backoff = self.max_backoff;
@@ -878,29 +908,52 @@ impl GatewayClient {
             // is re-issued with backoff, each retry reported to `retries`. We do *not* retry once events have started flowing — a
             // mid-stream drop would replay partial output — so that surfaces as a transport error the
             // loop handles instead (see `Agent::run_events`).
-            let resp = send_with_retry(
-                &http,
-                &url,
-                credential.key.expose(),
-                body,
-                is_codex_sse_fallback,
-                is_anthropic,
-                is_oauth,
-                needs_interleaved_beta,
-                needs_fine_grained_tool_streaming_beta,
-                session_affinity_header.as_deref(),
-                send_x_session_affinity,
-                &direct_headers,
-                copilot_dynamic,
-                auth_header.as_deref(),
-                auth_header_prefix.as_deref(),
-                max_retries,
-                base_backoff,
-                max_backoff,
-                &extra_headers,
-                retries.as_ref(),
-            )
-            .await?;
+            // A 401 is the one failure retried here with a different credential: the provider did not
+            // process the request, and nothing has been yielded yet (this runs before the first byte
+            // of the response), so a retry cannot repeat visible output. The source is told which
+            // token was rejected, asked again, and the request goes out once more with the token it
+            // returns, only if that differs from the rejected one; a second 401 is the error. Only the
+            // key is swapped: the route, headers and body were built from the first credential.
+            let mut key = credential.key.clone();
+            let mut rejected_once = false;
+            let resp = loop {
+                match send_with_retry(
+                    &http,
+                    &url,
+                    key.expose(),
+                    body.clone(),
+                    is_codex_sse_fallback,
+                    is_anthropic,
+                    is_oauth,
+                    needs_interleaved_beta,
+                    needs_fine_grained_tool_streaming_beta,
+                    session_affinity_header.as_deref(),
+                    send_x_session_affinity,
+                    &direct_headers,
+                    copilot_dynamic,
+                    auth_header.as_deref(),
+                    auth_header_prefix.as_deref(),
+                    max_retries,
+                    base_backoff,
+                    max_backoff,
+                    &extra_headers,
+                    retries.as_ref(),
+                )
+                .await
+                {
+                    Ok(resp) => break resp,
+                    Err(SendError::Unauthorized(e)) if !rejected_once => {
+                        rejected_once = true;
+                        credential_source.rejected(key.expose());
+                        let fresh = credential_source.credential().await?;
+                        if fresh.key.expose() == key.expose() {
+                            Err(e)?;
+                        }
+                        key = fresh.key;
+                    }
+                    Err(e) => Err(e.into_error())?,
+                }
+            };
 
             // Observability seam (Task #14, pi-parity: pi's real `onResponse`,
             // `packages/coding-agent/src/core/sdk.ts:340-346`, wired to the `"after_provider_response"`
@@ -1221,7 +1274,7 @@ async fn send_with_retry(
     extra_headers: &HashMap<String, String>,
     // Where each retry made here is reported as it starts its wait, so the agent loop can show it.
     retries: Option<&RetryReporter>,
-) -> Result<reqwest::Response> {
+) -> std::result::Result<reqwest::Response, SendError> {
     let report = |attempt: u32, delay: Duration, message: String| {
         if let Some(tx) = retries {
             // The receiver is gone only when the caller stopped listening; the retry goes ahead.
@@ -1335,7 +1388,7 @@ async fn send_with_retry(
         // name collision" contract.
         let mut request = match builder.build() {
             Ok(request) => request,
-            Err(e) => return Err(Error::Transport(e.to_string())),
+            Err(e) => return Err(Error::Transport(e.to_string()).into()),
         };
         for (name, value) in extra_headers {
             if let (Ok(header_name), Ok(header_value)) = (
@@ -1386,7 +1439,7 @@ async fn send_with_retry(
                             describe_error_body(&detail)
                         ),
                     };
-                    return Err(Error::Transport(msg));
+                    return Err(Error::Transport(msg).into());
                 }
                 // A live 401 (the key was rejected, as opposed to `run`/`serve`'s own preflight "no key
                 // given at all" check, which this can't be — a request only reaches here with *some* key
@@ -1395,12 +1448,12 @@ async fn send_with_retry(
                 // one (a direct provider route dials the provider itself); `who` names whichever host
                 // actually answered.
                 if status.as_u16() == 401 {
-                    return Err(Error::Transport(format!(
+                    return Err(SendError::Unauthorized(Error::Transport(format!(
                         "{who} rejected the request as unauthorized (401) — the API key being used \
                          is missing, invalid, expired, or lacks permission for this model; check the \
                          key and try again. Upstream detail: {}",
                         describe_error_body(&detail)
-                    )));
+                    ))));
                 }
                 // The server's wait hint dies with the response headers, so write it into the error:
                 // the turn-level rate-limit retry (`agent::run_turn`, `rate_limit::retry_hint`) reads
@@ -1412,7 +1465,8 @@ async fn send_with_retry(
                 return Err(Error::Transport(format!(
                     "{who} returned {status}{hint}: {}",
                     describe_error_body(&detail)
-                )));
+                ))
+                .into());
             }
             Err(e) => {
                 // Connection-level failures (refused, reset, timed out) are exactly the transient
@@ -1424,7 +1478,7 @@ async fn send_with_retry(
                     futures_timer::Delay::new(wait).await;
                     continue;
                 }
-                return Err(Error::Transport(e.to_string()));
+                return Err(Error::Transport(e.to_string()).into());
             }
         }
     }

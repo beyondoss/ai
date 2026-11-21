@@ -545,6 +545,16 @@ impl CredentialSource for CopilotRoutedCredentialSource {
         let credential = self.inner.credential().await?;
         Ok(credential.with_direct_routing(self.current_routing()))
     }
+
+    fn rejected(&self, token: &str) {
+        self.inner.rejected(token);
+        // The routing was derived from the rejected token; re-derive it from whatever the store holds
+        // once `inner` has refreshed.
+        *self
+            .cached_routing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
 }
 
 #[derive(Deserialize)]

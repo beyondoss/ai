@@ -258,6 +258,19 @@ impl AuthStore {
         provider: &str,
         refresh: impl FnOnce(&OAuthCredential) -> std::result::Result<OAuthCredential, String>,
     ) -> std::result::Result<OAuthCredential, AuthError> {
+        self.refreshed_rejecting(provider, None, refresh)
+    }
+
+    /// [`refreshed`](Self::refreshed), also refreshing a not-yet-expired credential whose access
+    /// token is `rejected`: the provider answered it with a 401, so its stated expiry is wrong. The
+    /// check is made under the lock against the fresh read, so a token another process already
+    /// replaced is used as it stands and the refresh token is spent once, not once per process.
+    pub fn refreshed_rejecting(
+        &mut self,
+        provider: &str,
+        rejected: Option<&str>,
+        refresh: impl FnOnce(&OAuthCredential) -> std::result::Result<OAuthCredential, String>,
+    ) -> std::result::Result<OAuthCredential, AuthError> {
         let _lock = crate::file_lock::lock_store_file(&self.path)?;
         let mut raw = crate::store_file::read_object_for_write(&self.path)?;
         let mut credentials = parse_credentials(&raw);
@@ -267,7 +280,8 @@ impl AuthStore {
             return Err(AuthError::NotLoggedIn);
         };
 
-        if !stored.credential.is_expired(now_ms()) {
+        let is_rejected = rejected.is_some_and(|r| stored.credential.access() == r);
+        if !is_rejected && !stored.credential.is_expired(now_ms()) {
             // Another process (or an earlier caller) already refreshed since our last read.
             let current = stored.credential.clone();
             self.credentials = credentials;

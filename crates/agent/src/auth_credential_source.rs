@@ -27,13 +27,60 @@ struct RefreshFailure {
     backoff: Duration,
 }
 
+/// The identity of the store file at one moment, from a single `stat`. `AuthStore` writes by
+/// temp-file-and-rename, so every write gives the path a new inode; size, mtime and ctime (both to
+/// the nanosecond) also catch a write made in place. A missing file is `None`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct StoreStamp {
+    #[cfg(unix)]
+    ids: (u64, u64, i64, i64),
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl StoreStamp {
+    fn of(path: &std::path::Path) -> Option<Self> {
+        let meta = std::fs::metadata(path).ok()?;
+        #[cfg(unix)]
+        let ids = {
+            use std::os::unix::fs::MetadataExt;
+            (meta.dev(), meta.ino(), meta.ctime(), meta.ctime_nsec())
+        };
+        Some(Self {
+            #[cfg(unix)]
+            ids,
+            len: meta.len(),
+            modified: meta.modified().ok(),
+        })
+    }
+}
+
+/// The token the last credential fetch returned, and the store file it was read from.
+struct Cached {
+    access: String,
+    expires_at_ms: i64,
+    /// Taken before the store was read, so a write racing the read makes the cache look stale, never
+    /// fresh.
+    stamp: StoreStamp,
+}
+
 /// Resolves a live, non-expired access token immediately before each request.
+///
+/// The on-disk store is the source of truth; `cached` is a copy of it. The copy is used only while
+/// the store file is unchanged since it was filled (one `stat`, no read) and the provider has not
+/// rejected the token ([`rejected`](agent_core::client::CredentialSource::rejected)).
 pub struct OAuthCredentialSource {
     provider: OAuthProviderId,
     store_path: PathBuf,
     /// In-memory fast path: avoids a disk read + cross-process file lock on the overwhelmingly
-    /// common case where the last-fetched token is still valid.
-    cached: Mutex<Option<(String, i64)>>,
+    /// common case where the store is unchanged and its token still valid.
+    cached: Mutex<Option<Cached>>,
+    /// A token the provider answered with 401. While the store still holds it, the next fetch
+    /// refreshes it even though its expiry says it is live.
+    rejected: Mutex<Option<String>>,
+    /// How many times a fetch left the fast path (test-only: proves the fast path reads nothing).
+    #[cfg(test)]
+    slow_paths: std::sync::atomic::AtomicUsize,
     /// The last refresh failure, while its backoff stands. Cleared by a successful refresh, and
     /// bypassed when the store holds a live token again (another process refreshed, or `login`).
     failed: Mutex<Option<RefreshFailure>>,
@@ -47,6 +94,9 @@ impl OAuthCredentialSource {
             provider,
             store_path,
             cached: Mutex::new(None),
+            rejected: Mutex::new(None),
+            #[cfg(test)]
+            slow_paths: std::sync::atomic::AtomicUsize::new(0),
             failed: Mutex::new(None),
             first_backoff: FIRST_BACKOFF,
             refresh: Arc::new(|cred| {
@@ -70,9 +120,14 @@ impl OAuthCredentialSource {
             f.message.clone()
         };
         let stored = AuthStore::open(self.store_path.clone());
-        let live = stored
-            .get(self.provider.store_key())
-            .is_none_or(|s| !s.credential.is_expired(now_ms()));
+        let rejected = self
+            .rejected
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let live = stored.get(self.provider.store_key()).is_none_or(|s| {
+            !s.credential.is_expired(now_ms()) && rejected.as_deref() != Some(s.credential.access())
+        });
         (!live).then_some(agent_core::Error::Transport(message))
     }
 }
@@ -80,12 +135,23 @@ impl OAuthCredentialSource {
 #[async_trait]
 impl agent_core::client::CredentialSource for OAuthCredentialSource {
     async fn credential(&self) -> agent_core::Result<agent_core::client::Credential> {
-        let now = now_ms();
-        if let Some((access, expires_at_ms)) = cached_snapshot(&self.cached)
-            && now < expires_at_ms
+        // One `stat`, before anything is read: the stamp a refill below stores is never newer than
+        // what it read.
+        let stamp = StoreStamp::of(&self.store_path);
         {
-            return Ok(agent_core::client::Credential::new(access, true));
+            let mut cached = self.cached.lock().unwrap_or_else(|e| e.into_inner());
+            match cached.as_ref() {
+                Some(c) if Some(c.stamp) == stamp && now_ms() < c.expires_at_ms => {
+                    return Ok(agent_core::client::Credential::new(c.access.clone(), true));
+                }
+                // Changed (login or logout elsewhere, a refresh by another process), gone, or
+                // expired: the copy is not used again.
+                _ => *cached = None,
+            }
         }
+        #[cfg(test)]
+        self.slow_paths
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         if let Some(e) = self.standing_failure(Instant::now()) {
             return Err(e);
@@ -94,6 +160,11 @@ impl agent_core::client::CredentialSource for OAuthCredentialSource {
         let provider = self.provider;
         let store_path = self.store_path.clone();
         let refresh = self.refresh.clone();
+        let rejected = self
+            .rejected
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         // `AuthStore::refreshed` holds a cross-process file lock across the *entire* refresh
         // (including the network call — see that method's doc comment for why), which can block for
         // up to several seconds under contention. That must not run directly on a tokio worker
@@ -101,7 +172,9 @@ impl agent_core::client::CredentialSource for OAuthCredentialSource {
         // `serve/persistence.rs`'s `persist_blocking` for an analogous blocking-write concern.
         let refreshed = tokio::task::spawn_blocking(move || {
             let mut store = AuthStore::open(store_path);
-            store.refreshed(provider.store_key(), |cred| refresh(cred))
+            store.refreshed_rejecting(provider.store_key(), rejected.as_deref(), |cred| {
+                refresh(cred)
+            })
         })
         .await
         .map_err(|e| {
@@ -139,14 +212,34 @@ impl agent_core::client::CredentialSource for OAuthCredentialSource {
 
         let access = credential.access().to_string();
         let expires_at_ms = credential.expires_at_ms();
-        *self.cached.lock().unwrap_or_else(|e| e.into_inner()) =
-            Some((access.clone(), expires_at_ms));
+        // The token the store handed back is not the rejected one (or the refresh would have
+        // replaced it); the rejection is spent.
+        {
+            let mut rejected = self.rejected.lock().unwrap_or_else(|e| e.into_inner());
+            if rejected.as_deref() != Some(access.as_str()) {
+                *rejected = None;
+            }
+        }
+        // No stamp (the file vanished again) means nothing is cached.
+        if let Some(stamp) = stamp {
+            *self.cached.lock().unwrap_or_else(|e| e.into_inner()) = Some(Cached {
+                access: access.clone(),
+                expires_at_ms,
+                stamp,
+            });
+        }
         Ok(agent_core::client::Credential::new(access, true))
     }
-}
 
-fn cached_snapshot(cached: &Mutex<Option<(String, i64)>>) -> Option<(String, i64)> {
-    cached.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    fn rejected(&self, token: &str) {
+        let mut cached = self.cached.lock().unwrap_or_else(|e| e.into_inner());
+        // A different cached token is a newer one (another request already refreshed): keep it.
+        if cached.as_ref().is_some_and(|c| c.access != token) {
+            return;
+        }
+        *cached = None;
+        *self.rejected.lock().unwrap_or_else(|e| e.into_inner()) = Some(token.to_string());
+    }
 }
 
 fn now_ms() -> i64 {
@@ -179,21 +272,6 @@ mod tests {
             }
             other => panic!("expected Transport error, got {other:?}"),
         }
-    }
-
-    #[tokio::test]
-    async fn a_cached_non_expired_token_never_touches_the_store() {
-        let dir = tempfile::tempdir().unwrap();
-        // A directory, not a file — any attempt to `AuthStore::open`/read this path would misbehave;
-        // proves the cached fast path genuinely skips storage entirely.
-        let bogus_path = dir.path().join("not-a-real-file").join("auth.json");
-        let source = OAuthCredentialSource::new(OAuthProviderId::Anthropic, bogus_path);
-        *source.cached.lock().unwrap() = Some(("cached-token".to_string(), now_ms() + 3_600_000));
-
-        let credential = source.credential().await.unwrap();
-        // `Credential`'s fields are private; the only externally observable proof available here is
-        // that no error occurred despite a store path that would fail to open for a real read.
-        drop(credential);
     }
 
     fn expired_store(dir: &tempfile::TempDir) -> PathBuf {
@@ -279,5 +357,254 @@ mod tests {
             .unwrap();
         source.credential().await.expect("the live token is used");
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    use crate::oauth::anthropic::AnthropicCredential;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+
+    fn anthropic(access: &str, refresh: &str) -> OAuthCredential {
+        OAuthCredential::Anthropic(AnthropicCredential {
+            access: access.into(),
+            refresh: refresh.into(),
+            expires_at_ms: now_ms() + 3_600_000,
+        })
+    }
+
+    /// A source over a store holding a live `old` token, whose refresh call hands out `new` and
+    /// counts itself.
+    fn live_source(dir: &tempfile::TempDir) -> (OAuthCredentialSource, PathBuf, Arc<AtomicUsize>) {
+        let path = dir.path().join("auth.json");
+        AuthStore::open(path.clone())
+            .set("anthropic", anthropic("old", "r"))
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let mut source = OAuthCredentialSource::new(OAuthProviderId::Anthropic, path.clone());
+        source.refresh = Arc::new(move |_| {
+            counted.fetch_add(1, SeqCst);
+            Ok(anthropic("new", "r2"))
+        });
+        (source, path, calls)
+    }
+
+    async fn token(source: &OAuthCredentialSource) -> agent_core::Result<String> {
+        // `Credential`'s key is private to agent_core; a successful fetch leaves the token it
+        // returned in the cache.
+        source.credential().await?;
+        let cached = source.cached.lock().unwrap();
+        Ok(cached
+            .as_ref()
+            .expect("a fetch fills the cache")
+            .access
+            .clone())
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_store_is_served_from_the_cache_without_a_read_or_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, _path, calls) = live_source(&dir);
+        assert_eq!(token(&source).await.unwrap(), "old");
+        let after_fill = source.slow_paths.load(SeqCst);
+        for _ in 0..5 {
+            assert_eq!(token(&source).await.unwrap(), "old");
+        }
+        assert_eq!(source.slow_paths.load(SeqCst), after_fill, "no slow path");
+        assert_eq!(calls.load(SeqCst), 0, "no refresh");
+    }
+
+    #[tokio::test]
+    async fn a_logout_in_another_process_is_not_served_from_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, path, calls) = live_source(&dir);
+        assert_eq!(token(&source).await.unwrap(), "old");
+        AuthStore::open(path).remove("anthropic").unwrap();
+        let err = token(&source).await.expect_err("logged out");
+        assert!(format!("{err}").contains("login anthropic"), "got: {err}");
+        assert_eq!(calls.load(SeqCst), 0, "no network call");
+    }
+
+    #[tokio::test]
+    async fn a_deleted_store_file_is_not_served_from_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, path, calls) = live_source(&dir);
+        assert_eq!(token(&source).await.unwrap(), "old");
+        std::fs::remove_file(path).unwrap();
+        assert!(token(&source).await.is_err());
+        assert_eq!(calls.load(SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_login_in_another_process_replaces_the_cached_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, path, calls) = live_source(&dir);
+        assert_eq!(token(&source).await.unwrap(), "old");
+        AuthStore::open(path)
+            .set("anthropic", anthropic("relogged", "r3"))
+            .unwrap();
+        assert_eq!(token(&source).await.unwrap(), "relogged");
+        assert_eq!(calls.load(SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_token_is_refreshed_even_though_its_expiry_is_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, _path, calls) = live_source(&dir);
+        assert_eq!(token(&source).await.unwrap(), "old");
+        source.rejected("old");
+        assert_eq!(token(&source).await.unwrap(), "new");
+        assert_eq!(calls.load(SeqCst), 1);
+        // The refreshed token is cached again, and not refreshed twice.
+        assert_eq!(token(&source).await.unwrap(), "new");
+        assert_eq!(token(&source).await.unwrap(), "new");
+        assert_eq!(calls.load(SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_rejection_of_a_token_already_replaced_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, _path, calls) = live_source(&dir);
+        assert_eq!(token(&source).await.unwrap(), "old");
+        source.rejected("some-older-token");
+        assert_eq!(token(&source).await.unwrap(), "old");
+        assert_eq!(calls.load(SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn another_process_having_refreshed_the_rejected_token_is_used_not_refreshed_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, path, calls) = live_source(&dir);
+        assert_eq!(token(&source).await.unwrap(), "old");
+        AuthStore::open(path)
+            .set("anthropic", anthropic("theirs", "r3"))
+            .unwrap();
+        source.rejected("old");
+        assert_eq!(token(&source).await.unwrap(), "theirs");
+        assert_eq!(calls.load(SeqCst), 0);
+    }
+
+    /// A provider that answers 401 to the token in `reject` and 200 to any other, recording the
+    /// bearer of every request it gets.
+    struct FakeProvider {
+        addr: std::net::SocketAddr,
+        seen: Arc<Mutex<Vec<String>>>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl FakeProvider {
+        fn start(reject: &'static [&'static str]) -> Self {
+            use std::io::{Read, Write};
+            let listener = beyond_test_support::ports::listener();
+            listener.set_nonblocking(true).unwrap();
+            let addr = listener.local_addr().unwrap();
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (seen2, stop2) = (seen.clone(), stop.clone());
+            let thread = std::thread::spawn(move || {
+                while !stop2.load(SeqCst) {
+                    let Ok((mut conn, _)) = listener.accept() else {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    };
+                    conn.set_nonblocking(false).unwrap();
+                    conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let end = loop {
+                        let n = conn.read(&mut chunk).unwrap();
+                        buf.extend_from_slice(&chunk[..n]);
+                        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break i + 4;
+                        }
+                        assert!(n > 0, "connection closed mid-headers");
+                    };
+                    let head = String::from_utf8_lossy(&buf[..end]).to_lowercase();
+                    let len = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length: "))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    while buf.len() < end + len {
+                        let n = conn.read(&mut chunk).unwrap();
+                        assert!(n > 0, "connection closed mid-body");
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    let bearer = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("authorization: bearer "))
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    let response: &[u8] = if reject.contains(&bearer.as_str()) {
+                        b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+                    } else {
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
+                    };
+                    seen2.lock().unwrap().push(bearer);
+                    let _ = conn.write_all(response);
+                }
+            });
+            Self {
+                addr,
+                seen,
+                stop,
+                thread: Some(thread),
+            }
+        }
+
+        fn seen(&self) -> Vec<String> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for FakeProvider {
+        fn drop(&mut self) {
+            self.stop.store(true, SeqCst);
+            if let Some(t) = self.thread.take() {
+                let _ = t.join();
+            }
+        }
+    }
+
+    async fn drain(
+        source: Arc<OAuthCredentialSource>,
+        provider: &FakeProvider,
+    ) -> agent_core::Result<()> {
+        use agent_core::ModelTransport as _;
+        use futures::StreamExt;
+        let client = agent_core::client::GatewayClient::with_credential_source(
+            format!("http://{}", provider.addr),
+            source,
+        )
+        .unwrap();
+        let req = agent_core::ModelRequest::new("claude-test", Vec::new(), 100);
+        let mut events = client.stream(req).await?;
+        while let Some(ev) = events.next().await {
+            ev?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_401_refreshes_the_token_and_the_request_is_retried_once_with_the_new_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, _path, calls) = live_source(&dir);
+        let provider = FakeProvider::start(&["old"]);
+        drain(Arc::new(source), &provider)
+            .await
+            .expect("retry succeeds");
+        assert_eq!(provider.seen(), ["old", "new"]);
+        assert_eq!(calls.load(SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn two_401s_are_one_retry_then_the_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, _path, calls) = live_source(&dir);
+        let provider = FakeProvider::start(&["old", "new"]);
+        let err = drain(Arc::new(source), &provider).await.expect_err("401");
+        assert!(format!("{err}").contains("401"), "got: {err}");
+        assert_eq!(provider.seen(), ["old", "new"], "exactly one retry");
+        assert_eq!(calls.load(SeqCst), 1);
     }
 }
