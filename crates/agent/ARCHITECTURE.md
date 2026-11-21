@@ -6986,6 +6986,17 @@ and writes through; `rmcp` itself calls `save()` after both the initial token ex
 refresh, so persistence is a side effect of driving the manager, not something this crate's own code
 does explicitly.
 
+**A login belongs to one server URL.** The spec forbids sending a token to any server other than the
+one it was issued for, and the name is only a label: a trusted project's `.mcp.json` can point the same
+name at another host. So each entry also records the canonical URL (`canonical_resource`: no fragment,
+no trailing `/` on a bare origin) it was logged in for, as a `resource` key beside the credential's own
+fields (`StoredCredentials` has no such field and ignores the extra one). `scoped(name, url)` stamps it
+on every save, and its `load` yields nothing for an entry stamped with another URL or none.
+`McpAuthStore::binding(name, url)` says which it is (`Binding`), and `ServerAuth::load` refuses to use
+or refresh anything but `Bound`: it warns with a message naming `agent mcp-login <name>` and sends no
+token. An entry from before this binding has no resource and is refused the same way, so each existing
+login needs one fresh `mcp-login`.
+
 **CLI**: `agent mcp-login <name>` (blocks in-terminal, prints the authorization URL, waits on a local
 callback) — `name` must already be a configured `http`-transport `mcp_servers` entry. Unlike `agent
 login`'s three providers, each pre-registered against one _fixed_ callback port, `mcp-login` picks a
@@ -6996,6 +7007,16 @@ own PKCE flows use) for the actual wait; the CSRF `state` value needed to valida
 extracted directly from the authorization URL `AuthorizationSession` generates (it doesn't otherwise
 expose the raw token) rather than threaded through as a separate return value. `agent mcp-logout <name>`
 removes the stored credential; idempotent, matching `agent logout`.
+
+**Discovery and refusals in `mcp-login`** (`commands/auth.rs`). The server is first sent an unauthenticated
+`initialize`; a 401's `Bearer` challenge goes to rmcp's `resolve_metadata_from_challenge`, which tries the
+challenge's `resource_metadata` first, then the well-known URIs, and seeds scope selection with the
+challenge's `scope` (then `scopes_supported`). The login is refused, before any URL is printed, when
+(a) nothing was discovered — rmcp would otherwise guess `/authorize`, `/token`, `/register` on the base
+URL with no issuer, which skips the RFC 9207 `iss` check — or (b) the authorization server's metadata
+does not list `S256` in `code_challenge_methods_supported` (spec "Authorization Code Protection": a
+client MUST refuse; rmcp only warns). Step-up on a 403 `insufficient_scope` is not implemented: the
+403 reaches the model as the server's text.
 
 **`tools::mcp::connect_http`'s consumption side**: before connecting, checks
 `McpAuthStore::has_credential` for the server's name — a plain file-existence check, so the common case

@@ -24,7 +24,66 @@ use crate::settings::config_dir_root;
 /// login (there's no way to know the old and new names refer to "the same" server) — an accepted,
 /// narrow limitation, not a bug: re-running `agent mcp-login <new-name>` is a one-time cost.
 #[derive(Default)]
-struct OnDisk(BTreeMap<String, StoredCredentials>);
+struct OnDisk(BTreeMap<String, Entry>);
+
+/// One server's stored login and the resource it was issued for (`None`: an entry written before
+/// credentials were bound to a resource, or by hand — unbound, and never used).
+struct Entry {
+    credential: StoredCredentials,
+    resource: Option<String>,
+}
+
+/// The key beside the credential's own fields that records its resource. `StoredCredentials` has
+/// no such field and ignores unknown ones, so it rides along in the same JSON object.
+const RESOURCE_KEY: &str = "resource";
+
+/// The canonical form of an MCP server URL as the RFC 8707 `resource` a token is bound to: the
+/// URL without its fragment, and without a trailing `/` on a bare origin. A string that is not a
+/// URL is kept as it is (it can then only match itself).
+pub fn canonical_resource(url: &str) -> String {
+    match url::Url::parse(url) {
+        Ok(mut u) => {
+            u.set_fragment(None);
+            let s = u.to_string();
+            if u.path() == "/" && u.query().is_none() {
+                s.trim_end_matches('/').to_owned()
+            } else {
+                s
+            }
+        }
+        Err(_) => url.to_owned(),
+    }
+}
+
+/// Whether a stored login may be used for a server at a given URL.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Binding {
+    /// Nothing is stored under the name.
+    NoLogin,
+    /// Stored for this URL.
+    Bound,
+    /// Stored with no resource: from before logins were bound, so no URL can be shown to match.
+    Unbound,
+    /// Stored for another URL (`stored`): the name now points somewhere else.
+    Mismatch { stored: String },
+}
+
+impl Binding {
+    /// The refusal to show for a login that exists but must not be used for `server`, or `None`.
+    pub fn refusal(&self, server: &str) -> Option<String> {
+        let why = match self {
+            Self::NoLogin | Self::Bound => return None,
+            Self::Unbound => "its stored login is not bound to a server URL".to_owned(),
+            Self::Mismatch { stored } => {
+                format!("its stored login was issued for {stored}, not this server's URL")
+            }
+        };
+        Some(format!(
+            "mcp server `{server}`: {why}, so it is not sent; run `{} mcp-login {server}` again",
+            crate::PROGRAM
+        ))
+    }
+}
 
 /// A persisted MCP OAuth credential store, one per machine (`~/.beyond/mcp_auth.json`).
 pub struct McpAuthStore {
@@ -44,10 +103,29 @@ impl McpAuthStore {
     /// `AuthorizationManager` actually reads and writes through once
     /// [`AuthorizationManager::set_credential_store`](rmcp::transport::auth::AuthorizationManager::set_credential_store)
     /// is given one of these.
-    pub fn scoped(&self, server_name: &str) -> ScopedMcpCredentialStore {
+    ///
+    /// The login belongs to `server_url`: a save records it, and a load of an entry recorded for
+    /// another URL (or none) yields nothing, so a token is never handed to a different server.
+    pub fn scoped(&self, server_name: &str, server_url: &str) -> ScopedMcpCredentialStore {
         ScopedMcpCredentialStore {
             path: self.path.clone(),
             server_name: server_name.to_string(),
+            resource: canonical_resource(server_url),
+        }
+    }
+
+    /// Whether `server_name`'s stored login may be used for the server at `server_url`.
+    pub fn binding(&self, server_name: &str, server_url: &str) -> Binding {
+        match read_store_file(&self.path).0.get(server_name) {
+            None => Binding::NoLogin,
+            Some(Entry { resource: None, .. }) => Binding::Unbound,
+            Some(Entry {
+                resource: Some(stored),
+                ..
+            }) if *stored != canonical_resource(server_url) => Binding::Mismatch {
+                stored: stored.clone(),
+            },
+            Some(_) => Binding::Bound,
         }
     }
 
@@ -72,6 +150,8 @@ impl McpAuthStore {
 pub struct ScopedMcpCredentialStore {
     path: PathBuf,
     server_name: String,
+    /// The canonical URL of the server this store is for (see [`canonical_resource`]).
+    resource: String,
 }
 
 #[async_trait::async_trait]
@@ -81,8 +161,13 @@ impl CredentialStore for ScopedMcpCredentialStore {
         // `auth_credential_source.rs` applies for `AuthStore`) so it can't stall the reactor.
         let path = self.path.clone();
         let server_name = self.server_name.clone();
+        let resource = self.resource.clone();
         crate::blocking::spawn(crate::blocking::Site::Store, move || {
-            read_store_file(&path).0.get(&server_name).cloned()
+            read_store_file(&path)
+                .0
+                .remove(&server_name)
+                .filter(|e| e.resource.as_deref() == Some(resource.as_str()))
+                .map(|e| e.credential)
         })
         .await
         .map_err(|e| AuthError::InternalError(e.to_string()))
@@ -93,8 +178,12 @@ impl CredentialStore for ScopedMcpCredentialStore {
         // `LOCK_TIMEOUT` under contention — never on a tokio worker; hand it to `spawn_blocking`.
         let path = self.path.clone();
         let server_name = self.server_name.clone();
+        let resource = self.resource.clone();
         crate::blocking::spawn(crate::blocking::Site::Store, move || {
-            let value = serde_json::to_value(&credentials).map_err(std::io::Error::other)?;
+            let mut value = serde_json::to_value(&credentials).map_err(std::io::Error::other)?;
+            if let Some(object) = value.as_object_mut() {
+                object.insert(RESOURCE_KEY.to_owned(), resource.into());
+            }
             mutate_locked(&path, |raw| {
                 raw.insert(server_name, value);
                 true
@@ -152,7 +241,17 @@ fn parse_entries(raw: &serde_json::Map<String, serde_json::Value>) -> OnDisk {
     for (name, value) in raw {
         match StoredCredentials::deserialize(value) {
             Ok(credential) => {
-                store.0.insert(name.clone(), credential);
+                let resource = value
+                    .get(RESOURCE_KEY)
+                    .and_then(|r| r.as_str())
+                    .map(str::to_owned);
+                store.0.insert(
+                    name.clone(),
+                    Entry {
+                        credential,
+                        resource,
+                    },
+                );
             }
             Err(e) => {
                 tracing::warn!(server = %name, error = %e, "could not parse a stored MCP credential, skipping");
@@ -196,6 +295,8 @@ mod tests {
         }
     }
 
+    const URL: &str = "http://127.0.0.1:1/mcp";
+
     fn fake_credential(client_id: &str) -> StoredCredentials {
         StoredCredentials::new(client_id.to_string(), None, vec![], None)
     }
@@ -220,12 +321,60 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
+    /// A login is usable only for the URL it was saved for; one saved before logins were bound
+    /// (no resource) is usable for none.
+    #[tokio::test]
+    async fn a_login_is_bound_to_the_url_it_was_saved_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_at(dir.path());
+        store
+            .scoped("fixture", URL)
+            .save(fake_credential("c"))
+            .await
+            .unwrap();
+        assert_eq!(store.binding("fixture", URL), Binding::Bound);
+        assert_eq!(
+            store.binding("fixture", "http://127.0.0.1:1/mcp#frag"),
+            Binding::Bound
+        );
+        let other = "http://127.0.0.1:2/mcp";
+        assert_eq!(
+            store.binding("fixture", other),
+            Binding::Mismatch { stored: URL.into() }
+        );
+        assert!(
+            store
+                .scoped("fixture", other)
+                .load()
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.scoped("fixture", URL).load().await.unwrap().is_some());
+        assert_eq!(store.binding("absent", URL), Binding::NoLogin);
+
+        let legacy = serde_json::to_value(fake_credential("old")).unwrap();
+        mutate_locked(&store.path, |raw| {
+            raw.insert("legacy".into(), legacy);
+            true
+        })
+        .unwrap();
+        assert_eq!(store.binding("legacy", URL), Binding::Unbound);
+        assert!(store.scoped("legacy", URL).load().await.unwrap().is_none());
+        assert!(
+            Binding::Unbound
+                .refusal("legacy")
+                .unwrap()
+                .contains("mcp-login legacy")
+        );
+    }
+
     #[tokio::test]
     async fn missing_store_file_has_no_credential_for_any_server() {
         let dir = tempfile::tempdir().unwrap();
         let store = store_at(dir.path());
         assert!(!store.has_credential("fixture"));
-        assert!(store.scoped("fixture").load().await.unwrap().is_none());
+        assert!(store.scoped("fixture", URL).load().await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -233,13 +382,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = store_at(dir.path());
         store
-            .scoped("fixture")
+            .scoped("fixture", URL)
             .save(fake_credential("client-1"))
             .await
             .unwrap();
 
         assert!(store.has_credential("fixture"));
-        let loaded = store.scoped("fixture").load().await.unwrap().unwrap();
+        let loaded = store.scoped("fixture", URL).load().await.unwrap().unwrap();
         assert_eq!(loaded.client_id, "client-1");
     }
 
@@ -248,19 +397,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = store_at(dir.path());
         store
-            .scoped("alpha")
+            .scoped("alpha", URL)
             .save(fake_credential("alpha-client"))
             .await
             .unwrap();
         store
-            .scoped("beta")
+            .scoped("beta", URL)
             .save(fake_credential("beta-client"))
             .await
             .unwrap();
 
         assert_eq!(
             store
-                .scoped("alpha")
+                .scoped("alpha", URL)
                 .load()
                 .await
                 .unwrap()
@@ -270,7 +419,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .scoped("beta")
+                .scoped("beta", URL)
                 .load()
                 .await
                 .unwrap()
@@ -278,7 +427,7 @@ mod tests {
                 .client_id,
             "beta-client"
         );
-        assert!(store.scoped("gamma").load().await.unwrap().is_none());
+        assert!(store.scoped("gamma", URL).load().await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -286,12 +435,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = store_at(dir.path());
         store
-            .scoped("alpha")
+            .scoped("alpha", URL)
             .save(fake_credential("alpha-client"))
             .await
             .unwrap();
         store
-            .scoped("beta")
+            .scoped("beta", URL)
             .save(fake_credential("beta-client"))
             .await
             .unwrap();
@@ -306,7 +455,7 @@ mod tests {
     async fn scoped_clear_via_the_credential_store_trait_also_works() {
         let dir = tempfile::tempdir().unwrap();
         let store = store_at(dir.path());
-        let scoped = store.scoped("fixture");
+        let scoped = store.scoped("fixture", URL);
         scoped.save(fake_credential("client-1")).await.unwrap();
         assert!(scoped.load().await.unwrap().is_some());
 
@@ -346,11 +495,15 @@ mod roundtrip_tests {
         fs::write(&path, json!({ "other": foreign }).to_string()).unwrap();
         let store = McpAuthStore { path: path.clone() };
         store
-            .scoped("mine")
+            .scoped("mine", "http://127.0.0.1:1/mcp")
             .save(StoredCredentials::new("c".into(), None, vec![], None))
             .await
             .unwrap();
-        store.scoped("never-saved").clear().await.unwrap();
+        store
+            .scoped("never-saved", "http://127.0.0.1:1/mcp")
+            .clear()
+            .await
+            .unwrap();
         let disk: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(disk["other"], foreign, "the unparseable entry must survive");
         assert!(store.has_credential("mine"));
@@ -365,7 +518,7 @@ mod roundtrip_tests {
         let store = McpAuthStore { path: path.clone() };
         assert!(
             store
-                .scoped("mine")
+                .scoped("mine", "http://127.0.0.1:1/mcp")
                 .save(StoredCredentials::new("c".into(), None, vec![], None))
                 .await
                 .is_err()

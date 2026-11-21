@@ -144,7 +144,12 @@ impl ServerAuth {
     /// `agent mcp-login` store — refreshed first if it is about to expire — or `None` when nobody
     /// has logged in to it (the common case: a single file check, no network).
     pub(crate) async fn load(name: &str, url: &str) -> Option<Arc<Self>> {
-        if !crate::mcp_auth_store::McpAuthStore::open_default().has_credential(name) {
+        let binding = crate::mcp_auth_store::McpAuthStore::open_default().binding(name, url);
+        if let Some(refusal) = binding.refusal(name) {
+            tracing::warn!(server = %name, "{refusal}");
+            return None;
+        }
+        if binding != crate::mcp_auth_store::Binding::Bound {
             return None;
         }
         let auth = {
@@ -301,7 +306,9 @@ async fn manager_with(
         rmcp::transport::auth::AuthorizationManager::new_with_oauth_http_client(url, http)
             .await
             .map_err(RefreshError::from_auth)?;
-    manager.set_credential_store(crate::mcp_auth_store::McpAuthStore::open_default().scoped(name));
+    manager.set_credential_store(
+        crate::mcp_auth_store::McpAuthStore::open_default().scoped(name, url),
+    );
     match manager.initialize_from_store().await {
         Ok(true) => Ok(manager),
         Ok(false) => Err(RefreshError::definitive("no stored login")),
