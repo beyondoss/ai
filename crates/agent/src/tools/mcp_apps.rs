@@ -183,15 +183,71 @@ pub struct AppServer {
     remote_names: HashMap<String, String>,
     /// Resource sizes the server advertised in `resources/list`, by URI.
     sizes: HashMap<String, u64>,
+    /// A `ui://` resource's listing-level `_meta.ui` (CSP, permissions, domain, prefersBorder), by
+    /// URI: the static default a view falls back to when its `resources/read` content carries none.
+    listing_ui: HashMap<String, Value>,
+    /// The tools a view may list (`tools/list` from a view): visibility includes `"app"`.
+    app_tools: Vec<Value>,
+}
+
+/// One listed tool, as the bridge needs it.
+pub(crate) struct ListedTool {
+    pub name: String,
+    pub description: String,
+    pub input_schema: Value,
+    pub ui: ToolUi,
+}
+
+/// One listed resource, as the bridge needs it.
+pub(crate) struct ListedResource {
+    pub uri: String,
+    pub size: Option<u64>,
+    /// The entry's `_meta.ui`, kept for `ui://` resources only.
+    pub ui: Option<Value>,
+}
+
+/// The `_meta.ui` a view opens with: the content item's when it has one, else the listing entry's.
+/// Spec (draft, "Metadata Location"): "When `_meta.ui` is present on **both**, the content-item
+/// value takes precedence. Hosts MUST check both locations, preferring the content item and falling
+/// back to the listing entry." The unit is the `_meta.ui` value, so it is not merged key by key: a
+/// content item that narrows the CSP must not inherit the listing's wider one.
+fn effective_ui<'a>(
+    content: Option<&'a JsonObject>,
+    listing: Option<&'a Value>,
+) -> Option<&'a Value> {
+    content.and_then(|m| m.get("ui")).or(listing)
 }
 
 impl AppServer {
     pub(crate) fn new(
         handle: McpServerHandle,
-        tools: impl IntoIterator<Item = (String, ToolUi)>,
-        sizes: impl IntoIterator<Item = (String, u64)>,
+        tools: impl IntoIterator<Item = ListedTool>,
+        resources: impl IntoIterator<Item = ListedResource>,
     ) -> Arc<Self> {
-        let tools: Vec<(String, ToolUi)> = tools.into_iter().collect();
+        let tools: Vec<ListedTool> = tools.into_iter().collect();
+        let app_tools = tools
+            .iter()
+            .filter(|t| t.ui.app_callable())
+            .map(|t| {
+                json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "inputSchema": t.input_schema,
+                    "_meta": { "ui": t.ui },
+                })
+            })
+            .collect();
+        let tools: Vec<(String, ToolUi)> = tools.into_iter().map(|t| (t.name, t.ui)).collect();
+        let mut sizes = HashMap::new();
+        let mut listing_ui = HashMap::new();
+        for r in resources {
+            if let Some(size) = r.size {
+                sizes.insert(r.uri.clone(), size);
+            }
+            if let Some(ui) = r.ui {
+                listing_ui.insert(r.uri, ui);
+            }
+        }
         let mut remote_names = HashMap::with_capacity(tools.len());
         for (remote, _) in &tools {
             // In listing order, first wins — as it does for the registered tools themselves.
@@ -204,7 +260,9 @@ impl AppServer {
             handle,
             tools,
             remote_names,
-            sizes: sizes.into_iter().collect(),
+            sizes,
+            listing_ui,
+            app_tools,
         })
     }
 
@@ -852,6 +910,25 @@ async fn proxy(
                 .map_err(|e| e.to_string())?;
             serde_json::to_value(result).map_err(|e| e.to_string())
         }
+        // The tools a view may call, listed with the same visibility rule as `tools/call`, and
+        // without the ones this session's tool filter or policy would refuse.
+        "tools/list" => {
+            let tools: Vec<&Value> = server
+                .app_tools
+                .iter()
+                .filter(|t| {
+                    let name = t["name"].as_str().unwrap_or_default();
+                    let registered = crate::tools::mcp::registered_name(server_name, name);
+                    crate::tools::filter_allows(
+                        &registered,
+                        filter.tools.as_deref(),
+                        filter.exclude.as_deref(),
+                        filter.no_tools,
+                    ) && !filter.deny.contains(&registered)
+                })
+                .collect();
+            Ok(json!({ "tools": tools }))
+        }
         "resources/read" => {
             let uri = params
                 .get("uri")
@@ -894,7 +971,7 @@ async fn proxy(
             "`{m}` is a renderer-side method; the agent does not handle it"
         )),
         m => Err(format!(
-            "`{m}` is not proxied for MCP Apps (supported: tools/call, resources/read, ping, \
+            "`{m}` is not proxied for MCP Apps (supported: tools/call, tools/list, resources/read, ping, \
              notifications/message, ui/update-model-context)"
         )),
     }
@@ -1192,6 +1269,8 @@ struct ViewFrames {
     input_schema: Value,
     ui: ToolUi,
     resource_uri: String,
+    /// The view's listing-level `_meta.ui`, the default under its content item's own.
+    listing_ui: Option<Value>,
     arguments: Option<Map<String, Value>>,
     shared: Arc<ViewShared>,
 }
@@ -1234,12 +1313,19 @@ impl ViewFrames {
             return false;
         }
         // Spec: "Host SHOULD log CSP configurations for security review".
-        let csp = meta
-            .as_ref()
-            .and_then(|m| m.get("ui"))
+        let ui = effective_ui(meta.as_deref(), self.listing_ui.as_ref());
+        let csp = ui
             .and_then(|ui| ui.get("csp"))
             .map_or_else(|| "default (restrictive)".to_owned(), Value::to_string);
         tracing::info!(%server, uri = %self.resource_uri, app_id = %self.app_id, %csp, "MCP App view CSP");
+        // The renderer reads only the content item, so the listing's default is carried onto it.
+        let mut resource = serde_json::to_value(content).unwrap_or(Value::Null);
+        if let (Some(ui), Some(obj)) = (ui, resource.as_object_mut()) {
+            let m = obj.entry("_meta").or_insert_with(|| json!({}));
+            if let Some(m) = m.as_object_mut() {
+                m.insert("ui".into(), ui.clone());
+            }
+        }
         self.shared.open(&self.app_id, server);
         (self.shared.sink)(json!({
             "type": "mcp_app_open",
@@ -1251,7 +1337,7 @@ impl ViewFrames {
                 "inputSchema": self.input_schema,
                 "_meta": { "ui": self.ui },
             },
-            "resource": content,
+            "resource": resource,
             "input": self.arguments.clone().unwrap_or_default(),
         }));
         true
@@ -1316,6 +1402,7 @@ impl AppTool {
             input_schema: self.input_schema.clone(),
             ui: self.ui.clone(),
             resource_uri: self.resource_uri.clone(),
+            listing_ui: self.server.listing_ui.get(&self.resource_uri).cloned(),
             arguments: arguments.clone(),
             shared: self.shared.clone(),
         };
@@ -1470,6 +1557,22 @@ mod tests {
     }
 
     #[test]
+    fn the_content_items_ui_replaces_the_listings_whole_and_the_listing_fills_in_when_absent() {
+        let listing =
+            json!({ "csp": { "connectDomains": ["https://l"] }, "permissions": { "camera": {} } });
+        let both = meta(json!({ "ui": { "csp": { "connectDomains": ["https://c"] } } }));
+        // Whole-object: the content item's narrower `ui` does not inherit the listing's permissions.
+        assert_eq!(
+            effective_ui(Some(&both), Some(&listing)),
+            Some(&json!({ "csp": { "connectDomains": ["https://c"] } }))
+        );
+        let other = meta(json!({ "other": 1 }));
+        assert_eq!(effective_ui(Some(&other), Some(&listing)), Some(&listing));
+        assert_eq!(effective_ui(None, Some(&listing)), Some(&listing));
+        assert_eq!(effective_ui(None, None), None);
+    }
+
+    #[test]
     fn a_cancelled_reason_is_redacted_before_it_reaches_the_client() {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let sink_sent = sent.clone();
@@ -1481,6 +1584,7 @@ mod tests {
             input_schema: json!({}),
             ui: ToolUi::default(),
             resource_uri: "ui://wx/v".into(),
+            listing_ui: None,
             arguments: None,
             shared: Arc::new(ViewShared {
                 sink: Arc::new(move |frame| lock(&sink_sent).push(frame)),
