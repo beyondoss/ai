@@ -35,15 +35,7 @@ pub(in crate::translate) fn openai_req_to_responses(v: &Value, openai: OpenAiMod
             .cloned()
             .unwrap_or(json!(false)),
     );
-    let effort = v
-        .get("reasoning_effort")
-        .and_then(Value::as_str)
-        .or_else(|| v.pointer("/reasoning/effort").and_then(Value::as_str))
-        .and_then(|e| openai.effort(e));
-    if openai.keeps_sampling(effort.as_deref()) {
-        copy_if(&mut out, v, "temperature");
-        copy_if(&mut out, v, "top_p");
-    }
+    let effort = openai.fit_effort_and_sampling(&mut out, v);
     if let Some(effort) = effort {
         out.insert(
             "reasoning".into(),

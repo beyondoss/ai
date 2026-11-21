@@ -235,6 +235,30 @@ impl OpenAiModel {
             || !matches!(self.reasoning, OpenAiReasoning::Efforts(_))
             || effort == Some("none")
     }
+
+    /// The effort `v` asks for (`reasoning_effort`, or Responses' `reasoning.effort`) fitted to
+    /// this model, and `temperature` / `top_p` copied into `out` when [`Self::keeps_sampling`]
+    /// allows. The same in both directions between Chat Completions and Responses; the caller
+    /// writes the returned effort in its own shape.
+    pub(super) fn fit_effort_and_sampling(
+        self,
+        out: &mut serde_json::Map<String, serde_json::Value>,
+        v: &serde_json::Value,
+    ) -> Option<String> {
+        let effort = v
+            .get("reasoning_effort")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                v.pointer("/reasoning/effort")
+                    .and_then(serde_json::Value::as_str)
+            })
+            .and_then(|e| self.effort(e));
+        if self.keeps_sampling(effort.as_deref()) {
+            super::copy_if(out, v, "temperature");
+            super::copy_if(out, v, "top_p");
+        }
+        effort
+    }
 }
 
 /// Accepted efforts by family, measured live (2026-09-30). Pro variants take fewer.

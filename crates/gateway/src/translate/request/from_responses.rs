@@ -29,15 +29,7 @@ pub(in crate::translate) fn responses_req_to_openai(
     {
         out.insert(openai.max_tokens_key().into(), t.clone());
     }
-    let effort = v
-        .get("reasoning_effort")
-        .and_then(Value::as_str)
-        .or_else(|| v.pointer("/reasoning/effort").and_then(Value::as_str))
-        .and_then(|e| openai.effort(e));
-    if openai.keeps_sampling(effort.as_deref()) {
-        copy_if(&mut out, v, "temperature");
-        copy_if(&mut out, v, "top_p");
-    }
+    let effort = openai.fit_effort_and_sampling(&mut out, v);
     if let Some(effort) = effort {
         out.insert("reasoning_effort".into(), json!(effort));
     }
