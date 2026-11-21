@@ -231,7 +231,7 @@ fn client_lifecycle() -> ClientLifecycleMode {
     }
 }
 
-fn client_info(apps: bool) -> ClientInfo {
+fn client_info(apps: bool, client_credentials: bool) -> ClientInfo {
     let mut capabilities = ClientCapabilities::builder()
         .enable_elicitation()
         .enable_sampling()
@@ -245,6 +245,18 @@ fn client_info(apps: bool) -> ClientInfo {
             .insert(
                 crate::tools::mcp_apps::EXTENSION_ID.to_string(),
                 crate::tools::mcp_apps::extension_settings(),
+            );
+    }
+    // A server configured with `client_credentials` is told so on every request (the extension's
+    // "declare support" step): rmcp sends these capabilities as the request's
+    // `_meta["io.modelcontextprotocol/clientCapabilities"]`. Never declared for a grant connector.
+    if client_credentials {
+        capabilities
+            .extensions
+            .get_or_insert_with(Default::default)
+            .insert(
+                crate::tools::mcp_client_credentials::EXTENSION_ID.to_string(),
+                Default::default(),
             );
     }
     // SEP-2640 needs nothing from the client side of the handshake (we only issue `skills/*` after
@@ -283,6 +295,9 @@ pub(crate) struct McpHandler {
     events: crate::tools::mcp_events::NotificationRouter,
     /// Advertise MCP Apps on the handshake — see [`Dial::apps`].
     apps: bool,
+    /// Declare the OAuth client-credentials extension: set only for a settings-configured server
+    /// that has `client_credentials`, never for a grant connector.
+    client_credentials: bool,
     /// MCP App view HTML by `ui://` URI, read once per connection and dropped when the server says
     /// its resources changed (`notifications/resources/list_changed`). On the handler, so a redial
     /// (a new process, perhaps new HTML) starts empty.
@@ -315,6 +330,7 @@ impl McpHandler {
             calls: Arc::new(std::sync::Mutex::new(Vec::new())),
             skills_changed: Arc::default(),
             apps: false,
+            client_credentials: false,
             views: Arc::default(),
             relist: Relist::default(),
         }
@@ -483,7 +499,7 @@ impl Drop for ProgressGuard {
 
 impl ClientHandler for McpHandler {
     fn get_info(&self) -> ClientInfo {
-        client_info(self.apps)
+        client_info(self.apps, self.client_credentials)
     }
 
     // The resource list changed: cached MCP Apps views are stale, and so is the SEP-2640 skills
@@ -2915,6 +2931,7 @@ fn granted_jobs(
                 transport: McpTransport::Http {
                     url: connector.url.clone(),
                     headers: BTreeMap::new(),
+                    client_credentials: None,
                 },
             },
             Dial {
@@ -3431,7 +3448,7 @@ async fn connect_http(
             // `mcp_oauth`); a server nobody has logged into (the common case — most MCP servers
             // need no auth at all, or use `headers` above for a static credential) connects exactly
             // as before.
-            auth = crate::tools::mcp_oauth::ServerAuth::load(&config.name, url).await;
+            auth = crate::tools::mcp_oauth::ServerAuth::load_for(config, url).await?;
             agent_core::ensure_provider();
             reqwest::Client::new()
         }
@@ -3467,7 +3484,16 @@ async fn connect_http(
     );
 
     // A slow server's late discover answer must not fail the handshake — see `mcp_handshake`.
-    McpHandler::for_dial(&config.name, dial)
+    let mut handler = McpHandler::for_dial(&config.name, dial);
+    handler.client_credentials = dial.http.is_none()
+        && matches!(
+            &config.transport,
+            McpTransport::Http {
+                client_credentials: Some(_),
+                ..
+            }
+        );
+    handler
         .serve_with_lifecycle(
             crate::tools::mcp_handshake::Guard::new(transport),
             client_lifecycle(),
@@ -3975,7 +4001,10 @@ impl McpCatalog {
                         headers.push((k, v));
                     }
                 }
-                auth = crate::tools::mcp_oauth::ServerAuth::load(&conn.config.name, url).await;
+                auth = crate::tools::mcp_oauth::ServerAuth::load_for(&conn.config, url)
+                    .await
+                    .ok()
+                    .flatten();
                 if let Some(auth) = &auth
                     && let Some(token) = auth.token().await
                     && let Ok(v) = HeaderValue::from_str(&format!("Bearer {token}"))
@@ -4544,6 +4573,90 @@ mod tests {
         assert!(err.contains("X-Token"), "{err}");
         assert!(!err.contains("a\nb"), "{err}");
         assert!(SecretHeader::new("bad name", "v").is_err());
+    }
+
+    /// A loopback server that answers 401 to everything and records each request (head and body,
+    /// lower-cased).
+    async fn recording_401() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = beyond_test_support::ports::tokio_listener().await;
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let log = log.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+                    let mut buf = vec![0u8; 65536];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    log.lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase());
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .await;
+                });
+            }
+        });
+        (url, seen)
+    }
+
+    /// Service mode never runs OAuth: a grant connector's dial ignores `client_credentials` even if
+    /// its config carried them (it never does), while the same config dialed as a configured server
+    /// does act on them. The second half is the control that shows the first half can fail.
+    #[tokio::test]
+    async fn client_credentials_never_activate_for_a_grant_connector() {
+        agent_core::ensure_provider();
+        let (url, seen) = recording_401().await;
+        let config = McpServerConfig {
+            name: "c".into(),
+            events: Vec::new(),
+            transport: McpTransport::Http {
+                url: url.clone(),
+                headers: BTreeMap::new(),
+                client_credentials: Some(crate::settings::McpClientCredentials {
+                    client_id: "id".into(),
+                    client_secret: Some("!echo not-a-real-secret".into()),
+                    private_key: None,
+                    signing_algorithm: None,
+                    scopes: vec!["s".into()],
+                }),
+            },
+        };
+        let touched_oauth = |seen: &[String]| {
+            seen.iter().any(|r| {
+                r.contains("oauth-protected-resource")
+                    || r.contains("oauth-client-credentials")
+                    || r.contains("authorization: bearer")
+            })
+        };
+
+        let grant = Dial {
+            http: Some(HttpDial {
+                client: reqwest::Client::new(),
+                policy: Arc::default(),
+                headers: Vec::new(),
+                sandbox: false,
+            }),
+            ..Dial::default()
+        };
+        assert!(connect_http(&config, &grant, &url).await.is_err());
+        assert!(
+            !seen.lock().unwrap().is_empty(),
+            "the handshake was attempted"
+        );
+        assert!(
+            !touched_oauth(&seen.lock().unwrap()),
+            "a grant connector must not discover, declare or acquire: {:?}",
+            seen.lock().unwrap()
+        );
+
+        seen.lock().unwrap().clear();
+        assert!(connect_http(&config, &Dial::default(), &url).await.is_err());
+        assert!(
+            touched_oauth(&seen.lock().unwrap()),
+            "control: a configured server with the same config does act on it"
+        );
     }
 
     #[test]

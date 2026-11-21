@@ -701,6 +701,7 @@ mod tests {
             transport: McpTransport::Http {
                 url: "https://example.com/mcp".into(),
                 headers: Default::default(),
+                client_credentials: None,
             },
         };
         assert_ne!(invocation_key(&s), invocation_key(&h));

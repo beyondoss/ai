@@ -145,11 +145,19 @@ jobs:
           CHECK_LOG_DIR: ${{ runner.temp }}/interop-logs
         run: |
           env -u AI_POOL_KEY_ANTHROPIC -u DATABASE_URL "$RUNNER_TEMP/interop-venv/bin/python" crates/agent/eval/mcp_oauth_interop/check.py </dev/null
+      - name: client credentials and step-up against Keycloak
+        env:
+          AGENT_BINS: head=${{ github.workspace }}/target/debug/agent
+          CHECK_LOG_DIR: ${{ runner.temp }}/interop-logs-cc
+        run: |
+          env -u AI_POOL_KEY_ANTHROPIC -u DATABASE_URL "$RUNNER_TEMP/interop-venv/bin/python" crates/agent/eval/mcp_oauth_interop/check_cc.py </dev/null
       - if: always()
         uses: actions/upload-artifact@v4
         with:
           name: mcp-oauth-interop-logs
-          path: ${{ runner.temp }}/interop-logs
+          path: |
+            ${{ runner.temp }}/interop-logs
+            ${{ runner.temp }}/interop-logs-cc
   # The calendar check PRs skip: a catalog row with a `retires` date in verify/catalog_truth.toml
   # only warns in a PR run (from 14 days before the date), so a date never fails an unrelated
   # change. CATALOG_RETIREMENT_STRICT=1 turns that warning into a failure here, up to two weeks

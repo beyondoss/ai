@@ -24,6 +24,7 @@ pub mod job_notify;
 pub mod ls;
 pub mod mcp;
 pub mod mcp_apps;
+pub(crate) mod mcp_client_credentials;
 pub mod mcp_events;
 pub(crate) mod mcp_handshake;
 pub mod mcp_host;

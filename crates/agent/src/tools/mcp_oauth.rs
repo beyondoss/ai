@@ -49,6 +49,9 @@ use rmcp::transport::streamable_http_client::{
 const FIRST_BACKOFF: Duration = Duration::from_secs(30);
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
 
+/// A client-credentials token is replaced this long before it expires.
+const CC_RENEW_SKEW: Duration = Duration::from_secs(5);
+
 /// Why a refresh did not produce a token.
 #[derive(Debug, Clone)]
 pub(crate) struct RefreshError {
@@ -75,7 +78,7 @@ impl RefreshError {
 
     /// rmcp's refresh error carries the authorization server's own text (its `error_description`),
     /// which reaches the model in the failed request's error: fenced like any server text.
-    fn from_auth(e: rmcp::transport::auth::AuthError) -> Self {
+    pub(crate) fn from_auth(e: rmcp::transport::auth::AuthError) -> Self {
         use rmcp::transport::auth::AuthError;
         let reason = crate::tools::mcp_wire::fenced_server_message(&e.to_string());
         match e {
@@ -89,7 +92,7 @@ impl RefreshError {
 }
 
 #[cfg(test)]
-type FakeRefresh = Arc<dyn Fn() -> Result<String, RefreshError> + Send + Sync>;
+type FakeRefresh = Arc<dyn Fn(&[String]) -> Result<String, RefreshError> + Send + Sync>;
 #[cfg(test)]
 type FakeStored = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 
@@ -99,6 +102,9 @@ pub(crate) struct ServerAuth {
     url: String,
     state: tokio::sync::Mutex<TokenState>,
     first_backoff: Duration,
+    /// Set for a server configured with `client_credentials`: its token is acquired from the
+    /// authorization server (in memory only), not read from the `mcp-login` store.
+    cc: Option<crate::settings::McpClientCredentials>,
     /// Stand-ins for the authorization server and the store, for unit tests (`None`: the real ones).
     #[cfg(test)]
     fake_refresh: Option<FakeRefresh>,
@@ -112,6 +118,12 @@ struct TokenState {
     token: Option<String>,
     /// The last refresh after `token` was rejected failed.
     failed: Option<Failed>,
+    /// Client credentials only: when `token` expires (`None`: the AS did not say).
+    expires_at: Option<Instant>,
+    /// Client credentials only: the scopes `token` was requested with.
+    scopes: Vec<String>,
+    /// Client credentials only: scope sets the authorization server refused a step-up to.
+    refused: Vec<Vec<String>>,
 }
 
 struct Failed {
@@ -133,6 +145,7 @@ impl ServerAuth {
             url: url.to_owned(),
             state: tokio::sync::Mutex::new(TokenState::default()),
             first_backoff: FIRST_BACKOFF,
+            cc: None,
             #[cfg(test)]
             fake_refresh: None,
             #[cfg(test)]
@@ -167,12 +180,50 @@ impl ServerAuth {
         Some(auth)
     }
 
+    /// The shared auth for configured server `config` at `url`: one that acquires its tokens with
+    /// the client-credentials grant when the server is configured with `client_credentials`
+    /// (`Err`: those settings cannot work), otherwise [`Self::load`]'s `mcp-login` one. Never
+    /// called for a grant connector (`mcp::connect_http`).
+    pub(crate) async fn load_for(
+        config: &crate::settings::McpServerConfig,
+        url: &str,
+    ) -> Result<Option<Arc<Self>>, String> {
+        let crate::settings::McpTransport::Http {
+            client_credentials: Some(cc),
+            ..
+        } = &config.transport
+        else {
+            return Ok(Self::load(&config.name, url).await);
+        };
+        cc.validate(&config.name)?;
+        let mut servers = SERVERS.lock().unwrap_or_else(|e| e.into_inner());
+        servers.retain(|a| !(a.server == config.name && a.url == url && a.cc.as_ref() != Some(cc)));
+        if let Some(auth) = servers
+            .iter()
+            .find(|a| a.server == config.name && a.url == url)
+        {
+            return Ok(Some(auth.clone()));
+        }
+        let mut auth = Self::new(&config.name, url);
+        auth.cc = Some(cc.clone());
+        auth.state = tokio::sync::Mutex::new(TokenState {
+            scopes: cc.scopes.clone(),
+            ..TokenState::default()
+        });
+        let auth = Arc::new(auth);
+        servers.push(auth.clone());
+        Ok(Some(auth))
+    }
+
     /// Reload the token from the store, **under the token's lock**: a refresh persists its token
     /// before it releases the lock, so what the store holds here is at least as new as what this
     /// process holds — never an older token read before a refresh finished and written over it
     /// after. When the store yields nothing (unreadable, or its refresh failed) the token held is
     /// kept. A login (or logout) made since the last dial takes effect here, as it always did.
     async fn reload(&self) {
+        if self.cc.is_some() {
+            return; // client credentials: nothing stored to reload
+        }
         let mut state = self.state.lock().await;
         let Some(stored) = self.stored().await else {
             return;
@@ -191,17 +242,45 @@ impl ServerAuth {
         stored_token(&self.server, &self.url).await
     }
 
-    async fn refresh(&self) -> Result<String, RefreshError> {
+    /// A new token: from the authorization server for client credentials (for `scopes`), otherwise
+    /// the `mcp-login` refresh. With its lifetime when the AS said.
+    async fn refresh(&self, scopes: &[String]) -> Result<(String, Option<Duration>), RefreshError> {
         #[cfg(test)]
         if let Some(fake) = &self.fake_refresh {
-            return fake();
+            return fake(scopes).map(|t| (t, None));
         }
-        refresh(&self.server, &self.url).await
+        if let Some(cc) = &self.cc {
+            return crate::tools::mcp_client_credentials::acquire(
+                &self.server,
+                &self.url,
+                cc,
+                scopes,
+            )
+            .await
+            .map(|a| (a.token, a.lifetime));
+        }
+        refresh(&self.server, &self.url).await.map(|t| (t, None))
     }
 
-    /// The token requests send now.
+    /// The token requests send now. A client-credentials token that is missing or about to expire
+    /// is acquired first, so the next call after an expiry re-acquires with no human and without
+    /// waiting for the server's 401 (which still works, see [`Self::after_rejection`]).
     pub(crate) async fn token(&self) -> Option<String> {
-        self.state.lock().await.token.clone()
+        let mut state = self.state.lock().await;
+        if self.cc.is_some() {
+            let now = Instant::now();
+            let stale = state.token.is_none()
+                || state.expires_at.is_some_and(|at| now + CC_RENEW_SKEW >= at);
+            let blocked = state
+                .failed
+                .as_ref()
+                .is_some_and(|f| f.until.is_none_or(|until| now < until));
+            if stale && !blocked {
+                let scopes = state.scopes.clone();
+                let _ = self.renew(&mut state, scopes).await;
+            }
+        }
+        state.token.clone()
     }
 
     /// `sent` was answered 401: the token to retry with. If another caller already replaced `sent`,
@@ -221,21 +300,37 @@ impl ServerAuth {
         {
             return Err(failed.message.clone());
         }
-        match self.refresh().await {
-            Ok(token) => {
-                tracing::info!(server = %self.server, "refreshed a rejected MCP OAuth token");
-                state.token = Some(token.clone());
+        let scopes = state.scopes.clone();
+        self.renew(&mut state, scopes).await
+    }
+
+    /// One new token (`scopes` for client credentials), recorded; a failure is remembered as the
+    /// module doc says. `state` is the token's lock, held by the caller.
+    async fn renew(&self, state: &mut TokenState, scopes: Vec<String>) -> Result<String, String> {
+        let now = Instant::now();
+        match self.refresh(&scopes).await {
+            Ok((token, lifetime)) => {
+                tracing::info!(server = %self.server, "obtained a fresh MCP OAuth token");
+                state.install(token.clone(), lifetime, scopes);
                 state.failed = None;
                 Ok(token)
             }
             Err(e) if e.definitive => {
-                let message = format!(
-                    "mcp server `{0}` rejected its OAuth token and it could not be refreshed ({1}); \
-                     run `{2} mcp-login {0}` again",
-                    self.server,
-                    e.reason,
-                    crate::PROGRAM
-                );
+                let message = if self.cc.is_some() {
+                    format!(
+                        "mcp server `{}` needs an OAuth token and its authorization server refused \
+                         one ({}); check its `client_credentials` settings",
+                        self.server, e.reason
+                    )
+                } else {
+                    format!(
+                        "mcp server `{0}` rejected its OAuth token and it could not be refreshed ({1}); \
+                         run `{2} mcp-login {0}` again",
+                        self.server,
+                        e.reason,
+                        crate::PROGRAM
+                    )
+                };
                 tracing::warn!(server = %self.server, error = %e.reason, "MCP OAuth refresh rejected");
                 state.failed = Some(Failed {
                     message: message.clone(),
@@ -265,6 +360,94 @@ impl ServerAuth {
                 Err(message)
             }
         }
+    }
+
+    /// `sent` was answered `403 insufficient_scope` whose challenge names `challenged`. The token to
+    /// retry the request with, or the error that ends it: **at most one step-up per request**, the
+    /// caller retries once.
+    ///
+    /// - A client-credentials server asks its authorization server for the union of the scopes
+    ///   already requested and `challenged` ([`step_up`](crate::tools::mcp_client_credentials::step_up));
+    ///   single flight, and a scope set the AS refused is remembered and not asked for again. A
+    ///   refusal does not disturb the token already held.
+    /// - An `mcp-login` server cannot ask: no human is present mid-run. The error names the scope and
+    ///   the exact command.
+    pub(crate) async fn after_insufficient_scope(
+        &self,
+        sent: Option<&str>,
+        challenged: &[String],
+    ) -> Result<String, String> {
+        use crate::tools::mcp_client_credentials::{StepUp, step_up, union_scopes};
+        let missing = challenged.join(" ");
+        if self.cc.is_none() {
+            return Err(if challenged.is_empty() {
+                format!(
+                    "mcp server `{0}` answered 403 insufficient_scope without naming the scope it \
+                     needs; its login cannot widen mid-run, so run `{1} mcp-login {0} --scope \
+                     <scope>` with the scope the server documents",
+                    self.server,
+                    crate::PROGRAM
+                )
+            } else {
+                format!(
+                    "mcp server `{0}` needs scope `{missing}` that its login lacks, and no one is \
+                     present to approve it mid-run; run `{1} mcp-login {0} --scope \"{missing}\"` \
+                     and run again",
+                    self.server,
+                    crate::PROGRAM
+                )
+            });
+        }
+        let mut state = self.state.lock().await;
+        // Another call already stepped up past the token `sent`: take its token, no second request.
+        if let Some(current) = state.token.as_deref()
+            && Some(current) != sent
+            && union_scopes(&state.scopes, challenged).len() == state.scopes.len()
+        {
+            return Ok(current.to_owned());
+        }
+        match step_up(&state.scopes, challenged, &state.refused) {
+            StepUp::NoScope => Err(format!(
+                "mcp server `{}` answered 403 insufficient_scope without naming the scope it needs; \
+                 nothing to step up to",
+                self.server
+            )),
+            StepUp::AlreadyRequested => Err(format!(
+                "mcp server `{}` still answers 403 insufficient_scope for `{missing}`, which was \
+                 already requested; not retried",
+                self.server
+            )),
+            StepUp::Refused => Err(self.refused_message(&missing, "refused it earlier")),
+            StepUp::Request(wanted) => match self.refresh(&wanted).await {
+                Ok((token, lifetime)) => {
+                    tracing::info!(server = %self.server, scope = %missing, "stepped up an MCP OAuth token");
+                    state.install(token.clone(), lifetime, wanted);
+                    Ok(token)
+                }
+                Err(e) => {
+                    if e.definitive {
+                        state.refused.push(wanted);
+                    }
+                    Err(self.refused_message(&missing, &e.reason))
+                }
+            },
+        }
+    }
+
+    fn refused_message(&self, missing: &str, why: &str) -> String {
+        format!(
+            "mcp server `{}` needs scope `{missing}` (403 insufficient_scope) and a token with it \
+             could not be obtained ({why}); not retried",
+            self.server
+        )
+    }
+}
+
+impl TokenState {
+    fn install(&mut self, token: String, lifetime: Option<Duration>, scopes: Vec<String>) {
+        self.token = Some(token);
+        self.expires_at = lifetime.map(|l| Instant::now() + l);
+        self.scopes = scopes;
     }
 }
 
@@ -364,13 +547,13 @@ const DEFINITIVE_OAUTH_ERRORS: [&str; 6] = [
 /// leave it to rmcp's error): an RFC 6749 §5.2 error code is definitive, as is a token endpoint
 /// that is not there (404/405/410 — the server has no refresh endpoint). Anything else — a 5xx, a
 /// 429, a body that is not an OAuth error — is transient.
-fn classify_token_response(status: u16, body: &[u8]) -> Option<RefreshError> {
+pub(crate) fn classify_token_response(status: u16, body: &[u8]) -> Option<RefreshError> {
     let code = serde_json::from_slice::<serde_json::Value>(body)
         .ok()
         .and_then(|v| v.get("error")?.as_str().map(str::to_owned));
     if let Some(code) = code.filter(|c| DEFINITIVE_OAUTH_ERRORS.contains(&c.as_str())) {
         return Some(RefreshError::definitive(format!(
-            "the authorization server refused the refresh: {code}"
+            "the authorization server refused the token request: {code}"
         )));
     }
     if matches!(status, 404 | 405 | 410) {
@@ -383,13 +566,13 @@ fn classify_token_response(status: u16, body: &[u8]) -> Option<RefreshError> {
 }
 
 /// rmcp's OAuth HTTP, done the same way (redirects as each request asks, its timeout, a 1 MiB body
-/// cap), that also keeps the token endpoint's answer to a `refresh_token` grant: rmcp's own error
+/// cap), that also keeps the token endpoint's answer to a `refresh_token` or `client_credentials` grant: rmcp's own error
 /// for a failed refresh keeps neither the status nor the RFC 6749 error code, and the difference
 /// between "try again later" and "log in again" is in exactly those.
-struct RecordingOAuthHttp {
+pub(crate) struct RecordingOAuthHttp {
     follow: reqwest::Client,
     stop: reqwest::Client,
-    /// The last `refresh_token` grant's response: status and body.
+    /// The last `refresh_token` or `client_credentials` grant's response: status and body.
     token_response: Mutex<Option<(u16, Vec<u8>)>>,
 }
 
@@ -397,7 +580,7 @@ struct RecordingOAuthHttp {
 const MAX_OAUTH_BODY: usize = 1024 * 1024;
 
 impl RecordingOAuthHttp {
-    fn new() -> Result<Self, RefreshError> {
+    pub(crate) fn new() -> Result<Self, RefreshError> {
         let build = |policy| {
             reqwest::Client::builder()
                 .redirect(policy)
@@ -411,7 +594,7 @@ impl RecordingOAuthHttp {
         })
     }
 
-    fn token_response(&self) -> Option<(u16, Vec<u8>)> {
+    pub(crate) fn token_response(&self) -> Option<(u16, Vec<u8>)> {
         self.token_response
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -433,8 +616,11 @@ impl rmcp::transport::auth::OAuthHttpClient for RecordingOAuthHttp {
                 timeout,
                 ..
             } = request;
-            let refresh_grant = request.method() == http::Method::POST
-                && String::from_utf8_lossy(request.body()).contains("grant_type=refresh_token");
+            let refresh_grant = request.method() == http::Method::POST && {
+                let body = String::from_utf8_lossy(request.body());
+                body.contains("grant_type=refresh_token")
+                    || body.contains("grant_type=client_credentials")
+            };
             let client = match redirect_policy {
                 OAuthHttpRedirectPolicy::Stop => &self.stop,
                 _ => &self.follow,
@@ -591,6 +777,24 @@ impl<C: StreamableHttpClient<Error = reqwest::Error>> OAuthHttp<C> {
                     )),
                 }
             }
+            // A 403 never refreshes (a refresh does not widen scopes). It steps up, once, or says
+            // how: see `ServerAuth::after_insufficient_scope`.
+            Err(StreamableHttpError::InsufficientScope(e)) => {
+                let challenged = e
+                    .required_scope
+                    .as_deref()
+                    .map(crate::tools::mcp_client_credentials::split_scopes)
+                    .unwrap_or_default();
+                match auth
+                    .after_insufficient_scope(sent.as_deref(), &challenged)
+                    .await
+                {
+                    Ok(widened) => call(Some(widened)).await,
+                    Err(message) => Err(StreamableHttpError::UnexpectedServerResponse(
+                        message.into(),
+                    )),
+                }
+            }
             other => other,
         }
     }
@@ -732,7 +936,31 @@ impl ServerAuth {
         let mut auth = Self::new("fake", "http://127.0.0.1:9/mcp");
         auth.state = tokio::sync::Mutex::new(TokenState {
             token: Some(token.into()),
-            failed: None,
+            ..TokenState::default()
+        });
+        auth.fake_refresh = Some(Arc::new(move |_| refresh()));
+        Arc::new(auth)
+    }
+
+    /// A client-credentials `ServerAuth` holding `token` (requested with `scopes`) whose token
+    /// requests are `refresh(scopes asked for)` instead of the authorization server.
+    pub(crate) fn fake_cc(
+        token: &str,
+        scopes: &[&str],
+        refresh: impl Fn(&[String]) -> Result<String, RefreshError> + Send + Sync + 'static,
+    ) -> Arc<Self> {
+        let mut auth = Self::new("fake", "http://127.0.0.1:9/mcp");
+        auth.cc = Some(crate::settings::McpClientCredentials {
+            client_id: "c".into(),
+            client_secret: Some("$S".into()),
+            private_key: None,
+            signing_algorithm: None,
+            scopes: scopes.iter().map(|s| (*s).to_owned()).collect(),
+        });
+        auth.state = tokio::sync::Mutex::new(TokenState {
+            token: Some(token.into()),
+            scopes: scopes.iter().map(|s| (*s).to_owned()).collect(),
+            ..TokenState::default()
         });
         auth.fake_refresh = Some(Arc::new(refresh));
         Arc::new(auth)
@@ -1087,13 +1315,12 @@ mod tests {
         assert_eq!(*seen.lock().unwrap(), ["bearer stale", "bearer fresh"]);
     }
 
+    const CHALLENGE: &str =
+        "WWW-Authenticate: Bearer error=\"insufficient_scope\", scope=\"admin\"\r\n";
+
     #[tokio::test]
-    async fn a_403_insufficient_scope_passes_through_without_a_refresh() {
-        let (url, seen) = endpoint(
-            "403 Forbidden",
-            "WWW-Authenticate: Bearer error=\"insufficient_scope\", scope=\"admin\"\r\n",
-        )
-        .await;
+    async fn a_403_never_refreshes_and_an_mcp_login_server_is_told_the_scope_and_the_command() {
+        let (url, seen) = endpoint("403 Forbidden", CHALLENGE).await;
         let refreshes = Arc::new(AtomicU32::new(0));
         let counter = refreshes.clone();
         let auth = ServerAuth::fake("stale", move || {
@@ -1103,12 +1330,100 @@ mod tests {
         let e = client(auth)
             .post_message(url.into(), tools_list(), None, None, HashMap::new())
             .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("`admin`") && e.contains("mcp-login fake --scope \"admin\""),
+            "{e}"
+        );
+        assert_eq!(
+            refreshes.load(Ordering::SeqCst),
+            0,
+            "no human, no token request"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 1, "and no retry");
+    }
+
+    #[tokio::test]
+    async fn a_client_credentials_server_steps_up_to_the_union_and_retries_once() {
+        let (url, seen) = endpoint("403 Forbidden", CHALLENGE).await;
+        let asked = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+        let log = asked.clone();
+        let auth = ServerAuth::fake_cc("stale", &["read"], move |scopes| {
+            log.lock().unwrap().push(scopes.to_vec());
+            Ok("fresh".into())
+        });
+        client(auth)
+            .post_message(url.into(), tools_list(), None, None, HashMap::new())
+            .await
+            .expect("the retry with the widened token succeeds");
+        assert_eq!(
+            *asked.lock().unwrap(),
+            [["read", "admin"]],
+            "the union, once"
+        );
+        assert_eq!(*seen.lock().unwrap(), ["bearer stale", "bearer fresh"]);
+    }
+
+    #[tokio::test]
+    async fn a_step_up_is_one_per_request_even_if_the_server_still_refuses() {
+        let (url, seen) = endpoint("403 Forbidden", CHALLENGE).await;
+        let asks = Arc::new(AtomicU32::new(0));
+        let counter = asks.clone();
+        let auth = ServerAuth::fake_cc("stale", &["read"], move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok("still-not-enough".into())
+        });
+        let e = client(auth.clone())
+            .post_message(url.clone().into(), tools_list(), None, None, HashMap::new())
+            .await
             .unwrap_err();
         assert!(
             matches!(e, StreamableHttpError::InsufficientScope(_)),
             "{e:?}"
         );
-        assert_eq!(refreshes.load(Ordering::SeqCst), 0, "a 403 never refreshes");
-        assert_eq!(seen.lock().unwrap().len(), 1, "nor is it retried");
+        assert_eq!(asks.load(Ordering::SeqCst), 1);
+        assert_eq!(seen.lock().unwrap().len(), 2, "one try, one retry, no loop");
+        // The next request already holds the widened scopes: it is not stepped up again.
+        let _ = client(auth)
+            .post_message(url.into(), tools_list(), None, None, HashMap::new())
+            .await;
+        assert_eq!(asks.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_scope_the_authorization_server_refused_fails_the_call_and_is_not_asked_for_again() {
+        let (url, seen) = endpoint("403 Forbidden", CHALLENGE).await;
+        let asks = Arc::new(AtomicU32::new(0));
+        let counter = asks.clone();
+        let auth = ServerAuth::fake_cc("stale", &["read"], move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Err(RefreshError::definitive("invalid_scope"))
+        });
+        for (i, why) in ["invalid_scope", "refused it earlier"]
+            .into_iter()
+            .enumerate()
+        {
+            let e = client(auth.clone())
+                .post_message(url.clone().into(), tools_list(), None, None, HashMap::new())
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("`admin`") && e.contains(why), "call {i}: {e}");
+        }
+        assert_eq!(asks.load(Ordering::SeqCst), 1, "refused once, remembered");
+        assert_eq!(seen.lock().unwrap().len(), 2, "never retried with a token");
+        assert_eq!(
+            auth.token().await.as_deref(),
+            Some("stale"),
+            "the held token is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_credentials_token_about_to_expire_is_replaced_before_the_next_request() {
+        let auth = ServerAuth::fake_cc("old", &["read"], |_| Ok("new".into()));
+        auth.state.lock().await.expires_at = Some(Instant::now() + Duration::from_secs(1));
+        assert_eq!(auth.token().await.as_deref(), Some("new"));
     }
 }

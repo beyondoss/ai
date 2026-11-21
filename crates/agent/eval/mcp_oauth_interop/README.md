@@ -57,3 +57,49 @@ apart: a client that only tries the well-known URI passes it too. The hermetic f
 Weekly in `deep.yml` (job `mcp-oauth-interop`), not on PRs: it builds the agent and installs the SDK
 from GitHub, a few minutes, no browser. It runs the checked-out tree's binary only (label `head`),
 so it asserts the post-binding behaviour and skips A4.
+
+## Client credentials and step-up against Keycloak (`check_cc.py`)
+
+The other half of this kit. `check_cc.py` drives the agent's OAuth **client credentials** (the
+`io.modelcontextprotocol/oauth-client-credentials` extension) and **step-up on 403 `insufficient_scope`**
+against an independent authorization server: **Keycloak 26.4**, pinned
+`quay.io/keycloak/keycloak:26.4@sha256:9409c59bdfb65dbffa20b11e6f18b8abb9281d480c7ca402f51ed3d5977e6007`,
+in Docker (containers are named `aimcpcc-<pid>-kc` and removed on exit). Needs Docker and the venv above.
+
+```sh
+AGENT_BINS=main=/path/to/main/agent,pr=/path/to/head/agent CHECK_LOG_DIR=./logs \
+  venv/bin/python crates/agent/eval/mcp_oauth_interop/check_cc.py
+```
+
+The protected server is `rs_server.py`: the official Python MCP SDK's `MCPServer` in resource-server mode
+(`token_verifier`, `AuthSettings`, its RFC 9728 metadata), adapted from the `simple-auth` example's
+resource server with exactly these changes: a JWT/JWKS token verifier instead of the demo AS's
+introspection, an ASGI gate that answers a `tools/call` lacking the tool's scope with `403` +
+`WWW-Authenticate: Bearer error="insufficient_scope", scope="..."` (the SDK enforces one scope for the
+whole endpoint only), two tools (`get_time` needs `mcp:read`, `write_note` needs `mcp:write`), and a JSON-lines
+request log (method, tool, whether the extension was declared, whether `Authorization` was present,
+the token's scopes and `jti`; never a token value).
+
+Keycloak's realm (generated per run): scopes `mcp:read`, `mcp:write` (optional) and `mcp:admin`
+(no client may have it); clients `agent-cc-secret` (secret), `agent-cc-jwt` (`private_key_jwt`, an RSA key
+generated per run), `agent-cc-narrow` (only `mcp:read`), `agent-cc-short` (4 s access tokens); an audience
+mapper so every token is for the RS; a user and dynamic client registration for the interactive case.
+
+| id   | what                                                                                          | main | with the feature |
+| ---- | --------------------------------------------------------------------------------------------- | ---- | ---------------- |
+| CC1  | client id + secret from an env var, no browser, no `mcp-login`: `run` calls a protected tool  | no   | yes              |
+| CC1b | the extension is declared in `_meta` on every `tools/call`                                    | n/a  | yes              |
+| CC1d | an inline literal secret is refused and never echoed                                          | n/a  | yes              |
+| CC2  | the same with `private_key_jwt`                                                               | no   | yes              |
+| CC3  | after a 4 s token expires the next call re-acquires (a different `jti`)                       | no   | yes              |
+| CC4  | the working token is not sent to another URL under the same name                              | no   | yes              |
+| SU1  | a tool needing an extra scope: 403, the agent steps up, the call succeeds                     | no   | yes              |
+| SU3  | the AS refuses the scope: one 403, a clear error, no loop                                     | no   | yes              |
+| SU2  | `mcp-login` server: the error names the scope and `mcp-login kc --scope`; running it fixes it | no   | yes              |
+
+SU2a (`mcp-login` against Keycloak at all) also fails on `main`: Keycloak sends the RFC 9207 `iss` in
+the redirect and `main` did not pass it to rmcp's issuer check. SM1 (service mode never activates either
+feature) is hermetic: `tools::mcp::tests::client_credentials_never_activate_for_a_grant_connector`.
+
+Keycloak sets `Secure` cookies even on its dev http listener, so the headless login returns them by hand.
+It runs in the weekly `deep.yml` job `mcp-oauth-interop` (after the simple-auth check).

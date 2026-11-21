@@ -51,7 +51,10 @@ pub(crate) fn auth_status(provider: Option<String>) -> Result<(), Box<dyn std::e
 }
 
 /// `mcp-login <name>`: OAuth against an MCP server from the effective settings.
-pub(crate) async fn mcp_login(name: String) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) async fn mcp_login(
+    name: String,
+    scope: Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let cwd = canonical_cwd(&std::env::current_dir().unwrap_or_default());
     let settings = beyond_agent::settings::effective_settings_for_cwd(&cwd);
     let servers = settings.mcp_servers.unwrap_or_default();
@@ -104,8 +107,31 @@ pub(crate) async fn mcp_login(name: String) -> Result<(), Box<dyn std::error::Er
 
     // rmcp 3.x folds scopes + client name into `AuthorizationRequest`; empty scopes
     // auto-select via the manager's scope policy inside `AuthorizationSession::new`.
-    let request = rmcp::transport::auth::AuthorizationRequest::new(&redirect_uri)
+    let mut request = rmcp::transport::auth::AuthorizationRequest::new(&redirect_uri)
         .with_client_name("beyond-agent");
+    // `--scope`: the union of what the stored login already holds and what was asked for now, so a
+    // widened login never loses a scope it had. No `--scope`: the manager's own selection, as before.
+    let wanted: Vec<String> = scope
+        .iter()
+        .flat_map(|s| s.split_whitespace().map(str::to_owned))
+        .collect();
+    if !wanted.is_empty() {
+        use rmcp::transport::auth::CredentialStore as _;
+        let held = auth_store
+            .scoped(&name, &url)
+            .load()
+            .await
+            .ok()
+            .flatten()
+            .map(|c| c.granted_scopes)
+            .unwrap_or_default();
+        request.scopes = held.clone();
+        for w in wanted {
+            if !request.scopes.contains(&w) {
+                request.scopes.push(w);
+            }
+        }
+    }
     let session = rmcp::transport::auth::AuthorizationSession::new(manager, request)
         .await
         .map_err(|(_manager, e)| {
@@ -123,12 +149,14 @@ pub(crate) async fn mcp_login(name: String) -> Result<(), Box<dyn std::error::Er
 
     eprintln!("Open this URL in a browser to continue:\n\n  {auth_url}\n");
     let cancel = agent_core::CancellationToken::new();
-    let code = listener
-        .wait_for_callback("/callback", csrf_token.clone(), cancel)
+    let (code, issuer) = listener
+        .wait_for_callback_with_issuer("/callback", csrf_token.clone(), cancel)
         .await
         .ok_or("login cancelled (no callback received)")?;
+    // RFC 9207: an authorization server that identifies itself in the redirect (`iss`) is checked
+    // against its metadata's issuer; one that does not is accepted as before.
     session
-        .handle_callback(&code, &csrf_token)
+        .handle_callback_with_issuer(&code, &csrf_token, issuer.as_deref())
         .await
         .map_err(|e| format!("failed to complete MCP OAuth login for `{name}`: {e}"))?;
     println!("logged in: {name}");

@@ -129,7 +129,11 @@ pub fn local_servers(text: &str) -> (Vec<McpServerConfig>, Vec<String>) {
             name,
             transport: match entry {
                 Entry::Stdio { command, args, env } => McpTransport::Stdio { command, args, env },
-                Entry::Http { url, headers } => McpTransport::Http { url, headers },
+                Entry::Http { url, headers } => McpTransport::Http {
+                    url,
+                    headers,
+                    client_credentials: None,
+                },
             },
             events: Vec::new(),
         })
@@ -244,6 +248,7 @@ mod tests {
             McpTransport::Http {
                 url: "https://example.com/mcp".into(),
                 headers: [("Authorization".to_owned(), "Bearer ${TOKEN}".to_owned())].into(),
+                client_credentials: None,
             }
         );
         assert!(matches!(by_name("typed"), McpTransport::Http { .. }));
