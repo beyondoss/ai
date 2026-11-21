@@ -182,10 +182,13 @@ pub struct AppServer {
     /// (`tools::mcp::registered_name`), so the remote one is never parsed back out of it.
     remote_names: HashMap<String, String>,
     /// Resource sizes the server advertised in `resources/list`, by URI.
-    sizes: HashMap<String, u64>,
+    sizes: std::sync::Mutex<HashMap<String, u64>>,
     /// A `ui://` resource's listing-level `_meta.ui` (CSP, permissions, domain, prefersBorder), by
     /// URI: the static default a view falls back to when its `resources/read` content carries none.
-    listing_ui: HashMap<String, Value>,
+    listing_ui: std::sync::Mutex<HashMap<String, Value>>,
+    /// How many `resources/list_changed` the listings above were read after; see
+    /// [`AppServer::refresh_resources`].
+    resources_seen: std::sync::atomic::AtomicU64,
     /// The tools a view may list (`tools/list` from a view): visibility includes `"app"`.
     app_tools: Vec<Value>,
 }
@@ -256,14 +259,50 @@ impl AppServer {
                 .or_insert_with(|| remote.clone());
         }
         let tools = tools.into_iter().collect();
+        let resources_seen = std::sync::atomic::AtomicU64::new(handle.resources_changed());
         Arc::new(Self {
             handle,
             tools,
             remote_names,
-            sizes,
-            listing_ui,
+            sizes: std::sync::Mutex::new(sizes),
+            listing_ui: std::sync::Mutex::new(listing_ui),
+            resources_seen,
             app_tools,
         })
+    }
+
+    /// Read the resource listing again if the server said (`notifications/resources/list_changed`,
+    /// requested on the connection's `subscriptions/listen` stream) that it changed since the
+    /// sizes and listing-level `_meta.ui` here were read. Done when a view is about to open — never
+    /// on the notification — so an idle server is not woken for it; a failed listing keeps the
+    /// last good one and is tried again at the next open.
+    async fn refresh_resources(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let now = self.handle.resources_changed();
+        if now == self.resources_seen.load(Relaxed) {
+            return;
+        }
+        let Ok(resources) = self.handle.list_resources().await else {
+            return;
+        };
+        let (mut sizes, mut listing_ui) = (HashMap::new(), HashMap::new());
+        for r in resources {
+            if let Some(size) = r.size {
+                sizes.insert(r.uri.clone(), size);
+            }
+            if let Some(ui) = r.ui {
+                listing_ui.insert(r.uri, ui);
+            }
+        }
+        *self
+            .sizes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = sizes;
+        *self
+            .listing_ui
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = listing_ui;
+        self.resources_seen.store(now, Relaxed);
     }
 
     fn name(&self) -> &str {
@@ -1391,6 +1430,7 @@ impl AppTool {
                 )));
             }
         };
+        self.server.refresh_resources().await;
         let frames = ViewFrames {
             app_id: progress.map_or_else(
                 || format!("app-{}", DIRECT_CALLS.fetch_add(1, Ordering::Relaxed)),
@@ -1402,7 +1442,13 @@ impl AppTool {
             input_schema: self.input_schema.clone(),
             ui: self.ui.clone(),
             resource_uri: self.resource_uri.clone(),
-            listing_ui: self.server.listing_ui.get(&self.resource_uri).cloned(),
+            listing_ui: self
+                .server
+                .listing_ui
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&self.resource_uri)
+                .cloned(),
             arguments: arguments.clone(),
             shared: self.shared.clone(),
         };
@@ -1412,7 +1458,13 @@ impl AppTool {
         let handle = self.server.handle.clone();
         let uri = self.resource_uri.clone();
         // A view the server advertised as oversized is refused without reading a byte of it.
-        let advertised = self.server.sizes.get(&uri).copied();
+        let advertised = self
+            .server
+            .sizes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&uri)
+            .copied();
         // The read is its own task (it may outlive this call), still answering to this session.
         let session_host = crate::tools::mcp::current_session_host();
         let mut read = tokio::spawn(async move {

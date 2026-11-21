@@ -144,6 +144,10 @@ struct State {
     listen_log: Vec<Value>,
     /// `events/list` requests answered.
     list_calls: u64,
+    /// `/control/stale_epoch`: the schema epoch poll cursors are minted under (`<seq>.e<epoch>` once
+    /// it is above 0). A poll carrying a cursor from an earlier epoch is answered `-32026
+    /// Unsupported {reason: schema_changed}`, as the SEP lets a server do.
+    epoch: u64,
     /// Requests refused `400 HeaderMismatch` for their routing headers.
     header_rejections: u64,
     /// The `Mcp-Name` / `Mcp-Param-*` headers of every `events/*` request that carried a name.
@@ -718,12 +722,33 @@ async fn rpc(
                     json!({ "events": [], "cursor": head.to_string(), "truncated": true, "hasMore": false, "nextPollMs": next_poll }),
                 );
             }
+            let epoch = st.epoch;
+            let mint = |seq: u64| {
+                if epoch == 0 {
+                    seq.to_string()
+                } else {
+                    format!("{seq}.e{epoch}")
+                }
+            };
+            if let Some(c) = params["cursor"].as_str() {
+                let cursor_epoch = c
+                    .split_once(".e")
+                    .and_then(|(_, e)| e.parse().ok())
+                    .unwrap_or(0);
+                if cursor_epoch != epoch {
+                    return Err((
+                        -32026,
+                        "Unsupported".into(),
+                        Some(json!({"feature": "inputSchema", "reason": "schema_changed"})),
+                    ));
+                }
+            }
             let Some(cursor) = params["cursor"]
                 .as_str()
-                .and_then(|c| c.parse::<u64>().ok())
+                .and_then(|c| c.split('.').next()?.parse::<u64>().ok())
             else {
                 return Ok(
-                    json!({ "events": [], "cursor": head.to_string(), "truncated": false, "hasMore": false, "nextPollMs": next_poll }),
+                    json!({ "events": [], "cursor": mint(head), "truncated": false, "hasMore": false, "nextPollMs": next_poll }),
                 );
             };
             let pending: Vec<&Occ> = st
@@ -739,7 +764,7 @@ async fn rpc(
             };
             Ok(json!({
                 "events": batch.iter().map(|o| occ_json(o, false)).collect::<Vec<_>>(),
-                "cursor": new_cursor.to_string(),
+                "cursor": mint(new_cursor),
                 "truncated": false,
                 "hasMore": pending.len() > max,
                 "nextPollMs": next_poll,
@@ -1322,6 +1347,11 @@ async fn control(state: &Shared, method: &str, path: &str, body: &[u8]) -> (u16,
                 }
             }
             (200, json!({ "sent": send_list_changed(state) }))
+        }
+        ("POST", "/control/stale_epoch") => {
+            let mut st = state.lock().unwrap();
+            st.epoch += 1;
+            (200, json!({ "epoch": st.epoch }))
         }
         ("POST", "/control/raise_nested") => {
             state.lock().unwrap().nested_released = true;

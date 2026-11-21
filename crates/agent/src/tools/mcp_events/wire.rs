@@ -64,11 +64,21 @@ struct RouterInner {
 /// forwarded either. Everything already queued precedes the drop, so once the consumer has drained
 /// it, its cursor is the last position it really delivered — it reconnects from there and the
 /// server replays the rest. A cursor can never move past an event that was dropped.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct NotificationRouter {
     inner: Arc<Mutex<RouterInner>>,
-    /// Bumped by `notifications/events/list_changed`; discovery caches compare against it.
-    generation: Arc<AtomicU64>,
+    /// Bumped by `notifications/events/list_changed`; discovery caches compare against it, and a
+    /// hub watches it to list again at once ([`Self::watch`]).
+    generation: Arc<tokio::sync::watch::Sender<u64>>,
+}
+
+impl Default for NotificationRouter {
+    fn default() -> Self {
+        Self {
+            inner: Arc::default(),
+            generation: Arc::new(tokio::sync::watch::channel(0).0),
+        }
+    }
 }
 
 impl NotificationRouter {
@@ -177,13 +187,18 @@ impl NotificationRouter {
     }
 
     pub(super) fn generation(&self) -> u64 {
-        self.generation.load(Ordering::Relaxed)
+        *self.generation.borrow()
+    }
+
+    /// Wakes when the generation moves: the event types may have changed.
+    pub(super) fn watch(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.generation.subscribe()
     }
 
     /// The event types may have changed (a `list_changed`, a stream that was down and may have
     /// missed one, a `HeaderMismatch`): discovery caches read before now are stale.
     pub(crate) fn bump(&self) {
-        self.generation.fetch_add(1, Ordering::Relaxed);
+        self.generation.send_modify(|g| *g += 1);
     }
 }
 
@@ -414,7 +429,7 @@ impl Conn {
         }
     }
 
-    fn router(&self) -> &NotificationRouter {
+    pub(super) fn router(&self) -> &NotificationRouter {
         match &self.peer {
             crate::tools::mcp::EventsPeer::Rmcp { router, .. }
             | crate::tools::mcp::EventsPeer::Http { router, .. } => router,
@@ -431,9 +446,12 @@ impl Conn {
         self.router().bump();
     }
 
-    /// The `Mcp-Name` / `Mcp-Param-*` headers for one `events/*` request over direct HTTP. Stdio
-    /// (and a session-bound legacy server) carry no HTTP routing headers.
-    fn routing_headers(
+    /// The `Mcp-Name` / `Mcp-Param-*` headers for one `events/*` request over direct HTTP, derived
+    /// from the descriptor the request is being built against. If this connection holds no
+    /// descriptor for the event (the hub's cache entry was dropped for a refresh, say) it lists
+    /// first: a request is never sent with headers made from nothing. Stdio (and a session-bound
+    /// legacy server) carry no HTTP routing headers.
+    async fn routing_headers(
         &self,
         method: &str,
         params: &Value,
@@ -441,13 +459,21 @@ impl Conn {
         if self.http.is_none() || !super::headers::is_named_method(method) {
             return Vec::new();
         }
-        let schema = params.get("name").and_then(Value::as_str).and_then(|name| {
+        let Some(name) = params.get("name").and_then(Value::as_str) else {
+            return Vec::new();
+        };
+        let find = || {
             let held = self.descriptors.lock().ok()?;
-            let list = held.as_ref()?;
-            list.iter()
+            held.as_ref()?
+                .iter()
                 .find(|e| e.get("name").and_then(Value::as_str) == Some(name))
-                .and_then(|e| e.get("inputSchema").cloned())
-        });
+                .cloned()
+        };
+        let mut descriptor = find();
+        if descriptor.is_none() && Box::pin(self.list_events()).await.is_ok() {
+            descriptor = find();
+        }
+        let schema = descriptor.and_then(|e| e.get("inputSchema").cloned());
         super::headers::routing_headers(params, schema.as_ref())
     }
 
@@ -743,7 +769,7 @@ impl Conn {
                     .as_ref()
                     .ok_or_else(|| RpcError::local("no HTTP client"))?;
                 let id = NEXT_HTTP_ID.fetch_add(1, Ordering::Relaxed);
-                let routing = self.routing_headers(method, &params);
+                let routing = self.routing_headers(method, &params).await;
                 let body = Self::http_body(id, method, params, protocol_version);
                 let want = body["id"].clone();
                 let headers = &[headers.as_slice(), routing.as_slice()].concat();
@@ -871,7 +897,7 @@ impl Conn {
                     .as_ref()
                     .ok_or_else(|| RpcError::local("no HTTP client"))?;
                 let id = NEXT_HTTP_ID.fetch_add(1, Ordering::Relaxed);
-                let routing = self.routing_headers(method, &params);
+                let routing = self.routing_headers(method, &params).await;
                 let body = Self::http_body(id, method, params, protocol_version);
                 let want = body["id"].clone();
                 let send_headers = [headers.as_slice(), routing.as_slice()].concat();
@@ -1428,6 +1454,87 @@ mod tests {
         assert!(
             !text.contains('\n') && !text.contains('\u{202E}'),
             "{text:?}"
+        );
+    }
+
+    /// A request is built against the descriptor it is for, never from nothing: a connection that
+    /// holds none (the hub's cache entry was dropped for a refresh) lists first, so the
+    /// `Mcp-Param-*` headers are there on the first attempt — not recovered by a `HeaderMismatch`.
+    #[tokio::test]
+    async fn a_request_with_no_cached_descriptor_lists_first_so_its_param_headers_are_present() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        agent_core::ensure_provider();
+        let listener = beyond_test_support::ports::tokio_listener().await;
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let seen: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+        let record = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let record = record.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16384];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let method = head
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("mcp-method: ")
+                                .map(str::to_owned)
+                        })
+                        .unwrap_or_default();
+                    record
+                        .lock()
+                        .unwrap()
+                        .push((method.clone(), head.to_ascii_lowercase()));
+                    let result = if method == "events/list" {
+                        json!({"resultType": "complete", "events": [{"name": "ticket.updated",
+                            "delivery": ["poll"], "payloadSchema": {},
+                            "inputSchema": {"type": "object", "properties": {
+                                "project": {"type": "string", "x-mcp-header": "Project"}}}}]})
+                    } else {
+                        json!({"resultType": "complete", "events": [], "cursor": "0"})
+                    };
+                    let body = json!({"jsonrpc": "2.0", "id": "x", "result": result}).to_string();
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(reply.as_bytes()).await;
+                });
+            }
+        });
+        let conn = Conn::new(
+            crate::tools::mcp::EventsPeer::Http {
+                url,
+                router: NotificationRouter::default(),
+                headers: Vec::new(),
+                auth: None,
+                protocol_version: "2026-07-28".into(),
+                events: None,
+            },
+            Some(reqwest::Client::new()),
+            None,
+        );
+        conn.call(
+            "events/poll",
+            json!({"name": "ticket.updated", "arguments": {"project": "alpha"}}),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        let seen = seen.lock().unwrap();
+        let methods: Vec<&str> = seen.iter().map(|(m, _)| m.as_str()).collect();
+        assert_eq!(
+            methods,
+            ["events/list", "events/poll"],
+            "listed first, once"
+        );
+        assert!(
+            seen[1].1.contains("mcp-param-project: alpha")
+                && seen[1].1.contains("mcp-name: ticket.updated"),
+            "{}",
+            seen[1].1
         );
     }
 

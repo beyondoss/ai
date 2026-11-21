@@ -1823,6 +1823,33 @@ impl McpServerHandle {
     /// An MCP App view's `resources/read`, served from this connection's cache when it can be — the
     /// spec lets a host cache view templates, and a view is re-read on every call of its tool
     /// otherwise. Invalidated by the server's `resources/list_changed` and by any redial.
+    /// How many `resources/list_changed` this connection has seen (see
+    /// `McpHandler::on_resource_list_changed`).
+    pub(crate) fn resources_changed(&self) -> u64 {
+        self.conn
+            .skills_changed()
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The server's `resources/list` again, as the apps host reads it.
+    pub(crate) async fn list_resources(
+        &self,
+    ) -> Result<Vec<crate::tools::mcp_apps::ListedResource>, String> {
+        let client = self.conn.client().await?;
+        let listed = client
+            .list_all_resources()
+            .await
+            .map_err(|e| format!("mcp server `{}` resources/list failed: {e}", self.name))?;
+        Ok(listed
+            .iter()
+            .map(|r| crate::tools::mcp_apps::ListedResource {
+                uri: r.uri.clone(),
+                size: r.size,
+                ui: listing_ui(r),
+            })
+            .collect())
+    }
+
     pub(crate) async fn read_view(
         &self,
         uri: &str,

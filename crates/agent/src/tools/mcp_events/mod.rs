@@ -485,6 +485,13 @@ struct Hub {
     /// while different keys (and slow servers) never wait on each other.
     key_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     discovery: Mutex<HashMap<String, Discovered>>,
+    /// Per server: the task that lists its events again the moment it says they changed (see
+    /// [`Hub::ensure_watcher`]).
+    watchers: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+    /// Names a server whose event types were just listed again, to wake a subscription waiting out
+    /// a retry or a refusal for it.
+    retry_tx: tokio::sync::broadcast::Sender<String>,
+    weak_self: std::sync::OnceLock<std::sync::Weak<Hub>>,
     /// Per key: re-discoveries used, and when the last one happened (the budget resets after
     /// [`healthy_for`]).
     rediscoveries: Mutex<HashMap<String, (u32, Instant)>>,
@@ -575,6 +582,9 @@ impl McpEventsHub {
             subs: Mutex::new(HashMap::new()),
             key_locks: Mutex::new(HashMap::new()),
             discovery: Mutex::new(HashMap::new()),
+            watchers: Mutex::new(HashMap::new()),
+            retry_tx: tokio::sync::broadcast::channel(16).0,
+            weak_self: std::sync::OnceLock::new(),
             rediscoveries: Mutex::new(HashMap::new()),
             configured: Mutex::new(HashSet::new()),
             shutdown: CancellationToken::new(),
@@ -588,6 +598,7 @@ impl McpEventsHub {
             questions_ready: CancellationToken::new(),
             dropped_seen: Mutex::new(std::collections::VecDeque::new()),
         });
+        let _ = hub.weak_self.set(Arc::downgrade(&hub));
         let weak_hub = Arc::downgrade(&hub);
         let on_change: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
             if let Some(hub) = weak_hub.upgrade() {
@@ -1160,6 +1171,7 @@ impl Hub {
                  (capabilities.extensions[\"{EVENTS_EXTENSION_ID}\"]); no events request was sent"
             )));
         }
+        self.ensure_watcher(server, conn.router().watch());
         let generation = conn.generation();
         if let Some((g, events)) = self
             .discovery
@@ -1181,6 +1193,44 @@ impl Hub {
             d.insert(server.to_owned(), (generation, events.clone()));
         }
         Ok(events)
+    }
+
+    /// `notifications/events/list_changed` makes the SEP's client "call `events/list` again": this
+    /// watches the server's connection for it and lists at once (not at the next subscribe), then
+    /// wakes every subscription of this hub waiting out a retry or a refusal for that server, so a
+    /// newly added event type brings a waiting subscription up promptly. One task per server;
+    /// idempotent; it ends with the hub or its connection (the next discovery starts another).
+    fn ensure_watcher(&self, server: &str, mut changes: tokio::sync::watch::Receiver<u64>) {
+        let mut watchers = self
+            .watchers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if watchers.get(server).is_some_and(|t| !t.is_finished()) {
+            return;
+        }
+        let Some(hub) = self.weak_self.get().and_then(std::sync::Weak::upgrade) else {
+            return;
+        };
+        let server2 = server.to_owned();
+        watchers.insert(
+            server.to_owned(),
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        () = hub.shutdown.cancelled() => return,
+                        changed = changes.changed() => {
+                            if changed.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    if let Err(e) = hub.discover(&server2).await {
+                        tracing::debug!(server = %server2, error = %e.message, "events/list after list_changed failed");
+                    }
+                    let _ = hub.retry_tx.send(server2.clone());
+                }
+            }),
+        );
     }
 
     /// Idempotent upsert. The same spec again is a no-op that returns the live status. A changed
@@ -1556,6 +1606,7 @@ impl Hub {
         let weak = Arc::downgrade(hub);
         let shutdown = hub.shutdown.clone();
         let ready = hub.questions_ready.clone();
+        let mut woken = hub.retry_tx.subscribe();
         let resumed = !delay.is_zero() && !restoring;
         tokio::spawn(async move {
             // Not a request before the session can take the server's questions.
@@ -1567,9 +1618,25 @@ impl Hub {
             let mut failures = 0u32;
             let mut forbidden_streak = 0u32;
             loop {
-                tokio::select! {
-                    () = tokio::time::sleep(delay) => {}
-                    () = shutdown.cancelled() => break,
+                // Out of the wait early when this server's event types are listed again.
+                let sleep = tokio::time::sleep(delay);
+                tokio::pin!(sleep);
+                loop {
+                    tokio::select! {
+                        () = &mut sleep => break,
+                        () = shutdown.cancelled() => break,
+                        got = woken.recv() => match got {
+                            Ok(server) if server != spec.server => {}
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                sleep.as_mut().await;
+                                break;
+                            }
+                            _ => break,
+                        },
+                    }
+                }
+                if shutdown.is_cancelled() {
+                    break;
                 }
                 let Some(hub) = weak.upgrade() else { return };
                 // An explicit unsubscribe while this was waiting ends the effort.
@@ -1668,6 +1735,23 @@ impl Hub {
         });
     }
 
+    /// The server said this subscription's event type was removed or changed in place (a
+    /// `NotFound {kind: event}` or `Unsupported {reason: schema_changed}`, which is also how a
+    /// server answers a cursor minted under an older schema). Its position belongs to the old
+    /// schema: it restarts from `null` ("now"), and the discovery cache is dropped so the next
+    /// subscribe lists the current descriptor. Without this a poll would send the same stale cursor
+    /// for ever. `tell_model` queues the gap notice (when the caller will not, on resubscribing).
+    fn forget_position(&self, spec: &SubSpec, state: &SubState, tell_model: bool) {
+        state.with(|s| s.cursor = None);
+        state.save();
+        if let Ok(mut d) = self.discovery.lock() {
+            d.remove(&spec.server);
+        }
+        if tell_model {
+            self.gap(spec, state, &Value::Null);
+        }
+    }
+
     /// A subscription came back after the server ended it: whatever happened in between may not
     /// have been delivered, so tell the model (and attached clients) there may be a gap.
     fn resubscribed(&self, spec: &SubSpec) {
@@ -1688,6 +1772,9 @@ impl Hub {
             s.last_error = Some(error.to_string());
         });
         self.status_event(spec, "terminated", json!({ "error": error.to_json() }));
+        if error.wants_rediscovery() {
+            self.forget_position(spec, state, false);
+        }
         if self.shutdown.is_cancelled() {
             self.refresh_keep_alive();
             return;
@@ -1974,6 +2061,9 @@ async fn run_poll(
             }
             Err(e) => {
                 if let Some(tx) = ready.take() {
+                    if e.wants_rediscovery() {
+                        hub.forget_position(&spec, &state, true);
+                    }
                     let _ = tx.send(Err(SubError::from_rpc(&e)));
                     return;
                 }
@@ -2077,6 +2167,9 @@ fn stream_error(
     e: RpcError,
 ) -> StreamEnd {
     if let Some(tx) = ready.take() {
+        if e.wants_rediscovery() {
+            hub.forget_position(spec, state, true);
+        }
         let _ = tx.send(Err(SubError::from_rpc(&e)));
         return StreamEnd::Terminated;
     }

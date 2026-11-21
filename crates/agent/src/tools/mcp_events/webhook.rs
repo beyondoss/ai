@@ -783,6 +783,9 @@ pub(super) async fn run_webhook(
             }
             Err(e) => {
                 if let Some(tx) = ready.take() {
+                    if e.wants_rediscovery() {
+                        hub.forget_position(&spec, &state, true);
+                    }
                     let _ = tx.send(Err(SubError::from_rpc(&e)));
                     return;
                 }

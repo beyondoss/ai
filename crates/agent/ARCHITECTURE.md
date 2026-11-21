@@ -5613,7 +5613,11 @@ listing marked stale, the events discovery cache invalidated — because a chang
 while the stream was down. A server that answers the listen with Method not found gets none; a
 pre-`2026-07-28` (`initialize`) server sends its `list_changed` unrequested and gets no stream. The
 acknowledgment is not inspected on this path (rmcp types it, losing `eventsListChanged`): the filter
-asks for no more than the server declared. Before this existed the handlers never fired against a
+asks for no more than the server declared. `resources/list_changed` is consumed lazily, never by an
+eager re-list: the MCP Apps view cache is cleared (the next `resources/read` of a view goes to the
+server), the skills listing is marked due (`ServerSkills::refresh_if_due`, checked at each turn:
+`mcp_skills.rs`), and an apps server's sizes and listing-level `_meta.ui` defaults are read again by
+`AppServer::refresh_resources` when the next view opens (`tests/mcp_apps_session.rs`). Before this existed the handlers never fired against a
 `2026-07-28` server, and tool, skills and Apps caches stayed stale until a redial.
 
 A server's tool list is not fixed at its first boot: one may add tools on request (an
@@ -7275,12 +7279,17 @@ mcp_events_subscribe (any session) ──► owned by that session
   transport's rules (empty or non-token name, duplicates ignoring case, a non-primitive property, one
   not reachable through `properties` alone) is **excluded from `events/list`** and logged. A
   `HeaderMismatch` (`-32020`, HTTP 400) lists again and retries once with the current schema's
-  headers. rmcp implements the same encoder for `tools/call` but keeps it crate-private, so there is
+  headers. The descriptor is the one the request is built against: a connection holding none for the
+  event (the hub's cache entry was dropped for a refresh) lists first, so the first attempt is never
+  sent without its `Mcp-Param-*`. rmcp implements the same encoder for `tools/call` but keeps it crate-private, so there is
   nothing to reuse; stdio and the legacy session-bound path carry no HTTP headers.
 - **`list_changed`.** The connection's `subscriptions/listen` stream (see "A server's tools can
   change") requests `eventsListChanged` when the server declared `listChanged: true`; each
-  `notifications/events/list_changed` bumps the connection's discovery generation, so the next
-  discovery lists again, as does a reopened stream.
+  `notifications/events/list_changed` bumps the connection's discovery generation, and a per-server
+  watcher task (`Hub::ensure_watcher`, started by the first discovery) **lists again at once** — the
+  SEP's "SHOULD call `events/list` again" — then wakes every subscription of the hub waiting out a
+  retry or a refusal for that server (`retry_tx`), so a type the server just added brings a waiting
+  configured subscription up promptly instead of after its hour. A reopened stream bumps too.
 - **Error codes.** SEP-3415's: `NotFound` `-32023`, `Forbidden` `-32024`, `ResourceExhausted` `-32025`
   (`data.limit`), `Unsupported` `-32026`, `CallbackEndpointError` `-32027` (`data.reason`, one of the
   `lastError` categories), plus `InvalidParams` and Method not found. NotFound and Unsupported are
@@ -7323,6 +7332,11 @@ mcp_events_subscribe (any session) ──► owned by that session
   and no record at all is not trusted: it is not restored. Boot restoration is bounded too: at most
   `BEYOND_AI_AGENT_MCP_EVENTS_MAX_RESTORED_SESSIONS` (32) sessions are started — the ones a client
   used most recently — and the rest come back when their clients do.
+- **A cursor from an older schema.** A server may mint cursors that encode a schema epoch and answer
+  a stale one with `Unsupported {reason: schema_changed}`. Any such answer (or a removal) makes the
+  subscription **forget its position** (`Hub::forget_position`: cursor back to `null`, discovery
+  dropped) before it resubscribes, and the model is told a gap is possible — never the same stale
+  cursor again.
 - **Schema changes.** For a runtime subscription, a termination saying the event type was removed
   (`-32023`, `kind: event`) or changed in place (`-32026`, `reason: schema_changed`) re-fetches
   `events/list` and resubscribes — the SEP's SHOULD — up to 5 times, with backoff; the budget is

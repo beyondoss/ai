@@ -600,7 +600,7 @@ async fn a_views_csp_that_only_the_listing_declares_reaches_the_renderer() {
     let ui = &open["resource"]["_meta"]["ui"];
     assert_eq!(
         ui["csp"]["connectDomains"],
-        json!(["https://listing.example.test"]),
+        json!(["https://listing-v1.example.test"]),
         "{open}"
     );
     assert_eq!(ui["permissions"], json!({ "camera": {} }), "{open}");

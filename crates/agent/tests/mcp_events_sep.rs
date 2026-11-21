@@ -224,10 +224,10 @@ fn an_event_type_with_an_invalid_annotation_is_excluded_over_http() {
 fn list_changed_refreshes_discovery(
     home: tempfile::TempDir,
     server: Value,
-    control: Result<String, std::path::PathBuf>,
+    addr: Result<String, std::path::PathBuf>,
 ) {
     let mut s = start(json!([server]), home);
-    let fixture = match control {
+    let fixture = match addr {
         Ok(url) => url,
         Err(file) => wait_control_file(&file),
     };
@@ -330,4 +330,143 @@ fn a_resource_exhausted_answer_is_retried_not_refused() {
             .any(|f| f["type"] == "mcp_event_status" && f["kind"] == "refused"),
         "a quota is not a permanent refusal"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Poll liveness: a cursor from an older schema epoch
+// ---------------------------------------------------------------------------------------------
+
+fn polls(fixture: &str) -> usize {
+    state(fixture)["methods"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| *m == "events/poll")
+        .count()
+}
+
+/// The SEP lets a server mint cursors that encode a schema epoch and answer a stale one with
+/// `Unsupported {reason: schema_changed}`. A poll must not send the same cursor for ever: it lists
+/// again and starts over from `null`, tells the model a gap is possible, and keeps delivering.
+fn poll_survives_a_stale_epoch_cursor(
+    home: tempfile::TempDir,
+    server: Value,
+    addr: Result<String, std::path::PathBuf>,
+) {
+    let mut s = start(json!([server]), home);
+    let fixture = match addr {
+        Ok(url) => url,
+        Err(file) => wait_control_file(&file),
+    };
+    wait_active(&mut s.stdin, &mut s.frames, 1);
+    emit(
+        &fixture,
+        json!({ "project": "alpha", "data": { "ticket_id": "E-1" } }),
+    );
+    s.frames
+        .wait(Duration::from_secs(20), "the first event", |f| {
+            f["type"] == "mcp_event" && f["event"]["data"]["ticket_id"] == "E-1"
+        });
+
+    control_post_path(&fixture, "/control/stale_epoch");
+    s.frames
+        .wait(Duration::from_secs(30), "the resubscription", |f| {
+            f["type"] == "mcp_event_status" && f["kind"] == "resubscribed"
+        });
+    // The model is told events may have been missed.
+    s.frames
+        .wait(Duration::from_secs(10), "the gap notice", |f| {
+            f["type"] == "mcp_event_status" && f["kind"] == "gap"
+        });
+    // A poll from `null` has run (and minted a cursor of the new epoch) before the next event.
+    let base = polls(&fixture);
+    eventually(Duration::from_secs(20), "polls after the restart", || {
+        (polls(&fixture) >= base + 2).then_some(())
+    });
+    emit(
+        &fixture,
+        json!({ "project": "alpha", "data": { "ticket_id": "E-2" } }),
+    );
+    s.frames.wait(
+        Duration::from_secs(20),
+        "the event after the restart",
+        |f| f["type"] == "mcp_event" && f["event"]["data"]["ticket_id"] == "E-2",
+    );
+}
+
+fn control_post_path(fixture: &str, path: &str) -> Value {
+    control(fixture, "POST", path, Some(&json!({})))
+}
+
+#[test]
+fn over_http_a_poll_with_a_stale_epoch_cursor_restarts_from_null() {
+    let (_fx, mcp_url, fixture) = spawn_http_fixture(&[]);
+    poll_survives_a_stale_epoch_cursor(
+        tempfile::tempdir().unwrap(),
+        http_server(&mcp_url, poll_alpha()),
+        Ok(fixture),
+    );
+}
+
+#[test]
+fn over_stdio_a_poll_with_a_stale_epoch_cursor_restarts_from_null() {
+    let home = tempfile::tempdir().unwrap();
+    let control_file = home.path().join("control");
+    let server = stdio_server("remote", &control_file, json!({}), poll_alpha());
+    poll_survives_a_stale_epoch_cursor(home, server, Err(control_file));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Gap 3: list_changed brings a waiting subscription up
+// ---------------------------------------------------------------------------------------------
+
+/// A configured subscription to an event type the server does not offer yet is refused (and would
+/// wait an hour to try again). When the server adds the type and says so, the client lists again at
+/// once and the waiting subscription comes up, with no subscribe from anyone.
+fn list_changed_wakes_a_waiting_subscription(
+    home: tempfile::TempDir,
+    server: Value,
+    addr: Result<String, std::path::PathBuf>,
+) {
+    let mut s = start(json!([server]), home);
+    let fixture = match addr {
+        Ok(url) => url,
+        Err(file) => wait_control_file(&file),
+    };
+    s.frames.wait(Duration::from_secs(20), "the refusal", |f| {
+        f["type"] == "mcp_event_status" && f["kind"] == "refused"
+    });
+    eventually(Duration::from_secs(20), "the listen stream", || {
+        (state(&fixture)["listens"] == 1).then_some(())
+    });
+    let sent = control(
+        &fixture,
+        "POST",
+        "/control/list_changed",
+        Some(&json!({ "add_event": true })),
+    );
+    assert_eq!(sent["sent"], 1, "{sent:#}");
+    wait_active(&mut s.stdin, &mut s.frames, 1);
+}
+
+fn waiting_events() -> Value {
+    json!([{ "name": "dynamic.added", "delivery": "poll", "action": "notify" }])
+}
+
+#[test]
+fn over_http_list_changed_brings_a_refused_subscription_up() {
+    let (_fx, mcp_url, fixture) = spawn_http_fixture(&[]);
+    list_changed_wakes_a_waiting_subscription(
+        tempfile::tempdir().unwrap(),
+        http_server(&mcp_url, waiting_events()),
+        Ok(fixture),
+    );
+}
+
+#[test]
+fn over_stdio_list_changed_brings_a_refused_subscription_up() {
+    let home = tempfile::tempdir().unwrap();
+    let control_file = home.path().join("control");
+    let server = stdio_server("remote", &control_file, json!({}), waiting_events());
+    list_changed_wakes_a_waiting_subscription(home, server, Err(control_file));
 }
