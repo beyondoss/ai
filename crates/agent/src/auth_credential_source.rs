@@ -73,7 +73,7 @@ impl OAuthCredentialSource {
         let live = stored
             .get(self.provider.store_key())
             .is_none_or(|s| !s.credential.is_expired(now_ms()));
-        (!live).then(|| agent_core::Error::Transport(message))
+        (!live).then_some(agent_core::Error::Transport(message))
     }
 }
 
