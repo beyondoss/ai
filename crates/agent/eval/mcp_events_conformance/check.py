@@ -451,8 +451,15 @@ async def scenario_core(transport):
                     seen = any(name in t for t in d.get("tools", [])) or any(name in json.dumps(r) for r in d.get("resources", []))
                     if seen:
                         break
-                f.say(seen, f"({'i' if kind == 'tools' else 'ii'}) {kind}: the new {kind[:-1]} `{name}` is in the agent session by next use (get_mcp)",
-                      f"get_mcp: {json.dumps(d)[:300]}")
+                how = "get_mcp"
+                if not seen and kind == "resources":
+                    # Next use: the next model turn. The mock gateway records the tool catalog it was sent.
+                    n0 = len(f.gw.bodies)
+                    await f.ws.send(json.dumps({"type": "prompt", "id": f"next{time.time()}", "message": "ping"}))
+                    seen = await f.until(lambda: any(name in b for b in f.gw.bodies[n0:]), 15)
+                    how = "the next model turn's tool catalog"
+                f.say(seen, f"({'i' if kind == 'tools' else 'ii'}) {kind}: the new {kind[:-1]} `{name}` is in the agent session by next use ({how})",
+                      f"absent from get_mcp and from the next model turn; get_mcp: {json.dumps(d)[:200]}")
             f.finish_common()
     finally:
         await f.stop()
