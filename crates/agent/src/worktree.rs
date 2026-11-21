@@ -50,7 +50,9 @@
 //! A checkout the developer must inspect — a conflicted, refused or failed child's — is moved to a
 //! `kept-` name by [`Worktree::preserve`], which no sweep reaps. So is a *cancelled* child's, when it
 //! holds changes (an edit, an untracked file, a commit past the baseline): only a clean one is removed
-//! on `Drop`, git's own default. And [`Worktree::create`] never
+//! on `Drop`, git's own default. A worktree cancelled *before* its baseline exists (mid-seed) holds
+//! only copies of the parent's files, so it is removed, never kept; seeding always commits the baseline
+//! (empty when the parent is clean) so a sandbox sweep can tell the two by `HEAD`. And [`Worktree::create`] never
 //! removes an existing path to make room for a new one: each spawn takes a fresh per-process
 //! sequence number, since a daemon's sessions share one PID and a retry spawns the same agent again.
 //!
@@ -515,11 +517,16 @@ impl Git {
     /// file, or a commit that is neither the seeded baseline (recognised by its subject, as the
     /// sweeper does not know its id) nor anything the repository's own `HEAD` already contains. A
     /// directory that is not a git checkout at all holds no child work git knows of: reaped. Any
-    /// other doubt reads as changed: it is not deleted.
+    /// other doubt reads as changed: it is not deleted. One whose `HEAD` is still inside the repository's
+    /// own history and (no baseline commit, which seeding always makes) was cancelled mid-seed: only
+    /// copies of the parent's files, no child work, reaped.
     async fn remote_has_changes(&self, repo_root: &Path, path: &Path) -> bool {
         let script = format!(
             "cd {wt} || exit 0; \
              git rev-parse --git-dir >/dev/null 2>&1 || {{ echo clean; exit 0; }}; \
+             if git merge-base --is-ancestor HEAD \"$(git -C {repo} rev-parse HEAD)\"; then \
+                 echo clean; exit 0; \
+             fi; \
              [ -z \"$(git status --porcelain --untracked-files=all 2>&1)\" ] || exit 0; \
              [ \"$(git log -1 --format=%s 2>&1)\" = {baseline} ] && echo clean && exit 0; \
              git merge-base --is-ancestor HEAD \"$(git -C {repo} rev-parse HEAD)\" && echo clean",
@@ -934,32 +941,26 @@ impl Worktree {
         // The baseline. `-A` stages the copied untracked files too, so the child's later delta is
         // measured against the tree the parent actually had, not against HEAD.
         self.git.run_text(&self.path, &["add", "-A"]).await?;
-        // A repo whose working tree is clean has nothing to commit, and `git commit` exits non-zero on
-        // an empty commit — so only commit when `add` produced something staged. (`diff --cached
-        // --quiet` exits non-zero, i.e. `Err` here, precisely when there *are* staged changes.)
-        if self
-            .git
-            .run_text(&self.path, &["diff", "--cached", "--quiet"])
-            .await
-            .is_err()
-        {
-            self.git
-                .run_text(
-                    &self.path,
-                    &[
-                        "-c",
-                        "user.name=beyond-agent",
-                        "-c",
-                        "user.email=agent@beyond.local",
-                        "commit",
-                        "--quiet",
-                        "--no-verify",
-                        "-m",
-                        BASELINE_SUBJECT,
-                    ],
-                )
-                .await?;
-        }
+        // Always a commit, empty when the parent's tree is clean: a seeded worktree is the one whose
+        // `HEAD` is the baseline. A cancel mid-seed leaves `HEAD` inside the repository's own history,
+        // and that is how the sandbox sweep (which cannot see `baseline`) tells it from a child's.
+        self.git
+            .run_text(
+                &self.path,
+                &[
+                    "-c",
+                    "user.name=beyond-agent",
+                    "-c",
+                    "user.email=agent@beyond.local",
+                    "commit",
+                    "--quiet",
+                    "--no-verify",
+                    "--allow-empty",
+                    "-m",
+                    BASELINE_SUBJECT,
+                ],
+            )
+            .await?;
         Ok(self
             .git
             .run_text(&self.path, &["rev-parse", "HEAD"])
@@ -1066,7 +1067,10 @@ impl Drop for Worktree {
         // A cancelled child's edits are the only copy of its work (see [`Worktree::preserve`]): a
         // worktree with changes is kept, as `git worktree remove` itself would refuse to remove it;
         // only a clean one is removed.
-        if has_changes_blocking(&self.path, &self.baseline) {
+        //
+        // No baseline yet means `create` was cancelled mid-seed: nothing in the checkout is the
+        // child's (it has not started), only copies of the parent's files. Removed, never kept.
+        if !self.baseline.is_empty() && has_changes_blocking(&self.path, &self.baseline) {
             if let (Some(base), Some(leaf)) = (self.path.parent(), self.path.file_name()) {
                 let kept = kept_path(base, leaf);
                 if git_blocking(&self.repo_root, |c| {
@@ -2144,6 +2148,67 @@ mod tests {
                 ],
             )
             .await;
+    }
+
+    /// A worktree as `create` leaves it when its future is dropped mid-seed: added, the parent's files
+    /// copied in, the baseline commit not yet made (`baseline` still empty).
+    async fn mid_seed(git: &Git, root: &Path, label: &str) -> Worktree {
+        let base = ensure_base_dir(git, root).await;
+        let path = base.join(format!("{}-{label}-0", git.owner()));
+        git.run_text(
+            root,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                "--quiet",
+                &path.display().to_string(),
+                "HEAD",
+            ],
+        )
+        .await
+        .unwrap();
+        std::fs::write(path.join("parent-copy.txt"), "the parent's file\n").unwrap();
+        Worktree {
+            path,
+            repo_root: root.to_path_buf(),
+            detached: false,
+            git: git.clone(),
+            baseline: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_worktree_dropped_mid_seed_is_removed_not_kept() {
+        let repo = repo().await;
+        let root = preflight(&Git::Local, repo.path()).await.unwrap();
+        let wt = mid_seed(&Git::Local, &root, "seeding").await;
+        let path = wt.path().to_path_buf();
+        drop(wt);
+        assert!(!path.exists(), "a pre-baseline worktree is removed");
+        assert!(
+            !kept_of(&path).exists(),
+            "and nothing is kept: it holds only the parent's files"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_remote_sweep_reaps_a_worktree_cancelled_mid_seed() {
+        let theirs = Git::Remote {
+            runner: std::sync::Arc::new(crate::tools::exec::RealRunner),
+            backend: std::sync::Arc::new(crate::tools::fs::local::LocalFs::new()),
+            owner: "deadbeef".to_string(),
+        };
+        let repo = repo().await;
+        let root = preflight(&theirs, repo.path()).await.unwrap();
+        let wt = mid_seed(&theirs, &root, "seeding").await;
+        let path = wt.path().to_path_buf();
+        drop(wt);
+        remote_git()
+            .sweep_siblings(&root, path.parent().unwrap())
+            .await;
+        assert!(!path.exists(), "reaped");
+        assert!(!kept_of(&path).exists(), "not kept");
     }
 
     #[tokio::test]
