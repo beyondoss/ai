@@ -766,29 +766,34 @@ async fn a_token_command_supplies_the_bearer_and_both_token_variables_together_a
     .unwrap();
 }
 
+/// The server over streamable HTTP on a port it picked: its process and the `/mcp` URL it announced.
+async fn spawn_http(mock_url: &str) -> (tokio::process::Child, String) {
+    use tokio::io::{AsyncBufReadExt as _, BufReader};
+    let mut cmd = server_command(mock_url);
+    // port-0: the child binds it, keeps it, and announces the port it got on stderr.
+    cmd.env("SANDBOX_MCP_LISTEN", "127.0.0.1:0")
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    let mut lines = BufReader::new(child.stderr.take().unwrap()).lines();
+    let first = lines.next_line().await.unwrap().unwrap();
+    let url = first
+        .split("listening on ")
+        .nth(1)
+        .unwrap()
+        .trim()
+        .to_string();
+    (child, url)
+}
+
 #[tokio::test]
 async fn streamable_http_serves_the_same_tools_on_loopback_and_refuses_a_public_address() {
     tokio::time::timeout(DEADLINE, async {
         use rmcp::transport::StreamableHttpClientTransport;
-        use tokio::io::{AsyncBufReadExt as _, BufReader};
 
         let _ = rustls::crypto::ring::default_provider().install_default();
         let (_dir, mock) = sandbox().await;
 
-        let mut cmd = server_command(&mock.url);
-        // port-0: the child binds it, keeps it, and announces the port it got on stderr.
-        cmd.env("SANDBOX_MCP_LISTEN", "127.0.0.1:0")
-            .stderr(std::process::Stdio::piped());
-        let mut child = cmd.spawn().unwrap();
-        let mut lines = BufReader::new(child.stderr.take().unwrap()).lines();
-        let first = lines.next_line().await.unwrap().unwrap();
-        let url = first
-            .split("listening on ")
-            .nth(1)
-            .unwrap()
-            .trim()
-            .to_string();
-
+        let (mut child, url) = spawn_http(&mock.url).await;
         let client = ().serve(StreamableHttpClientTransport::from_uri(url)).await.unwrap();
         assert_eq!(client.peer().list_all_tools().await.unwrap().len(), 14);
         let r = call(client.peer(), "exec", json!({"command": "echo over http"})).await;
@@ -833,20 +838,8 @@ async fn post_initialize(addr: &str, origin: Option<&str>) -> String {
 #[tokio::test]
 async fn streamable_http_refuses_a_foreign_origin_and_allows_none_or_loopback() {
     tokio::time::timeout(DEADLINE, async {
-        use tokio::io::{AsyncBufReadExt as _, BufReader};
         let (_dir, mock) = sandbox().await;
-        let mut cmd = server_command(&mock.url);
-        cmd.env("SANDBOX_MCP_LISTEN", "127.0.0.1:0")
-            .stderr(std::process::Stdio::piped());
-        let mut child = cmd.spawn().unwrap();
-        let mut lines = BufReader::new(child.stderr.take().unwrap()).lines();
-        let first = lines.next_line().await.unwrap().unwrap();
-        let url = first
-            .split("listening on ")
-            .nth(1)
-            .unwrap()
-            .trim()
-            .to_string();
+        let (mut child, url) = spawn_http(&mock.url).await;
         let addr = url
             .trim_start_matches("http://")
             .split('/')
