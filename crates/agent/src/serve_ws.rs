@@ -235,6 +235,25 @@ const HTTP_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 /// have no other way to address the session they just created.
 const SESSION_ID_HEADER: &str = "X-Session-Id";
 
+/// Releases one pin on every exit of whoever holds it: return, panic unwind, or a dropped future.
+/// A session with `attached > 0` is invisible to the idle reaper, so a leaked pin would hold it for
+/// the daemon's life. Also removes the connection's output sink, when it has registered one.
+struct PinGuard {
+    supervisor: Arc<Supervisor>,
+    id: String,
+    incarnation: u64,
+    sink: Option<(SharedOutConn, u64)>,
+}
+
+impl Drop for PinGuard {
+    fn drop(&mut self) {
+        if let Some((out_conn, sink_id)) = &self.sink {
+            lock_ignoring_poison(out_conn).remove(*sink_id);
+        }
+        self.supervisor.unpin(&self.id, self.incarnation);
+    }
+}
+
 /// How long a **detached** session (no attached connection) stays live before the reaper reclaims it,
 /// when the operator gave no `--session-idle-timeout`. The default has to be finite: without a reaper
 /// the session map only grows — a connection that omits `?session_id=` mints a fresh id, and every id
@@ -1207,6 +1226,13 @@ impl Supervisor {
             out_conn,
             exited,
         } = pinned;
+        // Unpins on every exit, a panic or a dropped future included (see [`PinGuard`]).
+        let mut pin_guard = PinGuard {
+            supervisor: Arc::clone(self),
+            id: id.clone(),
+            incarnation,
+            sink: None,
+        };
         simulated_slow_attach().await;
 
         // Register this connection's send channel as one of the session's output sinks — the session
@@ -1228,6 +1254,7 @@ impl Supervisor {
         // halves happen under the fanout's lock (which `broadcast` also takes), so the ordering is
         // structural rather than lucky — see `OutFanout::add_with_catchup`.
         let sink_id = lock_ignoring_poison(&out_conn).add_with_catchup(OutSink::Bounded(conn_tx));
+        pin_guard.sink = Some((Arc::clone(&out_conn), sink_id));
 
         let (mut sink, mut stream) = ws.split();
 
@@ -1444,8 +1471,9 @@ impl Supervisor {
             let _ = send_task.await;
         }
 
-        // One fewer attached connection; if that was the last, start the idle reaper's clock.
-        self.unpin(&id, incarnation);
+        // `pin_guard` drops here: one fewer attached connection; if that was the last, the idle
+        // reaper's clock starts.
+        drop(pin_guard);
     }
 
     /// Drain: stop taking new work, let what is in flight finish, then shut down.
@@ -3117,28 +3145,12 @@ where
     // ack ever arrived.
     let sink_id = lock_ignoring_poison(&out_conn).add(OutSink::Bounded(conn_tx));
 
-    // Unpin + remove the sink on every exit (timeout, send failure, reply). A session with
-    // `attached > 0` is invisible to the idle reaper; leaking a pin would pin it for the daemon's
-    // life.
-    struct PinGuard {
-        supervisor: Arc<Supervisor>,
-        id: String,
-        incarnation: u64,
-        out_conn: SharedOutConn,
-        sink_id: u64,
-    }
-    impl Drop for PinGuard {
-        fn drop(&mut self) {
-            lock_ignoring_poison(&self.out_conn).remove(self.sink_id);
-            self.supervisor.unpin(&self.id, self.incarnation);
-        }
-    }
+    // Unpin + remove the sink on every exit (timeout, send failure, reply); see [`PinGuard`].
     let _guard = PinGuard {
         supervisor: Arc::clone(supervisor),
         id: id.clone(),
         incarnation,
-        out_conn,
-        sink_id,
+        sink: Some((out_conn, sink_id)),
     };
 
     if input_tx.send(line).await.is_err() {
@@ -3991,6 +4003,33 @@ mod tests {
         assert_eq!(h.incarnation, second.incarnation);
         assert_eq!(h.attached, 1);
         assert!(h.phase.input().is_some(), "still attached, so not reaped");
+    }
+
+    /// A connection that is cancelled mid-session (the future dropped, as a panic unwind or an aborted
+    /// task does) must give its pin back: a leaked one keeps `attached > 0` and the reaper away.
+    #[tokio::test]
+    async fn a_dropped_attach_releases_its_pin() {
+        let probe = Arc::new(Probe::default());
+        let sup = probe_supervisor(&probe, false);
+        let pinned = sup.pin(Some("s1".into()), None).await.unwrap();
+        let (server_end, _client_end) = tokio::io::duplex(64 * 1024);
+        let ws = WebSocketStream::from_raw_socket(server_end, Role::Server, None).await;
+        let attach = tokio::spawn({
+            let sup = sup.clone();
+            async move { sup.attach(pinned, None, ws).await }
+        });
+        settle().await;
+        assert_eq!(lock_ignoring_poison(&sup.table).sessions["s1"].attached, 1);
+        attach.abort();
+        let _ = attach.await;
+        assert_eq!(
+            lock_ignoring_poison(&sup.table).sessions["s1"].attached,
+            0,
+            "the aborted attach left its pin behind"
+        );
+        sup.reap_idle(Duration::ZERO);
+        until("the detached session is reaped", || probe.exiting() == 1).await;
+        probe.release.cancel();
     }
 
     /// Shutdown closes the door before it waits: nothing new is spawned or attached while the sessions
