@@ -13,50 +13,23 @@
 //! A third membership, `blackhole.kid.{kid}`, distrusts a **signing key id**: every token under that
 //! kid is refused at verify (401), whichever source — config or the live ring — supplies its key.
 //! It is not a tenant or credential cut-off and `reason_for` never sees it; `Keyring::verify_with`
-//! asks [`DenySet::kid_denied`] before any signature math. Unlike the two maps above, the kid it is
-//! asked about comes straight from an *unverified* token, so that set uses std's SipHash (and is
-//! skipped when empty) rather than `DenyHasher`; it is also never capped, because refusing to
-//! record a distrust would fail unsafe. Its size is the number of kids the control plane has
-//! distrusted — a handful — and a KV delete of the entry frees it.
+//! asks [`DenySet::kid_denied`] before any signature math. The kid it is asked about comes straight
+//! from an *unverified* token, but the set is only ever read with it (callers cannot add to it), so
+//! it shares the id table; it is skipped when empty, and never capped, because refusing to record a
+//! distrust would fail unsafe. Its size is the number of kids the control plane has distrusted — a
+//! handful — and a KV delete of the entry frees it.
 //!
-//! Sizing, honestly: the stored element is the **pair** `(u64, DenyReason)` = 16 bytes (the 1-byte
-//! enum is padded out to the id's 8-byte alignment), and hashbrown rounds up to a power-of-two
-//! bucket count held at a 87.5% max load factor. So 1M denied tenants is `2^21` buckets × (16 B +
-//! 1 control byte) ≈ **34 MiB** — an order of magnitude past the "a few MB" that reasoning from the
-//! bare 8-byte id suggests. Worth stating plainly because it lands twice: `store_watch` applies
-//! each delta by rcu, *cloning the whole map* per update, so that figure is also the per-delta copy
-//! cost and both copies are live across the swap. The shape is still right (`O(denied)`, and a
-//! deny-set that large means something is very wrong upstream) — it just isn't free.
-//! `million_entry_footprint_is_tens_of_megabytes` pins the arithmetic so this claim can't rot again.
+//! Storage and updates: each membership is an [`IdMap`], mutated in place by the single watch loop
+//! (an update costs O(batch), not O(set)) and read lock-free by the request path. Its table is 10
+//! bytes a slot at most three-quarters full: 1M denied tenants is `2^21` slots ≈ **20 MiB**, and a
+//! seed sizes it up front. `million_entry_footprint_is_tens_of_megabytes` pins that arithmetic.
 //!
 //! TTL/auto-restore is handled by slipstream, not here: spend holds are written with a TTL to the
 //! next budget reset, so they expire into a `Del` event that removes them; fraud holds have no TTL
 //! (sticky). This struct only reflects current membership.
 
+use crate::id_map::{Full, IdMap};
 use crate::key::Kid;
-use std::collections::{HashMap, HashSet};
-use std::hash::BuildHasherDefault;
-
-/// The deny map's hasher. **Deliberately not** std's `RandomState` (SipHash-1-3).
-///
-/// HashDoS resistance exists to stop an attacker from *choosing* keys that collide. Here the key is
-/// `identity.tenant_id` or `identity.key_id`, which only ever comes out of `keyring.verify(raw_key)`
-/// — an Ed25519 signature check over a token minted by the control plane, which holds the only
-/// signing key. And the ordering is load-bearing: `request_filter`'s `authenticate` phase verifies
-/// **first** and only then looks the id up, so an unforgeable id is the *only* thing that ever
-/// reaches this map. An attacker cannot pick their tenant or key id, cannot enumerate ids to
-/// farm collisions, and never gets an unverified id into the table at all — so SipHash's collision
-/// resistance buys nothing and costs ~4x on a lookup that runs on **every managed request**.
-///
-/// Measured on the dev host (`benches/unit.rs`, `deny::reason_*`, 1M entries): SipHash 6.21 ns vs
-/// Fx 1.49 ns single-threaded; 13.44 ns vs 3.40 ns at 16 threads (the gateway is many-core, so the
-/// contended number is the one that matters).
-///
-/// **Do not "fix" this back to `RandomState`** without first breaking the property above — i.e. not
-/// unless some path starts inserting or looking up a tenant id that a caller supplied and we did not
-/// verify. If that ever happens, the hasher is the *second* thing to fix; the unverified id is the
-/// first.
-type DenyHasher = BuildHasherDefault<rustc_hash::FxHasher>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DenyReason {
@@ -80,7 +53,7 @@ impl DenyReason {
 }
 
 /// Who a `blackhole.*` entry names. Parsed from the KV key; the value is still just a reason.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DenyTarget {
     Tenant(u64),
     Key(u64),
@@ -88,12 +61,33 @@ pub enum DenyTarget {
     Kid(Kid),
 }
 
-#[derive(Debug, Default, Clone)]
+/// Reason codes as stored in an [`IdMap`] (0 is "absent" there, so they start at 1).
+impl DenyReason {
+    fn code(self) -> u8 {
+        match self {
+            DenyReason::Spend => 1,
+            DenyReason::Fraud => 2,
+            DenyReason::Unknown => 3,
+        }
+    }
+
+    fn from_code(c: u8) -> Self {
+        match c {
+            1 => DenyReason::Spend,
+            2 => DenyReason::Fraud,
+            _ => DenyReason::Unknown,
+        }
+    }
+}
+
+/// Mutated in place through `&self` by the one watch loop (see [`IdMap`]); a rescan builds a fresh
+/// set and replaces the whole thing atomically.
+#[derive(Debug, Default)]
 pub struct DenySet {
-    denied: HashMap<u64, DenyReason, DenyHasher>,
-    keys: HashMap<u64, DenyReason, DenyHasher>,
+    denied: IdMap,
+    keys: IdMap,
     /// Distrusted signing key ids. Membership only; the entry's value is not read.
-    kids: HashSet<Kid>,
+    kids: IdMap,
 }
 
 impl DenySet {
@@ -101,76 +95,99 @@ impl DenySet {
         Self::default()
     }
 
-    /// Pre-size for a known entry count — for the seed/rescan path, which knows how many entries it
-    /// is about to insert and would otherwise rehash the whole table a dozen times on the way up.
+    /// The seed/rescan constructor: a set holding `targets`, each map sized for its own entries.
+    pub fn from_targets(targets: &[(DenyTarget, DenyReason)]) -> Self {
+        let (mut denied, mut keys, mut kids) = (Vec::new(), Vec::new(), Vec::new());
+        for &(t, r) in targets {
+            match t {
+                DenyTarget::Tenant(t) => denied.push((t, r.code())),
+                DenyTarget::Key(k) => keys.push((k, r.code())),
+                DenyTarget::Kid(k) => kids.push((u64::from(k), 1)),
+            }
+        }
+        Self {
+            denied: IdMap::from_pairs(&denied),
+            keys: IdMap::from_pairs(&keys),
+            kids: IdMap::from_pairs(&kids),
+        }
+    }
+
+    /// A copy with room for `extra` more of each kind. The watch loop publishes it in place of
+    /// `self` when an in-place insert reports [`Full`].
+    pub fn grown(&self, extra: usize) -> Self {
+        Self {
+            denied: self.denied.grown(extra),
+            keys: self.keys.grown(extra),
+            kids: self.kids.grown(extra),
+        }
+    }
+
+    /// Pre-size the tenant map for `n` entries.
+    #[cfg(test)]
     pub fn with_capacity(n: usize) -> Self {
         Self {
-            denied: HashMap::with_capacity_and_hasher(n, DenyHasher::default()),
-            keys: HashMap::with_hasher(DenyHasher::default()),
-            kids: HashSet::new(),
+            denied: IdMap::with_capacity(n),
+            ..Self::default()
         }
     }
 
     /// Whether signing key id `kid` is distrusted. Hot path (every managed request): an empty set
     /// answers without hashing.
     pub fn kid_denied(&self, kid: Kid) -> bool {
-        !self.kids.is_empty() && self.kids.contains(&kid)
+        !self.kids.is_empty() && self.kids.contains(u64::from(kid))
     }
 
     /// Default-allow: absence from the set = allowed. This is the safe-for-availability default —
     /// a tenant we've never heard of is served, not blocked.
     pub fn is_denied(&self, tenant_id: u64) -> bool {
-        self.denied.contains_key(&tenant_id)
+        self.denied.contains(tenant_id)
     }
 
     /// Tenant-only reason. Prefer [`Self::reason_for`] on the request path so a key-level deny
     /// is visible too.
     pub fn reason(&self, tenant_id: u64) -> Option<DenyReason> {
-        self.denied.get(&tenant_id).copied()
+        self.denied.get(tenant_id).map(DenyReason::from_code)
     }
 
     /// Denied if the tenant is in the set **or** (when present) the credential's `key_id` is.
     /// Tenant deny wins when both match — it is the broader cut-off.
     pub fn reason_for(&self, tenant_id: u64, key_id: Option<u64>) -> Option<DenyReason> {
-        if let Some(r) = self.denied.get(&tenant_id).copied() {
+        if let Some(r) = self.reason(tenant_id) {
             return Some(r);
         }
-        key_id.and_then(|id| self.keys.get(&id).copied())
+        key_id.and_then(|id| self.keys.get(id).map(DenyReason::from_code))
     }
 
-    pub fn insert(&mut self, tenant_id: u64, reason: DenyReason) {
-        self.denied.insert(tenant_id, reason);
+    /// The inserts are in place and `Err(Full)` leaves the set unchanged: grow it (see `IdMap`).
+    pub fn insert(&self, tenant_id: u64, reason: DenyReason) -> Result<(), Full> {
+        self.denied.insert(tenant_id, reason.code())
     }
 
-    pub fn insert_key(&mut self, key_id: u64, reason: DenyReason) {
-        self.keys.insert(key_id, reason);
+    pub fn insert_key(&self, key_id: u64, reason: DenyReason) -> Result<(), Full> {
+        self.keys.insert(key_id, reason.code())
     }
 
-    pub fn insert_target(&mut self, target: DenyTarget, reason: DenyReason) {
+    pub fn insert_target(&self, target: DenyTarget, reason: DenyReason) -> Result<(), Full> {
         match target {
             DenyTarget::Tenant(t) => self.insert(t, reason),
             DenyTarget::Key(k) => self.insert_key(k, reason),
-            DenyTarget::Kid(k) => {
-                self.kids.insert(k);
-            }
+            DenyTarget::Kid(k) => self.kids.insert(u64::from(k), 1),
         }
     }
 
-    pub fn remove(&mut self, tenant_id: u64) {
-        self.denied.remove(&tenant_id);
+    pub fn remove(&self, tenant_id: u64) {
+        self.denied.remove(tenant_id);
     }
 
-    pub fn remove_key(&mut self, key_id: u64) {
-        self.keys.remove(&key_id);
+    pub fn remove_key(&self, key_id: u64) {
+        self.keys.remove(key_id);
     }
 
-    pub fn remove_target(&mut self, target: DenyTarget) {
+    pub fn remove_target(&self, target: DenyTarget) {
         match target {
             DenyTarget::Tenant(t) => self.remove(t),
             DenyTarget::Key(k) => self.remove_key(k),
-            DenyTarget::Kid(k) => {
-                self.kids.remove(&k);
-            }
+            DenyTarget::Kid(k) => self.kids.remove(u64::from(k)),
         }
     }
 
@@ -179,19 +196,16 @@ impl DenySet {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.denied.is_empty() && self.keys.is_empty() && self.kids.is_empty()
+        self.len() == 0
     }
 }
 
-/// The seed/rescan constructor (`store_watch::denyset_from_entries` builds the whole set with
-/// `.collect()`). The hasher is an implementation detail of `DenySet`, deliberately not a type
-/// parameter, so this signature — and every call site — is unaffected by the choice above.
 impl FromIterator<(u64, DenyReason)> for DenySet {
     fn from_iter<I: IntoIterator<Item = (u64, DenyReason)>>(iter: I) -> Self {
+        let pairs: Vec<_> = iter.into_iter().map(|(t, r)| (t, r.code())).collect();
         Self {
-            denied: iter.into_iter().collect(),
-            keys: HashMap::with_hasher(DenyHasher::default()),
-            kids: HashSet::new(),
+            denied: IdMap::from_pairs(&pairs),
+            ..Self::default()
         }
     }
 }
@@ -274,9 +288,9 @@ mod tests {
 
     #[test]
     fn insert_remove_and_reason() {
-        let mut set = DenySet::new();
-        set.insert(1, DenyReason::Spend);
-        set.insert(2, DenyReason::Fraud);
+        let set = DenySet::new();
+        set.insert(1, DenyReason::Spend).unwrap();
+        set.insert(2, DenyReason::Fraud).unwrap();
         assert!(set.is_denied(1));
         assert_eq!(set.reason(1), Some(DenyReason::Spend));
         assert_eq!(set.reason(2).unwrap().http_status(), 403);
@@ -285,24 +299,13 @@ mod tests {
         assert_eq!(set.len(), 1);
     }
 
-    /// The module doc quotes a concrete footprint for a 1M-entry set, and `store_watch` clones the
-    /// whole map on every delta — so understating it hides a real per-update cost. Pin the
-    /// arithmetic to the actual allocation rather than to a comment nobody re-derives.
+    /// The module doc quotes a concrete footprint for a 1M-entry set. Pin the arithmetic to the
+    /// actual allocation rather than to a comment nobody re-derives.
     #[test]
     fn million_entry_footprint_is_tens_of_megabytes() {
-        // The element is the pair, not the id: a 1-byte enum padded to the u64's alignment.
-        assert_eq!(std::mem::size_of::<DenyReason>(), 1);
-        assert_eq!(std::mem::size_of::<(u64, DenyReason)>(), 16);
-
         let set = DenySet::with_capacity(1_000_000);
-        // hashbrown holds a power-of-two bucket count at a 87.5% max load factor, so the usable
-        // `capacity()` it reports is `buckets - buckets/8` — invert that to recover the real table.
-        let buckets = set.denied.capacity() * 8 / 7;
-        assert_eq!(buckets, 1 << 21, "1M entries rounds up to 2^21 buckets");
-        // One `(u64, DenyReason)` slot plus one control byte per bucket (ignoring the small
-        // fixed-size mirrored control group at the tail).
-        let bytes = buckets * std::mem::size_of::<(u64, DenyReason)>() + buckets;
-        assert_eq!(bytes, 35_651_584); // 34.0 MiB — not "a few MB"
+        // 1M entries at most three-quarters full rounds up to 2^21 slots of 10 bytes each.
+        assert_eq!(set.denied.heap_bytes(), (1 << 21) * 10);
     }
 
     #[test]
@@ -320,13 +323,13 @@ mod tests {
 
     #[test]
     fn key_or_tenant_deny() {
-        let mut set = DenySet::new();
-        set.insert_key(100, DenyReason::Fraud);
+        let set = DenySet::new();
+        set.insert_key(100, DenyReason::Fraud).unwrap();
         // Same tenant, two credentials: only the named key is cut off.
         assert_eq!(set.reason_for(1, Some(100)), Some(DenyReason::Fraud));
         assert_eq!(set.reason_for(1, Some(101)), None);
         assert_eq!(set.reason_for(1, None), None); // v1: no key_id, tenant not denied
-        set.insert(1, DenyReason::Spend);
+        set.insert(1, DenyReason::Spend).unwrap();
         // Tenant deny kills every key for that tenant, including one already key-denied.
         assert_eq!(set.reason_for(1, Some(100)), Some(DenyReason::Spend));
         assert_eq!(set.reason_for(1, Some(101)), Some(DenyReason::Spend));
@@ -338,9 +341,10 @@ mod tests {
 
     #[test]
     fn kid_distrust_is_its_own_membership() {
-        let mut set = DenySet::new();
+        let set = DenySet::new();
         assert!(!set.kid_denied(3));
-        set.insert_target(DenyTarget::Kid(3), DenyReason::Fraud);
+        set.insert_target(DenyTarget::Kid(3), DenyReason::Fraud)
+            .unwrap();
         assert!(set.kid_denied(3));
         assert!(!set.kid_denied(4));
         // A kid is neither a tenant nor a credential id of the same number.

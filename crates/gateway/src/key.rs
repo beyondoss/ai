@@ -896,11 +896,12 @@ mod tests {
     fn a_distrusted_kid_is_refused_from_either_source_before_any_signature_math() {
         let (sk, vk) = test_keypair(1);
         let ring = ring_with(7, vk);
-        let mut deny = DenySet::new();
+        let deny = DenySet::new();
         deny.insert_target(
             crate::deny::DenyTarget::Kid(7),
             crate::deny::DenyReason::Fraud,
-        );
+        )
+        .unwrap();
         let token = mint_v2(&who(), 5, 7, &sk);
         let none = LiveKeys::default();
         assert_eq!(
@@ -924,7 +925,8 @@ mod tests {
         deny.insert_target(
             crate::deny::DenyTarget::Kid(8),
             crate::deny::DenyReason::Fraud,
-        );
+        )
+        .unwrap();
         assert_eq!(
             Keyring::new().verify_with(&t8, &live, &deny, || Some(0)),
             Err(KeyError::Distrusted(8))

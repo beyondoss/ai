@@ -411,7 +411,7 @@ mod deny {
     /// that this is O(1) and **0-alloc regardless of set size** — so the args span an empty set and
     /// a large one (1M cut-off tenants); the ns/iter and the (absent) alloc columns must stay flat.
     /// A regression to anything size-dependent shows up as the big-`n` row diverging from the small.
-    #[divan::bench(args = [0, 1_000_000])]
+    #[divan::bench(args = [0, 1_000_000, 10_000_000])]
     fn reason_miss(bencher: Bencher, n: u64) {
         let set = populated(n);
         // A tenant id past the populated range → guaranteed miss (the allow path).
@@ -420,7 +420,7 @@ mod deny {
 
     /// The deny case: tenant present. Same O(1) hash lookup, returning the reason — proves the
     /// enforce path costs the same as the allow path (no surprise on the rejection branch).
-    #[divan::bench(args = [1, 1_000_000])]
+    #[divan::bench(args = [1, 1_000_000, 10_000_000])]
     fn reason_hit(bencher: Bencher, n: u64) {
         let set = populated(n);
         bencher.bench(|| set.reason(black_box(n / 2)));
@@ -953,8 +953,8 @@ mod store_watch {
     use store::{KvEntry, KvUpdate, VersionToken};
 
     /// A realistically-sized live deny-set. The set is O(denied), not O(tenants), so a few thousand
-    /// cut-off tenants is a busy day — but it's the *size of the map that gets copied* on every
-    /// `rcu`, which is exactly what batching is about.
+    /// cut-off tenants is a busy day. An apply is in place, so its cost must not depend on this
+    /// (`apply_one_into_n` is the proof).
     const DENIED: u64 = 1_024;
 
     fn populated(n: u64) -> DenySet {
@@ -974,29 +974,36 @@ mod store_watch {
             .collect()
     }
 
-    /// The watcher's apply step, batched: `k` deltas land under **one** `rcu` clone of the map.
-    /// The alloc column is the claim — it must stay at 1 map allocation regardless of `k`, and the
-    /// `k = 1` row must match `apply_one_at_a_time`'s (batching costs nothing in the steady state).
+    /// The watcher's apply step, batched: `k` deltas applied in place, O(k). Nothing is copied.
     #[divan::bench(args = [1, 8, 64, 256])]
     fn apply_batched(bencher: Bencher, k: usize) {
         let set = populated(DENIED);
         let updates = burst(k);
-        bencher.bench(|| apply_batch(black_box(&set), black_box(&updates)));
+        bencher.bench(|| apply_batch(black_box(&set), black_box(&updates)).is_ok());
     }
 
-    /// The pre-batching shape, kept as the control: one `rcu` — i.e. one full clone of the map —
-    /// per delta, which is what the watch loop used to do. O(k·N) copies against the batched
-    /// O(N + k).
+    /// The control: one apply per delta (each pays its own coalescing and writer lock).
+    /// One revocation into a set of `n` entries. The claim: the cost does not grow with `n`
+    /// (it used to clone the whole map, O(n), and hold 2x the memory while doing it).
+    #[divan::bench(args = [1_000_000, 10_000_000])]
+    fn apply_one_into_n(bencher: Bencher, n: u64) {
+        let set = populated(n);
+        let updates = vec![KvUpdate::Put(KvEntry {
+            key: format!("blackhole.{}", n + 1),
+            value: b"fraud".to_vec(),
+            version: VersionToken::from_u64(7),
+        })];
+        bencher.bench(|| apply_batch(black_box(&set), black_box(&updates)).is_ok());
+    }
+
     #[divan::bench(args = [1, 8, 64, 256])]
     fn apply_one_at_a_time(bencher: Bencher, k: usize) {
         let set = populated(DENIED);
         let updates = burst(k);
         bencher.bench(|| {
-            let mut cur = apply_batch(black_box(&set), &updates[..1]);
-            for u in &updates[1..] {
-                cur = apply_batch(&cur, std::slice::from_ref(u));
+            for u in &updates {
+                black_box(apply_batch(black_box(&set), std::slice::from_ref(u)).is_ok());
             }
-            cur
         });
     }
 
@@ -1049,12 +1056,10 @@ mod allowance {
 
     /// `n` exhausted tenants and `n` exhausted keys. Built outside the timed closure.
     fn populated(n: u64) -> AllowanceSet {
-        let mut set = AllowanceSet::from_ready();
-        for id in 0..n {
-            set.insert_target(AllowanceTarget::Tenant(id));
-            set.insert_target(AllowanceTarget::Key(id));
-        }
-        set
+        let targets: Vec<_> = (0..n)
+            .flat_map(|id| [AllowanceTarget::Tenant(id), AllowanceTarget::Key(id)])
+            .collect();
+        AllowanceSet::from_targets(&targets)
     }
 
     /// Steady state: ready, and neither id is exhausted. `Some(key_id)` is the v2 shape — both
