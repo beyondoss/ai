@@ -964,6 +964,14 @@ const ENDS_TURN_META: &str = "beyond.dev/endsTurn";
 const AVAILABLE_IN_SUBAGENTS_META: &str = "beyond.dev/availableInSubagents";
 
 /// A `tools/list` entry as the manifest records it — and as a re-listing is compared.
+/// A `ui://` resource's `_meta.ui` from `resources/list`: the static default for its view.
+fn listing_ui(r: &rmcp::model::Resource) -> Option<serde_json::Value> {
+    if !crate::tools::mcp_apps::is_ui_uri(&r.uri) {
+        return None;
+    }
+    r.meta.as_deref().and_then(|m| m.get("ui")).cloned()
+}
+
 fn cached_tool(t: &rmcp::model::Tool) -> crate::tools::mcp_manifest::CachedTool {
     crate::tools::mcp_manifest::CachedTool {
         remote_name: t.name.to_string(),
@@ -3228,11 +3236,20 @@ fn tools_from_manifest(
             manifest
                 .tools
                 .iter()
-                .map(|t| (t.remote_name.clone(), t.ui.clone().unwrap_or_default())),
+                .map(|t| crate::tools::mcp_apps::ListedTool {
+                    name: t.remote_name.clone(),
+                    description: t.description.clone(),
+                    input_schema: t.input_schema.clone(),
+                    ui: t.ui.clone().unwrap_or_default(),
+                }),
             manifest
                 .resources
                 .iter()
-                .filter_map(|r| r.size.map(|size| (r.uri.clone(), size))),
+                .map(|r| crate::tools::mcp_apps::ListedResource {
+                    uri: r.uri.clone(),
+                    size: r.size,
+                    ui: r.ui.clone(),
+                }),
         )
     });
     let mut names = RegisteredNames::new(&config.name, manifest.skills.is_some());
@@ -4286,6 +4303,7 @@ async fn tools_from_client(
                     name: r.name.clone(),
                     uri: r.uri.clone(),
                     size: r.size,
+                    ui: listing_ui(r),
                     description: r.description.clone().unwrap_or_else(|| {
                         format!(
                             "MCP resource `{}` ({}) from server `{}`",
@@ -4319,16 +4337,22 @@ async fn tools_from_client(
                 name: config.name.clone(),
                 conn: conn.clone(),
             },
-            remote_tools.iter().map(|t| {
-                (
-                    t.name.to_string(),
-                    crate::tools::mcp_apps::ToolUi::from_meta(t.meta.as_deref())
+            remote_tools
+                .iter()
+                .map(|t| crate::tools::mcp_apps::ListedTool {
+                    name: t.name.to_string(),
+                    description: t.description.as_deref().unwrap_or_default().to_string(),
+                    input_schema: t.schema_as_json_value(),
+                    ui: crate::tools::mcp_apps::ToolUi::from_meta(t.meta.as_deref())
                         .unwrap_or_default(),
-                )
-            }),
+                }),
             remote_resources
                 .iter()
-                .filter_map(|r| r.size.map(|size| (r.uri.clone(), size))),
+                .map(|r| crate::tools::mcp_apps::ListedResource {
+                    uri: r.uri.clone(),
+                    size: r.size,
+                    ui: listing_ui(r),
+                }),
         )
     });
     let mut names = RegisteredNames::new(&config.name, skill_listing.is_some());

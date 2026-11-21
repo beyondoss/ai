@@ -1253,6 +1253,14 @@ impl ServerHandler for SandboxMcp {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        // An unknown tool is a protocol error (-32602), not a tool result: the agent asked for
+        // something this server does not have (MCP `server/tools`, "Error Handling").
+        if !self.tool_router.has_route(&request.name) {
+            return Err(ErrorData::invalid_params(
+                format!("unknown tool: {}", request.name),
+                None,
+            ));
+        }
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         match self.tool_router.call(tcc).await {
             // Arguments that do not fit the schema are the agent's mistake to see and fix. rmcp

@@ -577,3 +577,76 @@ fn run_never_advertises_the_extension() {
             .contains("weather-text:Lima")
     );
 }
+
+/// The `mcp_app_open` frame for the fixture's view when its `_meta.ui` is placed per `place`
+/// (`MCP_APPS_FIXTURE_UI_META`; `None` leaves the fixture's default).
+async fn open_frame_with_ui_meta(place: Option<&str>) -> Value {
+    let env = place.map_or_else(|| json!({}), |p| json!({ "MCP_APPS_FIXTURE_UI_META": p }));
+    let home = home_with_fixture(env);
+    let (base, _bodies) = views_model(1, vec![]);
+    let sessions = tempfile::tempdir().unwrap();
+    let daemon = daemon(&home.home, &base, sessions.path(), "0").await;
+    let mut ws = daemon.connect("meta").await;
+    declare_apps(&mut ws).await;
+    let frames = prompt(&mut ws, "zqopen1z").await;
+    let open = of_type(&frames, "mcp_app_open");
+    assert_eq!(open.len(), 1, "{frames:#?}");
+    open[0].clone()
+}
+
+#[tokio::test]
+async fn a_views_csp_that_only_the_listing_declares_reaches_the_renderer() {
+    let open = open_frame_with_ui_meta(Some("listing")).await;
+    let ui = &open["resource"]["_meta"]["ui"];
+    assert_eq!(
+        ui["csp"]["connectDomains"],
+        json!(["https://listing.example.test"]),
+        "{open}"
+    );
+    assert_eq!(ui["permissions"], json!({ "camera": {} }), "{open}");
+    assert_eq!(open["resource"]["mimeType"], "text/html;profile=mcp-app");
+}
+
+#[tokio::test]
+async fn the_content_items_ui_wins_over_the_listings() {
+    let open = open_frame_with_ui_meta(Some("both")).await;
+    let ui = &open["resource"]["_meta"]["ui"];
+    assert_eq!(
+        ui["csp"]["connectDomains"],
+        json!(["https://api.example.test"]),
+        "{open}"
+    );
+    // The content item's `ui` replaces the listing's whole: no permissions leak through.
+    assert!(ui.get("permissions").is_none(), "{open}");
+}
+
+#[tokio::test]
+async fn a_view_with_no_ui_meta_anywhere_keeps_the_restrictive_default() {
+    let open = open_frame_with_ui_meta(Some("none")).await;
+    assert!(open["resource"].get("_meta").is_none(), "{open}");
+    assert_eq!(open["resource"]["uri"], "ui://apps-fixture/weather");
+}
+
+#[tokio::test]
+async fn a_view_lists_only_the_tools_it_may_call() {
+    let home = home_with_fixture(json!({}));
+    let (base, _bodies) = views_model(1, vec![]);
+    let sessions = tempfile::tempdir().unwrap();
+    let daemon = daemon(&home.home, &base, sessions.path(), "0").await;
+    let mut ws = daemon.connect("viewlist").await;
+    declare_apps(&mut ws).await;
+    let view = open_view(&mut ws, 1).await;
+    let r = app_request(&mut ws, "wx", &view, "tools/list", json!({})).await;
+    assert_eq!(r["success"], true, "{r}");
+    let names: Vec<&str> = r["data"]["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"refresh_weather"), "{names:?}");
+    assert!(names.contains(&"show_weather"), "{names:?}");
+    assert!(!names.contains(&"model_only_tool"), "{names:?}");
+    let t = &r["data"]["result"]["tools"][0];
+    assert!(t["inputSchema"].is_object() && t["name"].is_string(), "{t}");
+}

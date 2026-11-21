@@ -206,6 +206,13 @@ pub struct OAuthFixture {
     pub delete_requests: Arc<Mutex<Vec<HeaderPair>>>,
     /// The client's answers to server→client requests (JSON-RPC responses POSTed back), by id.
     pub client_answers: Arc<Mutex<Vec<Value>>>,
+    /// Serve the protected-resource metadata only at this path (anywhere else: 404), so only a
+    /// challenge's `resource_metadata` reaches it.
+    pub prm_only_at: Arc<Mutex<Option<String>>>,
+    /// Publish no authorization-server metadata (its well-known URIs are 404).
+    pub no_as_metadata: Arc<AtomicBool>,
+    /// Leave `code_challenge_methods_supported` out of the authorization server's metadata.
+    pub omit_pkce: Arc<AtomicBool>,
     issued: Arc<Mutex<HashSet<String>>>,
     live_sessions: Arc<Mutex<HashSet<String>>>,
 }
@@ -256,6 +263,9 @@ impl OAuthFixture {
             call_sessions: Arc::default(),
             delete_requests: Arc::default(),
             client_answers: Arc::default(),
+            prm_only_at: Arc::default(),
+            no_as_metadata: Arc::default(),
+            omit_pkce: Arc::default(),
             issued: Arc::default(),
             live_sessions: Arc::default(),
         };
@@ -299,6 +309,11 @@ impl Shared {
             .path
             .starts_with("/.well-known/oauth-protected-resource")
         {
+            if let Some(only) = f.prm_only_at.lock().unwrap().as_ref()
+                && req.path != *only
+            {
+                return write_response(&mut stream, "404 Not Found", "", b"");
+            }
             // SEP-985 protected-resource metadata: points at this fixture's own AS so rmcp 3.x
             // discovers the correct issuer (`http://host`) instead of expecting the resource URL.
             return write_json(
@@ -316,19 +331,25 @@ impl Shared {
             .starts_with("/.well-known/oauth-authorization-server")
             || req.path.starts_with("/.well-known/openid-configuration")
         {
-            return write_json(
-                &mut stream,
-                "200 OK",
-                &json!({
-                    "issuer": base,
-                    "authorization_endpoint": format!("{base}/authorize"),
-                    "token_endpoint": format!("{base}/token"),
-                    "registration_endpoint": format!("{base}/register"),
-                    "scopes_supported": ["mcp"],
-                    "response_types_supported": ["code"],
-                    "code_challenge_methods_supported": ["S256"],
-                }),
-            );
+            if f.no_as_metadata.load(Ordering::SeqCst) {
+                return write_response(&mut stream, "404 Not Found", "", b"");
+            }
+            let mut metadata = json!({
+                "issuer": base,
+                "authorization_endpoint": format!("{base}/authorize"),
+                "token_endpoint": format!("{base}/token"),
+                "registration_endpoint": format!("{base}/register"),
+                "scopes_supported": ["mcp"],
+                "response_types_supported": ["code"],
+                "code_challenge_methods_supported": ["S256"],
+            });
+            if f.omit_pkce.load(Ordering::SeqCst) {
+                metadata
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("code_challenge_methods_supported");
+            }
+            return write_json(&mut stream, "200 OK", &metadata);
         }
         if req.path == "/register" && req.method == "POST" {
             let request: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
