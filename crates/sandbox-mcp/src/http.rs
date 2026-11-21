@@ -40,6 +40,9 @@ pub async fn bind(listen: &str, insecure_no_auth: bool) -> Result<TcpListener, S
         .map_err(|e| format!("cannot listen on {first}: {e}"))
 }
 
+/// Origins a browser on this machine sends (`:*` matches any port).
+const LOOPBACK_ORIGINS: [&str; 3] = ["http://localhost:*", "http://127.0.0.1:*", "http://[::1]:*"];
+
 /// Serve MCP over streamable HTTP on `listener` until `stop` is cancelled.
 pub async fn serve(
     listener: TcpListener,
@@ -47,8 +50,12 @@ pub async fn serve(
     insecure_no_auth: bool,
     stop: CancellationToken,
 ) {
-    let mut config =
-        StreamableHttpServerConfig::default().with_cancellation_token(stop.child_token());
+    // A browser page on any other origin must not drive this server (MCP streamable-http
+    // "Security"): loopback origins and requests with no `Origin` (non-browser clients) pass, the
+    // rest get 403. `insecure_no_auth` lifts only the `Host` check, never this one.
+    let mut config = StreamableHttpServerConfig::default()
+        .with_allowed_origins(LOOPBACK_ORIGINS)
+        .with_cancellation_token(stop.child_token());
     if insecure_no_auth {
         config = config.disable_allowed_hosts();
     }
