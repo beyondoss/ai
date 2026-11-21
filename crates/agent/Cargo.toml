@@ -156,6 +156,10 @@ base64 = "0.22"
 # false` drops the `rayon`/AVIF/EXR/etc. formats we never decode; only the four raster formats `read`
 # actually accepts are enabled.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+# `mcp_client_credentials` signs the `private_key_jwt` client assertion (RFC 7523). `ring`, already in
+# the graph under rustls, rather than rmcp's `auth-client-credentials-jwt` feature, whose
+# `jsonwebtoken` pulls the aws-lc-rs/aws-lc-sys C blob the comment on `rmcp` below keeps out.
+ring = "0.17"
 
 # The `web` tool's `markdown` mode: HTML→markdown, so the model reads a page's prose rather than its
 # HTML. See `tools/web/markdown.rs`.
@@ -216,7 +220,7 @@ http = "1"
 # provider unselected; `agent-core`'s `rustls` pin names it for the whole graph, and every
 # client-construction site installs it via `agent_core::ensure_provider()` (see `agent-core/src/tls.rs`
 # for why that has to be explicit rather than inferred from crate features).
-rmcp = { version = "3.9.0", default-features = false, features = ["client", "macros", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider", "auth", "auth-client-credentials-jwt", "elicitation"] }
+rmcp = { version = "3.9.0", default-features = false, features = ["client", "macros", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider", "auth", "elicitation"] }
 
 # Names the SSE event type in `tools::mcp_wire`'s `StreamableHttpClient` impl (rmcp re-exports its error
 # but not the event). Already resolved transitively at this exact version via rmcp.

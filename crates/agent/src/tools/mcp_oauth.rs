@@ -951,6 +951,7 @@ impl ServerAuth {
     ) -> Arc<Self> {
         let mut auth = Self::new("fake", "http://127.0.0.1:9/mcp");
         auth.cc = Some(crate::settings::McpClientCredentials {
+            issuer: "http://127.0.0.1:9".into(),
             client_id: "c".into(),
             client_secret: Some("$S".into()),
             private_key: None,

@@ -1509,10 +1509,10 @@ pub enum McpTransport {
 /// `specification/stable/oauth-client-credentials/2026-07-28`).
 ///
 /// ```json
-/// "client_credentials": { "client_id": "my-agent", "client_secret": "$MCP_CLIENT_SECRET",
-///                         "scopes": ["mcp:read"] }
-/// "client_credentials": { "client_id": "my-agent", "private_key": "!cat /run/secrets/mcp.pem",
-///                         "signing_algorithm": "RS256" }
+/// "client_credentials": { "issuer": "https://auth.example.com/realms/mcp", "client_id": "my-agent",
+///                         "client_secret": "$MCP_CLIENT_SECRET", "scopes": ["mcp:read"] }
+/// "client_credentials": { "issuer": "https://auth.example.com/realms/mcp", "client_id": "my-agent",
+///                         "private_key": "!cat /run/secrets/mcp.pem", "signing_algorithm": "RS256" }
 /// ```
 ///
 /// Exactly one of `client_secret` and `private_key` (an RFC 7523 `private_key_jwt`, the spec's
@@ -1523,6 +1523,11 @@ pub enum McpTransport {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpClientCredentials {
+    /// The authorization server's issuer, **pinned**: credentials are sent only if the server's
+    /// discovered authorization server metadata has exactly this `issuer` (RFC 8414), so a server
+    /// cannot name an authorization server of its own and collect the secret. Required; `https`
+    /// (or loopback `http`).
+    pub issuer: String,
     pub client_id: String,
     /// `$VAR` / `!command` yielding the client secret (`client_secret_post`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1544,6 +1549,7 @@ impl std::fmt::Debug for McpClientCredentials {
     /// The secret references are redacted (a reference names where a secret lives).
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("McpClientCredentials")
+            .field("issuer", &self.issuer)
             .field("client_id", &self.client_id)
             .field(
                 "client_secret",
@@ -1572,6 +1578,9 @@ impl McpClientCredentials {
         let bad = |why: &str| Err(format!("mcp server `{server}` client_credentials: {why}"));
         if self.client_id.trim().is_empty() {
             return bad("`client_id` is empty");
+        }
+        if !crate::tools::mcp_client_credentials::endpoint_allowed(&self.issuer) {
+            return bad("`issuer` is required and must be an https URL (or loopback http)");
         }
         match (&self.client_secret, &self.private_key) {
             (Some(_), Some(_)) => return bad("set only one of `client_secret` and `private_key`"),
@@ -3296,13 +3305,13 @@ mod tests {
     fn client_credentials_round_trip_and_reject_unknown_fields() {
         let json = serde_json::json!({
             "name": "r", "transport": "http", "url": "https://example.com/mcp", "headers": {},
-            "client_credentials": { "client_id": "a", "client_secret": "$S", "scopes": ["x"] },
+            "client_credentials": { "issuer": "https://as.example.com", "client_id": "a", "client_secret": "$S", "scopes": ["x"] },
         });
         let cfg: McpServerConfig = serde_json::from_value(json.clone()).unwrap();
         assert_eq!(serde_json::to_value(&cfg).unwrap(), json);
         assert!(
             serde_json::from_value::<McpClientCredentials>(
-                serde_json::json!({ "client_id": "a", "client_secret": "$S", "secret": "x" })
+                serde_json::json!({ "issuer": "https://as.example.com", "client_id": "a", "client_secret": "$S", "secret": "x" })
             )
             .is_err()
         );
@@ -3312,14 +3321,14 @@ mod tests {
     fn client_credentials_secrets_are_references_never_inline_literals() {
         for ok in ["$S", "${S}", "!cat /run/secrets/x"] {
             assert!(
-                cc(serde_json::json!({"client_id":"a","client_secret":ok}))
+                cc(serde_json::json!({"issuer":"https://as.example.com","client_id":"a","client_secret":ok}))
                     .validate("s")
                     .is_ok(),
                 "{ok}"
             );
         }
         for bad in ["hunter2", "$$literal", "$!literal", ""] {
-            let e = cc(serde_json::json!({"client_id":"a","client_secret":bad}))
+            let e = cc(serde_json::json!({"issuer":"https://as.example.com","client_id":"a","client_secret":bad}))
                 .validate("s")
                 .unwrap_err();
             assert!(
@@ -3328,7 +3337,7 @@ mod tests {
             );
         }
         let e =
-            cc(serde_json::json!({"client_id":"a","private_key":"-----BEGIN PRIVATE KEY-----x"}))
+            cc(serde_json::json!({"issuer":"https://as.example.com","client_id":"a","private_key":"-----BEGIN PRIVATE KEY-----x"}))
                 .validate("s")
                 .unwrap_err();
         assert!(e.contains("private_key") && !e.contains("BEGIN"), "{e}");
@@ -3337,25 +3346,27 @@ mod tests {
     #[test]
     fn client_credentials_need_exactly_one_method_and_a_known_algorithm() {
         let v = |j: serde_json::Value| cc(j).validate("s");
-        assert!(v(serde_json::json!({"client_id":"a"})).is_err());
+        assert!(v(serde_json::json!({"issuer":"https://as.example.com","client_id":"a"})).is_err());
         assert!(
-            v(serde_json::json!({"client_id":"a","client_secret":"$S","private_key":"$K"}))
+            v(serde_json::json!({"issuer":"https://as.example.com","client_id":"a","client_secret":"$S","private_key":"$K"}))
                 .is_err()
         );
-        assert!(v(serde_json::json!({"client_id":"a","client_secret":"$S","signing_algorithm":"RS256"})).is_err());
+        assert!(v(serde_json::json!({"issuer":"https://as.example.com","client_id":"a","client_secret":"$S","signing_algorithm":"RS256"})).is_err());
         assert!(
-            v(serde_json::json!({"client_id":"a","private_key":"$K","signing_algorithm":"HS256"}))
+            v(serde_json::json!({"issuer":"https://as.example.com","client_id":"a","private_key":"$K","signing_algorithm":"HS256"}))
                 .is_err()
         );
         assert!(
-            v(serde_json::json!({"client_id":"a","private_key":"$K","signing_algorithm":"ES256"}))
+            v(serde_json::json!({"issuer":"https://as.example.com","client_id":"a","private_key":"$K","signing_algorithm":"ES256"}))
                 .is_ok()
         );
     }
 
     #[test]
     fn client_credentials_resolve_through_the_env_and_debug_hides_them() {
-        let c = cc(serde_json::json!({"client_id":"a","client_secret":"$S"}));
+        let c = cc(
+            serde_json::json!({"issuer":"https://as.example.com","client_id":"a","client_secret":"$S"}),
+        );
         let env = [("S".to_string(), "the-secret".to_string())].into();
         match c.resolve_with_env("s", Some(&env)).unwrap() {
             ResolvedClientCredential::Secret(v) => assert_eq!(v, "the-secret"),

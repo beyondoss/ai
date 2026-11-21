@@ -4615,6 +4615,7 @@ mod tests {
                 url: url.clone(),
                 headers: BTreeMap::new(),
                 client_credentials: Some(crate::settings::McpClientCredentials {
+                    issuer: "http://127.0.0.1:9".into(),
                     client_id: "id".into(),
                     client_secret: Some("!echo not-a-real-secret".into()),
                     private_key: None,

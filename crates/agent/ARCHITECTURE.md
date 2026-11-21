@@ -7023,18 +7023,25 @@ issuer check (an authorization server that sends it, Keycloak among them, otherw
 
 **Client credentials** (`tools/mcp_client_credentials.rs`; settings `mcp_servers[].client_credentials`). For
 self-hosted, CI and cron use there is no human to `mcp-login`: an `http` server configured with
-`{"client_id", "client_secret" | "private_key", "signing_algorithm"?, "scopes"?}` gets its token from its
-authorization server with the `io.modelcontextprotocol/oauth-client-credentials` extension's grant
-(rmcp: discovery from the server's protected-resource metadata, the method check, `resource` = the
-server's URL; the `private_key_jwt` path is rmcp's `auth-client-credentials-jwt` feature). The secret
-or key is **never an inline literal**: it must be a `$VAR` or `!command` (`settings::McpClientCredentials::validate`),
-is resolved for each token request and dropped, and is redacted in `Debug`. The extension is declared
-on every request (`mcp::client_info` puts it in the client capabilities rmcp sends as
-`_meta["io.modelcontextprotocol/clientCapabilities"]`). The token lives **in memory only**, in the same
-`ServerAuth` keyed by `(name, URL)` — never in `mcp_auth.json`, so it cannot be offered to another URL
-under the same name; it is replaced shortly before it expires and, if the server still answers 401, by
-the single-flight rejection path above. rmcp 3.11.0's client-credentials future is not `Send`, so it
-runs on a blocking thread (`acquire`).
+`{"issuer", "client_id", "client_secret" | "private_key", "signing_algorithm"?, "scopes"?}` gets its token
+from its authorization server with the `io.modelcontextprotocol/oauth-client-credentials` extension's
+grant. rmcp discovers the authorization server from the server's protected-resource metadata, **but
+`issuer` is pinned and required**: credentials are resolved and sent only if the discovered metadata
+was really published, its `issuer` equals the pinned one exactly (RFC 8414), and its token endpoint is
+https (or loopback); the grant goes to that metadata's token endpoint with `resource` = the server's
+URL. A server therefore cannot name an authorization server of its own and collect the secret (a
+mismatch is a definitive error, nothing sent; `a_server_naming_another_authorization_server_never_receives_the_credential`,
+e2e CC5). The secret (`client_secret_post`, or Basic if that is all the AS offers) or key
+(`private_key_jwt`, RFC 7523, `aud` = the issuer, signed in `client_assertion` with `ring`: RS256/384/512
+or ES256/384, PKCS#8 or PKCS#1 PEM) is **never an inline literal**: it must be a `$VAR` or `!command`
+(`settings::McpClientCredentials::validate`), is resolved for each token request and dropped, and is
+redacted in `Debug`. rmcp's own `auth-client-credentials-jwt` feature is deliberately not used: its
+`jsonwebtoken` links aws-lc-rs/aws-lc-sys, which this crate keeps out (see the `rmcp` comment in
+`Cargo.toml`). The extension is declared on every request (`mcp::client_info` puts it in the client
+capabilities rmcp sends as `_meta["io.modelcontextprotocol/clientCapabilities"]`). The token lives
+**in memory only**, in the same `ServerAuth` keyed by `(name, URL)`: never in `mcp_auth.json`, so it
+cannot be offered to another URL under the same name; it is replaced shortly before it expires and, if
+the server still answers 401, by the single-flight rejection path above.
 
 **Step-up on 403 `insufficient_scope`** (`ServerAuth::after_insufficient_scope`, called from
 `OAuthHttp`). A client-credentials server requests a token for the union of the scopes it already

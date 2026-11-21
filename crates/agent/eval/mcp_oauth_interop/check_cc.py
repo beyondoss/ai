@@ -214,8 +214,11 @@ def ok_result(res, needle):
     return bool(res) and not res["is_error"] and needle in res["text"]
 
 
+ISSUER = ""  # Keycloak's issuer, pinned in every client_credentials block (set in main)
+
+
 def cc(client_id, **kw):
-    return {"client_credentials": dict({"client_id": client_id, "scopes": ["mcp:read"]}, **kw)}
+    return {"client_credentials": dict({"issuer": ISSUER, "client_id": client_id, "scopes": ["mcp:read"]}, **kw)}
 
 
 def main():
@@ -228,7 +231,9 @@ def main():
     pem = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()).decode()
     jwk = json.loads(RSAAlgorithm.to_jwk(key.public_key()))
     jwk.update(kid="agent-cc-jwt-1", use="sig", alg="RS256")
+    global ISSUER
     _, issuer, _ = start_keycloak(rs_url, jwk)
+    ISSUER = issuer
     spawn([sys.executable, os.path.join(HERE, "rs_server.py"), str(rs_port), issuer, RS_LOG], "rs.log")
     wait_port(rs_port)
     print(f"[stack] keycloak {issuer} (image {KC_IMAGE.split('@')[1][:19]}...), RS {rs_url}", flush=True)
@@ -292,6 +297,31 @@ def main():
         print(f"[{label}] CC4 B received {len(blog)} requests, {len(got)} with an Authorization header", flush=True)
         record("CC4 the working CC token is not sent to another URL under the same name", label,
                ok_result(res, "current_time") and not got and not ok_result(res_b, "current_time"), new, f"B requests={blog[:3]}")
+
+        # CC5: a server that names an authorization server of its own (the issuer is pinned) receives no credential.
+        a_log = os.path.join(LOGDIR, f"attacker-{label}.jsonl")
+        a_rs, a_as = free_port(), free_port()
+        spawn([sys.executable, os.path.join(HERE, "attacker.py"), str(a_rs), str(a_as), a_log], f"attacker-{label}.log")
+        wait_port(a_rs)
+        wait_port(a_as)
+        home = time_tool.home({"url": f"http://127.0.0.1:{a_rs}/mcp", **cc("agent-cc-secret", client_secret="$KC_SECRET")})
+        res_a, out_a = time_tool.run(home, sec("agent-cc-secret"))
+        alog = [json.loads(l) for l in open(a_log)] if os.path.exists(a_log) else []
+        tokens = [e for e in alog if e["role"] == "as" and e["path"].startswith("/token")]
+        leaked = [e for e in alog if e["has_secret"]]
+        res_k, _ = time_tool.run(time_tool.home({"url": rs_url, **cc("agent-cc-secret", client_secret="$KC_SECRET")}), sec("agent-cc-secret"))
+        record("CC5 a server naming another authorization server gets 0 token requests and no credential; Keycloak still works pinned", label,
+               ok_result(res_k, "current_time") and not tokens and not leaked and not ok_result(res_a, "current_time")
+               and SECRETS["agent-cc-secret"] not in out_a, new,
+               f"attacker saw {len(alog)} requests, {len(tokens)} token requests, {len(leaked)} carrying a credential; "
+               + out_a.strip()[-140:].replace("\n", " "))
+        # CC5b (control, so CC5 can fail): pinned to the attacker's own issuer, the same flow does send it the grant.
+        home = time_tool.home({"url": f"http://127.0.0.1:{a_rs}/mcp",
+                               **cc("agent-cc-secret", client_secret="$KC_SECRET", issuer=f"http://127.0.0.1:{a_as}")})
+        time_tool.run(home, sec("agent-cc-secret"))
+        alog = [json.loads(l) for l in open(a_log)]
+        record("CC5b control: pinned to the attacker's issuer, the credential does reach it", label,
+               any(e["role"] == "as" and e["path"].startswith("/token") and e["has_secret"] for e in alog), new)
 
         # SU1: a CC server whose tool needs an extra scope: 403, step up, success.
         home = write_tool.home({"url": rs_url, **cc("agent-cc-secret", client_secret="$KC_SECRET")})

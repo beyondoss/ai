@@ -82,20 +82,22 @@ the token's scopes and `jti`; never a token value).
 
 Keycloak's realm (generated per run): scopes `mcp:read`, `mcp:write` (optional) and `mcp:admin`
 (no client may have it); clients `agent-cc-secret` (secret), `agent-cc-jwt` (`private_key_jwt`, an RSA key
-generated per run), `agent-cc-narrow` (only `mcp:read`), `agent-cc-short` (4 s access tokens); an audience
+generated per run), `agent-cc-narrow` (only `mcp:read`), `agent-cc-short` (4 s access tokens); `attacker.py` is CC5's hostile resource-server/authorization-server pair; an audience
 mapper so every token is for the RS; a user and dynamic client registration for the interactive case.
 
-| id   | what                                                                                          | main | with the feature |
-| ---- | --------------------------------------------------------------------------------------------- | ---- | ---------------- |
-| CC1  | client id + secret from an env var, no browser, no `mcp-login`: `run` calls a protected tool  | no   | yes              |
-| CC1b | the extension is declared in `_meta` on every `tools/call`                                    | n/a  | yes              |
-| CC1d | an inline literal secret is refused and never echoed                                          | n/a  | yes              |
-| CC2  | the same with `private_key_jwt`                                                               | no   | yes              |
-| CC3  | after a 4 s token expires the next call re-acquires (a different `jti`)                       | no   | yes              |
-| CC4  | the working token is not sent to another URL under the same name                              | no   | yes              |
-| SU1  | a tool needing an extra scope: 403, the agent steps up, the call succeeds                     | no   | yes              |
-| SU3  | the AS refuses the scope: one 403, a clear error, no loop                                     | no   | yes              |
-| SU2  | `mcp-login` server: the error names the scope and `mcp-login kc --scope`; running it fixes it | no   | yes              |
+| id   | what                                                                                                                         | main | with the feature |
+| ---- | ---------------------------------------------------------------------------------------------------------------------------- | ---- | ---------------- |
+| CC1  | client id + secret from an env var, no browser, no `mcp-login`: `run` calls a protected tool                                 | no   | yes              |
+| CC1b | the extension is declared in `_meta` on every `tools/call`                                                                   | n/a  | yes              |
+| CC1d | an inline literal secret is refused and never echoed                                                                         | n/a  | yes              |
+| CC2  | the same with `private_key_jwt`                                                                                              | no   | yes              |
+| CC3  | after a 4 s token expires the next call re-acquires (a different `jti`)                                                      | no   | yes              |
+| CC4  | the working token is not sent to another URL under the same name                                                             | no   | yes              |
+| CC5  | a server naming an attacker's authorization server (issuer is pinned): 0 token requests, no credential; Keycloak still works | no   | yes              |
+| CC5b | control: pinned to the attacker's issuer, the credential does reach it                                                       | n/a  | yes              |
+| SU1  | a tool needing an extra scope: 403, the agent steps up, the call succeeds                                                    | no   | yes              |
+| SU3  | the AS refuses the scope: one 403, a clear error, no loop                                                                    | no   | yes              |
+| SU2  | `mcp-login` server: the error names the scope and `mcp-login kc --scope`; running it fixes it                                | no   | yes              |
 
 SU2a (`mcp-login` against Keycloak at all) also fails on `main`: Keycloak sends the RFC 9207 `iss` in
 the redirect and `main` did not pass it to rmcp's issuer check. SM1 (service mode never activates either
