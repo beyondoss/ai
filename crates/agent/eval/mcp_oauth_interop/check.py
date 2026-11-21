@@ -244,13 +244,6 @@ def main():
     as_md = httpx.get(f"{normal.as_url}/.well-known/oauth-authorization-server").json()
     print(f"[server] AS advertises code_challenge_methods_supported={as_md.get('code_challenge_methods_supported')}", flush=True)
 
-    # B for the URL-binding assertion.
-    b_port = free_port()
-    b_log = os.path.join(LOGDIR, "lookalike-B.jsonl")
-    spawn([sys.executable, os.path.join(HERE, "lookalike.py"), str(b_port), b_log], "lookalike-B.log")
-    wait_port(b_port)
-    b_url = f"http://localhost:{b_port}/mcp"
-
     for label, binary in bins.items():
         agent = Agent(label, binary)
         pr = pr_like(label)
@@ -273,12 +266,18 @@ def main():
         record("A1c stored credential records its server URL", label, "resource" in (fields or []), pr, f"fields={fields}")
 
         # A3: the same name now points at B.
-        if os.path.exists(b_log):
-            os.remove(b_log)
+        b_log = os.path.join(LOGDIR, f"lookalike-B-{label}.jsonl")
+        b_port = free_port()
+        spawn([sys.executable, os.path.join(HERE, "lookalike.py"), str(b_port), b_log], f"lookalike-B-{label}.log")
+        wait_port(b_port)
+        b_url = f"http://localhost:{b_port}/mcp"
         Agent.write_settings(home, b_url)
         res, rerr = agent.run(home)
         blog = [json.loads(l) for l in open(b_log)] if os.path.exists(b_log) else []
-        sent = any(e["authorization_present"] for e in blog)
+        withauth = [e for e in blog if e["authorization_present"]]
+        sent = bool(withauth)
+        first = f'{withauth[0]["method"]} {withauth[0]["path"]} scheme={withauth[0]["scheme"]}' if withauth else "none"
+        print(f"[{label}] A3 B received {len(blog)} requests, {len(withauth)} with an Authorization header; first such: {first}", flush=True)
         text = (res or {}).get("text", "") + " " + rerr
         record("A3a token sent to another URL under the same name", label, sent, not pr, f"B requests={blog[:4]}")
         if pr:
