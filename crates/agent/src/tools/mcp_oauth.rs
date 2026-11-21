@@ -122,8 +122,24 @@ struct TokenState {
     expires_at: Option<Instant>,
     /// Client credentials only: the scopes `token` was requested with.
     scopes: Vec<String>,
-    /// Client credentials only: scope sets the authorization server refused a step-up to.
-    refused: Vec<Vec<String>>,
+    /// Client credentials only: scope sets a step-up failed for, and until when.
+    refused: Vec<RefusedScopes>,
+}
+
+/// A step-up to `scopes` failed. Same shape as [`Failed`]: for good when the authorization server
+/// refused it, or until `until` (doubling) when it was only unreachable.
+struct RefusedScopes {
+    scopes: Vec<String>,
+    /// `None`: for good. Otherwise when a step-up to `scopes` may be tried again.
+    until: Option<Instant>,
+    /// The backoff that produced `until`; the next transient failure doubles it.
+    backoff: Duration,
+}
+
+impl RefusedScopes {
+    fn stands(&self, now: Instant) -> bool {
+        self.until.is_none_or(|until| now < until)
+    }
 }
 
 struct Failed {
@@ -368,8 +384,9 @@ impl ServerAuth {
     ///
     /// - A client-credentials server asks its authorization server for the union of the scopes
     ///   already requested and `challenged` ([`step_up`](crate::tools::mcp_client_credentials::step_up));
-    ///   single flight, and a scope set the AS refused is remembered and not asked for again. A
-    ///   refusal does not disturb the token already held.
+    ///   single flight, and a scope set the AS refused is remembered and not asked for again; one
+    ///   that failed transiently is not asked for again until a doubling backoff (as for a 401's
+    ///   refresh) has passed. A failure does not disturb the token already held.
     /// - An `mcp-login` server cannot ask: no human is present mid-run. The error names the scope and
     ///   the exact command.
     pub(crate) async fn after_insufficient_scope(
@@ -406,7 +423,14 @@ impl ServerAuth {
         {
             return Ok(current.to_owned());
         }
-        match step_up(&state.scopes, challenged, &state.refused) {
+        let now = Instant::now();
+        let standing: Vec<Vec<String>> = state
+            .refused
+            .iter()
+            .filter(|r| r.stands(now))
+            .map(|r| r.scopes.clone())
+            .collect();
+        match step_up(&state.scopes, challenged, &standing) {
             StepUp::NoScope => Err(format!(
                 "mcp server `{}` answered 403 insufficient_scope without naming the scope it needs; \
                  nothing to step up to",
@@ -417,16 +441,48 @@ impl ServerAuth {
                  already requested; not retried",
                 self.server
             )),
-            StepUp::Refused => Err(self.refused_message(&missing, "refused it earlier")),
+            StepUp::Refused => {
+                let transient = state
+                    .refused
+                    .iter()
+                    .any(|r| r.until.is_some() && r.stands(now));
+                Err(self.refused_message(
+                    &missing,
+                    if transient {
+                        "the authorization server failed it earlier and is not asked again yet"
+                    } else {
+                        "refused it earlier"
+                    },
+                ))
+            }
             StepUp::Request(wanted) => match self.refresh(&wanted).await {
                 Ok((token, lifetime)) => {
                     tracing::info!(server = %self.server, scope = %missing, "stepped up an MCP OAuth token");
+                    state.refused.retain(|r| r.scopes != wanted);
                     state.install(token.clone(), lifetime, wanted);
                     Ok(token)
                 }
                 Err(e) => {
-                    if e.definitive {
-                        state.refused.push(wanted);
+                    // Remembered either way, as `renew` does for a 401: for good when the AS
+                    // refused, a doubling backoff when it was only unreachable. The held token is
+                    // not touched.
+                    let previous = state.refused.iter().position(|r| r.scopes == wanted);
+                    let backoff = match previous.map(|i| &state.refused[i]) {
+                        Some(r) if r.until.is_some() => (r.backoff * 2).min(MAX_BACKOFF),
+                        _ => self.first_backoff,
+                    };
+                    let entry = RefusedScopes {
+                        scopes: wanted,
+                        until: if e.definitive {
+                            None
+                        } else {
+                            Some(now + backoff)
+                        },
+                        backoff,
+                    };
+                    match previous {
+                        Some(i) => state.refused[i] = entry,
+                        None => state.refused.push(entry),
                     }
                     Err(self.refused_message(&missing, &e.reason))
                 }
@@ -1426,5 +1482,48 @@ mod tests {
         let auth = ServerAuth::fake_cc("old", &["read"], |_| Ok("new".into()));
         auth.state.lock().await.expires_at = Some(Instant::now() + Duration::from_secs(1));
         assert_eq!(auth.token().await.as_deref(), Some("new"));
+    }
+
+    #[tokio::test]
+    async fn a_transient_step_up_failure_backs_off_then_asks_again() {
+        let (url, _seen) = endpoint("403 Forbidden", CHALLENGE).await;
+        let asks = Arc::new(AtomicU32::new(0));
+        let counter = asks.clone();
+        // The authorization server is down for the first ask, then works.
+        let mut auth = ServerAuth::fake_cc("stale", &["read"], move |_| {
+            match counter.fetch_add(1, Ordering::SeqCst) {
+                0 => Err(RefreshError::transient("503")),
+                _ => Ok("fresh".into()),
+            }
+        });
+        Arc::get_mut(&mut auth).unwrap().first_backoff = Duration::from_millis(300);
+        let call = |auth: Arc<ServerAuth>| {
+            let url = url.clone();
+            async move {
+                client(auth)
+                    .post_message(url.into(), tools_list(), None, None, HashMap::new())
+                    .await
+            }
+        };
+        assert!(call(auth.clone()).await.is_err());
+        assert_eq!(asks.load(Ordering::SeqCst), 1);
+        // Inside the window: the error, and no authorization-server call.
+        assert!(call(auth.clone()).await.is_err());
+        assert_eq!(
+            asks.load(Ordering::SeqCst),
+            1,
+            "backed off, not asked again"
+        );
+        assert_eq!(
+            auth.token().await.as_deref(),
+            Some("stale"),
+            "the held token is untouched"
+        );
+        // Past it: the next 403 asks again, and the cause having cleared, succeeds.
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        call(auth.clone())
+            .await
+            .expect("the retry after the window succeeds");
+        assert_eq!(asks.load(Ordering::SeqCst), 2);
     }
 }

@@ -4159,7 +4159,9 @@ other.
   the user) to resolve; a policy refusal rejects the whole patch (all-or-nothing).
   The preserved path rides every mode's result — `single` and a stopped `chain` included, success or
   failure — not just `parallel`'s sections: it is the only pointer to the child's work.
-- **Cleanup.** `Drop` removes a worktree best-effort, but a `process::exit`/SIGKILL runs no destructors,
+- **Cleanup.** `Drop` (a cancelled child) removes a _clean_ worktree best-effort and keeps one with changes
+  (an edit, an untracked file, a commit past the baseline) under the `kept-` name below; the sandbox's owner
+  sweep applies the same rule to what a previous incarnation left. But a `process::exit`/SIGKILL runs no destructors,
   so worktrees live under `$XDG_CACHE_HOME/beyond-agent/worktrees/<repo-id>/<pid>-<label>-<seq>` (on
   disk, not tmpfs — a checkout in RAM would exhaust it) and a startup `sweep` reaps any whose owning PID
   is gone. Keyed by PID so a sweep never deletes a concurrently-running session's work; `<seq>` is a
@@ -4170,7 +4172,8 @@ other.
   subdirectory reaps the same base `create` writes to.
 - **Preserved worktrees are kept.** A conflicted, refused or failed child's checkout is moved
   (`git worktree move`) to a `kept-<leaf>` name and that path is reported. Neither the local PID sweep
-  nor the sandbox's owner sweep ever reaps a `kept-` entry: it is the developer's to remove.
+  nor the sandbox's owner sweep ever reaps a `kept-` entry: it is the developer's to remove. A cancelled child
+  with changes is kept the same way (its path is only in the log: the cancel returns no result).
 
 ---
 
@@ -7074,7 +7077,7 @@ the server still answers 401, by the single-flight rejection path above.
 `OAuthHttp`). A client-credentials server requests a token for the union of the scopes it already
 asked for and the challenge's `scope` (`mcp_client_credentials::step_up`, a pure decision) and the
 request is retried **once**: at most one step-up per request, never a loop; a scope set the
-authorization server refused is remembered and not asked for again, and the held token is untouched.
+authorization server refused is remembered and not asked for again, one that failed transiently waits out the same doubling backoff as a 401 refresh (a 403 for it makes no authorization-server call meanwhile), and the held token is untouched.
 An `mcp-login` server cannot ask anyone mid-run: the error names the scope and the command
 (`agent mcp-login <name> --scope "<scope>"`). A 403 never refreshes.
 
@@ -7235,7 +7238,7 @@ mcp_events_subscribe (any session) ──► owned by that session
   Standard Webhooks senders treat as "stop"). Before any state is read, a daemon with a callback URL answers every
   unknown token `503` from its start until each session it starts to restore callbacks (the events
   session, and every session holding runtime subscriptions) has read its state and held its tokens
-  (`webhook::restore_pending` / `restored`, also bounded at 10 min); after that an unknown token is
+  (`webhook::restore_pending` / `restored`, also bounded at 10 min; a restore that ends any other way, such as its hub dropped first, calls `restored` too); after that an unknown token is
   `410` at once. A runtime subscription the server ended is not restored, so its token is not held
   and its old callback answers `410`. No subscription makes a request — configured, restored after a
   restart or a panic, or resubscribing — until the session can take the server's questions (its

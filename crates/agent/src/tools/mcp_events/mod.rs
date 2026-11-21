@@ -537,6 +537,16 @@ fn events_http_client(
     })
 }
 
+/// Tells the webhook receiver this session is done restoring (see `webhook::restore_pending`) when
+/// dropped, on whatever path: reserving its tokens, or never getting to.
+struct RestoredOnDrop(String);
+
+impl Drop for RestoredOnDrop {
+    fn drop(&mut self) {
+        webhook::restored(&self.0);
+    }
+}
+
 /// A session's MCP Events client: its subscriptions, its coalescer, and the injection path into
 /// the session's own command channel. Owned by `serve_session`; dropping it cancels everything.
 pub struct McpEventsHub {
@@ -578,7 +588,7 @@ impl McpEventsHub {
             catalog: cfg.catalog,
             callback_url: cfg.callback_url.map(|u| u.trim_end_matches('/').to_owned()),
             emit: cfg.emit,
-            session_id: cfg.session_id,
+            session_id: cfg.session_id.clone(),
             subs: Mutex::new(HashMap::new()),
             key_locks: Mutex::new(HashMap::new()),
             discovery: Mutex::new(HashMap::new()),
@@ -612,6 +622,9 @@ impl McpEventsHub {
         // the runtime ones, which make no request before `start` (see `Hub::questions_ready`).
         {
             let weak_hub = Arc::downgrade(&hub);
+            // Held until the tokens are reserved, or this task ends any other way (the hub is gone,
+            // a panic): the daemon's hold on unknown tokens must never be left to its timer.
+            let restore = RestoredOnDrop(cfg.session_id);
             tokio::spawn(async move {
                 let Some(store) = weak_hub.upgrade().map(|h| h.store.clone()) else {
                     return;
@@ -645,7 +658,7 @@ impl McpEventsHub {
                 }
                 // The daemon may be holding every unknown token at `503` until this session's
                 // tokens are reserved (`webhook::restore_pending`); they are now.
-                webhook::restored(&hub.session_id);
+                drop(restore);
                 for (key, spec) in runtime {
                     hub.restoring
                         .lock()
@@ -2585,6 +2598,37 @@ mod tests {
         assert_eq!(text.matches("</mcp_event>").count(), 1, "{text}");
         assert!(text.contains("1 event(s)"));
         assert!(text.contains("may have been missed"), "{text}");
+    }
+
+    /// A session whose hub is gone before its restore task runs (the session ended at once) must not
+    /// leave the daemon answering `503` to every unknown webhook token until the hold's timer ends.
+    #[tokio::test]
+    async fn a_hub_dropped_before_its_restore_runs_still_releases_the_webhook_hold() {
+        webhook::restore_pending(["gone".to_owned()]);
+        assert!(webhook::route_exists("any-unknown-token"), "held");
+        let (_tx, input_rx) = mpsc::channel::<String>(1);
+        let (_rx, hub) = McpEventsHub::attach(
+            input_rx,
+            McpEventsConfig {
+                catalog: McpCatalog::default(),
+                callback_url: None,
+                emit: Arc::new(|_| {}),
+                running: Arc::new(AtomicBool::new(false)),
+                keep_alive: None,
+                owns_configured: false,
+                state_path: None,
+                session_id: "gone".into(),
+            },
+        );
+        // The restore task is spawned but has not run: this runtime is single-threaded.
+        drop(hub);
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !webhook::route_exists("any-unknown-token"),
+            "the hold outlived the session that was to release it"
+        );
     }
 
     /// The session's command channel is full and never drained: the coalescer blocked sending an

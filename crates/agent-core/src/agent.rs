@@ -1441,7 +1441,6 @@ impl Agent {
                 // queued (plus any steer messages stranded by a tool-less turn) and continue with them
                 // as new user turns. The last message is the assistant's, so pushing user turns here
                 // keeps the wire's role alternation valid.
-                let injected = steering.drain_at_stop();
                 // Background work (see `crate::background`): a finish notice still pending is
                 // delivered before the run may end, so the model never stops without a result that
                 // already arrived; failing that, work still running is listed — once per run — so
@@ -1450,9 +1449,15 @@ impl Agent {
                 //
                 // Not once the step limit (or the wrap-up's extended one) is reached: the run cannot
                 // take the step either would start, so continuing turned a clean final answer into a
-                // `MaxSteps` failure. The run ends here instead; notices stay unconsumed, for the next
-                // run (a `serve` prompt) or the next stop.
+                // `MaxSteps` failure. The run ends here instead; notices and queued follow-ups stay
+                // unconsumed (draining one would also emit `Steered`, which a host records as
+                // delivery), for the next run (a `serve` prompt) or the next stop.
                 let at_step_limit = budget.limit.is_some_and(|limit| steps_this_call >= limit);
+                let injected = if at_step_limit {
+                    Vec::new()
+                } else {
+                    steering.drain_at_stop()
+                };
                 let mut background_note = None;
                 if !at_step_limit {
                     let background = crate::background::collect(&self.tools);
