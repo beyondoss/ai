@@ -902,7 +902,7 @@ impl Agent {
         let mut budget = crate::step_budget::BudgetState::new(self.max_steps);
         // Whether this call has already given the model its stop reminder: at most one per run, so
         // a model that ends again ends — even if it started or waited on a job in between.
-        let mut stop_reminded = false;
+        let mut stop = crate::stop_kernel::StopState::new();
         // The previous turn's stop reason, read by `is_hard_overflow`'s `MaxTokens` check. Re-derived
         // from `session`'s own last assistant message rather than hardcoded to `EndTurn` (pi-parity fix
         // — matches pi's own `isContextOverflow`, re-evaluated fresh from the persisted
@@ -1026,9 +1026,8 @@ impl Agent {
                     tool_names: current_tool_defs.iter().map(|d| d.name.clone()).collect(),
                 });
             }
-            if let Some(limit) = budget.limit
-                && steps_this_call >= limit
-            {
+            if crate::stop_kernel::limit_reached(steps_this_call, budget.limit) {
+                let limit = budget.limit.unwrap_or(0);
                 // The configured ceiling, not the wrap-up-extended one: callers match on it.
                 let err = Error::MaxSteps(self.max_steps.unwrap_or(limit));
                 sink(AgentEvent::Error {
@@ -1452,30 +1451,29 @@ impl Agent {
                 // `MaxSteps` failure. The run ends here instead; notices and queued follow-ups stay
                 // unconsumed (draining one would also emit `Steered`, which a host records as
                 // delivery), for the next run (a `serve` prompt) or the next stop.
-                let at_step_limit = budget.limit.is_some_and(|limit| steps_this_call >= limit);
-                let injected = if at_step_limit {
-                    Vec::new()
-                } else {
-                    steering.drain_at_stop()
+                // The decision is `stop_kernel`'s; this only performs the effects it asks for, in
+                // its order (drain, finish notices, then the once-per-run reminder).
+                let mut fx = StopFx {
+                    steering: &steering,
+                    tools: &self.tools,
+                    background: None,
+                    injected: Vec::new(),
+                    note: None,
                 };
-                let mut background_note = None;
-                if !at_step_limit {
-                    let background = crate::background::collect(&self.tools);
-                    background_note = crate::background::take_notices(&background)
-                        .map(|t| (crate::BackgroundReason::Finished, t));
-                    if background_note.is_none() && injected.is_empty() && !stop_reminded {
-                        background_note = crate::background::stop_reminder(&background)
-                            .map(|t| (crate::BackgroundReason::StillRunning, t));
-                        stop_reminded = background_note.is_some();
-                    }
-                }
-                if injected.is_empty() && background_note.is_none() {
+                let outcome =
+                    crate::stop_kernel::decide(&mut stop, steps_this_call, budget.limit, &mut fx);
+                let StopFx {
+                    injected,
+                    note: background_note,
+                    ..
+                } = fx;
+                if outcome == crate::stop_kernel::Outcome::End {
                     sink(AgentEvent::AgentEnd {
                         steps: session.steps,
                     });
                     return Ok(());
                 }
-                if injected.is_empty()
+                if outcome.steered().is_none()
                     && let Some((reason, text)) = background_note
                 {
                     session.user(text.clone());
@@ -1490,7 +1488,8 @@ impl Agent {
                     });
                     continue;
                 }
-                let count = injected.len();
+                let count = outcome.steered().unwrap_or(0);
+                debug_assert_eq!(count, injected.len());
                 let tags: Vec<u64> = injected.iter().filter_map(|m| m.tag).collect();
                 for msg in injected {
                     if msg.images.is_empty() {
@@ -4458,6 +4457,41 @@ impl Accumulator {
             usage: self.usage,
             not_run,
         }
+    }
+}
+
+/// Backs [`crate::stop_kernel::Effects`] with the live steering queue and the tools' background
+/// sources, keeping what they return for the interpreter to deliver.
+struct StopFx<'a> {
+    steering: &'a Steering,
+    tools: &'a ToolRegistry,
+    background: Option<Vec<Arc<dyn crate::background::Background>>>,
+    injected: Vec<crate::steering::SteeringMessage>,
+    note: Option<(crate::BackgroundReason, String)>,
+}
+
+impl StopFx<'_> {
+    fn background(&mut self) -> &[Arc<dyn crate::background::Background>] {
+        let tools = self.tools;
+        self.background
+            .get_or_insert_with(|| crate::background::collect(tools))
+    }
+}
+
+impl crate::stop_kernel::Effects for StopFx<'_> {
+    fn drain(&mut self) -> usize {
+        self.injected = self.steering.drain_at_stop();
+        self.injected.len()
+    }
+    fn take_notices(&mut self) -> bool {
+        let text = crate::background::take_notices(self.background());
+        self.note = text.map(|t| (crate::BackgroundReason::Finished, t));
+        self.note.is_some()
+    }
+    fn stop_reminder(&mut self) -> bool {
+        let text = crate::background::stop_reminder(self.background());
+        self.note = text.map(|t| (crate::BackgroundReason::StillRunning, t));
+        self.note.is_some()
     }
 }
 

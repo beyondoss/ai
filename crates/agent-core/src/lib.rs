@@ -43,6 +43,7 @@ pub mod session;
 pub mod session_title;
 pub mod steering;
 pub mod step_budget;
+pub mod stop_kernel;
 pub mod tls;
 pub mod token_size;
 pub mod tool;
