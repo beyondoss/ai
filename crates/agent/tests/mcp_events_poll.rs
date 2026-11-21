@@ -1,4 +1,4 @@
-//! MCP Events (draft) over **poll**, end to end: a real stdio `serve`, a real events fixture
+//! MCP Events over **poll**, end to end: a real stdio `serve`, a real events fixture
 //! process, a mock model. Discovery, `events/poll` delivery into an `mcp_event` frame *and* into a
 //! model-visible follow-up, and the "server without the extension" cases.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -244,20 +244,28 @@ fn a_server_without_the_extension_is_reported_and_its_tools_are_unchanged() {
         json!([{ "name": "ticket.updated" }]),
     );
     let mut s = start(json!([server]), home);
-    let _ = wait_control_file(&control_file);
+    let control = wait_control_file(&control_file);
 
     let status = s
         .frames
         .wait(Duration::from_secs(20), "the subscribe failure", |f| {
-            // Permanent: the server does not speak the extension.
+            // Permanent: the server did not advertise the extension.
             f["type"] == "mcp_event_status" && f["kind"] == "refused"
         });
     assert!(
         status["error"]
             .as_str()
             .unwrap()
-            .contains("does not support the MCP Events extension"),
+            .contains("did not advertise the MCP Events extension"),
         "{status:#}"
+    );
+    assert!(
+        !state(&control)["methods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m.as_str().is_some_and(|m| m.starts_with("events/"))),
+        "an events request reached a server that never advertised the extension"
     );
     send(
         &mut s.stdin,
@@ -520,7 +528,7 @@ fn a_slow_server_does_not_serialize_subscriptions_to_others() {
     assert_eq!(s.frames.response("slow")["success"], true);
 }
 
-/// "Forbidden" (`-32012`) is how a server answers an expired credential: retried, with credentials
+/// "Forbidden" (`-32024`) is how a server answers an expired credential: retried, with credentials
 /// resolved afresh, on a short backoff — and the subscription comes up once they work.
 #[test]
 fn a_forbidden_subscribe_is_retried_and_comes_up_once_credentials_work() {

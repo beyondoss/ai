@@ -1,4 +1,4 @@
-//! MCP Events (draft) over **webhook** — the mode ChatGPT ships — end to end: a real `serve --listen`
+//! MCP Events over **webhook** — the mode ChatGPT ships — end to end: a real `serve --listen`
 //! daemon receiving signed deliveries from a real streamable-HTTP events fixture on its own HTTP
 //! listener (`/_beyond/mcp-events/<token>`), a session attached over WebSocket, and a mock model.
 //!
@@ -269,6 +269,20 @@ async fn webhook_end_to_end_verify_deliver_dedup_reject_refresh_rotate_unsubscri
     assert_eq!(unsubs[0]["delivery"]["url"], callback.as_str());
     assert_eq!(unsubs[0]["arguments"], json!({ "project": "alpha" }));
     assert!(st["hooks"].as_array().unwrap().is_empty());
+    // Subscribe, every refresh and the unsubscribe all carried `Mcp-Name` and
+    // `Mcp-Param-Project`: the fixture rejects an `events/*` request whose headers do not match.
+    assert_eq!(st["header_rejections"], 0, "{st:#}");
+    let unsub_headers = st["routing_log"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["method"] == "events/unsubscribe")
+        .expect("an unsubscribe was sent");
+    assert!(
+        unsub_headers["headers"]
+            .to_string()
+            .contains("ticket.updated")
+    );
     let _ = d.home.path();
 }
 
@@ -343,7 +357,7 @@ async fn a_callback_url_nothing_answers_fails_the_challenge_and_the_subscribe() 
     assert_eq!(r["success"], false);
     let e = r["error"].as_str().unwrap();
     assert!(
-        e.contains("CallbackEndpointError") && e.contains("-32015"),
+        e.contains("CallbackEndpointError") && e.contains("-32027"),
         "{e}"
     );
 }

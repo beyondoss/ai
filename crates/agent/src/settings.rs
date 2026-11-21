@@ -1415,8 +1415,7 @@ pub struct McpServerConfig {
 
 /// One MCP Events subscription declared on a configured server (`mcp_servers[].events[]`).
 ///
-/// Implements the Triggers & Events Working Group's *draft* design sketch (no SEP yet; pinned in
-/// `tools::mcp_events`). `name` + `arguments` say what to listen for; `delivery` forces a mode
+/// Implements SEP-3415, the Events extension (pinned in `tools::mcp_events`). `name` + `arguments` say what to listen for; `delivery` forces a mode
 /// (otherwise the client picks webhook > push > poll from what the server offers and this process
 /// can receive); `action` says what an arriving event does to the session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,4 +1,4 @@
-//! MCP Events (draft): an event that arrives while the session is busy with something that is
+//! MCP Events: an event that arrives while the session is busy with something that is
 //! not a prompt — a host `bash` command, a manual `compact` — is queued and delivered to the model
 //! afterwards, never refused as busy. Also: `mcp_events_*` commands are answered mid-run, without
 //! waiting for the run. Real `serve`, real fixture process, mock model.

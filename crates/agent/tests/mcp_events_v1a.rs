@@ -1,5 +1,5 @@
-//! MCP Events (draft) webhook **server identity**: a server that publishes an Ed25519 key at
-//! `/.well-known/mcp-webhook-jwks.json` gets its deliveries checked for a Standard Webhooks `v1a,`
+//! MCP Events webhook **server identity**: a server that publishes an Ed25519 key at
+//! its Server Card (`<MCP URL>/server-card`) gets its deliveries checked for a Standard Webhooks `v1a,`
 //! signature as well as the HMAC — a delivery whose `v1a,` is missing or wrong is refused even
 //! though its HMAC is valid. A server that publishes no key is unaffected (every other webhook
 //! suite). Real `serve --listen`, real fixture, mock model.
@@ -236,7 +236,7 @@ async fn a_jwks_body_that_stalls_is_timed_out_and_leaves_nothing_behind() {
         home.path(),
         &base,
         &[],
-        &[("BEYOND_AI_AGENT_MCP_EVENTS_JWKS_TIMEOUT_MS", "300")],
+        &[("BEYOND_AI_AGENT_MCP_EVENTS_SERVER_CARD_TIMEOUT_MS", "300")],
     );
     let mut ws = ws_connect(port, Some("stalled-jwks")).await;
     let started = Instant::now();

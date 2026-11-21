@@ -1,4 +1,4 @@
-//! MCP Events (draft) in a multi-session daemon: subscriptions configured in
+//! MCP Events in a multi-session daemon: subscriptions configured in
 //! `mcp_servers[].events` are owned by **one** session — the events session, started at boot — so
 //! one event is one subscription and one model run however many clients are connected, and
 //! ordinary sessions stay reapable. Configured subscriptions are kept up — retried after a failure

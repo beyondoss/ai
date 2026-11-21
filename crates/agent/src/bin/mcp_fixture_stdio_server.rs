@@ -96,7 +96,7 @@ fn record_cancel_flag(task_id: &str) {
 fn capabilities() -> Value {
     json!({
         "tools": if list_changes() { json!({ "listChanged": true }) } else { json!({}) },
-        "resources": {},
+        "resources": if list_changes() { json!({ "listChanged": true }) } else { json!({}) },
         "prompts": {},
         "completions": {},
         "extensions": {
@@ -174,6 +174,46 @@ async fn main() {
 
         let params = request.get("params").cloned().unwrap_or(Value::Null);
 
+        if method == "initialize" {
+            LEGACY_SESSION.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        // A `2026-07-28` server sends a `list_changed` only to a client that asked on a
+        // `subscriptions/listen` stream. The stream is acknowledged with what this server agrees
+        // to, then left open (no response).
+        if method == "subscriptions/listen" {
+            let wants = params.pointer("/notifications/toolsListChanged") == Some(&json!(true));
+            *LISTEN_ID
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(id.clone());
+            LISTEN_TOOLS.store(wants && list_changes(), std::sync::atomic::Ordering::SeqCst);
+            let wants_resources =
+                params.pointer("/notifications/resourcesListChanged") == Some(&json!(true));
+            LISTEN_RESOURCES.store(
+                wants_resources && list_changes(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            let mut agreed = json!({});
+            if wants && list_changes() {
+                agreed["toolsListChanged"] = json!(true);
+            }
+            if wants_resources && list_changes() {
+                agreed["resourcesListChanged"] = json!(true);
+            }
+            let ack = json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/subscriptions/acknowledged",
+                "params": {
+                    "_meta": { "io.modelcontextprotocol/subscriptionId": id },
+                    "notifications": agreed,
+                },
+            });
+            if write_json_line(&mut stdout, &ack).await.is_err() {
+                break;
+            }
+            continue;
+        }
+
         if method == "tools/call"
             && params.get("name").and_then(Value::as_str) == Some("slow_progress")
         {
@@ -215,6 +255,19 @@ async fn main() {
             && params.get("name").and_then(Value::as_str) == Some("unlock")
         {
             if write_unlock(&mut lines, &mut stdout, id).await.is_err() {
+                break;
+            }
+            continue;
+        }
+
+        if method == "tools/call"
+            && list_changes()
+            && params.get("name").and_then(Value::as_str) == Some("publish_doc")
+        {
+            if write_publish_doc(&mut lines, &mut stdout, id)
+                .await
+                .is_err()
+            {
                 break;
             }
             continue;
@@ -348,6 +401,26 @@ fn list_changes() -> bool {
     std::env::var_os("MCP_FIXTURE_LIST_CHANGES").is_some()
 }
 
+/// Whether the client opened a `subscriptions/listen` stream asking for `toolsListChanged` (and the
+/// fixture agreed), and that stream's JSON-RPC id.
+static LISTEN_TOOLS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static LISTEN_ID: std::sync::Mutex<Option<Value>> = std::sync::Mutex::new(None);
+/// Whether the client fell back to the legacy `initialize` handshake, where `list_changed` is
+/// unrequested.
+static LEGACY_SESSION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this server may send `notifications/tools/list_changed` now: always on a legacy session,
+/// else only to an opted-in `subscriptions/listen` stream.
+fn may_send_tools_list_changed() -> bool {
+    LEGACY_SESSION.load(std::sync::atomic::Ordering::SeqCst)
+        || LISTEN_TOOLS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Whether a listen stream asked for `resourcesListChanged` (and was agreed), and whether
+/// `publish_doc` has been called.
+static LISTEN_RESOURCES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static DOC_PUBLISHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Whether `unlock` has been called.
 static UNLOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -361,8 +434,19 @@ async fn write_unlock(
     tool_id: Value,
 ) -> Result<(), std::io::Error> {
     UNLOCKED.store(true, std::sync::atomic::Ordering::SeqCst);
-    let changed = json!({ "jsonrpc": "2.0", "method": "notifications/tools/list_changed" });
-    write_json_line(stdout, &changed).await?;
+    if may_send_tools_list_changed() {
+        let mut changed = json!({ "jsonrpc": "2.0", "method": "notifications/tools/list_changed" });
+        if let Some(id) = LISTEN_ID
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            && !LEGACY_SESSION.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            changed["params"] =
+                json!({ "_meta": { "io.modelcontextprotocol/subscriptionId": id } });
+        }
+        write_json_line(stdout, &changed).await?;
+    }
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while let Ok(Ok(Some(line))) = tokio::time::timeout_at(deadline, lines.next_line()).await {
         let Ok(request) = serde_json::from_str::<Value>(&line) else {
@@ -390,6 +474,59 @@ async fn write_unlock(
     }
     let result =
         json!({ "jsonrpc": "2.0", "id": tool_id, "result": text_result("unlocked", false) });
+    write_json_line(stdout, &result).await
+}
+
+/// `publish_doc`: add the `published` resource and say so with `notifications/resources/list_changed`
+/// (only to a listen stream that asked, or on a legacy session), then hold the call's answer until
+/// the client has read `resources/list` (or 5 s pass).
+async fn write_publish_doc(
+    lines: &mut Lines<BufReader<Stdin>>,
+    stdout: &mut Stdout,
+    tool_id: Value,
+) -> Result<(), std::io::Error> {
+    DOC_PUBLISHED.store(true, std::sync::atomic::Ordering::SeqCst);
+    if LEGACY_SESSION.load(std::sync::atomic::Ordering::SeqCst)
+        || LISTEN_RESOURCES.load(std::sync::atomic::Ordering::SeqCst)
+    {
+        let mut changed =
+            json!({ "jsonrpc": "2.0", "method": "notifications/resources/list_changed" });
+        if let Some(id) = LISTEN_ID
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            && !LEGACY_SESSION.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            changed["params"] =
+                json!({ "_meta": { "io.modelcontextprotocol/subscriptionId": id } });
+        }
+        write_json_line(stdout, &changed).await?;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while let Ok(Ok(Some(line))) = tokio::time::timeout_at(deadline, lines.next_line()).await {
+        let Ok(request) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let (Some(method), Some(id)) = (
+            request.get("method").and_then(Value::as_str),
+            request.get("id").cloned(),
+        ) else {
+            continue;
+        };
+        let params = request.get("params").cloned().unwrap_or(Value::Null);
+        let envelope = match handle(method, params) {
+            Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+            Err((code, message)) => json!({
+                "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message },
+            }),
+        };
+        write_json_line(stdout, &envelope).await?;
+        if method == "resources/list" {
+            break;
+        }
+    }
+    let result =
+        json!({ "jsonrpc": "2.0", "id": tool_id, "result": text_result("published", false) });
     write_json_line(stdout, &result).await
 }
 
@@ -491,6 +628,14 @@ fn handle(method: &str, params: Value) -> Result<Value, (i64, String)> {
                 "description": "A fixture text resource.",
                 "mimeType": "text/plain",
             })];
+            if DOC_PUBLISHED.load(std::sync::atomic::Ordering::SeqCst) {
+                resources.push(json!({
+                    "uri": "fixture://published",
+                    "name": "published",
+                    "description": "Published after connect.",
+                    "mimeType": "text/plain",
+                }));
+            }
             if odd_names() {
                 resources.push(json!({
                     "uri": ODD_RESOURCE_URI,
@@ -693,6 +838,11 @@ fn tool_defs() -> Value {
         let Value::Array(defs) = &mut defs else {
             unreachable!()
         };
+        defs.push(json!({
+            "name": "publish_doc",
+            "description": "Adds a `published` resource to this server's resource list.",
+            "inputSchema": { "type": "object", "properties": {} },
+        }));
         defs.push(json!({
             "name": "unlock",
             "description": "Adds the `secret` tool to this server's tool list.",
