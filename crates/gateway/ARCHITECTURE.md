@@ -4086,7 +4086,7 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 
 - **Unit (`cargo test --lib`):** key, route, peek, usage, deny, allowance, secret, config, cache, control,
   pin, translate. `clippy --all-targets -D warnings` clean. The response side of translate
-  (`src/translate_response_tests.rs`) feeds every stream whole, byte by byte and in 7-byte chunks
+  (`src/translate/response_tests.rs`) feeds every stream whole, byte by byte and in 7-byte chunks
   and requires the same events from each, and rebuilds client state the way the OpenAI and
   Anthropic SDKs accumulate it (tool calls by `index`, blocks by `content[index]`, the Responses
   item lifecycle, and openai-python's `accumulate_delta` for the message a Chat client echoes on
@@ -4115,7 +4115,7 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
   `peek` walker (the streaming and buffered scans, the span reads and edits) answers exactly as
   the copy of it kept from before it shared one lexer, on valid, broken and truncated bodies fed
   whole, byte by byte and cut at random (`tests/props_lex.rs`, oracle in
-  `tests/props_support/old_peek.rs`; `ArgsEnd` the same way in `translate_response_tests.rs`);
+  `tests/props_support/old_peek.rs`; `ArgsEnd` the same way in `translate/response_tests.rs`);
   that no field that changes the answer is silently dropped; that the route tables classify any path as
   documented; and that a signed Responses id round-trips for its tenant, never verifies for another
   or after any one-byte change, and is rewritten exactly where it appears in a request body or a

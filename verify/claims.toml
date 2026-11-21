@@ -31,7 +31,7 @@ touches = [
   "crates/gateway/src/route.rs",
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/proxy/",
-  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/translate/",
 ]
 defects = ["D63", "D147", "D172", "D269"]
 
@@ -48,7 +48,7 @@ touches = [
   "crates/gateway/src/route.rs",
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/proxy/",
-  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/translate/",
 ]
 defects = ["D147", "D172", "D269"]
 
@@ -72,7 +72,7 @@ touches = [
   "crates/gateway/src/route.rs",
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/proxy/",
-  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/translate/",
 ]
 defects = ["D74", "D128", "D145", "D147", "D175"]
 
@@ -144,7 +144,7 @@ touches = [
   "crates/gateway/src/route.rs",
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/proxy/",
-  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/translate/",
 ]
 defects = []
 
@@ -173,7 +173,7 @@ clients = [
 failover_clients = ["openai-py", "anthropic-py", "claude-code", "pi"]
 client_note = "A coding agent (claude-code, codex, opencode, pi) chooses its own tools and arguments, so its cells can't force one with fixed args. They hold the rest of the oracle on the wire instead (`harness_long.py cell <harness>+task` behind the recording proxy): a served turn replays one of the agent's own tool calls with its result, paired by id (`tool_round_trips`), no turn feeding a result back is refused, and the fixture test passes, which needs those results (the agent reads calc.py and runs the test through its tools). Each runs native and translated: Claude Code on Claude and GPT (Messages to Chat), Codex on its own row and Claude (Responses to Messages), opencode and pi's Chat mode on Claude (Chat to Messages), OpenRouter and GPT. The forced-tool, fixed-args half is the SDK and raw cells'."
 touches = [
-  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/translate/",
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/proxy/",
 ]
@@ -196,7 +196,7 @@ clients = [
 ]
 failover_clients = ["anthropic-py", "claude-code"]
 touches = [
-  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/translate/",
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/proxy/",
 ]
@@ -213,7 +213,7 @@ clients = ["openai-py", "anthropic-py", "ai-sdk", "pi", "raw"]
 client_note = "pi sends only base64 images: pi 0.73.1 has no image-URL or PDF input. Its `@file` argument (dist/cli/file-processor.js) attaches a file as a base64 image only when its sniffed type is JPEG, PNG, GIF or WebP (dist/utils/mime.js), and inlines any other file, a PDF included, as UTF-8 text. So pi's cells (`pi:{chat,messages,responses}+vision`) read the PNG fixture on each of its three wires, native and translated, on Claude and GPT; URLs and PDFs are the SDK and raw cells'."
 failover_clients = []
 touches = [
-  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/translate/",
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/proxy/",
 ]
@@ -237,7 +237,7 @@ clients = [
 ]
 failover_clients = []
 touches = [
-  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/translate/",
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/proxy/",
 ]
@@ -253,7 +253,7 @@ layer = "both"
 clients = ["openai-py", "openai-node", "raw"]
 failover_clients = []
 touches = [
-  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/translate/",
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/proxy/",
 ]
@@ -276,7 +276,7 @@ clients = [
 ]
 failover_clients = []
 touches = [
-  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/translate/",
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/proxy/",
   "crates/gateway/src/remedy.rs",
@@ -294,7 +294,7 @@ layer_note = "Reclassified from live/both on 2026-10-01: A truncated stream need
 clients = ["raw", "openai-py", "anthropic-py"]
 failover_clients = []
 touches = [
-  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/translate/",
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/proxy/",
 ]
@@ -525,7 +525,7 @@ layer = "both"
 clients = ["openai-py", "openai-node", "ai-sdk", "langchain", "raw"]
 client_note = "Not opencode: opencode 1.18.34 marks its own cache breakpoints on a Claude model id (2-3 cache_control markers in every request, seen by the recording proxy on 2026-10-01), so it never relies on the automatic breakpoints this claim is about. Its cache hits over long sessions are LNG-2."
 failover_clients = []
-touches = ["crates/gateway/src/translate.rs"]
+touches = ["crates/gateway/src/translate/"]
 defects = []
 
 [[claim]]
@@ -718,7 +718,7 @@ failover_clients = []
 touches = [
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/proxy/",
-  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/translate/",
   "crates/gateway/src/main.rs",
 ]
 defects = ["D92"]
@@ -735,7 +735,7 @@ failover_clients = []
 touches = [
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/proxy/",
-  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/translate/",
   "crates/gateway/src/main.rs",
 ]
 defects = ["D124"]
@@ -753,7 +753,7 @@ failover_clients = []
 touches = [
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/proxy/",
-  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/translate/",
   "crates/gateway/src/main.rs",
 ]
 defects = []
@@ -1217,7 +1217,7 @@ touches = [
   "crates/gateway/src/control.rs",
   "crates/gateway/src/secret.rs",
   "crates/gateway/src/peek.rs",
-  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/translate/",
   "crates/gateway/src/concurrency.rs",
 ]
 defects = ["D35", "D215", "D216", "D218"]
@@ -2397,7 +2397,7 @@ group = "Translation detail"
 text = "The default Responses call (no store) works on every row, or the catalog honestly says it doesn't"
 layer = "both"
 touches = [
-  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/translate/",
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/proxy/",
 ]
@@ -2410,7 +2410,7 @@ group = "Translation detail"
 text = "System and developer messages land in the right place, mid-conversation included, per model"
 layer = "both"
 touches = [
-  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/translate/",
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/proxy/",
 ]
@@ -2423,7 +2423,7 @@ group = "Translation detail"
 text = "Consecutive same-role messages keep separate blocks"
 layer = "hermetic"
 touches = [
-  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/translate/",
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/proxy/",
 ]
@@ -2436,7 +2436,7 @@ group = "Translation detail"
 text = "cache_control is honored at message and part level for every role, and auto breakpoints are verified live"
 layer = "both"
 touches = [
-  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/translate/",
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/proxy/",
 ]
@@ -2449,7 +2449,7 @@ group = "Translation detail"
 text = "max_tokens defaults and clamps never truncate or 400"
 layer = "both"
 touches = [
-  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/translate/",
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/proxy/",
   "crates/gateway/src/peek.rs",
@@ -2463,7 +2463,7 @@ group = "Translation detail"
 text = "Forced tool choice on newer Claude actually returns a tool call live"
 layer = "live"
 touches = [
-  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/translate/",
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/proxy/",
 ]
@@ -2476,7 +2476,7 @@ group = "Translation detail"
 text = "Thinking replay works for clients that don't echo thinking"
 layer = "both"
 touches = [
-  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/translate/",
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/proxy/",
 ]
@@ -2489,7 +2489,7 @@ group = "Translation detail"
 text = "Codex and Agents SDK reasoning replays without item ids"
 layer = "both"
 touches = [
-  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/translate/",
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/proxy/",
 ]
@@ -2502,7 +2502,7 @@ group = "Translation detail"
 text = "Zero-argument tool calls stream \"{}\""
 layer = "hermetic"
 touches = [
-  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/translate/",
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/proxy/",
 ]
@@ -2515,7 +2515,7 @@ group = "Translation detail"
 text = "Claude Code's request shape is accepted by native OpenAI"
 layer = "live"
 touches = [
-  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/translate/",
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/proxy/",
 ]
@@ -2528,7 +2528,7 @@ group = "Translation detail"
 text = "Strict tools are accepted onto Messages, and strict defaults match across dialects"
 layer = "live"
 touches = [
-  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/translate/",
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/proxy/",
 ]
@@ -2541,7 +2541,7 @@ group = "Translation detail"
 text = "Parallel tool_use blocks are sequential on Messages streams"
 layer = "hermetic"
 touches = [
-  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/translate/",
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/proxy/",
 ]
@@ -2554,7 +2554,7 @@ group = "Translation detail"
 text = "Tool input sent in the start block is preserved"
 layer = "hermetic"
 touches = [
-  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/translate/",
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/proxy/",
 ]
@@ -2567,7 +2567,7 @@ group = "Translation detail"
 text = "Custom tool calls round-trip in history across dialects"
 layer = "hermetic"
 touches = [
-  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/translate/",
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/proxy/",
 ]
@@ -2580,7 +2580,7 @@ group = "Translation detail"
 text = "Explicit nulls never cause spurious 400s"
 layer = "both"
 touches = [
-  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/translate/",
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/proxy/",
 ]
@@ -2593,7 +2593,7 @@ group = "Translation detail"
 text = "The developer role is mapped for non-OpenAI Chat hosts"
 layer = "live"
 touches = [
-  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/translate/",
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/proxy/",
 ]
@@ -2606,7 +2606,7 @@ group = "Translation detail"
 text = "Unknown Responses input items are forwarded so the provider rejects them, never silently dropped"
 layer = "hermetic"
 touches = [
-  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/translate/",
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/proxy/",
 ]
@@ -2619,7 +2619,7 @@ group = "Translation detail"
 text = "Context-overflow errors carry the phrasing and code each harness compacts on"
 layer = "live"
 touches = [
-  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/translate/",
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/proxy/",
 ]
@@ -2632,7 +2632,7 @@ group = "Translation detail"
 text = "Mid-stream error codes are preserved"
 layer = "hermetic"
 touches = [
-  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/translate/",
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/proxy/",
 ]
@@ -2645,7 +2645,7 @@ group = "Translation detail"
 text = "Gateway reasoning items never reach a real OpenAI Responses candidate"
 layer = "hermetic"
 touches = [
-  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/translate/",
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/proxy/",
 ]
@@ -2658,7 +2658,7 @@ group = "Translation detail"
 text = "Every documented lossy mapping is asserted as a negative claim"
 layer = "hermetic"
 touches = [
-  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/translate/",
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/proxy/",
 ]
@@ -2671,7 +2671,7 @@ group = "Translation detail"
 text = "Stop-reason, refusal and finish tables hold in every direction"
 layer = "hermetic"
 touches = [
-  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/translate/",
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/proxy/",
 ]
@@ -2684,7 +2684,7 @@ group = "Translation detail"
 text = "Usage mapping and minted ids/created hold in every direction"
 layer = "hermetic"
 touches = [
-  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/translate/",
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/proxy/",
 ]
@@ -2697,7 +2697,7 @@ group = "Translation detail"
 text = "Responses stream lifecycle conformance holds live through Codex and the Agents SDK"
 layer = "live"
 touches = [
-  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/translate/",
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/proxy/",
 ]
@@ -2713,7 +2713,7 @@ oracle = "harness/SDK session with the primary killed between turns: every later
 layer = "live"
 clients = ["claude-code", "pi", "openai-py", "anthropic-py"]
 touches = [
-  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/translate/",
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/proxy/",
 ]
@@ -2728,7 +2728,7 @@ oracle = "opencode/pi/SDK session switching model every few turns: every turn su
 layer = "live"
 clients = ["opencode", "pi", "openai-py", "anthropic-py"]
 touches = [
-  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/translate/",
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/proxy/",
 ]
@@ -2745,7 +2745,7 @@ clients = ["openai-agents", "openai-py", "codex"]
 touches = [
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/proxy/",
-  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/translate/",
 ]
 defects = []
 
@@ -2773,7 +2773,7 @@ oracle = "Claude Code / Codex / pi multi-step repo task: task completes, compact
 layer = "live"
 clients = ["claude-code", "codex", "pi"]
 touches = [
-  "crates/gateway/src/translate.rs",
+  "crates/gateway/src/translate/",
   "crates/gateway/src/proxy.rs",
   "crates/gateway/src/proxy/",
   "crates/gateway/src/usage.rs",
@@ -2788,7 +2788,7 @@ text = "Prompt caching holds across long sessions: cache read share rises after 
 oracle = "per-turn ledger cache_read / input ratio over a long harness session exceeds a stated floor after warm-up, per route"
 layer = "live"
 clients = ["claude-code", "pi", "opencode"]
-touches = ["crates/gateway/src/translate.rs", "crates/gateway/src/pin.rs"]
+touches = ["crates/gateway/src/translate/", "crates/gateway/src/pin.rs"]
 defects = []
 
 [[claim]]
@@ -2799,7 +2799,7 @@ text = "Large tool sets (more than 128 tools, large schemas, Codex namespace too
 oracle = "SDK and harness requests with N tools around each provider's limit: success below it; a clear 4xx naming the limit above it (never a 5xx or silent drop)"
 layer = "live"
 clients = ["openai-py", "anthropic-py", "claude-code", "codex"]
-touches = ["crates/gateway/src/translate.rs"]
+touches = ["crates/gateway/src/translate/"]
 defects = ["D131", "D146"]
 
 [[claim]]
