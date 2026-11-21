@@ -93,7 +93,6 @@ zstd = "0.14"
 
 [dev-dependencies]
 # Exhaustive model checking of the end-of-turn kernel (`tests/stop_kernel_model.rs`); same pin as `crates/agent`.
-stateright = "0.31.0"
 # Loopback listeners for the socket tests (`ports`): the one place a test binds port 0.
 beyond-test-support = { path = "../test-support" }
 # Bench harness for the streaming decode hot path. `divan` (the workspace's `bench:unit` pin, matching
@@ -105,6 +104,7 @@ divan = "0.1"
 # (flattens the curve) or CPU-side SMT/turbo/bandwidth (doesn't). Gated behind `bench-mimalloc` so the
 # default build/bench stays on the production system allocator; only the control run opts in.
 mimalloc = "0.1"
+stateright = "0.31.0"
 
 [features]
 # Install mimalloc as the global allocator in `decode_concurrent` — the allocator-contention control
