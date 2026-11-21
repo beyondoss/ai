@@ -5613,8 +5613,10 @@ listing marked stale, the events discovery cache invalidated — because a chang
 while the stream was down. A server that answers the listen with Method not found gets none; a
 pre-`2026-07-28` (`initialize`) server sends its `list_changed` unrequested and gets no stream. The
 acknowledgment is not inspected on this path (rmcp types it, losing `eventsListChanged`): the filter
-asks for no more than the server declared. `resources/list_changed` is consumed lazily, never by an
-eager re-list: the MCP Apps view cache is cleared (the next `resources/read` of a view goes to the
+asks for no more than the server declared. `resources/list_changed` also re-lists the server's resources (`Relist::run_resources`, beside the tools
+re-listing: same one-at-a-time lock, same swap in the live set, and the shared catalog `get_mcp` reads),
+so a resource added at runtime is a tool from the next request (`ui://` views and a skills server's
+own files filtered out as at connect; `tests/mcp_list_changed.rs`). The other consumers refresh lazily: the MCP Apps view cache is cleared (the next `resources/read` of a view goes to the
 server), the skills listing is marked due (`ServerSkills::refresh_if_due`, checked at each turn:
 `mcp_skills.rs`), and an apps server's sizes and listing-level `_meta.ui` defaults are read again by
 `AppServer::refresh_resources` when the next view opens (`tests/mcp_apps_session.rs`). Before this existed the handlers never fired against a
