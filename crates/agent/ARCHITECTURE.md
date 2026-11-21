@@ -7172,6 +7172,37 @@ that is not there (404/405/410), or no refresh token, classified from the endpoi
 OAuth HTTP goes through `RecordingOAuthHttp`, since rmcp's refresh error keeps neither status nor
 code); a _transient_ one (the authorization server unreachable, a 5xx, a 429) for a backoff of 30 s
 doubling to 5 min, after which a rejection refreshes again. A reload clears a remembered failure
+**The token's decisions are a pure kernel** (`tools/mcp_oauth_kernel.rs`): `step(&mut State, &Config, Event)
+-> Action`. No I/O, no async, no clock: time arrives in the events. `ServerAuth` takes its tokio `Mutex`
+(held across the AS call, which is what keeps a refresh single flight), feeds the kernel an `Event`
+(`Need`, `Rejected`, `Insufficient`, `Stored`, and `Refreshed` for the AS's answer), performs the
+`Action` (`Refresh`: the AS call; `Reply`; `Nothing`) and feeds the answer back, in `drive`. Nothing else
+writes the state (the structure test `production_decides_through_the_kernel` fails if `ServerAuth` stops
+calling the kernel). The step-up decision is `mcp_client_credentials::step_up`, called by the kernel.
+
+`tests/mcp_oauth_model.rs` is a Stateright model that calls that same `step`: two callers interleaving
+at the lock, an AS answering Ok, transient or definitive, a server answering 401/403, a clock, and a
+second process changing the store; for client credentials and for `mcp-login`. Properties: S1 one AS
+call outstanding; S2 a 401 for a replaced token takes the current one, no AS call; S3 no AS call for a
+401's refresh or a step-up while its transient failure stands; S4 after a definitive failure no AS call
+until a reload reads a new stored token; S5 a failed step-up never touches the held token; S6 a refused
+step-up is never asked for again; L1 (a 401's refresh, and a step-up) and L2 (after a changed store
+token): once the cause clears, the next request gets a fresh token within a bounded number of steps
+(a bounded measure under `always`). Run it with `cargo test -p beyond-agent --test it mcp_oauth_model`.
+Each `mut_*` feature removes one guard, and `cargo test -p beyond-agent --features mut_<name> --test it
+mcp_oauth_model::the_mutation` passes only when the named property is red:
+
+| feature                   | property that goes red |
+| ------------------------- | ---------------------- |
+| `mut_no_stepup_backoff`   | S3 (step-up)           |
+| `mut_no_401_backoff`      | S3 (401 refresh)       |
+| `mut_stale_refresh`       | S2                     |
+| `mut_no_definitive_latch` | S4                     |
+| `mut_no_refused_memory`   | S6                     |
+| `mut_backoff_never_ends`  | L1                     |
+| `mut_reload_keeps_failed` | L2                     |
+| `mut_unlocked`            | S1                     |
+
 only when the stored token actually changed. Tested in
 `tests/mcp_oauth_refresh.rs` (a token revoked between two tool calls of one run, a failing refresh,
 three concurrent 401s) against the shared fixture in `tests/common/mcp_oauth_fixture.rs`, and by unit
