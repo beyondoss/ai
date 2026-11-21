@@ -1,0 +1,5 @@
+# The official Python MCP SDK, release 2.3.0 (PyPI), and its examples/servers/simple-auth at the
+# same release tag (sha 2118f14f8a19bc158d8a1cf90af58d85d187f849).
+mcp==2.3.0
+mcp-simple-auth @ git+https://github.com/modelcontextprotocol/python-sdk@2118f14f8a19bc158d8a1cf90af58d85d187f849#subdirectory=examples/servers/simple-auth
+httpx>=0.27

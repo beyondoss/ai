@@ -120,6 +120,36 @@ jobs:
       - uses: jdx/mise-action@v4
       - uses: Swatinem/rust-cache@v2
       - run: mise run test:loom </dev/null
+  # The agent's MCP OAuth client against the official Python MCP SDK's simple-auth example (a
+  # separate authorization server and protected resource server), pinned in
+  # crates/agent/eval/mcp_oauth_interop/requirements.txt. No browser: the example's login page is a
+  # plain form, submitted over HTTP. A few minutes, dominated by the agent build. Only the checked-out
+  # tree's binary runs here, so only the post-binding behaviour is asserted (the README's `main`
+  # baseline column is for comparing against a pre-binding binary by hand).
+  mcp-oauth-interop:
+    name: MCP OAuth interop (python-sdk simple-auth)
+    if: ${{ !inputs.only_mutants }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v6
+      - run: CARGO_PROFILE_DEV_DEBUG=0 cargo build -p beyond-agent --bin agent --locked
+      - run: |
+          uv venv "$RUNNER_TEMP/interop-venv"
+          VIRTUAL_ENV="$RUNNER_TEMP/interop-venv" uv pip install -r crates/agent/eval/mcp_oauth_interop/requirements.txt
+      - env:
+          AGENT_BINS: head=${{ github.workspace }}/target/debug/agent
+          CHECK_LOG_DIR: ${{ runner.temp }}/interop-logs
+        run: |
+          env -u AI_POOL_KEY_ANTHROPIC -u DATABASE_URL "$RUNNER_TEMP/interop-venv/bin/python" crates/agent/eval/mcp_oauth_interop/check.py </dev/null
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcp-oauth-interop-logs
+          path: ${{ runner.temp }}/interop-logs
   # The calendar check PRs skip: a catalog row with a `retires` date in verify/catalog_truth.toml
   # only warns in a PR run (from 14 days before the date), so a date never fails an unrelated
   # change. CATALOG_RETIREMENT_STRICT=1 turns that warning into a failure here, up to two weeks
