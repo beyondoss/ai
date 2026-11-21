@@ -498,7 +498,7 @@ jobs:
   # a strict server written independently from the spec text, over Streamable HTTP and stdio, in poll,
   # push and webhook mode, with a mock model gateway. The agent's own tests run against a fixture server
   # written to the same draft as the client, so only this job can see spec drift. Only when the change
-  # touches the agent or what it links (the `changes` job). Estimated 12 minutes (about 7 of dev build
+  # touches the agent's MCP client or serve paths or the kit (the `changes` job). Estimated 12 minutes (about 7 of dev build
   # on a warm dependency cache, about 5 for the 14 scenarios, 4 at a time).
   mcp-events-conformance:
     name: mcp events conformance
@@ -566,8 +566,8 @@ jobs:
             if git diff --name-only "$base"...HEAD | grep -qE '^sdk/|^crates/sandbox|^crates/execd/|^crates/agent/src/(exec_endpoint|tools/fs/|tools/exec\.rs)|^crates/agent/tests/sdk_conformance|^\.github/workflows/ci\.yml$'; then
               clients=true
             fi
-            # The agent and the crates it links, its MCP Events conformance kit, and this workflow.
-            if git diff --name-only "$base"...HEAD | grep -qE '^crates/(agent|agent-core|providers|exec-notify|sandbox)|^Cargo\.lock$|^mise\.toml$|^\.github/workflows/ci\.yml$'; then
+            # The agent's MCP client and serve paths (tools/mcp*, tools/mcp_events/, serve/), the MCP Events conformance kit, and this workflow.
+            if git diff --name-only "$base"...HEAD | grep -qE '^crates/agent/src/(tools/mcp|serve/)|^crates/agent/eval/mcp_events_conformance/|^mise\.toml$|^\.github/workflows/ci\.yml$'; then
               agent=true
             fi
           fi

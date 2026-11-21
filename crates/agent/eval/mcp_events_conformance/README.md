@@ -74,7 +74,7 @@ Each scenario is a fresh server, agent and WebSocket. `{http,stdio} x {poll,push
 | poll honours `nextPollMs` | poll flows |
 | `violations.log` is empty | every flow |
 
-(g) goes past a SEP MUST on purpose. The SEP says "Endpoints that do not enforce server identity ignore
+(g) is **beyond SEP (our fail-closed policy)**, not a spec MUST, and is labelled so in the output. (iii) is beyond SEP too: SHOULD-level at most (the spec has no MUST on what a client may request). The SEP says "Endpoints that do not enforce server identity ignore
 `v1a,`" and makes `v1a` optional for the server; the project requires the agent to enforce it when the
 Server Card publishes a key. Over stdio there is no MCP origin and so no Server Card: the server signs `v1`
 only and (g), (h) are HTTP-only. (h) over stdio is not asserted: restarting a stdio server is a client

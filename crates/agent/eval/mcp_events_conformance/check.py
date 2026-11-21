@@ -315,6 +315,19 @@ class Flow:
         self.emit("ticket.updated", {"ticket_id": "T-1", "summary": SUMMARY + "-after"}, "e2")
         got2 = await self.until(lambda: self.events("e2"), 20)
         self.say(got2, f"(d) {m}: delivery resumes after schema_changed", self.last_status())
+        if self.transport == "http" and m != "poll":
+            # Churn: terminate both subscriptions repeatedly so resubscribes race the re-lists they trigger.
+            # A request sent while the descriptor registry is being refreshed must still carry Mcp-Param-*.
+            t_churn = time.time()
+            for _ in range(5):
+                for n in ("ticket.updated", "region.alert"):
+                    ctl(self.sp, {"op": "schema_change", "name": n})
+                await asyncio.sleep(0.4)
+            await asyncio.sleep(6)
+            rs = [r for r in self.reqs(t_churn, "events/") if r["method"] in ("events/stream", "events/subscribe") and r["name"] == "region.alert"]
+            lost = [r for r in rs if r["hdr"].get("mcp-param-region") != "us-west1" or r["hdr"].get("mcp-name") != "region.alert"]
+            self.say(bool(rs) and not lost, f"(b) {m}: Mcp-Param-* present on every resubscribe while descriptors churn",
+                     f"{len(lost)} of {len(rs)} region.alert requests lacked Mcp-Name/Mcp-Param-Region" if rs else "no resubscribe seen")
         # -- (e) revoke: refusal surfaced, no tight retry loop
         t_rev = time.time()
         ctl(self.sp, {"op": "revoke"})
@@ -338,6 +351,12 @@ class Flow:
         lim = lambda k, n: n * (subs if k.startswith("events/list") else 1)
         ok = all(v <= lim(k, 6) for k, v in first.items()) and all(v <= lim(k, 3) for k, v in second.items())
         self.say(ok, f"(e) {m}: no tight retry loop after revoke (backoff)", f"attempts 0-10s {first}; 10-20s {second}")
+        if self.transport == "http" and m != "poll":
+            # Where the race was seen: resubscribes overlapping the re-lists a refusal triggers.
+            rs = [r for r in reqs if r["method"] in ("events/stream", "events/subscribe") and r["name"] == "region.alert"]
+            lost = [r for r in rs if r["hdr"].get("mcp-param-region") != "us-west1"]
+            self.say(bool(rs) and not lost, f"(b) {m}: Mcp-Param-* present on every retry while refusals trigger re-lists",
+                     f"{len(lost)} of {len(rs)} retries lacked Mcp-Param-Region" if rs else "no retry seen")
         ctl(self.sp, {"op": "restore"})
 
     def check_headers(self):
@@ -409,7 +428,7 @@ async def scenario_core(transport):
             f.say(ok, "(iii) the client opens subscriptions/listen", "no subscriptions/listen request (the client never listens)")
             asked = {k for r in listen() for k, v in (r.get("notifications") or {}).items() if v}
             f.say(bool(asked) and asked <= {"toolsListChanged", "resourcesListChanged", "eventsListChanged", "promptsListChanged"},
-                  "(iii) the filter asks only for list-changed types", f"asked {sorted(asked)}")
+                  "(iii, beyond SEP: SHOULD-level) the filter asks only for list-changed types", f"asked {sorted(asked)}")
 
             async def mcp():
                 await f.ws.send(json.dumps({"type": "get_mcp", "id": f"g{time.time()}"}))
@@ -445,17 +464,17 @@ async def scenario_v1a():
             f.say(ok, "webhook subscription established", f.last_status())
             f.emit("ticket.updated", {"ticket_id": "T-1", "summary": "signed"}, "g1")
             f.say(await f.until(lambda: f.events("g1"), 15),
-                  "(g) a delivery carrying v1 and a valid v1a (Server Card key) is accepted and delivered", f.last_status())
+                  "(g, beyond SEP: our fail-closed policy) a delivery carrying v1 and a valid v1a (Server Card key) is accepted and delivered", f.last_status())
             st = f.st()
             f.say(st["stats"].get("card_gets", 0) >= 1,
-                  "(g) the agent fetched the Server Card from the MCP origin to learn the signing key",
+                  "(g, beyond SEP: our fail-closed policy) the agent fetched the Server Card from the MCP origin to learn the signing key",
                   "no GET /mcp/server-card (nor any card fetch) was seen")
             r = ctl(f.sp, {"op": "bad_v1a", "data": {"ticket_id": "T-1", "summary": "forged"}})
             f.say(bool(r["statuses"]) and all(s == 401 for s in r["statuses"]),
-                  "(g) a delivery with a correct v1 HMAC but a v1a not from the Server Card key is rejected (401)",
+                  "(g, beyond SEP: our fail-closed policy) a delivery with a correct v1 HMAC but a v1a not from the Server Card key is rejected (401)",
                   f"statuses {r['statuses']}")
             await asyncio.sleep(1.5)
-            f.say(not f.events("evt-bad-v1a"), "(g) the forged delivery does not reach the session")
+            f.say(not f.events("evt-bad-v1a"), "(g, beyond SEP: our fail-closed policy) the forged delivery does not reach the session")
             f.finish_common()
     finally:
         await f.stop()
