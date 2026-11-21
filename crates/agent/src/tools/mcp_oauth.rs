@@ -46,8 +46,8 @@ use rmcp::transport::streamable_http_client::{
 
 /// The first wait after a transient refresh failure; each further one doubles it, up to
 /// [`MAX_BACKOFF`].
-const FIRST_BACKOFF: Duration = Duration::from_secs(30);
-const MAX_BACKOFF: Duration = Duration::from_secs(300);
+pub(crate) const FIRST_BACKOFF: Duration = Duration::from_secs(30);
+pub(crate) const MAX_BACKOFF: Duration = Duration::from_secs(300);
 
 /// A client-credentials token is replaced this long before it expires.
 const CC_RENEW_SKEW: Duration = Duration::from_secs(5);
