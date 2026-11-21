@@ -1269,10 +1269,20 @@ pub fn has_typed_member(b: &[u8], span: (usize, usize), types: &[&str]) -> bool 
     })
 }
 
-/// Whether a member keyed one of `quoted_keys` (each spelled with its quotes), anywhere inside `span`, names a URL for which `bad` holds:
+/// A member key [`has_url_member`] reads, spelled with its quotes, and the shapes it accepts.
+#[derive(Clone, Copy)]
+pub struct UrlKey {
+    pub quoted: &'static [u8],
+    /// Only an object with `"type": "url"` names a URL (a Messages `source`); otherwise a string,
+    /// or an object whose `url` is one, does. A key that is also an ordinary word (`source`) must
+    /// be typed, or a tool call's `input` that holds one reads as a URL.
+    pub typed: bool,
+}
+
+/// Whether a member keyed one of `keys`, anywhere inside `span`, names a URL for which `bad` holds:
 /// the member's value is a string (`"image_url": "file:///x"`) or an object whose `url` is
-/// (`"image_url": {"url": ...}`, `"source": {"type": "url", "url": ...}`). A value of any other
-/// shape names no URL and is skipped.
+/// (`"image_url": {"url": ...}`, `"source": {"type": "url", "url": ...}`), as the key allows. A
+/// value of any other shape names no URL and is skipped.
 ///
 /// Found as [`has_typed_member`] finds a type: the bytes `"key"`, `:`, then the value, with an
 /// unescaped opening quote, by one `memmem` pass per key and O(1) per hit, without a walk of the
@@ -1280,13 +1290,14 @@ pub fn has_typed_member(b: &[u8], span: (usize, usize), types: &[&str]) -> bool 
 pub fn has_url_member(
     b: &[u8],
     span: (usize, usize),
-    quoted_keys: &[&[u8]],
+    keys: &[UrlKey],
     bad: impl Fn(&str) -> bool,
 ) -> bool {
     let Some(region) = b.get(span.0..span.1) else {
         return false;
     };
-    quoted_keys.iter().any(|quoted| {
+    keys.iter().any(|key| {
+        let quoted = key.quoted;
         memchr::memmem::find_iter(region, quoted).any(|at| {
             let at = span.0.saturating_add(at);
             if escaped_at(b, at) {
@@ -1298,8 +1309,15 @@ pub fn has_url_member(
             }
             let value = skip_ws(b, colon.saturating_add(1));
             let url = match b.get(value) {
-                Some(b'"') => string_end(b, value).map(|end| (value, end)),
-                Some(b'{') => last_member(b, value, "url").flatten().map(|m| m.value),
+                Some(b'"') if !key.typed => string_end(b, value).map(|end| (value, end)),
+                Some(b'{')
+                    if !key.typed
+                        || last_member(b, value, "type")
+                            .flatten()
+                            .is_some_and(|m| str_is(b, m.value, "url")) =>
+                {
+                    last_member(b, value, "url").flatten().map(|m| m.value)
+                }
                 _ => None,
             };
             url.filter(|&(_, end)| end <= span.1)
@@ -1610,7 +1628,16 @@ mod tests {
     /// member: not prose that mentions one, not an object with no string `url`.
     #[test]
     fn has_url_member_reads_only_real_url_members() {
-        let keys: &[&[u8]] = &[b"\"image_url\"", b"\"source\""];
+        let keys = &[
+            UrlKey {
+                quoted: b"\"image_url\"",
+                typed: false,
+            },
+            UrlKey {
+                quoted: b"\"source\"",
+                typed: true,
+            },
+        ];
         let bad = |u: &str| !u.starts_with("https://");
         let hit = |b: &[u8]| has_url_member(b, (0, b.len()), keys, bad);
         assert!(hit(br#"[{"image_url":{"url":"file:///x"}}]"#));
@@ -1619,6 +1646,10 @@ mod tests {
         assert!(hit(br#"[{"image_url":{"url":"file:\/\/\/x"}}]"#));
         assert!(!hit(br#"[{"image_url":{"url":"https://a/x"}}]"#));
         assert!(!hit(br#"[{"source":{"type":"base64","data":"AAAA"}}]"#));
+        // A tool call's `input` may hold any key: a `source` that is a string, or an object with
+        // a `url` and no `"type": "url"`, is not a Messages source.
+        assert!(!hit(br#"[{"type":"tool_use","input":{"source":"main"}}]"#));
+        assert!(!hit(br#"[{"input":{"source":{"url":"x"}}}]"#));
         assert!(!hit(br#"[{"image_url":{"type":"string"}}]"#));
         assert!(!hit(br#"[{"text":"\"image_url\": \"file:///x\""}]"#));
     }

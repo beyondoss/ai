@@ -616,8 +616,26 @@ pub fn walk_reads_urls(row: &ModelRoute, path: &str) -> bool {
 /// answer without the picture or document it was sent. Translation runs after the headers went
 /// upstream and cannot answer 400, so the walk does, here. Read by span, as [`carries_part`] is.
 fn carries_unforwardable_url(body: &[u8]) -> bool {
-    const KEYS: &[&[u8]] = &[b"\"image_url\"", b"\"source\"", b"\"file_url\""];
-    if !KEYS.iter().any(|k| memchr::memmem::find(body, k).is_some()) {
+    use crate::peek::UrlKey;
+    // A Messages `source` is always an object, and names a URL only typed `url`.
+    const KEYS: &[UrlKey] = &[
+        UrlKey {
+            quoted: b"\"image_url\"",
+            typed: false,
+        },
+        UrlKey {
+            quoted: b"\"source\"",
+            typed: true,
+        },
+        UrlKey {
+            quoted: b"\"file_url\"",
+            typed: false,
+        },
+    ];
+    if !KEYS
+        .iter()
+        .any(|k| memchr::memmem::find(body, k.quoted).is_some())
+    {
         return false;
     }
     root_spans(body, &["messages", "input", "system"]).is_some_and(|spans| {
@@ -1759,6 +1777,15 @@ mod tests {
         assert_eq!(refused_input(&gpt, chat, img("file:///x").as_bytes()), None);
         let resp = br#"{"input":[{"content":[{"type":"input_image","image_url":"gs://b/x"}]}]}"#;
         assert_eq!(refused_input(&gpt, Some(Endpoint::Responses), resp), None);
+        // A Messages client to a Chat row: a tool call's input holding a `source` is not a URL,
+        // a `url` source is.
+        let msgs = Some(Endpoint::Messages);
+        let tool = br#"{"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"git_log","input":{"source":"main"}}]}]}"#;
+        assert_eq!(refused_input(&gpt, msgs, tool), None);
+        let b64 = br#"{"messages":[{"content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA"}}]}]}"#;
+        assert_eq!(refused_input(&gpt, msgs, b64), None);
+        let gs = br#"{"messages":[{"content":[{"type":"image","source":{"type":"url","url":"gs://b/x"}}]}]}"#;
+        assert_eq!(refused_input(&gpt, msgs, gs), Some(URL_KIND));
         assert!(!walk_reads_urls(&gpt, "/v1/chat/completions"));
         assert!(walk_reads_urls(&claude, "/v1/chat/completions"));
     }
