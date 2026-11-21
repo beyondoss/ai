@@ -56,6 +56,8 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use pingora_core::server::ShutdownWatch;
 use pingora_core::services::background::BackgroundService;
+use prometheus::{IntCounter, IntGauge};
+use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -98,6 +100,14 @@ const SNAPSHOT_COMPACT_THRESHOLD: u64 = 1024 * 1024;
 /// doubles as the "was that connection productive?" threshold — see `ReconnectBackoff`.
 const RECONNECT_BACKOFF_BASE: Duration = Duration::from_secs(1);
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// Snapshot rebuild backoff after a failed write or rebuild: 1s doubling to a 60s ceiling. A rebuild
+/// rewrites the whole (small, low-churn) file and fsyncs it, so on a disk that is still full or
+/// erroring we don't want to repeat it every second; and 60s is the longest a recovered disk waits
+/// before the file is current again. Same shape as [`RECONNECT_BACKOFF_BASE`], a longer ceiling
+/// because a full volume clears on an operator's timescale, not a network blip's.
+const SNAPSHOT_RETRY_BASE: Duration = Duration::from_secs(1);
+const SNAPSHOT_RETRY_MAX: Duration = Duration::from_secs(60);
 
 /// One watched control-plane set: which prefix it lives under, how to build it, and where to publish
 /// it. Implemented once per set ([`Deny`], and the capture-set), then driven by [`watch_set`].
@@ -473,7 +483,7 @@ impl<W: WatchedSet> BackgroundService for WatcherService<W> {
         // Resume position + on-disk snapshot writer persist across reconnects: a NATS blip resumes
         // the watch from `cursor` instead of re-scanning, and `seeded` stays true so we don't reseed.
         let mut cursor = WatchCursor::none();
-        let mut writer: Option<SnapshotWriter> = None;
+        let mut sink: Option<SnapshotSink> = None;
         let mut seeded = false;
 
         if let Some(path) = W::snapshot_path(&self.state) {
@@ -481,6 +491,8 @@ impl<W: WatchedSet> BackgroundService for WatcherService<W> {
             // Snapshot I/O is synchronous (whole-file read/rewrite) — offload it so we never stall
             // the serving runtime this BackgroundService shares with the proxy.
             let load_path = path.clone();
+            // What the file holds, kept so a failed writer can be rebuilt without NATS.
+            let mut loaded_image = HashMap::new();
             match tokio::task::spawn_blocking(move || store::snapshot::load(&load_path)).await {
                 Ok(Ok(Some(snap))) => {
                     // A snapshot without a *resumable* cursor can't safely resume (a bare watch
@@ -517,21 +529,13 @@ impl<W: WatchedSet> BackgroundService for WatcherService<W> {
                         cursor = snap.cursor;
                         seeded = true;
                     }
+                    loaded_image = snap.entries;
                 }
                 Ok(Ok(None)) => info!("no on-disk snapshot yet; will seed from a NATS scan"),
                 Ok(Err(e)) => warn!(error = %e, "snapshot load failed; will seed from a NATS scan"),
                 Err(e) => warn!(error = %e, "snapshot load task panicked; seeding from NATS"),
             }
-            let open_path = path.clone();
-            match tokio::task::spawn_blocking(move || {
-                SnapshotWriter::open(&open_path, SNAPSHOT_COMPACT_THRESHOLD)
-            })
-            .await
-            {
-                Ok(Ok(w)) => writer = Some(w),
-                Ok(Err(e)) => warn!(error = %e, "snapshot writer open failed; running without it"),
-                Err(e) => warn!(error = %e, "snapshot writer open task panicked"),
-            }
+            sink = Some(SnapshotSink::open(&self.state, path, W::NOUN, loaded_image).await);
         }
 
         let mut backoff = ReconnectBackoff::new();
@@ -575,7 +579,7 @@ impl<W: WatchedSet> BackgroundService for WatcherService<W> {
                 &self.state,
                 store,
                 &mut cursor,
-                &mut writer,
+                &mut sink,
                 &mut seeded,
                 &mut shutdown,
             )
@@ -733,9 +737,10 @@ fn livekeys_from_entries<'a>(entries: impl Iterator<Item = &'a KvEntry>) -> Live
 /// Rewrite the on-disk snapshot from a fresh scan, atomically: write every live entry plus the
 /// cursor to `{path}.tmp`, fsync it, rename it over `path`, fsync the directory, and reopen `path`
 /// for appends. A crash at any point leaves either the old complete file or the new complete one.
-/// Returns the reopened writer, or `None` if the rewrite failed (the gateway then runs
-/// snapshot-less — the in-memory set is unaffected). Synchronous file I/O, so it runs on a blocking
-/// thread off the serving runtime.
+/// Returns the reopened writer, or `None` if the rewrite failed; [`SnapshotSink`] then retries with
+/// backoff until it lands, and the in-memory set is unaffected meanwhile. `entries` and `cursor`
+/// must describe the same instant: the cursor never ahead of the data. Synchronous file I/O, so it
+/// runs on a blocking thread off the serving runtime.
 async fn rebuild_snapshot(
     path: PathBuf,
     entries: Vec<KvEntry>,
@@ -749,7 +754,7 @@ async fn rebuild_snapshot(
     match res {
         Ok(Ok(w)) => Some(w),
         Ok(Err(e)) => {
-            warn!(error = %e, "snapshot rebuild failed; running without on-disk snapshot");
+            warn!(error = %e, "snapshot rebuild failed");
             None
         }
         Err(e) => {
@@ -846,7 +851,7 @@ async fn watch_set<W: WatchedSet>(
     state: &Arc<GatewayState>,
     store: Arc<dyn KvStore>,
     cursor: &mut WatchCursor,
-    writer: &mut Option<SnapshotWriter>,
+    sink: &mut Option<SnapshotSink>,
     seeded: &mut bool,
     shutdown: &mut ShutdownWatch,
 ) -> bool {
@@ -879,10 +884,8 @@ async fn watch_set<W: WatchedSet>(
                 // tenant deleted while we were offline — whose `Delete` was compacted away — which a
                 // later `load()` would replay and resurrect (wrongly re-denying a tenant). A clean
                 // rewrite from the live scan makes the on-disk state exactly match NATS.
-                if writer.is_some()
-                    && let Some(path) = W::snapshot_path(state)
-                {
-                    *writer = rebuild_snapshot(PathBuf::from(path), entries, cursor.clone()).await;
+                if let Some(sink) = sink.as_mut() {
+                    sink.reseed(entries, cursor, Instant::now()).await;
                 }
                 // Latch `seeded` only when the scan produced a cursor we can actually resume from.
                 // An empty bucket scans to revision 0, and `watch_prefix_from` degrades that to
@@ -935,10 +938,24 @@ async fn watch_set<W: WatchedSet>(
     let mut batch: Vec<KvUpdate> = Vec::new();
     loop {
         batch.clear();
+        // A failed snapshot writer wakes the loop when its retry is due, so a quiet stream still
+        // recovers it. Copied out so the future borrows nothing the arm below mutates.
+        let retry_due = sink.as_ref().and_then(SnapshotSink::retry_due);
         let received = tokio::select! {
             _ = shutdown.changed() => {
                 watch.abort();
                 return true;
+            }
+            _ = async {
+                match retry_due {
+                    Some(due) => tokio::time::sleep_until(due).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some(sink) = sink.as_mut() {
+                    sink.recover(cursor, Instant::now()).await;
+                }
+                continue;
             }
             n = rx.recv_many(&mut batch, WATCH_CHANNEL_CAPACITY) => n,
         };
@@ -962,7 +979,9 @@ async fn watch_set<W: WatchedSet>(
         if let Some(last) = batch.last() {
             *cursor = WatchCursor::from_version(last.version().clone());
         }
-        persist_batch(writer, &batch, cursor).await;
+        if let Some(sink) = sink.as_mut() {
+            sink.persist(&batch, cursor, Instant::now()).await;
+        }
     }
 
     // The watch ended (NATS dropped, or the cursor was compacted away). Inspect why so a compacted
@@ -987,54 +1006,193 @@ async fn watch_set<W: WatchedSet>(
     false
 }
 
-/// Append an applied batch to the on-disk snapshot (if configured) and checkpoint the cursor once.
-/// `write_update` is a buffered write and cheap; `checkpoint` is the call that flushes (a `write(2)`
-/// into the page cache), so checkpointing per batch rather than per delta turns a K-delta burst into
-/// one syscall instead of K — and one cursor record is all the batch needs, since it only has to say
-/// where the batch left off. `compact` reads+rewrites the whole file, so it's offloaded off the
-/// serving runtime when the log crosses its threshold.
+/// One set's on-disk snapshot: the writer, the image of what the file should say, and the retry
+/// state that heals the writer after a failure.
 ///
-/// The file's cursor is only ever *behind* its data, never ahead of it, so a restart replays and
-/// never skips. Two things keep that true:
-/// - The checkpoint is written last, so a crash after some records but before the cursor record
-///   leaves a cursor older than the data; the next boot resumes early and re-applies those deltas
-///   (idempotent: a `Put`/`Delete` of the same key lands the same set).
-/// - If any `write_update` or the checkpoint fails, the batch's cursor is not recorded and the
-///   writer is dropped (`None`). The file keeps its last good cursor, which is older than the lost
-///   delta, so the next boot resumes from it and re-applies the delta (or rescans if that cursor
-///   has expired). Appending past the gap would let a later checkpoint cover it. Nothing re-creates
-///   the writer for the life of the process: the gateway runs snapshot-less until restart, and the
-///   in-memory set (fed by NATS) is unaffected.
-async fn persist_batch(
-    writer: &mut Option<SnapshotWriter>,
-    updates: &[KvUpdate],
-    cursor: &WatchCursor,
-) {
-    let needs_compact = match writer.as_mut() {
-        Some(w) => {
-            let result = updates.iter().try_for_each(|u| w.write_update(u));
-            match result.and_then(|()| w.checkpoint(cursor)) {
-                Ok(b) => b,
-                Err(e) => {
-                    warn!(error = %e, "snapshot write failed; disabling snapshot writer so the cursor never passes the lost delta");
-                    *writer = None;
-                    false
+/// **The file's cursor is never ahead of its data**, so a restart replays and never skips. Two
+/// things keep that true:
+/// - A batch appends its deltas and checkpoints the cursor last, so a crash between them leaves a
+///   cursor older than the data (idempotent replay).
+/// - If any `write_update`, the checkpoint or a compaction fails, the batch's cursor is not
+///   recorded and the writer is dropped: appending past the gap would let a later checkpoint cover
+///   a lost delta. The file keeps its last good cursor.
+///
+/// **A failed writer heals itself.** Dropping the writer is not the end: the sink also keeps `image`
+/// (every live entry as the file should hold it, advanced by every batch together with the cursor in
+/// the same watch-loop step, so the two cannot drift). While the writer is down, [`Self::recover`]
+/// re-seeds the file from `image` at the current cursor through [`rebuild_snapshot`] (tmp + fsync +
+/// rename + dir fsync, off the serving runtime), on a 1s-doubling, 60s-capped backoff
+/// ([`SNAPSHOT_RETRY_BASE`], [`SNAPSHOT_RETRY_MAX`]), and the watch loop wakes for it even when no
+/// delta arrives. The rebuilt file holds the data and the cursor for the same instant, so the
+/// invariant holds across recovery. The in-memory set (fed by NATS) is unaffected throughout.
+/// `ai_snapshot_writer_healthy` is 0 for the whole outage, with an `error!` on the way down and an
+/// `info!` on the way up.
+struct SnapshotSink {
+    path: PathBuf,
+    noun: &'static str,
+    writer: Option<SnapshotWriter>,
+    /// Live entries by key: what the file should hold. Kept only because the sets themselves are
+    /// lossy (hashed ids, parsed values) and cannot be written back out.
+    image: HashMap<String, KvEntry>,
+    /// `Some` while the writer is down.
+    retry: Option<Retry>,
+    healthy: IntGauge,
+    write_failures: IntCounter,
+    rebuild_ok: IntCounter,
+    rebuild_failed: IntCounter,
+}
+
+#[derive(Clone, Copy)]
+struct Retry {
+    delay: Duration,
+    due: Instant,
+}
+
+impl SnapshotSink {
+    /// Open the writer on `path`, which holds `image`. A failed open starts in the unhealthy state,
+    /// so it heals by the same path as any later failure.
+    async fn open(
+        state: &GatewayState,
+        path: PathBuf,
+        noun: &'static str,
+        image: HashMap<String, KvEntry>,
+    ) -> Self {
+        let m = &state.metrics;
+        let mut sink = Self {
+            path: path.clone(),
+            noun,
+            writer: None,
+            image,
+            retry: None,
+            healthy: m.snapshot_writer_healthy.with_label_values(&[noun]),
+            write_failures: m.snapshot_write_failures_total.with_label_values(&[noun]),
+            rebuild_ok: m.snapshot_rebuilds_total.with_label_values(&[noun, "ok"]),
+            rebuild_failed: m
+                .snapshot_rebuilds_total
+                .with_label_values(&[noun, "failed"]),
+        };
+        let opened = tokio::task::spawn_blocking(move || {
+            SnapshotWriter::open(&path, SNAPSHOT_COMPACT_THRESHOLD)
+        })
+        .await;
+        match opened {
+            Ok(Ok(w)) => {
+                sink.writer = Some(w);
+                sink.healthy.set(1);
+            }
+            Ok(Err(e)) => sink.fail(&format!("open failed: {e}"), Instant::now()),
+            Err(e) => sink.fail(&format!("open task panicked: {e}"), Instant::now()),
+        }
+        sink
+    }
+
+    /// When the next recovery attempt is due, if the writer is down.
+    fn retry_due(&self) -> Option<Instant> {
+        self.retry.map(|r| r.due)
+    }
+
+    /// Mark the writer down and schedule (or back off) the next rebuild.
+    fn fail(&mut self, what: &str, now: Instant) {
+        let delay = match self.retry {
+            Some(r) => (r.delay * 2).min(SNAPSHOT_RETRY_MAX),
+            None => {
+                error!(
+                    set = self.noun,
+                    error = what,
+                    "snapshot writer unhealthy; the file stops advancing until a rebuild lands (retrying with backoff)"
+                );
+                self.healthy.set(0);
+                SNAPSHOT_RETRY_BASE
+            }
+        };
+        self.retry = Some(Retry {
+            delay,
+            due: now + delay,
+        });
+    }
+
+    fn apply_to_image(&mut self, updates: &[KvUpdate]) {
+        for u in updates {
+            match u {
+                KvUpdate::Put(e) => {
+                    self.image.insert(e.key.clone(), e.clone());
+                }
+                KvUpdate::Delete { key, .. } | KvUpdate::Purge { key, .. } => {
+                    self.image.remove(key);
                 }
             }
         }
-        None => false,
-    };
-    if needs_compact {
-        // Move the writer into a blocking task for the rewrite, then take it back. If it fails we
-        // drop the writer (None) and run snapshot-less until the next restart reopens the file —
-        // the deny-set itself is unaffected (it lives in the ArcSwap, fed by NATS).
-        if let Some(mut w) = writer.take() {
-            match tokio::task::spawn_blocking(move || w.compact().map(|()| w)).await {
-                Ok(Ok(w)) => *writer = Some(w),
-                Ok(Err(e)) => {
-                    warn!(error = %e, "snapshot compaction failed; disabling snapshot writer")
+    }
+
+    /// Fold an applied batch into the image and the file, then give a down writer its retry if due.
+    ///
+    /// `write_update` is a buffered write and cheap; `checkpoint` is the call that flushes (a
+    /// `write(2)` into the page cache), so checkpointing per batch rather than per delta turns a
+    /// K-delta burst into one syscall, and one cursor record is all the batch needs. `compact` reads
+    /// and rewrites the whole file, so it runs on a blocking thread once the log crosses its
+    /// threshold.
+    async fn persist(&mut self, updates: &[KvUpdate], cursor: &WatchCursor, now: Instant) {
+        self.apply_to_image(updates);
+        let mut needs_compact = false;
+        if let Some(w) = self.writer.as_mut() {
+            let result = updates.iter().try_for_each(|u| w.write_update(u));
+            match result.and_then(|()| w.checkpoint(cursor)) {
+                Ok(b) => needs_compact = b,
+                Err(e) => {
+                    self.write_failures.inc();
+                    self.writer = None;
+                    self.fail(&format!("write failed: {e}"), now);
                 }
-                Err(e) => warn!(error = %e, "snapshot compaction task panicked"),
+            }
+        }
+        if needs_compact && let Some(mut w) = self.writer.take() {
+            match tokio::task::spawn_blocking(move || w.compact().map(|()| w)).await {
+                Ok(Ok(w)) => self.writer = Some(w),
+                Ok(Err(e)) => {
+                    self.write_failures.inc();
+                    self.fail(&format!("compaction failed: {e}"), now);
+                }
+                Err(e) => {
+                    self.write_failures.inc();
+                    self.fail(&format!("compaction task panicked: {e}"), now);
+                }
+            }
+        }
+        self.recover(cursor, now).await;
+    }
+
+    /// If the writer is down and its retry is due, re-seed the file from the image at `cursor`.
+    async fn recover(&mut self, cursor: &WatchCursor, now: Instant) {
+        if self.retry.is_some_and(|r| now >= r.due) {
+            let entries = self.image.values().cloned().collect();
+            self.rebuild(entries, cursor, now).await;
+        }
+    }
+
+    /// A fresh scan is a new baseline: the image becomes the scan, and the file is rewritten from it
+    /// at the scan's cursor (not appended to: a stale log could resurrect a deleted key).
+    async fn reseed(&mut self, entries: Vec<KvEntry>, cursor: &WatchCursor, now: Instant) {
+        self.image = entries.iter().map(|e| (e.key.clone(), e.clone())).collect();
+        self.rebuild(entries, cursor, now).await;
+    }
+
+    async fn rebuild(&mut self, entries: Vec<KvEntry>, cursor: &WatchCursor, now: Instant) {
+        match rebuild_snapshot(self.path.clone(), entries, cursor.clone()).await {
+            Some(w) => {
+                self.rebuild_ok.inc();
+                self.writer = Some(w);
+                self.healthy.set(1);
+                if self.retry.take().is_some() {
+                    info!(
+                        set = self.noun,
+                        "snapshot writer recovered; file rebuilt at the current cursor"
+                    );
+                }
+            }
+            None => {
+                self.rebuild_failed.inc();
+                self.writer = None;
+                self.fail("rebuild failed", now);
             }
         }
     }
@@ -1571,6 +1729,35 @@ mod tests {
         assert_eq!(snap.cursor.as_u64(), Some(4));
     }
 
+    fn test_state() -> Arc<GatewayState> {
+        GatewayState::new(
+            crate::config::AiConfig::default().validate().unwrap(),
+            crate::state::test_metrics(),
+        )
+        .unwrap()
+    }
+
+    /// A key past the record format's u16 length: `write_update` refuses it, no I/O involved. Its
+    /// presence in the image is the "disk is still bad" fault (every write and rebuild fails); a
+    /// delete of it is the fault clearing.
+    fn poison_key() -> String {
+        "k".repeat(usize::from(u16::MAX) + 1)
+    }
+
+    fn poison_batch() -> [KvUpdate; 3] {
+        [
+            KvUpdate::Put(put("blackhole.2", 2)),
+            KvUpdate::Put(put(&poison_key(), 3)),
+            KvUpdate::Put(put("blackhole.3", 4)),
+        ]
+    }
+
+    async fn sink_at(path: &Path, noun: &'static str) -> SnapshotSink {
+        drop(full_rebuild(path, vec![put("blackhole.1", 1)], 1));
+        let image = store::snapshot::load(path).unwrap().unwrap().entries;
+        SnapshotSink::open(&test_state(), path.to_path_buf(), noun, image).await
+    }
+
     /// A batch whose delta did not reach the file must not be checkpointed: the cursor would then
     /// sit past a lost `Put` (a deny or blackhole key), and the next boot would resume after it and
     /// never apply it. The writer is dropped too, so nothing later is appended to the gapped file.
@@ -1578,18 +1765,16 @@ mod tests {
     async fn a_failed_snapshot_write_leaves_no_cursor_past_the_lost_delta() {
         let dir = ScratchDir::new("lostdelta");
         let path = dir.0.join("snap.log");
-        let mut writer = Some(full_rebuild(&path, vec![put("blackhole.1", 1)], 1));
+        let mut sink = sink_at(&path, "t-lostdelta").await;
 
-        // A key past the record format's u16 length: `write_update` refuses it, no I/O involved.
-        let too_long = "k".repeat(usize::from(u16::MAX) + 1);
-        let batch = [
-            KvUpdate::Put(put("blackhole.2", 2)),
-            KvUpdate::Put(put(&too_long, 3)),
-            KvUpdate::Put(put("blackhole.3", 4)),
-        ];
-        persist_batch(&mut writer, &batch, &WatchCursor::from_u64(4)).await;
-        assert!(writer.is_none(), "a gapped file takes no further appends");
-        drop(writer);
+        sink.persist(&poison_batch(), &WatchCursor::from_u64(4), Instant::now())
+            .await;
+        assert!(
+            sink.writer.is_none(),
+            "a gapped file takes no further appends"
+        );
+        assert_eq!(sink.healthy.get(), 0);
+        drop(sink);
 
         let snap = store::snapshot::load(&path).unwrap().unwrap();
         assert_eq!(
@@ -1597,6 +1782,95 @@ mod tests {
             Some(1),
             "the cursor must stay before the lost delta so the next boot replays it"
         );
+    }
+
+    /// After a write failure the file catches up to the in-memory cursor by itself once the fault
+    /// clears: no restart, no scan, the rebuilt file holds the image and the cursor of the same
+    /// instant. Without the retry the writer stays dead and the file stays at its old cursor.
+    #[tokio::test]
+    async fn a_failed_writer_rebuilds_the_snapshot_once_the_fault_clears() {
+        let dir = ScratchDir::new("heals");
+        let path = dir.0.join("snap.log");
+        let mut sink = sink_at(&path, "t-heals").await;
+        let t0 = Instant::now();
+
+        sink.persist(&poison_batch(), &WatchCursor::from_u64(4), t0)
+            .await;
+        assert_eq!(sink.healthy.get(), 0);
+
+        // Still bad: the rebuild fails too, and the file has not moved.
+        let t1 = t0 + SNAPSHOT_RETRY_BASE;
+        sink.recover(&WatchCursor::from_u64(4), t1).await;
+        assert_eq!(sink.healthy.get(), 0);
+        assert_eq!(
+            store::snapshot::load(&path)
+                .unwrap()
+                .unwrap()
+                .cursor
+                .as_u64(),
+            Some(1)
+        );
+
+        // The fault clears (the next batch deletes the poison); once the retry is due the file is
+        // rebuilt at the cursor that image reflects.
+        let clear = [KvUpdate::Delete {
+            key: poison_key(),
+            version: VersionToken::from_u64(5),
+        }];
+        let due = sink.retry_due().unwrap();
+        sink.persist(&clear, &WatchCursor::from_u64(5), due).await;
+        assert_eq!(sink.healthy.get(), 1);
+        assert!(sink.retry_due().is_none());
+
+        // And it appends again afterwards.
+        sink.persist(
+            &[KvUpdate::Put(put("blackhole.9", 6))],
+            &WatchCursor::from_u64(6),
+            due,
+        )
+        .await;
+        drop(sink);
+        let snap = store::snapshot::load(&path).unwrap().unwrap();
+        assert_eq!(snap.cursor.as_u64(), Some(6));
+        assert_eq!(
+            keys(&snap),
+            ["blackhole.1", "blackhole.2", "blackhole.3", "blackhole.9"]
+        );
+    }
+
+    /// On a disk that stays bad the retries back off (1s doubling to the 60s cap) and are never a
+    /// hot loop: calling `recover` every 100ms for ten minutes attempts a rebuild only when due.
+    #[tokio::test]
+    async fn a_dead_disk_is_retried_on_a_capped_backoff() {
+        let dir = ScratchDir::new("backoff");
+        let path = dir.0.join("snap.log");
+        let mut sink = sink_at(&path, "t-backoff").await;
+        let t0 = Instant::now();
+        sink.persist(&poison_batch(), &WatchCursor::from_u64(4), t0)
+            .await;
+
+        let mut attempts = Vec::new();
+        let mut last_failed = sink.rebuild_failed.get();
+        for tick in 1..=6000u32 {
+            let now = t0 + Duration::from_millis(100) * tick;
+            sink.recover(&WatchCursor::from_u64(4), now).await;
+            if sink.rebuild_failed.get() != last_failed {
+                last_failed = sink.rebuild_failed.get();
+                attempts.push(now - t0);
+            }
+        }
+        // 1,3,7,15,31,63s, then every 60s: 14 attempts in 600s, against 6000 calls.
+        assert!(
+            attempts.len() == 14,
+            "attempts over 10 minutes: {attempts:?}"
+        );
+        let gaps: Vec<_> = attempts.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(
+            gaps.windows(2).all(|g| g[1] >= g[0]),
+            "gaps never shrink: {gaps:?}"
+        );
+        assert_eq!(*gaps.last().unwrap(), SNAPSHOT_RETRY_MAX);
+        assert_eq!(sink.healthy.get(), 0);
     }
 
     /// The trait's policy, pinned: only the fail-closed set refuses a cursorless snapshot.
@@ -1698,14 +1972,14 @@ mod tests {
             });
             let (_tx, mut shutdown) = tokio::sync::watch::channel(false);
             let mut cursor = WatchCursor::from_u64(5);
-            let mut writer = None;
+            let mut sink = None;
             let mut seeded = true;
 
             let exited = watch_set::<Deny>(
                 &state,
                 Arc::new(FakeHandle(fake.clone())),
                 &mut cursor,
-                &mut writer,
+                &mut sink,
                 &mut seeded,
                 &mut shutdown,
             )
@@ -1723,7 +1997,7 @@ mod tests {
                 &state,
                 Arc::new(FakeHandle(ok.clone())),
                 &mut cursor,
-                &mut writer,
+                &mut sink,
                 &mut seeded,
                 &mut shutdown,
             )
