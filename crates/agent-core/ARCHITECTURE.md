@@ -1019,7 +1019,7 @@ has been told about (`bash` under `serve`: an intended job outlives the turn and
 session), and with nothing left to list there is no reminder turn. A pending stop request still wins over both, and so does the step limit: once
 the run has used its steps (or the wrap-up's extended ones), neither is delivered — the step they
 would start is one the run cannot take, and a clean final answer used to become a `MaxSteps`
-failure. The run ends `Ok`; notices stay unconsumed for the next run. Each delivery is reported as
+failure. The run ends `Ok`; notices stay unconsumed for the next run, and so do queued follow-ups (not drained, so no `Steered`). Each delivery is reported as
 `AgentEvent::Background { reason: finished | still_running, text, wake }` (`wake` is for a host that
 starts a turn itself to deliver a notice). Every text starts with one of `background::NOTE_PREFIXES`
 (`[job `, `[background jobs]`, `[step budget]`), which `merge_user_requests` skips: a run of harness
