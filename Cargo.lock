@@ -667,9 +667,9 @@ dependencies = [
 
 [[package]]
 name = "beyond-slipstream"
-version = "0.10.1"
+version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca79abef8f532e80b9bb7e70747bc0a40af63284afe20995985072cb34ae1505"
+checksum = "982274043a7f8d8006199a1e8c770584559dfd19cce5dd981dbaad2b6e7cfbab"
 dependencies = [
  "aho-corasick",
  "async-nats",
