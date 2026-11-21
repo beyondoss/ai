@@ -119,3 +119,34 @@ async fn a_model_that_stops_during_the_wrap_up_ends_cleanly() {
     assert!(result.is_ok(), "{result:?}");
     assert_eq!(fired, vec![WRAP_UP_STEPS]);
 }
+
+#[tokio::test]
+async fn a_follow_up_queued_at_the_step_limit_stays_queued_and_the_run_ends_clean() {
+    // The model's final answer is the last step the wrap-up allows. A follow-up queued by then must
+    // not be drained (the run cannot take the step it would start, so `MaxSteps` would replace the
+    // clean answer, after `Steered` told the host it was delivered): it stays for the next run.
+    let mut turns = tool_turns(WRAP_UP_STEPS as usize);
+    turns.push(turn::text("final answer"));
+    let agent = agent(turns, Some(1));
+    let steering = crate::Steering::new();
+    let mut session = Session::new();
+    session.user("go");
+    let mut events = Vec::new();
+    let result = agent
+        .run_events_steered(
+            &mut session,
+            |ev| {
+                if let AgentEvent::WrapUp { .. } = ev {
+                    steering.push("one more thing");
+                }
+                events.push(ev);
+            },
+            tokio_util::sync::CancellationToken::new(),
+            steering.clone(),
+        )
+        .await;
+    assert!(result.is_ok(), "{result:?}");
+    assert!(events.iter().any(|e| matches!(e, AgentEvent::AgentEnd { .. })));
+    assert!(!events.iter().any(|e| matches!(e, AgentEvent::Steered { .. })));
+    assert_eq!(steering.pending_count(), 1);
+}
