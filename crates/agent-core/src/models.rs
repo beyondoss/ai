@@ -372,7 +372,7 @@ pub fn is_mistral_model(model: &str) -> bool {
 /// `{"type": "disabled"}`: Claude Sonnet 5.5 and later Sonnets reject `disabled` with a 400 ("To turn
 /// thinking off on this model, send thinking {type: between_tools} instead of {type: disabled}"), and
 /// an omitted `thinking` is adaptive thinking. `between_tools` does no extended thinking. Parsed the
-/// way the gateway's `ClaudeModel::of` parses it (`crates/gateway/src/translate.rs`), so a Bedrock or
+/// way the gateway's `ClaudeModel::of` parses it (`crates/gateway/src/translate/model.rs`), so a Bedrock or
 /// OpenRouter spelling (`us.anthropic.claude-sonnet-5-5-v1:0`, `anthropic/claude-sonnet-5.5`)
 /// counts too.
 pub fn thinking_off_is_between_tools(model: &str) -> bool {
