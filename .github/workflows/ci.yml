@@ -511,6 +511,7 @@ jobs:
       deps: ${{ steps.diff.outputs.deps }}
       execd: ${{ steps.diff.outputs.execd }}
       clients: ${{ steps.diff.outputs.clients }}
+      mcpapps: ${{ steps.diff.outputs.mcpapps }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -523,6 +524,7 @@ jobs:
           deps=false
           execd=false
           clients=false
+          mcpapps=false
           if [ "$EVENT" = pull_request ] || [ "$EVENT" = workflow_dispatch ] || [ "$EVENT" = merge_group ]; then
             base=${BASE_SHA:-$(git rev-parse origin/main)}
             if git diff --name-only "$base"...HEAD | grep -qE '(^|/)Cargo\.toml$|^Cargo\.lock$|^\.cargo/(audit\.toml|config(\.toml)?)$|(^|/)rust-toolchain(\.toml)?$|(^|/)Dockerfile[^/]*$'; then
@@ -539,9 +541,14 @@ jobs:
               clients=true
             fi
           fi
+          # The agent's MCP client and its apps bridge, the interop check itself, and this workflow.
+          if git diff --name-only "$base"...HEAD | grep -qE '^crates/agent/src/(tools/mcp|serve/)|^crates/agent/eval/mcp_apps_interop/|^\.github/workflows/ci\.yml$'; then
+            mcpapps=true
+          fi
           echo "deps=$deps" >>"$GITHUB_OUTPUT"
           echo "execd=$execd" >>"$GITHUB_OUTPUT"
           echo "clients=$clients" >>"$GITHUB_OUTPUT"
+          echo "mcpapps=$mcpapps" >>"$GITHUB_OUTPUT"
   # execd on a native arm64 machine. execd ships for arm64 (release-execd.yml) and is Linux-syscall
   # code (subreaper, process groups, /proc, waits) whose struct layouts and syscall numbers differ
   # per arch, so x86 green says nothing about it. The suite runs here as on amd64, including the
@@ -613,6 +620,43 @@ jobs:
           name: sandbox-matrix-report
           path: target/sandbox-matrix/report.json
           retention-days: 7
+  # MCP Apps interop (crates/agent/eval/mcp_apps_interop): the real `agent serve` as a host against
+  # servers built on the official ext-apps SDK, and the SDK's own view class. The agent's own MCP Apps
+  # tests only ever see our hand-rolled fixture server. ~3s of checks; the cost is the agent build, so
+  # only when the change touches the MCP client / apps bridge (the `changes` job). Restore-only cache
+  # shared with `tests` (same dev profile), written by cache-warm.yml on main.
+  mcp-apps-interop:
+    name: mcp apps interop
+    needs: changes
+    if: needs.changes.outputs.mcpapps == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+      - run: mise use --global node@22
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: tests
+          save-if: false
+      - run: cargo build -p beyond-agent --bin agent --locked
+        timeout-minutes: 15
+      - run: npm ci
+        working-directory: crates/agent/eval/mcp_apps_interop
+      - name: check
+        working-directory: crates/agent/eval/mcp_apps_interop
+        run: node check.mjs
+        env:
+          AGENT_BIN: ${{ github.workspace }}/target/debug/agent
+          LOG_DIR: ${{ runner.temp }}/mcp-apps-interop
+        timeout-minutes: 5
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mcp-apps-interop-frames
+          path: ${{ runner.temp }}/mcp-apps-interop
+          if-no-files-found: ignore
+          retention-days: 7
   # The TypeScript SDK (sdk/ts): typecheck, build, and the tests, whose smoke tests run against a real
   # loopback execd built here. Needs no Rust beyond that one small crate.
   sdk-ts:
@@ -670,21 +714,21 @@ jobs:
   # Mutation testing is not a PR check: a missed mutant is a test gap, not a bug, and the per-PR
   # run added about an hour to every gateway change. The full mutation sweep is weekly (deep.yml).
   # Single required status check. Branch protection can require just `Check`; it stays green only if
-  # every parallel job above did. Two kinds of skip are allowed: `advisories`, `execd-arm64` and `clients` may be
+  # every parallel job above did. Two kinds of skip are allowed: `advisories`, `execd-arm64`, `clients` and `mcp-apps-interop` may be
   # skipped on any event (each must pass only when it ran: the change touched dependencies / execd), and `gateway-stress` and
   # `build` may be skipped on a pull_request only (they run in the merge queue, so every commit that
   # reaches main passed them). Cheap (no build), and keeps the required-check name stable.
   Check:
     name: Check
     runs-on: ubuntu-24.04
-    needs: [fmt, clippy, archive, test, gateway-stress, build, changes, advisories, execd-arm64, clients, sdk-ts, sdk-python]
+    needs: [fmt, clippy, archive, test, gateway-stress, build, changes, advisories, execd-arm64, clients, mcp-apps-interop, sdk-ts, sdk-python]
     if: always()
     steps:
       - name: Gate on all checks
         env:
           EVENT: ${{ github.event_name }}
         run: |
-          echo "event=$EVENT fmt=${{ needs.fmt.result }} clippy=${{ needs.clippy.result }} archive=${{ needs.archive.result }} test=${{ needs.test.result }} gateway-stress=${{ needs.gateway-stress.result }} build=${{ needs.build.result }} changes=${{ needs.changes.result }} advisories=${{ needs.advisories.result }} execd-arm64=${{ needs.execd-arm64.result }} clients=${{ needs.clients.result }} sdk-ts=${{ needs.sdk-ts.result }} sdk-python=${{ needs.sdk-python.result }}"
+          echo "event=$EVENT fmt=${{ needs.fmt.result }} clippy=${{ needs.clippy.result }} archive=${{ needs.archive.result }} test=${{ needs.test.result }} gateway-stress=${{ needs.gateway-stress.result }} build=${{ needs.build.result }} changes=${{ needs.changes.result }} advisories=${{ needs.advisories.result }} execd-arm64=${{ needs.execd-arm64.result }} clients=${{ needs.clients.result }} mcp-apps-interop=${{ needs.mcp-apps-interop.result }} sdk-ts=${{ needs.sdk-ts.result }} sdk-python=${{ needs.sdk-python.result }}"
           # gateway-stress and build are skipped on a pull_request and nowhere else: a skip on the
           # merge queue or a dispatch is a job that never ran, which must not read as green.
           pr_only() { [ "$1" = "success" ] || { [ "$EVENT" = pull_request ] && [ "$1" = "skipped" ]; }; }
@@ -699,4 +743,5 @@ jobs:
             && [ "${{ needs.sdk-python.result }}" = "success" ] \
             && { [ "${{ needs.advisories.result }}" = "success" ] || [ "${{ needs.advisories.result }}" = "skipped" ]; } \
             && { [ "${{ needs.execd-arm64.result }}" = "success" ] || [ "${{ needs.execd-arm64.result }}" = "skipped" ]; } \
-            && { [ "${{ needs.clients.result }}" = "success" ] || [ "${{ needs.clients.result }}" = "skipped" ]; }
+            && { [ "${{ needs.clients.result }}" = "success" ] || [ "${{ needs.clients.result }}" = "skipped" ]; } \
+            && { [ "${{ needs.mcp-apps-interop.result }}" = "success" ] || [ "${{ needs.mcp-apps-interop.result }}" = "skipped" ]; }
