@@ -4174,7 +4174,14 @@ other.
 - **Preserved worktrees are kept.** A conflicted, refused or failed child's checkout is moved
   (`git worktree move`) to a `kept-<leaf>` name and that path is reported. Neither the local PID sweep
   nor the sandbox's owner sweep ever reaps a `kept-` entry: it is the developer's to remove. A cancelled child
-  with changes is kept the same way (its path is only in the log: the cancel returns no result).
+  with changes is kept the same way, and the path is reported: `Worktree::release_on_cancel` is the one
+  place that decides keep or remove and returns the kept path; the subagent's `CancelGuard` (which owns
+  the worktree while the child runs) calls it when the parent drops the child, marks the task `cancelled`
+  on the progress board and puts the path in its `kept` field. The cancelled loop forwards that last
+  update to the client (the parent model's own `tool_result` is still the generic "cancelled" line). A
+  child cancelled while `create` is still seeding has no work yet and is removed, never kept: seeding
+  always commits the baseline (empty for a clean parent), so the sandbox sweep tells a mid-seed
+  checkout (`HEAD` inside the repository's history) from a child's.
 
 ---
 
