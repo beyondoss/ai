@@ -304,6 +304,15 @@ description = "TypeScript SDK tests: parsers and command builders, a fake endpoi
 run = "npm test"
 dir = "sdk/ts"
 
+[tasks."test:mcp-apps-interop"]
+description = "MCP Apps interop: the real `agent serve` against the official ext-apps SDK and example servers (crates/agent/eval/mcp_apps_interop)."
+run = """
+cargo build -p beyond-agent --bin agent
+cd crates/agent/eval/mcp_apps_interop
+npm ci
+AGENT_BIN="$OLDPWD/target/debug/agent" node check.mjs
+"""
+
 # ---- sandbox clients: the conformance matrix --------------------------------------------------------
 
 [tasks."build:execd-static"]

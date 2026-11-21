@@ -7450,6 +7450,11 @@ cursor inclusively, bursts, changes schemas, and verifies via the receiver docum
 in CI): `eval/mcp_events_interop/check.py` against the independent `mcp-webhook-events` 0.2.0 server
 on the official Python SDK, over both transports.
 
+MCP Apps interop (CI job `mcp apps interop`, when the MCP client or apps bridge changes):
+`eval/mcp_apps_interop/check.mjs` drives the real `serve` against servers built on the official
+`@modelcontextprotocol/ext-apps` SDK (the map and system-monitor examples, and a tiny SDK server for
+listing-only `_meta.ui`), with the SDK's `App` as the view and the official client as the oracle.
+
 ## CLI flags: rationale
 
 `--help` says what each flag does in a line or two: the doc comments on
