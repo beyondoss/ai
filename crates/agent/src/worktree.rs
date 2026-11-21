@@ -48,7 +48,9 @@
 //! have reaped. That is the safe direction to be wrong in: a leak, never a deletion.
 //!
 //! A checkout the developer must inspect — a conflicted, refused or failed child's — is moved to a
-//! `kept-` name by [`Worktree::preserve`], which no sweep reaps. And [`Worktree::create`] never
+//! `kept-` name by [`Worktree::preserve`], which no sweep reaps. So is a *cancelled* child's, when it
+//! holds changes (an edit, an untracked file, a commit past the baseline): only a clean one is removed
+//! on `Drop`, git's own default. And [`Worktree::create`] never
 //! removes an existing path to make room for a new one: each spawn takes a fresh per-process
 //! sequence number, since a daemon's sessions share one PID and a retry spawns the same agent again.
 //!
@@ -76,7 +78,8 @@
 //!   exactly one session, so the key only has to differ between incarnations.
 //! - **`Drop` cannot clean up.** Every removal step is a round trip and `Drop` cannot await one. A
 //!   remote worktree is instead reaped by the next incarnation, which sweeps its base directory
-//!   before creating its own — so the cost falls only on sessions that use isolation at all.
+//!   before creating its own — so the cost falls only on sessions that use isolation at all. That
+//!   sweep applies the same rule: one with changes is moved to a `kept-` name, a clean one reaped.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -482,13 +485,49 @@ impl Git {
             if owner == mine || owner == KEPT {
                 continue;
             }
+            let path = base.join(leaf);
+            // A cancelled child's `Drop` could not decide for itself in a sandbox, so this does, by
+            // the same rule as a local one: with changes, it is kept; only a clean one is reaped.
+            if self.remote_has_changes(repo_root, &path).await {
+                let kept = kept_path(base, std::ffi::OsStr::new(leaf));
+                let (from, to) = (path.display().to_string(), kept.display().to_string());
+                if self
+                    .run_text(repo_root, &["worktree", "move", &from, &to])
+                    .await
+                    .is_ok()
+                {
+                    tracing::info!(worktree = %kept.display(), "kept a sandbox worktree left by a previous incarnation: it has changes");
+                } else {
+                    tracing::warn!(worktree = %from, "left a sandbox worktree with changes in place");
+                }
+                continue;
+            }
             tracing::debug!(
-                worktree = %base.join(leaf).display(),
+                worktree = %path.display(),
                 owner,
                 "reaping a sandbox worktree left by a previous incarnation"
             );
-            self.remove_worktree(repo_root, &base.join(leaf)).await;
+            self.remove_worktree(repo_root, &path).await;
         }
+    }
+
+    /// Whether a sandbox worktree left by another incarnation holds work: an edit or an untracked
+    /// file, or a commit that is neither the seeded baseline (recognised by its subject, as the
+    /// sweeper does not know its id) nor anything the repository's own `HEAD` already contains. A
+    /// directory that is not a git checkout at all holds no child work git knows of: reaped. Any
+    /// other doubt reads as changed: it is not deleted.
+    async fn remote_has_changes(&self, repo_root: &Path, path: &Path) -> bool {
+        let script = format!(
+            "cd {wt} || exit 0; \
+             git rev-parse --git-dir >/dev/null 2>&1 || {{ echo clean; exit 0; }}; \
+             [ -z \"$(git status --porcelain --untracked-files=all 2>&1)\" ] || exit 0; \
+             [ \"$(git log -1 --format=%s 2>&1)\" = {baseline} ] && echo clean && exit 0; \
+             git merge-base --is-ancestor HEAD \"$(git -C {repo} rev-parse HEAD)\" && echo clean",
+            wt = shell_quote(&path.display().to_string()),
+            repo = shell_quote(&repo_root.display().to_string()),
+            baseline = shell_quote(BASELINE_SUBJECT),
+        );
+        !matches!(self.sh(repo_root, &script).await, Ok(out) if out.trim() == "clean")
     }
 
     /// Copy `files` (relative to `src`) to the same relative paths under `dst`, creating parent
@@ -916,7 +955,7 @@ impl Worktree {
                         "--quiet",
                         "--no-verify",
                         "-m",
-                        "subagent baseline (throwaway)",
+                        BASELINE_SUBJECT,
                     ],
                 )
                 .await?;
@@ -987,7 +1026,7 @@ impl Worktree {
         let (Some(base), Some(leaf)) = (self.path.parent(), self.path.file_name()) else {
             return self.path.clone();
         };
-        let kept = base.join(format!("{KEPT}-{}", leaf.to_string_lossy()));
+        let kept = kept_path(base, leaf);
         let (from, to) = (self.path.display().to_string(), kept.display().to_string());
         match self
             .git
@@ -1024,7 +1063,72 @@ impl Drop for Worktree {
             );
             return;
         }
+        // A cancelled child's edits are the only copy of its work (see [`Worktree::preserve`]): a
+        // worktree with changes is kept, as `git worktree remove` itself would refuse to remove it;
+        // only a clean one is removed.
+        if has_changes_blocking(&self.path, &self.baseline) {
+            if let (Some(base), Some(leaf)) = (self.path.parent(), self.path.file_name()) {
+                let kept = kept_path(base, leaf);
+                if git_blocking(&self.repo_root, |c| {
+                    c.args(["worktree", "move"]).arg(&self.path).arg(&kept)
+                }) {
+                    tracing::info!(worktree = %kept.display(), "kept a cancelled subagent's worktree: it has changes");
+                    return;
+                }
+            }
+            // Could not move it: leave it where it is rather than delete the only copy.
+            tracing::warn!(worktree = %self.path.display(), "left a cancelled subagent's worktree in place: it has changes");
+            return;
+        }
         remove_worktree_blocking(&self.repo_root, &self.path);
+    }
+}
+
+/// Where a worktree at `base/leaf` lives once kept (see [`KEPT`]).
+fn kept_path(base: &Path, leaf: &std::ffi::OsStr) -> PathBuf {
+    base.join(format!("{KEPT}-{}", leaf.to_string_lossy()))
+}
+
+/// Run `git -C dir ...` (the closure adds the arguments) to completion; whether it succeeded.
+/// Synchronous: [`Drop`] cannot await.
+fn git_blocking(
+    dir: &Path,
+    args: impl FnOnce(&mut std::process::Command) -> &mut std::process::Command,
+) -> bool {
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-C").arg(dir);
+    args(&mut cmd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Whether the child left anything: an edit, an untracked file, or a commit past `baseline` (the
+/// parent's own work is committed into the baseline, so it never counts). Any doubt reads as
+/// changed: a worktree that cannot be inspected is not deleted.
+fn has_changes_blocking(path: &Path, baseline: &str) -> bool {
+    let out = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(args)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+    };
+    let Some(status) = out(&["status", "--porcelain", "--untracked-files=all"]) else {
+        return true;
+    };
+    if !status.stdout.is_empty() {
+        return true;
+    }
+    match out(&["rev-parse", "HEAD"]) {
+        Some(head) => String::from_utf8_lossy(&head.stdout).trim() != baseline,
+        None => true,
     }
 }
 
@@ -1307,6 +1411,10 @@ async fn git_stdout_with_stdin(dir: &Path, args: &[&str], stdin: &[u8]) -> Resul
 /// The leaf prefix of a preserved worktree (see [`Worktree::preserve`]). Never a PID and never a
 /// remote owner, so neither sweep can mistake it for an orphan: it is the developer's to remove.
 const KEPT: &str = "kept";
+
+/// The subject of the throwaway commit that records the seeded baseline (see
+/// [`Worktree::seed_from_parent`]).
+const BASELINE_SUBJECT: &str = "subagent baseline (throwaway)";
 
 /// Reap subagent worktrees left behind by agent processes that are no longer running. Safe to call at
 /// any time, from any number of concurrent agents: a worktree whose owning PID is still alive is never
@@ -1953,6 +2061,122 @@ mod tests {
             "our own live worktree must never be swept"
         );
         mine.remove().await.unwrap();
+    }
+
+    /// Where `path` lives once kept.
+    fn kept_of(path: &Path) -> PathBuf {
+        kept_path(path.parent().unwrap(), path.file_name().unwrap())
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_child_with_changes_keeps_its_worktree_and_a_clean_one_is_removed() {
+        let repo = repo().await;
+        // The parent's own uncommitted work is in the baseline: it is not the child's change.
+        std::fs::write(repo.path().join("tracked.txt"), "parent wip\n").unwrap();
+        let root = preflight(&Git::Local, repo.path()).await.unwrap();
+
+        let clean = Worktree::create(&Git::Local, &root, "clean-0")
+            .await
+            .unwrap();
+        let clean_path = clean.path().to_path_buf();
+        let edited = Worktree::create(&Git::Local, &root, "edited-0")
+            .await
+            .unwrap();
+        let edited_path = edited.path().to_path_buf();
+        std::fs::write(edited.path().join("child.txt"), "the child's work\n").unwrap();
+        let committed = Worktree::create(&Git::Local, &root, "committed-0")
+            .await
+            .unwrap();
+        let committed_path = committed.path().to_path_buf();
+        std::fs::write(committed.path().join("c.txt"), "committed\n").unwrap();
+        for args in [
+            vec!["add", "-A"],
+            vec![
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "--quiet",
+                "-m",
+                "child",
+            ],
+        ] {
+            Git::Local.run_text(committed.path(), &args).await.unwrap();
+        }
+
+        // A cancelled subagent's future is dropped, and its worktree with it.
+        drop(clean);
+        drop(edited);
+        drop(committed);
+
+        assert!(!clean_path.exists(), "a clean worktree is removed");
+        assert!(
+            !edited_path.exists(),
+            "the edited one moved to its kept name"
+        );
+        let kept = kept_of(&edited_path);
+        assert_eq!(
+            std::fs::read_to_string(kept.join("child.txt")).unwrap(),
+            "the child's work\n"
+        );
+        assert!(
+            kept_of(&committed_path).join("c.txt").exists(),
+            "so did a committed one"
+        );
+        // And no sweep takes it, whoever owned it.
+        sweep(&root);
+        assert!(kept.exists());
+        let _ = Git::Local
+            .run_text(
+                &root,
+                &["worktree", "remove", "--force", &kept.display().to_string()],
+            )
+            .await;
+        let _ = Git::Local
+            .run_text(
+                &root,
+                &[
+                    "worktree",
+                    "remove",
+                    "--force",
+                    &kept_of(&committed_path).display().to_string(),
+                ],
+            )
+            .await;
+    }
+
+    #[tokio::test]
+    async fn the_remote_sweep_keeps_another_incarnations_worktree_that_has_changes() {
+        let theirs = Git::Remote {
+            runner: std::sync::Arc::new(crate::tools::exec::RealRunner),
+            backend: std::sync::Arc::new(crate::tools::fs::local::LocalFs::new()),
+            owner: "deadbeef".to_string(),
+        };
+        let repo = repo().await;
+        let root = preflight(&theirs, repo.path()).await.unwrap();
+        let edited = Worktree::create(&theirs, &root, "edited").await.unwrap();
+        std::fs::write(edited.path().join("child.txt"), "the child's work\n").unwrap();
+        let clean = Worktree::create(&theirs, &root, "clean").await.unwrap();
+        let (edited_path, clean_path) = (edited.path().to_path_buf(), clean.path().to_path_buf());
+        // Their session was cancelled: `Drop` leaves a sandbox worktree to the next sweep.
+        drop(edited);
+        drop(clean);
+
+        // The next incarnation's first worktree sweeps its predecessors.
+        let ours = remote_git();
+        ours.sweep_siblings(&root, edited_path.parent().unwrap())
+            .await;
+
+        assert!(!clean_path.exists(), "a clean one is reaped");
+        let kept = kept_of(&edited_path);
+        assert!(kept.join("child.txt").exists(), "one with changes is kept");
+        let _ = Git::Local
+            .run_text(
+                &root,
+                &["worktree", "remove", "--force", &kept.display().to_string()],
+            )
+            .await;
     }
 
     #[tokio::test]

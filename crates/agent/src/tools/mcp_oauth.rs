@@ -442,7 +442,10 @@ impl ServerAuth {
                 self.server
             )),
             StepUp::Refused => {
-                let transient = state.refused.iter().any(|r| r.until.is_some() && r.stands(now));
+                let transient = state
+                    .refused
+                    .iter()
+                    .any(|r| r.until.is_some() && r.stands(now));
                 Err(self.refused_message(
                     &missing,
                     if transient {
@@ -1506,7 +1509,11 @@ mod tests {
         assert_eq!(asks.load(Ordering::SeqCst), 1);
         // Inside the window: the error, and no authorization-server call.
         assert!(call(auth.clone()).await.is_err());
-        assert_eq!(asks.load(Ordering::SeqCst), 1, "backed off, not asked again");
+        assert_eq!(
+            asks.load(Ordering::SeqCst),
+            1,
+            "backed off, not asked again"
+        );
         assert_eq!(
             auth.token().await.as_deref(),
             Some("stale"),
@@ -1514,7 +1521,9 @@ mod tests {
         );
         // Past it: the next 403 asks again, and the cause having cleared, succeeds.
         tokio::time::sleep(Duration::from_millis(350)).await;
-        call(auth.clone()).await.expect("the retry after the window succeeds");
+        call(auth.clone())
+            .await
+            .expect("the retry after the window succeeds");
         assert_eq!(asks.load(Ordering::SeqCst), 2);
     }
 }

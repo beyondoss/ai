@@ -146,7 +146,15 @@ async fn a_follow_up_queued_at_the_step_limit_stays_queued_and_the_run_ends_clea
         )
         .await;
     assert!(result.is_ok(), "{result:?}");
-    assert!(events.iter().any(|e| matches!(e, AgentEvent::AgentEnd { .. })));
-    assert!(!events.iter().any(|e| matches!(e, AgentEvent::Steered { .. })));
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::AgentEnd { .. }))
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Steered { .. }))
+    );
     assert_eq!(steering.pending_count(), 1);
 }

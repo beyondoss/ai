@@ -4159,7 +4159,9 @@ other.
   the user) to resolve; a policy refusal rejects the whole patch (all-or-nothing).
   The preserved path rides every mode's result — `single` and a stopped `chain` included, success or
   failure — not just `parallel`'s sections: it is the only pointer to the child's work.
-- **Cleanup.** `Drop` removes a worktree best-effort, but a `process::exit`/SIGKILL runs no destructors,
+- **Cleanup.** `Drop` (a cancelled child) removes a *clean* worktree best-effort and keeps one with changes
+  (an edit, an untracked file, a commit past the baseline) under the `kept-` name below; the sandbox's owner
+  sweep applies the same rule to what a previous incarnation left. But a `process::exit`/SIGKILL runs no destructors,
   so worktrees live under `$XDG_CACHE_HOME/beyond-agent/worktrees/<repo-id>/<pid>-<label>-<seq>` (on
   disk, not tmpfs — a checkout in RAM would exhaust it) and a startup `sweep` reaps any whose owning PID
   is gone. Keyed by PID so a sweep never deletes a concurrently-running session's work; `<seq>` is a
@@ -4170,7 +4172,8 @@ other.
   subdirectory reaps the same base `create` writes to.
 - **Preserved worktrees are kept.** A conflicted, refused or failed child's checkout is moved
   (`git worktree move`) to a `kept-<leaf>` name and that path is reported. Neither the local PID sweep
-  nor the sandbox's owner sweep ever reaps a `kept-` entry: it is the developer's to remove.
+  nor the sandbox's owner sweep ever reaps a `kept-` entry: it is the developer's to remove. A cancelled child
+  with changes is kept the same way (its path is only in the log: the cancel returns no result).
 
 ---
 
