@@ -7235,7 +7235,7 @@ mcp_events_subscribe (any session) ──► owned by that session
   Standard Webhooks senders treat as "stop"). Before any state is read, a daemon with a callback URL answers every
   unknown token `503` from its start until each session it starts to restore callbacks (the events
   session, and every session holding runtime subscriptions) has read its state and held its tokens
-  (`webhook::restore_pending` / `restored`, also bounded at 10 min); after that an unknown token is
+  (`webhook::restore_pending` / `restored`, also bounded at 10 min; a restore that ends any other way, such as its hub dropped first, calls `restored` too); after that an unknown token is
   `410` at once. A runtime subscription the server ended is not restored, so its token is not held
   and its old callback answers `410`. No subscription makes a request — configured, restored after a
   restart or a panic, or resubscribing — until the session can take the server's questions (its
