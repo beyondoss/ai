@@ -51,15 +51,11 @@ pub(in crate::translate) fn responses_req_to_openai(
                 continue;
             }
             if t.get("type").and_then(Value::as_str) == Some("namespace") {
-                let ns = t.get("name").and_then(Value::as_str).unwrap_or("");
                 let about = non_empty_str(t, "description");
-                for m in namespace_members(t) {
-                    let Some(name) = m.get("name").and_then(Value::as_str) else {
-                        continue;
-                    };
-                    let mut m = m.clone();
+                for member in namespace_members(t) {
+                    let mut m = member.tool.clone();
                     if let Some(obj) = m.as_object_mut() {
-                        obj.insert("name".into(), json!(namespaced_name(ns, name)));
+                        obj.insert("name".into(), json!(member.flat));
                         if let Some(about) = about {
                             // The namespace's description is shown to the model once on
                             // Responses; flat, each member carries it.
