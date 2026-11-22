@@ -32,7 +32,7 @@ fn production_calls_the_verified_kernel() {
 }
 
 /// Every decision is inside `verus!`: the verified block holds each function, and the code after
-/// it is only storage (`HashMap`, string comparison) and accessors that reshape a field.
+/// it is only accessors that reshape a field and the table's `Clone`, `Debug` and `Eq`.
 #[test]
 fn the_decisions_are_in_the_verified_block() {
     let src = std::fs::read_to_string(
@@ -45,11 +45,18 @@ fn the_decisions_are_in_the_verified_block() {
     let storage = &src[close..];
     for decision in [
         "pub fn step(",
-        "pub fn window(",
         "pub fn follow(",
         "pub fn bound<",
         "pub fn admit(",
         "pub fn visible(",
+        "pub struct Table<",
+        "fn locate(",
+        "pub fn is_held(",
+        "pub fn insert(",
+        "pub fn get(",
+        "pub fn in_scope(",
+        "pub fn take(",
+        "fn has(",
         "pub proof fn lemma_end_progress(",
         "pub proof fn lemma_follow_progress(",
     ] {
@@ -61,14 +68,27 @@ fn the_decisions_are_in_the_verified_block() {
     for banned in ["assume(", "admit()", "external_body", "verifier::external"] {
         assert!(!verified.contains(banned), "{banned} inside verus!");
     }
+    // The table's storage is verified too: no unverified map behind it, and the code after `verus!`
+    // never reaches into `entries` to look a key up, put one in or take one out.
     for stray in [
-        "fn step(",
-        "fn window(",
-        "fn follow(",
-        "fn bound<",
-        "Ev::",
-        "Phase::",
+        "HashMap",
+        ".entries.remove(",
+        ".entries.insert(",
+        ".entries.push(",
+        ".entries.get(",
+        "fn locate(",
+        "fn has(",
+        "fn take(",
+        "fn get(",
+        "fn insert(",
+        "fn in_scope(",
     ] {
+        assert!(
+            !storage.contains(stray),
+            "{stray} outside verus!: the table's storage is not the verified one"
+        );
+    }
+    for stray in ["fn step(", "fn follow(", "fn bound<", "Ev::", "Phase::"] {
         assert!(
             !storage.contains(stray),
             "{stray} outside verus!: a decision the proof does not see"

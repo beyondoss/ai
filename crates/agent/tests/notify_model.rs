@@ -711,7 +711,7 @@ impl Notify {
             }
         }
         let gone = table.take(&keys, |a, b| a == b);
-        for c in gone {
+        for (_, c) in gone {
             let c = c as usize;
             if expect.is_some_and(|e| e != c) {
                 s.bad |= X1_ATTRIBUTED;

@@ -299,7 +299,7 @@ impl St {
     /// `Jobs::remove`: out of the table, then each job taken.
     fn take(&mut self, checked: &[(Key, usize)]) {
         let handles = self.table.take(checked, |a, b| a == b);
-        for h in handles {
+        for (_, h) in handles {
             // J10: only a job that was checked leaves.
             if !checked.iter().any(|(_, c)| *c == h) {
                 self.bad |= V_J10;
@@ -636,7 +636,7 @@ impl Model for Jobs {
                 s.resolved(scope, h);
                 let sim = &s.sims[h];
                 let (from, want) =
-                    kernel::window(0, u64::from(sim.base), u64::from(sim.end), 1 << 20);
+                    execd_ring::window(0, u64::from(sim.base), u64::from(sim.end), 1 << 20);
                 // J5: never before the oldest byte held, and never more than is held after it.
                 if from < u64::from(sim.base) || from + want as u64 != u64::from(sim.end) {
                     s.bad |= V_J5;
@@ -1008,7 +1008,6 @@ fn ended_is_final() {
     feature = "mut_scope_ignored",
     feature = "mut_remove_keeps_entry",
     feature = "mut_end_rewritten",
-    feature = "mut_read_before_base",
     feature = "mut_disconnect_kills_kept",
     feature = "mut_stream_follows_key",
     feature = "mut_remove_live",
@@ -1031,8 +1030,6 @@ fn the_mutation_turns_its_property_red() {
         println!("red: [\"J4\"] kernel check failed: {}", r.is_err());
         assert!(r.is_err(), "no property `J4` went red");
         return;
-    } else if cfg!(feature = "mut_read_before_base") {
-        "J5: "
     } else if cfg!(feature = "mut_stream_follows_key") {
         "J9: "
     } else if cfg!(feature = "mut_disconnect_kills_kept") {
@@ -1111,11 +1108,14 @@ fn production_calls_the_kernel() {
         "kernel::follow(",
         "Pick::",
         ".take(checked, Arc::ptr_eq)",
+        "map: Mutex<kernel::Table<JobCell>>",
         ".in_scope(scope, pick)",
         ".alive()",
     ] {
         assert!(prod.contains(needle), "jobs.rs no longer calls {needle}");
     }
+    // The table is the kernel's verified storage, not a map of the shell's.
+    assert!(!prod.contains("HashMap<Key"), "jobs.rs keeps its own map");
     // No decision of the job's life is made outside the kernel: its state is only written there.
     for banned in [
         ".removed =",
