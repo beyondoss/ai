@@ -28,7 +28,8 @@
     clippy::match_like_matches_macro,
     clippy::if_same_then_else,
     clippy::implicit_saturating_sub,
-    clippy::needless_return
+    clippy::needless_return,
+    unused_braces
 )]
 
 use vstd::prelude::*;

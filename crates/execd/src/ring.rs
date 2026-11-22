@@ -1,0 +1,412 @@
+//! The job output ring: the last bytes of a job's output, by offset from its first byte, kept as
+//! chunk files (see [`crate::spool`]) plus an unfinished chunk in memory, one stderr bit per byte.
+//!
+//! Every decision (which offsets are held, where a read starts and how its pieces tile the window,
+//! which chunks retention drops, what a refused chunk costs, which byte ranges are stderr) is the
+//! pure kernel [`execd_ring`], proven in Verus (R1..R6, see its docs); this file keeps the I/O:
+//! files, the copy of bytes, and the bits' storage. A differential test holds it to a plain
+//! `Vec<(u8, bool)>` over random pushes, reads and refused chunks.
+
+use std::path::PathBuf;
+use std::sync::atomic::Ordering;
+
+use execd_ring as kernel;
+
+use crate::frame::FRAME_MAX;
+use crate::spool;
+
+pub(crate) use kernel::RANGES_MAX;
+
+// The kernel's chunk is execd's frame, and its bits are one per byte.
+const _: () = assert!(kernel::CHUNK == FRAME_MAX && kernel::CHUNK == 8 * kernel::CHUNK_BITS);
+
+/// The last bytes of a job's output, by offset from its first byte, kept as chunk files (see
+/// [`crate::spool`]). A chunk is the 64 KiB at a multiple of 64 KiB; whole chunks are evicted from
+/// the front, so the retention is a floor. In memory: a path and the unfinished chunk.
+pub(crate) struct Ring {
+    /// This job's directory, created when the first chunk is written.
+    dir: PathBuf,
+    made: bool,
+    /// Full chunks on disk.
+    files: usize,
+    /// The bytes after them, fewer than a chunk.
+    tail: Vec<u8>,
+    /// The offset of the first byte held (a multiple of a chunk).
+    pub(crate) base: u64,
+    retain: usize,
+    /// One bit per byte of `tail`, set for a byte that came from stderr. Allocated at the first
+    /// stderr byte, so a job that never writes stderr pays nothing; may be shorter than `tail`
+    /// (a missing bit is stdout). A full chunk's bits go to `<chunk>.e` when any is set.
+    tail_e: Option<Vec<u8>>,
+}
+
+impl Ring {
+    pub(crate) fn new(retain: usize, dir: PathBuf) -> Self {
+        Self {
+            dir,
+            made: false,
+            files: 0,
+            tail: Vec::new(),
+            base: 0,
+            retain,
+            tail_e: None,
+        }
+    }
+
+    fn held(&self) -> usize {
+        self.files * FRAME_MAX + self.tail.len()
+    }
+
+    /// The offset of the next byte.
+    pub fn end(&self) -> u64 {
+        self.base + self.held() as u64
+    }
+
+    fn chunk_path(&self, offset: u64) -> PathBuf {
+        self.dir.join(format!("{:010x}", offset / FRAME_MAX as u64))
+    }
+
+    /// The bits of the chunk that starts at `at`: the file beside it, if it has stderr.
+    fn chunk_bits_path(&self, at: u64) -> PathBuf {
+        self.dir.join(format!("{:010x}.e", at / FRAME_MAX as u64))
+    }
+
+    /// Append `data`, which came from stderr when `stderr`.
+    pub fn push(&mut self, data: &[u8], stderr: bool) {
+        if stderr && !data.is_empty() {
+            let at = self.tail.len();
+            kernel::set_bits(
+                self.tail_e.get_or_insert_with(Vec::new),
+                at,
+                at + data.len(),
+            );
+        }
+        self.tail.extend_from_slice(data);
+        while self.tail.len() >= FRAME_MAX {
+            let at = self.base + (self.files * FRAME_MAX) as u64;
+            // This chunk's bits, taken off the front of the tail's.
+            let bits: Option<Vec<u8>> = match self.tail_e.take() {
+                Some(e) => {
+                    let (chunk, rest) = kernel::take_chunk_bits(e);
+                    self.tail_e = Some(rest);
+                    chunk.iter().any(|&b| b != 0).then_some(chunk)
+                }
+                None => None,
+            };
+            let made = self.made || spool::make_job_dir(&self.dir).is_ok();
+            let wrote = made
+                && spool::write_chunk(&self.chunk_path(at), &self.tail[..FRAME_MAX]).is_ok()
+                && bits.as_ref().is_none_or(|b| {
+                    let ok = spool::write_chunk(&self.chunk_bits_path(at), b).is_ok();
+                    if !ok {
+                        // Bytes without their labels would read back as stdout: a gap instead.
+                        let _ = std::fs::remove_file(self.chunk_path(at));
+                    }
+                    ok
+                });
+            self.made |= wrote;
+            self.tail.drain(..FRAME_MAX);
+            if !wrote {
+                // The disk refused it: what was held and this chunk read back as a gap.
+                self.forget_files();
+            }
+            (self.base, self.files) = kernel::after_flush(self.base, self.files, wrote);
+        }
+        for _ in 0..kernel::evict(self.files, self.tail.len(), self.retain) {
+            let _ = std::fs::remove_file(self.chunk_path(self.base));
+            let _ = std::fs::remove_file(self.chunk_bits_path(self.base));
+            self.base += FRAME_MAX as u64;
+            self.files -= 1;
+        }
+    }
+
+    /// Delete every chunk file held (the caller moves `base` past them).
+    fn forget_files(&self) {
+        for i in 0..self.files {
+            let at = self.base + (i * FRAME_MAX) as u64;
+            let _ = std::fs::remove_file(self.chunk_path(at));
+            let _ = std::fs::remove_file(self.chunk_bits_path(at));
+        }
+    }
+
+    /// Up to `max` bytes from `offset` (or from the oldest byte held, when that is later); where
+    /// they start, and the absolute `(from, len)` ranges of them that came from stderr: ascending,
+    /// disjoint, at most [`RANGES_MAX`] (the window is cut before the range that would exceed it).
+    pub fn read(&self, offset: u64, max: usize) -> (u64, Vec<u8>, Vec<(u64, u64)>) {
+        let (from, want) = kernel::window(offset, self.base, self.end(), max);
+        let mut out = vec![0u8; want];
+        let mut ranges: Vec<(u64, u64)> = Vec::new();
+        let mut done = 0;
+        while done < want {
+            let at = from + done as u64;
+            let seg = kernel::seg(at, want - done, self.base, self.files, self.tail.len());
+            let (n, bits): (usize, Option<std::borrow::Cow<[u8]>>) = if seg.disk {
+                let dst = &mut out[done..done + seg.n];
+                match spool::read_chunk(&self.chunk_path(at), seg.pos as u64, dst) {
+                    Ok(k) if k > 0 => {
+                        let bits = std::fs::read(self.chunk_bits_path(at)).ok();
+                        (k, bits.map(std::borrow::Cow::Owned))
+                    }
+                    _ => break,
+                }
+            } else {
+                out[done..done + seg.n].copy_from_slice(&self.tail[seg.pos..seg.pos + seg.n]);
+                (
+                    seg.n,
+                    self.tail_e.as_deref().map(std::borrow::Cow::Borrowed),
+                )
+            };
+            if let Some(bits) = bits {
+                // `bits` is indexed from the chunk's (or the tail's) first byte, as `seg.pos` is.
+                let kept = kernel::scan(&bits, seg.pos, n, at, &mut ranges);
+                if kept < n {
+                    done += kept;
+                    break;
+                }
+            }
+            done += n;
+        }
+        out.truncate(done);
+        (from, out, ranges)
+    }
+}
+
+impl Drop for Ring {
+    fn drop(&mut self) {
+        if self.made {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+}
+
+/// Fuzz seam: drive a [`Ring`] with the pushes and reads `bytes` describe, and hold it to a plain
+/// `Vec` of everything pushed: every read returns the bytes at its offsets, from the oldest kept
+/// byte when the offset is older, and the ring keeps at least its retention.
+pub(crate) fn fuzz_ring(bytes: &[u8]) {
+    let mut it = bytes.iter().copied();
+    let retain = 1 + usize::from(it.next().unwrap_or(0)) * 1024;
+    // The ring spools to files: give this run a directory of its own, removed when it ends.
+    static RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "execd-fuzz-ring-{}-{}",
+        std::process::id(),
+        RUNS.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _cleanup = scopeguard_remove(dir.clone());
+    let _ = std::fs::create_dir_all(&dir);
+    let mut ring = Ring::new(retain, dir.join("ring"));
+    let mut all: Vec<(u8, bool)> = Vec::new();
+    while let Some(op) = it.next() {
+        let a = u16::from_le_bytes([it.next().unwrap_or(0), it.next().unwrap_or(0)]);
+        if op % 2 == 0 {
+            let seed = op;
+            let data: Vec<u8> = (0..usize::from(a))
+                .map(|i| (i % 251) as u8 ^ seed)
+                .collect();
+            ring.push(&data, op % 4 == 0);
+            all.extend(data.iter().map(|&b| (b, op % 4 == 0)));
+            continue;
+        }
+        let end = ring.end();
+        assert_eq!(end as usize, all.len());
+        // Offsets: near zero, around the end, and absurd. Sizes: small, huge and unbounded.
+        let offset = match op % 8 {
+            1 => u64::from(a),
+            3 => end.saturating_sub(u64::from(a)),
+            5 => end + u64::from(a),
+            _ => u64::MAX - u64::from(a),
+        };
+        let max = match (op / 8) % 4 {
+            0 => usize::from(a),
+            1 => usize::MAX,
+            2 => usize::MAX - usize::from(a),
+            _ => 1 << 20,
+        };
+        let (from, data, ranges) = ring.read(offset, max);
+        assert_eq!(from, offset.max(ring.base));
+        let avail = end.saturating_sub(from).min(max as u64);
+        // A read with too many stderr runs is cut short, never longer.
+        assert!(data.len() as u64 <= avail);
+        assert!(ranges.len() <= RANGES_MAX);
+        if ranges.len() < RANGES_MAX {
+            assert_eq!(data.len() as u64, avail);
+        }
+        for (i, b) in data.iter().enumerate() {
+            let (want, e) = all[from as usize + i];
+            assert_eq!(*b, want);
+            let off = from + i as u64;
+            let in_range = ranges.iter().any(|&(a, n)| off >= a && off < a + n);
+            assert_eq!(in_range, e, "stderr flag at {off}");
+        }
+        let mut prev_end = from;
+        for &(a, n) in &ranges {
+            assert!(n > 0 && a >= prev_end && a + n <= from + data.len() as u64);
+            prev_end = a + n;
+        }
+        let kept = end - ring.base;
+        assert!(kept >= (all.len().min(retain)) as u64);
+        assert!(kept < (retain + FRAME_MAX) as u64);
+    }
+}
+
+/// Removes a directory tree when dropped.
+struct RemoveOnDrop(PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn scopeguard_remove(p: PathBuf) -> RemoveOnDrop {
+    RemoveOnDrop(p)
+}
+
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    fn ring(retain: usize) -> (Ring, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let r = Ring::new(retain, dir.path().join("job"));
+        (r, dir)
+    }
+
+    /// Write `n` bytes whose value at stream offset `i` is `i % 251`.
+    fn fill(ring: &mut Ring, n: usize) {
+        let mut at = 0usize;
+        while at < n {
+            let k = (n - at).min(10_000);
+            let piece: Vec<u8> = (at..at + k).map(|i| (i % 251) as u8).collect();
+            ring.push(&piece, false);
+            at += k;
+        }
+    }
+
+    #[test]
+    fn it_keeps_at_least_the_retention_and_never_more_than_a_chunk_over() {
+        let (mut ring, _d) = ring(200_000);
+        fill(&mut ring, 1_000_000);
+        assert_eq!(ring.end(), 1_000_000);
+        let kept = ring.end() - ring.base;
+        assert!(
+            (200_000..200_000 + FRAME_MAX as u64).contains(&kept),
+            "kept {kept}"
+        );
+        assert_eq!(ring.held() as u64, kept);
+        // The oldest bytes are gone: a read from 0 starts where the ring does.
+        let (from, data, _) = ring.read(0, 5);
+        assert_eq!(from, ring.base);
+        assert_eq!(data.len(), 5);
+        // Evicted chunks are deleted: only what is held is on disk.
+        let n = std::fs::read_dir(&ring.dir).unwrap().count();
+        assert_eq!(n, ring.files);
+    }
+
+    #[test]
+    fn stderr_bits_survive_chunks_and_go_with_their_chunk_on_eviction() {
+        let (mut ring, _d) = ring(100_000);
+        // A stderr byte early in every chunk, stdout elsewhere, over many chunks.
+        for _ in 0..8 {
+            ring.push(b"e", true);
+            ring.push(&vec![b'o'; FRAME_MAX - 1], false);
+        }
+        let (from, data, ranges) = ring.read(0, 1 << 20);
+        assert_eq!(from, ring.base);
+        assert!(
+            ranges
+                .iter()
+                .all(|&(a, n)| n == 1 && a % FRAME_MAX as u64 == 0)
+        );
+        for (i, b) in data.iter().enumerate() {
+            let off = from + i as u64;
+            assert_eq!(*b == b'e', ranges.iter().any(|&(a, _)| a == off), "{off}");
+        }
+        // Only the chunks held have sidecars: evicted ones took theirs along.
+        let sidecars = std::fs::read_dir(&ring.dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".e")
+            })
+            .count();
+        assert!(
+            ring.files > 0 && sidecars == ring.files,
+            "{sidecars} sidecars, {} chunks",
+            ring.files
+        );
+    }
+
+    #[test]
+    fn a_read_spans_chunks_and_matches_what_was_written() {
+        let (mut ring, _d) = ring(10_000_000);
+        fill(&mut ring, 300_000);
+        let (from, data, _) = ring.read(70_000, 200_000);
+        assert_eq!(from, 70_000);
+        let expect: Vec<u8> = (70_000..270_000usize).map(|i| (i % 251) as u8).collect();
+        assert_eq!(data, expect);
+        assert!(ring.read(300_000, 10).1.is_empty());
+    }
+
+    /// A `max` the client chose (`u64::MAX` is a valid JSON number) must not overflow the arithmetic
+    /// of a read from inside a chunk: it panicked while holding the job's lock.
+    #[test]
+    fn a_read_of_any_size_from_any_offset_does_not_overflow() {
+        let (mut ring, _d) = ring(10_000_000);
+        fill(&mut ring, 1000);
+        for offset in [0, 1, 500, 999, 1000, 5000, u64::MAX] {
+            let (from, data, _) = ring.read(offset, usize::MAX);
+            assert_eq!(from, offset, "{offset}");
+            assert_eq!(
+                data.len() as u64,
+                1000u64.saturating_sub(offset),
+                "{offset}"
+            );
+        }
+    }
+
+    #[test]
+    fn tiny_writes_do_not_make_tiny_chunks_and_a_small_job_touches_no_disk() {
+        let (mut ring, d) = ring(10_000_000);
+        for _ in 0..100_000 {
+            ring.push(b"x", false);
+        }
+        assert_eq!(ring.files, 1);
+        assert_eq!(ring.tail.len(), 100_000 - FRAME_MAX);
+        let (mut small, d2) = self::ring(10_000_000);
+        small.push(b"hello", false);
+        assert!(!d2.path().join("job").exists());
+        drop((small, d2));
+        // Dropping the ring removes its directory.
+        let path = ring.dir.clone();
+        assert!(path.exists());
+        drop(ring);
+        assert!(!path.exists());
+        drop(d);
+    }
+
+    #[test]
+    fn files_are_private_and_never_follow_a_link() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let (mut ring, _d) = ring(10_000_000);
+        ring.push(&vec![7u8; FRAME_MAX], false);
+        let dir_mode = std::fs::metadata(&ring.dir).unwrap().mode() & 0o777;
+        let file_mode = std::fs::metadata(ring.chunk_path(0))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!((dir_mode, file_mode), (0o700, 0o600));
+        // A link planted where the next chunk goes is refused, and the bytes read back as a gap.
+        let target = ring.dir.join("elsewhere");
+        std::os::unix::fs::symlink(&target, ring.chunk_path(FRAME_MAX as u64)).unwrap();
+        ring.push(&vec![8u8; FRAME_MAX], false);
+        assert!(!target.exists());
+        assert_eq!(ring.base, 2 * FRAME_MAX as u64);
+    }
+}

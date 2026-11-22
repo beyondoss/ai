@@ -59,6 +59,26 @@ mut_take_by_key = [
 mut_follow_waits_after_end = [
   "beyond-execd-jobs/mut_follow_waits_after_end",
 ] # a stream never sends its final frame (L2)
+# Mutations of `ring` (the crate `execd-ring`, which Verus proves), used only by `src/ring.rs`'s differential
+# test's red runs: each removes one guard.
+mut_window_before_base = [
+  "beyond-execd-ring/mut_window_before_base",
+]
+mut_seg_boundary_off_by_one = [
+  "beyond-execd-ring/mut_seg_boundary_off_by_one",
+]
+mut_evict_one_extra = [
+  "beyond-execd-ring/mut_evict_one_extra",
+]
+mut_bits_shifted = [
+  "beyond-execd-ring/mut_bits_shifted",
+]
+mut_ranges_unbounded = [
+  "beyond-execd-ring/mut_ranges_unbounded",
+]
+mut_flush_fail_base = [
+  "beyond-execd-ring/mut_flush_fail_base",
+]
 
 [dependencies]
 base64.workspace = true
@@ -67,6 +87,8 @@ base64.workspace = true
 beyond-exec-notify = { path = "../exec-notify", version = "0.1.0" }
 # The job table's decisions (`execd::job_kernel`), written inside `verus!` and proven there.
 beyond-execd-jobs = { path = "../execd-jobs", version = "0.1.0" }
+# The job output ring's decisions (`execd::ring`), written inside `verus!` and proven there.
+beyond-execd-ring = { path = "../execd-ring", version = "0.1.0" }
 bytes.workspace = true
 # The jitter draw for a retry's wait (one u32 per failed attempt).
 getrandom = { version = "0.3", features = ["std"] }
