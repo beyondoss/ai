@@ -38,6 +38,7 @@ mod jobs;
 pub mod log;
 mod notify;
 mod proc;
+mod ring;
 mod runas;
 mod spool;
 
@@ -55,7 +56,7 @@ pub mod __fuzz {
 
     /// Hold the job output ring to a reference buffer over the operations `bytes` describe.
     pub fn ring(bytes: &[u8]) {
-        crate::jobs::fuzz_ring(bytes);
+        crate::ring::fuzz_ring(bytes);
     }
 }
 

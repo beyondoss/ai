@@ -47,6 +47,7 @@ curl localhost:8080/v1/chat/completions \
 | [`crates/exec-notify`](crates/exec-notify) | `beyond-exec-notify`  | Exec protocol job-end callback rules as a pure function. No dependencies.               |
 | [`crates/execd`](crates/execd)             | `beyond-execd`        | The exec endpoint for a sandbox: the whole exec protocol in one static binary.          |
 | [`crates/execd-jobs`](crates/execd-jobs)   | `beyond-execd-jobs`   | execd's job-table decisions as pure functions, proven in Verus.                         |
+| [`crates/execd-ring`](crates/execd-ring)   | `beyond-execd-ring`   | execd's job-output ring decisions (offsets, retention, stderr ranges), proven in Verus. |
 | [`crates/sandbox-mcp`](crates/sandbox-mcp) | `beyond-sandbox-mcp`  | An MCP server that gives any agent exec, files, search and jobs in a sandbox.           |
 | `crates/demo`                              | `beyond-demo`         | Sandbox exec endpoint, key and grant minters, chat client for `deploy/demo`.            |
 | `crates/fleet-sim`                         | `beyond-fleet-sim`    | Runs a replica set against a shared filesystem and checks the fleet design's claims.    |
