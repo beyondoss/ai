@@ -191,6 +191,8 @@ before. The two locks stay as they were, and the kernel follows them:
 | `Remove`                             | out of the table only with its group observed empty, or, for `remove`, once ended                                  |
 | `Disconnect`                         | a held job nobody kept, still running, dies with its client's connection; a kept one never does                    |
 
+A stream is bound to the job it attached to (`bound`): after that job is removed it is gone to the stream, and a later job of the same id is never followed or killed by it (the model found the by-key lookup that did, J9).
+
 There is no cap and no expiry here (see Bounds): an ended job is freed only by `remove`, `kill` with `remove` or `wipe`.
 
 `tests/job_model.rs` is a Stateright model that calls these functions, never a copy: two scopes with the same ids, up to three
