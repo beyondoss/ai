@@ -21,7 +21,7 @@ use std::hash::BuildHasherDefault;
 /// Same `FxHasher` choice, and the same justification, as [`crate::deny`]: the key is a `tenant_id`
 /// that only ever arrives from `keyring.verify()`, so it is unforgeable and un-enumerable by an
 /// attacker and SipHash's collision resistance buys nothing on a lookup that runs on every managed
-/// request. See `deny.rs`'s `DenyHasher` for the measured numbers and the conditions under which
+/// request. See `id_map.rs`'s `FIB` for the measured numbers and the conditions under which
 /// this choice would have to be revisited.
 type CaptureHasher = BuildHasherDefault<rustc_hash::FxHasher>;
 

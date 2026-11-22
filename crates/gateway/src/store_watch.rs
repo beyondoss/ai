@@ -49,7 +49,8 @@
 
 use crate::allowance::{self, AllowanceSet};
 use crate::capture::{self, CaptureSet};
-use crate::deny::{self, DenySet};
+use crate::deny::{self, DenyReason, DenySet, DenyTarget};
+use crate::id_map::Full;
 use crate::live_keys::{self, LiveKeys};
 use crate::state::GatewayState;
 use arc_swap::ArcSwap;
@@ -57,6 +58,7 @@ use async_trait::async_trait;
 use pingora_core::server::ShutdownWatch;
 use pingora_core::services::background::BackgroundService;
 use prometheus::{IntCounter, IntGauge};
+use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -70,8 +72,9 @@ use tokio::time::Instant;
 use tracing::{error, info, warn};
 
 /// A set watched from the store (deny, allowance, capture): read lock-free by the request path,
-/// and replaced only by its watcher in this module, the one writer the set has. The `ArcSwap` is
-/// private to this module, so no other code can publish a set.
+/// and changed only by its watcher in this module, the one writer the set has. The `ArcSwap` is
+/// private to this module, so no other code can publish a set. A seed or rescan replaces the whole
+/// set atomically through it; the large sets then take batches in place (see [`apply_batch`]).
 pub struct Watched<T>(ArcSwap<T>);
 
 impl<T> Watched<T> {
@@ -83,6 +86,44 @@ impl<T> Watched<T> {
     /// The set as last published.
     pub fn load(&self) -> arc_swap::Guard<Arc<T>> {
         self.0.load()
+    }
+
+    /// Apply a batch to the published set **in place**, returning its new length. If the set has no
+    /// room for it ([`Full`]), publish `grow(current)` with the batch applied instead: one O(set)
+    /// copy, taken only when the set has outgrown its table. Re-applying the batch to the copy is
+    /// safe because a batch is idempotent (last delta per id), and readers on the old set never see a
+    /// state with a deny missing (inserts land before removals).
+    fn apply_growing(
+        &self,
+        apply: impl Fn(&T) -> Result<(), Full>,
+        grow: impl Fn(&T) -> T,
+        len: impl Fn(&T) -> usize,
+    ) -> usize {
+        let cur = self.0.load();
+        if apply(&cur).is_ok() {
+            return len(&cur);
+        }
+        let mut next = grow(&cur);
+        while apply(&next).is_err() {
+            next = grow(&next);
+        }
+        let n = len(&next);
+        self.0.store(Arc::new(next));
+        n
+    }
+
+    /// Publish `f(current)` atomically (clone-on-write), returning the new set's length. O(set):
+    /// only for sets that stay small.
+    fn replace_with(&self, f: impl Fn(&T) -> T, len: impl Fn(&T) -> usize) -> usize {
+        // `rcu` re-runs on contention and the run that wins is the last, so the length is the one
+        // actually published. (`rcu` returns the *previous* value.)
+        let mut count = 0usize;
+        self.0.rcu(|cur| {
+            let set = f(cur);
+            count = len(&set);
+            Arc::new(set)
+        });
+        count
     }
 }
 
@@ -147,9 +188,11 @@ pub trait WatchedSet: Send + Sync + 'static {
         entries: impl Iterator<Item = &'a KvEntry>,
     ) -> Self::Set;
 
-    /// Fold a batch of watched deltas into a new set. See [`apply_batch`] for why this is per-batch
-    /// rather than per-delta.
-    fn apply_batch(state: &GatewayState, cur: &Self::Set, updates: &[KvUpdate]) -> Self::Set;
+    /// Fold a batch of watched deltas into the published set and return its new cardinality. Per
+    /// batch rather than per delta: see [`apply_batch`]. A set that can grow large (deny, allowance)
+    /// is updated **in place**, O(batch); a small one (capture, signing keys) is cloned, changed and
+    /// swapped with [`Watched::replace_with`], which is O(set) and fine at its size.
+    fn apply_batch(state: &GatewayState, slot: &Watched<Self::Set>, updates: &[KvUpdate]) -> usize;
 
     /// Cardinality, for the size gauge and the seed log line.
     fn len(set: &Self::Set) -> usize;
@@ -211,8 +254,12 @@ impl WatchedSet for Deny {
         denyset_from_entries(entries)
     }
 
-    fn apply_batch(_state: &GatewayState, cur: &DenySet, updates: &[KvUpdate]) -> DenySet {
-        apply_batch(cur, updates)
+    fn apply_batch(_state: &GatewayState, slot: &Watched<DenySet>, updates: &[KvUpdate]) -> usize {
+        slot.apply_growing(
+            |set| apply_batch(set, updates),
+            |set| set.grown(updates.len()),
+            DenySet::len,
+        )
     }
 
     fn len(set: &DenySet) -> usize {
@@ -262,26 +309,15 @@ impl WatchedSet for Capture {
             .collect()
     }
 
-    fn apply_batch(state: &GatewayState, cur: &CaptureSet, updates: &[KvUpdate]) -> CaptureSet {
-        let defaults = state.capture_defaults;
-        let mut set = cur.clone();
-        for update in updates {
-            match update {
-                KvUpdate::Put(e) => {
-                    if let Some(t) = capture::parse_key(&e.key) {
-                        set.insert(t, capture::parse_rule(&e.value, defaults));
-                    }
-                }
-                // Delete/Purge = capture off (explicit delete, or the TTL on a time-boxed
-                // "capture tenant 42 for an hour" entry expiring).
-                KvUpdate::Delete { key, .. } | KvUpdate::Purge { key, .. } => {
-                    if let Some(t) = capture::parse_key(key) {
-                        set.remove(t);
-                    }
-                }
-            }
-        }
-        set
+    fn apply_batch(
+        state: &GatewayState,
+        slot: &Watched<CaptureSet>,
+        updates: &[KvUpdate],
+    ) -> usize {
+        slot.replace_with(
+            |cur| apply_capture_batch(state, cur, updates),
+            CaptureSet::len,
+        )
     }
 
     fn len(set: &CaptureSet) -> usize {
@@ -312,6 +348,29 @@ impl WatchedSet for Capture {
     }
 }
 
+/// Apply a batch of watched deltas to the capture-set (clone-on-write: the set is small).
+fn apply_capture_batch(state: &GatewayState, cur: &CaptureSet, updates: &[KvUpdate]) -> CaptureSet {
+    let defaults = state.capture_defaults;
+    let mut set = cur.clone();
+    for update in updates {
+        match update {
+            KvUpdate::Put(e) => {
+                if let Some(t) = capture::parse_key(&e.key) {
+                    set.insert(t, capture::parse_rule(&e.value, defaults));
+                }
+            }
+            // Delete/Purge = capture off (explicit delete, or the TTL on a time-boxed
+            // "capture tenant 42 for an hour" entry expiring).
+            KvUpdate::Delete { key, .. } | KvUpdate::Purge { key, .. } => {
+                if let Some(t) = capture::parse_key(key) {
+                    set.remove(t);
+                }
+            }
+        }
+    }
+    set
+}
+
 /// The allowance-set: exhausted tenants/keys under `allowance.{tenant}` and `allowance.key.{id}`.
 ///
 /// Fail-closed until [`AllowanceSet::from_ready`] via a scan or snapshot. An empty scan is still a
@@ -334,10 +393,14 @@ impl WatchedSet for Allowance {
 
     fn apply_batch(
         _state: &GatewayState,
-        cur: &AllowanceSet,
+        slot: &Watched<AllowanceSet>,
         updates: &[KvUpdate],
-    ) -> AllowanceSet {
-        apply_allowance_batch(cur, updates)
+    ) -> usize {
+        slot.apply_growing(
+            |set| apply_allowance_batch(set, updates),
+            |set| set.grown(updates.len()),
+            AllowanceSet::len,
+        )
     }
 
     fn len(set: &AllowanceSet) -> usize {
@@ -391,8 +454,8 @@ impl WatchedSet for SigningKeys {
         livekeys_from_entries(entries)
     }
 
-    fn apply_batch(_state: &GatewayState, cur: &LiveKeys, updates: &[KvUpdate]) -> LiveKeys {
-        apply_signing_keys_batch(cur, updates)
+    fn apply_batch(_state: &GatewayState, slot: &Watched<LiveKeys>, updates: &[KvUpdate]) -> usize {
+        slot.replace_with(|cur| apply_signing_keys_batch(cur, updates), LiveKeys::len)
     }
 
     fn len(set: &LiveKeys) -> usize {
@@ -632,77 +695,107 @@ fn baseline_revision(entries: &[KvEntry]) -> u64 {
         .unwrap_or(0)
 }
 
-/// Apply a batch of watched deltas to `cur`, returning the set to publish.
+/// Apply a batch of watched deltas to the published deny-set **in place**.
 ///
-/// **One clone of the map per batch, not per delta.** The deny-set lives behind an `ArcSwap` and is
-/// updated by `rcu`, i.e. clone-on-write: every call here copies the whole O(N) map, so folding a
-/// K-delta burst into a single call turns O(K·N) into O(N + K). A single delta — the steady state —
-/// is exactly what it always was: one clone.
+/// The set is mutated through `&self` by the one watch loop while the request path reads it
+/// lock-free (see [`crate::id_map::IdMap`]), so a batch costs O(batch) and allocates nothing: no
+/// copy of the set, no transient second one. (It used to clone the whole map into a new `Arc` and
+/// `rcu` it in, so one revocation in a 500M-entry set was an O(N) copy at 2x memory.)
+/// Only the seed/rescan replaces the whole set, atomically, through [`Watched`].
 ///
-/// `pub` because `benches/unit.rs` measures this seam (batched vs one-at-a-time).
-pub fn apply_batch(cur: &DenySet, updates: &[KvUpdate]) -> DenySet {
-    let mut set = cur.clone();
+/// What a reader can see. Each id is one atomic slot, so a lookup returns a state that id really had.
+/// A reader may land mid-batch, so a batch is not atomic as a whole; that cannot turn a deny into an
+/// allow, for two reasons:
+/// - The batch is first reduced to its **last** delta per target (so a Put then Delete of one id
+///   applies as the Delete alone, exactly what in-order application ends with), then every insert is
+///   applied **before** every removal. No intermediate state is missing a deny that both the
+///   before- and after-state have.
+/// - `reason_for` reads the tenant map, then the key map. The one interleaving that could allow a
+///   request every whole-batch state denies is a single batch that both removes a deny from one map
+///   and adds the replacing deny in the other (e.g. lifts a key hold while holding the tenant), and
+///   the reader straddling both writes. Inserts first narrows that to a reader preempted between
+///   its two lookups across the whole batch; a request concurrent with the delta that lifts a hold
+///   was never ordered against it.
+///
+/// `pub` because `benches/unit.rs` measures this seam.
+pub fn apply_batch(set: &DenySet, updates: &[KvUpdate]) -> Result<(), Full> {
+    let mut last: HashMap<DenyTarget, Option<DenyReason>> = HashMap::new();
     for update in updates {
         match update {
             KvUpdate::Put(e) => {
                 if let Some(t) = deny::parse_key(&e.key) {
-                    set.insert_target(t, deny::parse_reason(&e.value));
+                    last.insert(t, Some(deny::parse_reason(&e.value)));
                 }
             }
             // Delete/Purge = restore (explicit delete or TTL expiry).
             KvUpdate::Delete { key, .. } | KvUpdate::Purge { key, .. } => {
                 if let Some(t) = deny::parse_key(key) {
-                    set.remove_target(t);
+                    last.insert(t, None);
                 }
             }
         }
     }
-    set
+    for (t, r) in &last {
+        if let Some(r) = r {
+            set.insert_target(*t, *r)?;
+        }
+    }
+    for (t, r) in &last {
+        if r.is_none() {
+            set.remove_target(*t);
+        }
+    }
+    Ok(())
 }
 
 /// Build a `DenySet` from KV entries, dropping any whose key isn't a `blackhole.{tenant}`
 /// or `blackhole.key.{id}`. Both shapes share the `blackhole.` watch prefix — one watcher.
 fn denyset_from_entries<'a>(entries: impl Iterator<Item = &'a KvEntry>) -> DenySet {
-    let mut set = DenySet::new();
-    for e in entries {
-        if let Some(target) = deny::parse_key(&e.key) {
-            set.insert_target(target, deny::parse_reason(&e.value));
-        }
-    }
-    set
+    let targets: Vec<_> = entries
+        .filter_map(|e| Some((deny::parse_key(&e.key)?, deny::parse_reason(&e.value))))
+        .collect();
+    DenySet::from_targets(&targets)
 }
 
-/// Apply a batch of watched deltas to the allowance-set. Presence = exhausted; the value is ignored.
-fn apply_allowance_batch(cur: &AllowanceSet, updates: &[KvUpdate]) -> AllowanceSet {
-    let mut set = cur.clone();
+/// Apply a batch of watched deltas to the published allowance-set in place (see [`apply_batch`]).
+/// Presence = exhausted; the value is ignored. Inserts then removals, last delta per target.
+fn apply_allowance_batch(set: &AllowanceSet, updates: &[KvUpdate]) -> Result<(), Full> {
     set.mark_ready();
+    let mut last: HashMap<allowance::AllowanceTarget, bool> = HashMap::new();
     for update in updates {
         match update {
             KvUpdate::Put(e) => {
                 if let Some(t) = allowance::parse_key(&e.key) {
-                    set.insert_target(t);
+                    last.insert(t, true);
                 }
             }
             KvUpdate::Delete { key, .. } | KvUpdate::Purge { key, .. } => {
                 if let Some(t) = allowance::parse_key(key) {
-                    set.remove_target(t);
+                    last.insert(t, false);
                 }
             }
         }
     }
-    set
+    for (t, present) in &last {
+        if *present {
+            set.insert_target(*t)?;
+        }
+    }
+    for (t, present) in &last {
+        if !*present {
+            set.remove_target(*t);
+        }
+    }
+    Ok(())
 }
 
 /// Build an [`AllowanceSet`] from KV entries, dropping any whose key isn't `allowance.{tenant}`
 /// or `allowance.key.{id}`. A successful call — including zero entries — is remaining-ok.
 fn allowanceset_from_entries<'a>(entries: impl Iterator<Item = &'a KvEntry>) -> AllowanceSet {
-    let mut set = AllowanceSet::from_ready();
-    for e in entries {
-        if let Some(target) = allowance::parse_key(&e.key) {
-            set.insert_target(target);
-        }
-    }
-    set
+    let targets: Vec<_> = entries
+        .filter_map(|e| allowance::parse_key(&e.key))
+        .collect();
+    AllowanceSet::from_targets(&targets)
 }
 
 /// Apply a batch of watched deltas to the live signing keys. A `Put` trusts the key (a bad value or a
@@ -927,14 +1020,13 @@ async fn watch_set<W: WatchedSet>(
             .await
     });
 
-    // Deltas are applied in **batches**. `rcu` is clone-on-write over the whole map, so applying a
-    // K-delta burst one at a time is O(K·N) copies of an O(N) set — and bursts are the realistic
-    // shape here (a control-plane sweep blackholes a batch of tenants at once, and a reconnect
-    // replays everything published while we were away). `recv_many` takes whatever is already queued
-    // — bounded by the channel's own capacity, so it can't be starved by a fast producer — and the
-    // batch lands under one clone, one metric write, and one snapshot checkpoint. The steady state
-    // is unchanged: `recv_many` returns as soon as a single update is available, so one delta is
-    // still one clone with no added latency.
+    // Deltas are applied in **batches**: bursts are the realistic shape here (a control-plane sweep
+    // blackholes a batch of tenants at once, and a reconnect replays everything published while we
+    // were away). `recv_many` takes whatever is already queued — bounded by the channel's own
+    // capacity, so it can't be starved by a fast producer — and the batch lands as one apply, one
+    // metric write, and one snapshot checkpoint (the small sets are cloned once per batch, not per
+    // delta). The steady state is unchanged: `recv_many` returns as soon as a single update is
+    // available, so one delta is still one apply with no added latency.
     //
     // We `select!` on shutdown so a quiet stream (no deltas arriving) doesn't pin the task open
     // through teardown; `select!` can only switch at an await point — between batches — so we never
@@ -967,16 +1059,7 @@ async fn watch_set<W: WatchedSet>(
         if received == 0 {
             break;
         }
-        // Capture the new cardinality from inside the closure rather than re-loading the `ArcSwap`
-        // afterwards: `rcu` returns the *previous* value, and taking a second guard just to count
-        // what we already hold is wasted work. The closure re-runs on contention, and the run that
-        // wins is the last one, so this ends up holding the length actually published.
-        let mut count = 0usize;
-        W::slot(state).0.rcu(|cur| {
-            let set = W::apply_batch(state, cur, &batch);
-            count = W::len(&set);
-            Arc::new(set)
-        });
+        let count = W::apply_batch(state, W::slot(state), &batch);
         W::record_size(state, count);
         // The batch's resume point is its newest delta — that's what the checkpoint below records,
         // and what a reconnect resumes strictly after.
@@ -1506,13 +1589,15 @@ mod tests {
             &[KvUpdate::Put(entry("signing_key.10", &pubkey_b64(11)))],
         );
 
-        let mut deny = apply_batch(
-            &DenySet::new(),
+        let deny = DenySet::new();
+        apply_batch(
+            &deny,
             &[
                 KvUpdate::Put(entry("blackhole.kid.9", b"fraud")),
                 KvUpdate::Put(entry("blackhole.kid.10", b"fraud")),
             ],
-        );
+        )
+        .unwrap();
         assert_eq!(
             cfg.verify_with(&cfg_token, &live, &deny, || Some(0)),
             Err(KeyError::Distrusted(9))
@@ -1522,7 +1607,7 @@ mod tests {
             Err(KeyError::Distrusted(10))
         );
 
-        deny = apply_batch(&deny, &[del("blackhole.kid.9"), del("blackhole.kid.10")]);
+        apply_batch(&deny, &[del("blackhole.kid.9"), del("blackhole.kid.10")]).unwrap();
         assert!(
             cfg.verify_with(&cfg_token, &live, &deny, || Some(0))
                 .is_ok()
@@ -1589,7 +1674,8 @@ mod tests {
                 version: VersionToken::from_u64(3),
             },
         ];
-        let batched = apply_allowance_batch(&cur, &updates);
+        apply_allowance_batch(&cur, &updates).unwrap();
+        let batched = cur;
         assert!(batched.is_ready());
         assert_eq!(batched.reason_for(1, None), None);
         assert_eq!(
@@ -1643,7 +1729,7 @@ mod tests {
     #[test]
     fn apply_batch_matches_one_at_a_time() {
         // Batching is a performance change only: a batch must land exactly the set that applying
-        // its deltas one `rcu` at a time would have. Ordering inside the batch is what makes this
+        // its deltas one at a time would have. Ordering inside the batch is what makes this
         // non-trivial — a Put followed by a Delete of the same tenant must end deleted, and the
         // reverse must end denied.
         let updates = vec![
@@ -1667,10 +1753,11 @@ mod tests {
             KvUpdate::Put(entry("blackhole.key.500", b"spend")),
         ];
 
-        let batched = apply_batch(&DenySet::new(), &updates);
-        let mut sequential = DenySet::new();
+        let batched = DenySet::new();
+        apply_batch(&batched, &updates).unwrap();
+        let sequential = DenySet::new();
         for u in &updates {
-            sequential = apply_batch(&sequential, std::slice::from_ref(u));
+            apply_batch(&sequential, std::slice::from_ref(u)).unwrap();
         }
 
         assert_eq!(batched.len(), sequential.len());
@@ -1681,6 +1768,124 @@ mod tests {
         assert!(!batched.is_denied(2)); // deleted
         assert!(!batched.is_denied(9)); // purge of an absent tenant
         assert!(!batched.is_denied(0)); // `signkey.1` never became tenant 0
+    }
+
+    fn test_state() -> Arc<GatewayState> {
+        GatewayState::new(
+            crate::config::AiConfig::default().validate().unwrap(),
+            crate::state::test_metrics(),
+        )
+        .unwrap()
+    }
+
+    /// A batch must not copy the set: it changes the one allocation readers already hold. A guard
+    /// taken **before** the batch sees it (clone-and-swap would leave that guard on the old set), and
+    /// the published `Arc` is the same one after. Holds for both sets that can grow large.
+    #[test]
+    fn a_batch_updates_the_published_set_in_place_without_copying_it() {
+        let state = test_state();
+
+        let before = state.deny.load();
+        let published = Arc::as_ptr(&before);
+        assert_eq!(
+            Deny::apply_batch(
+                &state,
+                &state.deny,
+                &[KvUpdate::Put(entry("blackhole.7", b"fraud"))]
+            ),
+            1
+        );
+        assert_eq!(
+            before.reason(7),
+            Some(DenyReason::Fraud),
+            "old guard sees it"
+        );
+        assert_eq!(Arc::as_ptr(&state.deny.load()), published, "no new set");
+
+        let before = state.allowance.load();
+        let published = Arc::as_ptr(&before);
+        Allowance::apply_batch(
+            &state,
+            &state.allowance,
+            &[KvUpdate::Put(entry("allowance.7", b"1"))],
+        );
+        assert!(before.reason_for(7, None).is_some(), "old guard sees it");
+        assert_eq!(Arc::as_ptr(&state.allowance.load()), published);
+        assert!(before.is_ready());
+    }
+
+    /// The one case that does copy: a batch the table has no room for publishes a bigger copy of the
+    /// whole set with every entry (and the batch) in it, and the next batch is in place again.
+    #[test]
+    fn a_set_that_outgrows_its_table_is_republished_once_with_everything_in_it() {
+        let state = test_state();
+        let puts = |lo: u64, hi: u64| -> Vec<KvUpdate> {
+            (lo..hi)
+                .map(|t| KvUpdate::Put(entry(&format!("blackhole.{t}"), b"spend")))
+                .collect()
+        };
+        Deny::apply_batch(&state, &state.deny, &puts(1, 4));
+        let small = state.deny.load();
+        let n = Deny::apply_batch(&state, &state.deny, &puts(4, 250));
+        assert_eq!(n, 249);
+        let big = state.deny.load();
+        assert!(!Arc::ptr_eq(&small, &big), "the full table was replaced");
+        assert!(
+            (1..250).all(|t| big.is_denied(t)),
+            "nothing lost in the copy"
+        );
+        assert!(!big.is_denied(250));
+
+        Deny::apply_batch(&state, &state.deny, &puts(250, 251));
+        assert!(Arc::ptr_eq(&big, &state.deny.load()), "room left: in place");
+        assert!(big.is_denied(250));
+    }
+
+    /// Applied in place, a batch is visible to readers part-way. The decision a reader gets must
+    /// still be one the whole batch allows: a Put then Delete of one id lands as the Delete, a
+    /// Delete then Put as the Put, and a batch that moves a hold from the key to the tenant never
+    /// shows a state with neither.
+    #[test]
+    fn batch_order_inside_a_batch_is_last_delta_wins_and_never_opens_a_gap() {
+        let set = DenySet::new();
+        apply_batch(
+            &set,
+            &[
+                KvUpdate::Put(entry("blackhole.key.5", b"spend")),
+                KvUpdate::Put(entry("blackhole.1", b"spend")),
+                KvUpdate::Delete {
+                    key: "blackhole.1".to_string(),
+                    version: VersionToken::from_u64(2),
+                },
+                KvUpdate::Delete {
+                    key: "blackhole.2".to_string(),
+                    version: VersionToken::from_u64(3),
+                },
+                KvUpdate::Put(entry("blackhole.2", b"fraud")),
+            ],
+        )
+        .unwrap();
+        assert!(!set.is_denied(1), "put then delete ends deleted");
+        assert_eq!(
+            set.reason(2),
+            Some(DenyReason::Fraud),
+            "delete then put ends denied"
+        );
+
+        // Move the hold from key 5 to tenant 9: the tenant is denied before the key is released.
+        apply_batch(
+            &set,
+            &[
+                KvUpdate::Delete {
+                    key: "blackhole.key.5".to_string(),
+                    version: VersionToken::from_u64(4),
+                },
+                KvUpdate::Put(entry("blackhole.9", b"fraud")),
+            ],
+        )
+        .unwrap();
+        assert_eq!(set.reason_for(9, Some(5)), Some(DenyReason::Fraud));
+        assert_eq!(set.reason_for(3, Some(5)), None);
     }
 
     #[test]
@@ -1858,14 +2063,6 @@ mod tests {
         let snap = store::snapshot::load(&path).unwrap().unwrap();
         assert_eq!(keys(&snap), ["allowance.1", "allowance.2"]);
         assert_eq!(snap.cursor.as_u64(), Some(4));
-    }
-
-    fn test_state() -> Arc<GatewayState> {
-        GatewayState::new(
-            crate::config::AiConfig::default().validate().unwrap(),
-            crate::state::test_metrics(),
-        )
-        .unwrap()
     }
 
     fn fault(sink: &SnapshotSink, on: bool) {

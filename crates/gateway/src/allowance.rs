@@ -10,17 +10,15 @@
 //! `allowance.key.{id}` exhausts one `bai_v2` credential. A request is blocked if **either**
 //! matches. v1 tokens have no `key_id`, so only the tenant grain can exhaust them.
 //!
-//! The hasher is the same FxHasher as the deny-set, for the same reason: ids only reach this map
-//! after Ed25519 verify, so SipHash buys nothing on a lookup that runs on every managed request.
+//! Both memberships are [`IdMap`]s, mutated in place by the one watch loop and read lock-free (same
+//! table, same hash and the same reason as the deny-set).
 
-use std::collections::HashSet;
-use std::hash::BuildHasherDefault;
-
-type AllowanceHasher = BuildHasherDefault<rustc_hash::FxHasher>;
+use crate::id_map::{Full, IdMap};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Who an `allowance.*` entry names. Parsed from the KV key; the value is ignored (presence =
 /// exhausted).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AllowanceTarget {
     Tenant(u64),
     Key(u64),
@@ -40,21 +38,11 @@ pub enum AllowanceReject {
 /// `ready == false` is the cold-boot default: we have not yet stored a scan or snapshot, so we
 /// cannot tell remaining-ok from "the store is unread". `from_entries` (even an empty scan)
 /// flips it to `true`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Default)]
 pub struct AllowanceSet {
-    ready: bool,
-    tenants: HashSet<u64, AllowanceHasher>,
-    keys: HashSet<u64, AllowanceHasher>,
-}
-
-impl Default for AllowanceSet {
-    fn default() -> Self {
-        Self {
-            ready: false,
-            tenants: HashSet::with_hasher(AllowanceHasher::default()),
-            keys: HashSet::with_hasher(AllowanceHasher::default()),
-        }
-    }
+    ready: AtomicBool,
+    tenants: IdMap,
+    keys: IdMap,
 }
 
 impl AllowanceSet {
@@ -65,54 +53,72 @@ impl AllowanceSet {
     /// Seed constructor: a successful scan or snapshot, including an empty one.
     pub fn from_ready() -> Self {
         Self {
-            ready: true,
-            tenants: HashSet::with_hasher(AllowanceHasher::default()),
-            keys: HashSet::with_hasher(AllowanceHasher::default()),
+            ready: AtomicBool::new(true),
+            ..Self::default()
+        }
+    }
+
+    /// The seed constructor: ready, holding `targets`, each map sized for its entries.
+    pub fn from_targets(targets: &[AllowanceTarget]) -> Self {
+        let (mut tenants, mut keys) = (Vec::new(), Vec::new());
+        for t in targets {
+            match *t {
+                AllowanceTarget::Tenant(t) => tenants.push((t, 1)),
+                AllowanceTarget::Key(k) => keys.push((k, 1)),
+            }
+        }
+        Self {
+            ready: AtomicBool::new(true),
+            tenants: IdMap::from_pairs(&tenants),
+            keys: IdMap::from_pairs(&keys),
+        }
+    }
+
+    /// A copy with room for `extra` more of each kind, published by the watch loop in place of
+    /// `self` when an in-place insert reports [`Full`].
+    pub fn grown(&self, extra: usize) -> Self {
+        Self {
+            ready: AtomicBool::new(self.is_ready()),
+            tenants: self.tenants.grown(extra),
+            keys: self.keys.grown(extra),
         }
     }
 
     pub fn is_ready(&self) -> bool {
-        self.ready
+        self.ready.load(Ordering::Acquire)
     }
 
     /// A successful store read. Empty membership after this is remaining-ok, not unready.
-    pub fn mark_ready(&mut self) {
-        self.ready = true;
+    pub fn mark_ready(&self) {
+        self.ready.store(true, Ordering::Release);
     }
 
     /// Remaining-ok if ready and neither id is a member. Unready → [`AllowanceReject::Unavailable`].
     pub fn reason_for(&self, tenant_id: u64, key_id: Option<u64>) -> Option<AllowanceReject> {
-        if !self.ready {
+        if !self.is_ready() {
             return Some(AllowanceReject::Unavailable);
         }
-        if key_id.is_some_and(|id| self.keys.contains(&id)) {
+        if key_id.is_some_and(|id| self.keys.contains(id)) {
             return Some(AllowanceReject::Exhausted);
         }
-        if self.tenants.contains(&tenant_id) {
+        if self.tenants.contains(tenant_id) {
             return Some(AllowanceReject::Exhausted);
         }
         None
     }
 
-    pub fn insert_target(&mut self, target: AllowanceTarget) {
+    /// In place; `Err(Full)` leaves the set unchanged: grow it (see `IdMap`).
+    pub fn insert_target(&self, target: AllowanceTarget) -> Result<(), Full> {
         match target {
-            AllowanceTarget::Tenant(t) => {
-                self.tenants.insert(t);
-            }
-            AllowanceTarget::Key(k) => {
-                self.keys.insert(k);
-            }
+            AllowanceTarget::Tenant(t) => self.tenants.insert(t, 1),
+            AllowanceTarget::Key(k) => self.keys.insert(k, 1),
         }
     }
 
-    pub fn remove_target(&mut self, target: AllowanceTarget) {
+    pub fn remove_target(&self, target: AllowanceTarget) {
         match target {
-            AllowanceTarget::Tenant(t) => {
-                self.tenants.remove(&t);
-            }
-            AllowanceTarget::Key(k) => {
-                self.keys.remove(&k);
-            }
+            AllowanceTarget::Tenant(t) => self.tenants.remove(t),
+            AllowanceTarget::Key(k) => self.keys.remove(k),
         }
     }
 
@@ -166,8 +172,8 @@ mod tests {
 
     #[test]
     fn key_or_tenant_exhaust() {
-        let mut set = AllowanceSet::from_ready();
-        set.insert_target(AllowanceTarget::Key(100));
+        let set = AllowanceSet::from_ready();
+        set.insert_target(AllowanceTarget::Key(100)).unwrap();
         // Same tenant, two credentials: only the named key is cut off.
         assert_eq!(
             set.reason_for(1, Some(100)),
@@ -175,7 +181,7 @@ mod tests {
         );
         assert_eq!(set.reason_for(1, Some(101)), None);
         assert_eq!(set.reason_for(1, None), None); // v1: no key_id, tenant not exhausted
-        set.insert_target(AllowanceTarget::Tenant(1));
+        set.insert_target(AllowanceTarget::Tenant(1)).unwrap();
         // Tenant exhaust kills every key for that tenant, including one already key-exhausted.
         assert_eq!(
             set.reason_for(1, Some(100)),

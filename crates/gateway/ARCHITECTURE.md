@@ -227,8 +227,8 @@ Client (stock OpenAI/Anthropic SDK)
 
 Three sparse per-tenant sets, watched independently. The seed → watch → batch-apply → reconnect loop
 is written **once**, over the `WatchedSet` trait, and instantiated per set — that loop carries the
-non-obvious correctness properties (revision-0 resume trap, scan→subscribe race, batched `rcu`,
-backoff crediting), and a second copy would be a standing invitation for the sets to drift.
+non-obvious correctness properties (revision-0 resume trap, scan→subscribe race, batched
+apply, backoff crediting), and a second copy would be a standing invitation for the sets to drift.
 
 ```
 NATS (blackhole.*)     NATS (allowance.*)      NATS (aicapture.*)
@@ -237,10 +237,21 @@ NATS (blackhole.*)     NATS (allowance.*)      NATS (aicapture.*)
   │                      │  WatcherService<Capture>
   │  seed snapshot/scan  │  seed snapshot/scan    │  scan only
   │                      │  (empty scan = ready)  │
-  ▼  ArcSwap<DenySet>    ▼  ArcSwap<AllowanceSet> ▼  ArcSwap<CaptureSet>
+  ▼  Watched<DenySet>    ▼  Watched<AllowanceSet> ▼  Watched<CaptureSet>
      fail-open                fail-closed until        fail-open (off)
                               first successful read
 ```
+
+**A batch updates a large set in place, not by copy.** `Watched<T>` is an `ArcSwap<T>`; a seed or
+rescan builds a whole new set and replaces it atomically. A batch of deltas does not: the deny and
+allowance sets (which can hold hundreds of millions of ids) are `IdMap`s the watch loop mutates
+through `&self` while requests read them, so an update is O(batch) with no copy and no transient
+second set. (It used to `rcu` a clone of the whole map: one revocation in a 500M-entry set was an
+O(N) copy at 2x memory.) The capture set and the live signing keys stay small and are still cloned
+and swapped per batch. A batch is reduced to its last delta per id and applied inserts-first, so a
+reader that lands mid-batch never sees a deny missing that both the before and after sets have.
+The one copy left: when a set outgrows its table (`IdMap` reports `Full`, after it has grown by
+about half since its seed), `Watched::apply_growing` publishes a bigger copy with the batch applied.
 
 **The cursor never runs ahead of its data.** `SnapshotSink::persist` appends a batch's deltas and
 then checkpoints once. If any append, the checkpoint or a compaction fails, the cursor is not
@@ -2500,14 +2511,22 @@ customer is charged what it cost: `cost_micros` and `price_micros` are both 0, `
 
 ### Deny-Set (`deny.rs`)
 
-Two `HashMap<u64, DenyReason>`s — tenants (`blackhole.{tenant}`) and credentials
-(`blackhole.key.{id}`). Only denied ids are stored: `O(denied)` memory, not `O(tenants)`. A
+Two `IdMap`s (`id_map.rs`: `u64` to a one-byte reason) — tenants (`blackhole.{tenant}`) and
+credentials (`blackhole.key.{id}`). Only denied ids are stored: `O(denied)` memory, not `O(tenants)`. A
 request is denied if the tenant is in the set **or** (v2) its `key_id` is. Tenant deny wins when
 both match and kills every key for that tenant. v1 tokens have no `key_id`, so only the tenant
 map can deny them. Both key shapes live under the `blackhole.` prefix; one `WatchedSet` watcher
 applies both. Published through a `store_watch::Watched` (an `ArcSwap` only `store_watch` can
 write; the deny, allowance and capture sets each sit behind one), so reads on the hot path are
-lock-free and nothing but the watcher can replace a set.
+lock-free and nothing but the watcher can change a set.
+
+`IdMap` is a fixed-size open-addressing table of three flat atomic arrays (a one-byte control tag,
+the id, the reason: 10 bytes a slot, at most three-quarters full). A miss — nearly every request —
+reads only the control bytes, so a lookup costs what the `HashMap` it replaced did; a lookup returns
+a state the id really had even while the watcher writes. Measured on the 16-core dev host, random
+ids, 99% misses: 10M entries 52 vs 49 ns p50 (`IdMap` vs `HashMap`), 16.8 vs 29.4 bytes per entry
+(1M: 21.2 vs 44.9). A concurrent-map crate was measured first and lost: `dashmap`/`scc` +30-100% per
+lookup at 10M (a lock or epoch pin per read), `flurry`/`papaya` 40-180 bytes per entry.
 
 Reasons: `Spend` (→ 402), `Fraud` (→ 403), `Unknown` (→ 403, fail-safe for unrecognized values).
 Restore = explicit delete from NATS KV or TTL expiry — no gateway-side timer.
@@ -2540,8 +2559,9 @@ the same timing, a `signing_key.{kid}` entry (a new key is trusted, a deleted on
 
 - **A connected gateway applies it within 2s.** The path has no gateway-side timer: the NATS KV
   watch pushes the delta (a JetStream push consumer, `watch_prefix_from`), `recv_many` takes it as
-  soon as one is queued, and one `rcu` publishes the new set. Every `request_filter` loads the set
-  afresh, so the first request admitted after the publish sees it. The real cost is one NATS
+  soon as one is queued, and the batch is applied to the set in place (one `rcu`-and-swap for the small capture and
+  signing-key sets). Every `request_filter` loads the set afresh, so the first request admitted after
+  the apply sees it. The real cost is one NATS
   delivery: 17–50 ms live (`tenancy_live.rs`). The 2s is the stated bound with that headroom, and
   `a_deny_lands_within_the_bound_and_in_flight_streams_finish` holds it. A delete restores service
   the same way.
@@ -3615,7 +3635,7 @@ to serve.
   permission is as sensitive as the signing key itself.
 - Virtual key format (`bai_v1` 16-byte payload, `bai_v2` 24-byte payload with `key_id`, `bai_v3` 32-byte
   payload with `key_id` and `exp`) and, for v3, that it has not expired (30 s leeway, admission only)
-- Tenant / key not in deny-set (managed traffic only; O(1) HashMap lookup; tenant deny kills every key)
+- Tenant / key not in deny-set (managed traffic only; O(1) `IdMap` lookup; tenant deny kills every key)
 - Tenant / key remaining-ok on the allowance-set (managed only; fail-closed with a 503 until the set has been read; 402 before `upstream_peer` when exhausted)
 - Pool key configured for the requested provider (managed traffic only — else 503). On a catalog
   walk this is per candidate: none keyed → 503, not a request-wide missing openai key.
@@ -4067,6 +4087,7 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | `refusal`                          | `Refusal`: every gateway-made refusal as one closed type (status, type, message, compile-time body, metric label, `Retry-After`), carried through pingora as an error's cause                                                                                                         | unit ✓ + e2e ✓ |
 | `unpriced`                         | Managed-request refusal (400, before the body goes upstream) of features a provider bills outside metered usage (`code_interpreter`, `image_generation`, …) and stored-object references (`file_search`, `file_id`, `prompt`); BYO never checked                                      | unit ✓ + e2e ✓ |
 | `terminal`                         | Whether the bytes sent to a client end with the stream's terminal event (`[DONE]`, `message_stop`, `response.completed`)                                                                                                                                                              | unit ✓ + e2e ✓ |
+| `id_map`                           | Fixed open-addressing id → u8 table the deny and allowance sets update in place (O(batch), no copy); grows by republishing a copy on `Full`                                                                                                                                           | unit ✓         |
 | `deny`                             | Sparse deny-set, default-allow, reason → HTTP status                                                                                                                                                                                                                                  | unit ✓         |
 | `allowance`                        | Sparse remaining-ok / exhausted set; fail-closed until seeded (503); 402 when exhausted                                                                                                                                                                                               | unit ✓ + e2e ✓ |
 | `capture`                          | Sparse capture-set (default-off) + head-bounded `CaptureBufs` and 1-in-N sampling                                                                                                                                                                                                     | unit ✓ + e2e ✓ |

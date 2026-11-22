@@ -33,6 +33,7 @@ pub(crate) mod deny;
 pub mod doctor;
 pub(crate) mod drain;
 pub(crate) mod error;
+pub(crate) mod id_map;
 pub(crate) mod key;
 pub(crate) mod lex;
 pub(crate) mod live_keys;
