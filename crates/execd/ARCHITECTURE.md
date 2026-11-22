@@ -168,6 +168,14 @@ verified, 30 s at most) and feeds back what happened. A job's latest `keep` gove
 and a removed job's timers are dropped with it. The token is held in the job and in the request header, and appears in no log,
 no answer, no argument and no environment; `Debug` for it prints `<redacted>`.
 
+The notifier lives in the job's cell and is tied to the cell, never to its `(scope, id)`: an attempt and a timer hold the cell, and
+the key only names the callback's body, so a later job of the same id is never settled by an old job's answer. When the table lets a
+job go, `Jobs::remove` leaves its notifier as the kernel's removed job (`Notifier::removed`, `exec_notify::Event::Removed`), which
+owes nothing and answers every later event with no action. A `keep` looks its job up by id and takes the job's lock afterwards, so
+it can meet a job that left in between; the removed notifier is what keeps it from calling back about a job that is gone. Before this,
+removal reset the notifier to its default and such a `keep` began a callback for the removed job. The agent's fleet model
+(`crates/agent/tests/notify_model.rs`, properties X1 to X4) runs this table's kernel next to the notifier to hold that seam.
+
 ### The job kernel: `job_kernel`
 
 The job table's decisions are pure functions in `crates/execd-jobs` (re-exported as `execd::job_kernel`, so the model and production call the same code; written inside `verus!` and proven for every J and L below with no bound, see its README): no I/O, no async, no clock (a time arrives in the event),
