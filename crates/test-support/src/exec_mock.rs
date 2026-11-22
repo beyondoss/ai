@@ -1624,8 +1624,8 @@ fn feed(shared: &Shared, j: &mut MockJob, key: &(String, String), event: exec_no
         }
         _ => {}
     }
-    let now = shared.epoch.elapsed().as_millis() as u64;
-    let (next, actions) = exec_notify::step(j.notifier.kernel, event, now);
+    let now = exec_notify::clock(shared.epoch.elapsed().as_millis());
+    let (next, actions) = exec_notify::step_checked(j.notifier.kernel, event, now);
     j.notifier.kernel = next;
     for action in actions {
         match action {

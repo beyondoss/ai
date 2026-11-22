@@ -16,7 +16,11 @@
 //! callback changes no state; (S5) a superseded owner never commits a report; (S6) nothing on a
 //! timer alone contacts the sandbox: every `list` answers a callback, a release or a real use;
 //! (S7) a job has at most one attempt in flight; (S8) a report lands only in its job's own
-//! transcript.
+//! transcript; and, read off every step of the notifier's kernel as it is taken (so a later real
+//! use that rescues a lost notice cannot hide a bad step): (S9) a count makes at most 12 attempts;
+//! (S10) a wake before its time begins nothing; (S11) the wait after failed attempt n lies in
+//! [d(n)/2, d(n)]; (S12) an answer that settles is never retried; (S13) an answer settles only its
+//! own attempt; (S14) a `keep` with notify, and a change under one, each owe one callback more.
 //!
 //! Liveness (L1), checked in every settled state (no action left): every end the open session
 //! tracks has been reported, by its stream, a callback or the next real use after it. A session that is not open
@@ -45,8 +49,10 @@
 //! Both kernels read no clock: time is an input. Each replica has its own clock, which moves only
 //! to the replica kernel's `next_wake()` ([`Act::Advance`]) or before a real use; [`Act::Tick`]
 //! then delivers a deadline, so a callback can also arrive after its deadline passed and before
-//! its tick, as a late timer allows. The notifier's waits end when [`Act::NotifierTimer`] says (it
-//! wakes at exactly the time the kernel asked for, on a clock of 0, with a draw of 0). Every other
+//! its tick, as a late timer allows. The notifier has its own clock, which moves only to the time the
+//! kernel asked to be woken at ([`Act::NotifierAdvance`]); a wake can also arrive early
+//! ([`Act::NotifierEarly`]). An answer's draw is the longest wait, or in [`Notify::drawn`] the
+//! shortest, the midpoint or the longest. Every other
 //! timer (the edge's 25 s, the supervisor's 30 s, a session's idle reap) is a nondeterministic
 //! action, so the model covers every order of them.
 //!
@@ -88,11 +94,12 @@
 //!   seconds). `NOTIFY_MODEL_FULL=1` adds any two moves of any class (about 85 M states), two
 //!   ownership moves (25 M) and two jobs (46 M), each minutes. Every mutation's
 //!   counterexample needs at most one move, so the default budget reaches every guard.
-//! - **A count of attempts runs to [`RETRY_CAP`] (3), not 12.** The kernel resets a count on
+//! - **The capped configs run a count to [`RETRY_CAP`] (3), not 12.** The kernel resets a count on
 //!   every answer that settles it, so a success at attempt 5 leaves the state a success at
 //!   attempt 2 leaves; a reopen re-keeps the job, which abandons the count and begins a new one;
 //!   and a count that never succeeds is the spec's accepted loss either way. Attempts 4 to 12 add
-//!   only later instances of what attempts 2 and 3 already cover.
+//!   only later instances of what attempts 2 and 3 already cover. [`Notify::deep`] does run to 12,
+//!   with only the receiver failing, so the limit itself (S9) is checked.
 //!
 //! ## Faithful vs mutated
 //!
@@ -112,9 +119,30 @@ use stateright::{Checker, Model, Property};
 /// Replicas in the ring.
 const R: usize = 2;
 
-/// The model lets a count of attempts run to this many; past it, the supervisor's next wait
-/// outlasts the run. See "Bounds" for why that loses no behaviour a property can see.
+/// The capped configs let a count of attempts run to this many; past it, the supervisor's next
+/// wait outlasts the run. See "Bounds" for why that loses no behaviour the capped configs' properties
+/// can see. The retry-limit config ([`Notify::deep`]) runs to the spec's real limit instead.
 const RETRY_CAP: u32 = 3;
+
+/// The spec's attempt limit (N18): a count makes at most this many attempts. The S9 latch judges
+/// by this, not by the kernel's constant.
+const SPEC_MAX_ATTEMPTS: u32 = 12;
+
+/// The wake-up draws a config may hand the kernel: the shortest wait, the midpoint, the longest.
+const DRAWS: [u32; 3] = [u32::MAX, 1 << 31, 0];
+
+/// The spec's `d(n)` in ms (N18): `min(2^(n-1), 60)` s, 1 s for `n` 0 or 1.
+fn spec_backoff_ms(n: u32) -> u64 {
+    1000 * (1u64 << n.saturating_sub(1).min(6)).min(60)
+}
+
+/// The spec's table of answers (N17): does the answer ask for a retry? Everything else settles.
+fn spec_retries(outcome: nk::Outcome) -> bool {
+    match outcome {
+        nk::Outcome::Failed => true,
+        nk::Outcome::Status(s) => matches!(s, 407 | 408 | 425 | 429 | 500..=599),
+    }
+}
 
 /// The spec's proof window (N37): it closes 30 s after `keep` is answered. The S2 ghost judges a
 /// proof by this, not by the kernel's constant.
@@ -255,6 +283,8 @@ struct St {
     sb_alive: bool,
     job: Vec<SbJob>,
     nk: Vec<nk::Job>,
+    /// The notifier's clock, in ms. It moves only to a time the notifier asked for.
+    nnow: u64,
     net: Vec<Msg>,
     ring: u8,
     up: [bool; R],
@@ -276,6 +306,12 @@ const S5_FENCED: u16 = 1 << 4;
 const S6_TIMER: u16 = 1 << 5;
 const S7_TWO: u16 = 1 << 6;
 const S8_TRANSCRIPT: u16 = 1 << 7;
+const S9_LIMIT: u16 = 1 << 8;
+const S10_EARLY_WAKE: u16 = 1 << 9;
+const S11_WAIT: u16 = 1 << 10;
+const S12_SETTLED_RETRIED: u16 = 1 << 11;
+const S13_FOREIGN_SETTLE: u16 = 1 << 12;
+const S14_NOT_OWED: u16 = 1 << 13;
 
 // Witnesses.
 const W_UNHELD: u16 = 1 << 0;
@@ -328,6 +364,8 @@ const OWN: u8 = 1 << 1;
 const SBX: u8 = 1 << 2;
 /// A live reconcile slower than a callback's 20 s.
 const SLOW: u8 = 1 << 3;
+/// The receiver: it answers an attempt with an error status of its choosing (a `503`, a `404`).
+const RCV: u8 = 1 << 4;
 const ALL: u8 = NET | OWN | SBX | SLOW;
 
 #[derive(Clone, Copy)]
@@ -338,6 +376,11 @@ struct Notify {
     adversary: u8,
     /// `bash_job` calls the session may make.
     calls: u8,
+    /// A count of attempts may begin only while it has made fewer than this many ([`RETRY_CAP`]
+    /// for the capped configs, past the spec's limit for [`Notify::deep`]).
+    retry_cap: u32,
+    /// How many of [`DRAWS`] an answer may carry: 1 (the longest wait) or 3.
+    draws: usize,
     /// Let the one real use come less than 30 s after a reconcile ended (N29 then asks for one at
     /// the 30 s mark). On in every faithful config; off only to compare.
     use_in_quiet_window: bool,
@@ -351,8 +394,31 @@ impl Notify {
             chaos,
             adversary: ALL,
             calls: 1,
+            retry_cap: RETRY_CAP,
+            draws: 1,
             use_in_quiet_window: true,
             mutation: Mutation::None,
+        }
+    }
+
+    /// The notifier's retry schedule, to the spec's real limit: only the receiver misbehaves
+    /// (`failures` times, a `503` or a `404`), one job, no `bash_job` call.
+    fn deep(failures: u8) -> Self {
+        Notify {
+            adversary: RCV,
+            calls: 0,
+            retry_cap: SPEC_MAX_ATTEMPTS + 1,
+            ..Notify::new(1, failures)
+        }
+    }
+
+    /// The notifier's waits, over the shortest, the midpoint and the longest draw.
+    fn drawn(failures: u8) -> Self {
+        Notify {
+            adversary: RCV,
+            calls: 0,
+            draws: DRAWS.len(),
+            ..Notify::new(1, failures)
         }
     }
 
@@ -378,9 +444,16 @@ enum Act {
     ShellExit(u8),
     JobEnd(u8),
     SandboxDies,
+    /// The notifier's clock reaches the time it asked to be woken at.
+    NotifierAdvance(u8),
+    /// A wake arrives before its time (a timer fired early, or fired twice).
+    NotifierEarly(u8),
     NotifierTimer(u8),
     Route(u8),
-    Answer(u8),
+    /// An attempt's answer, with the wake-up draw (an index into [`DRAWS`]) the supervisor takes.
+    Answer(u8, u8),
+    /// The receiver answers an attempt itself with this status ([`RCV`]).
+    Reply(u8, u16, u8),
     Lose(u8),
     Abandon(u8),
     Replay(u8),
@@ -429,15 +502,85 @@ impl Notify {
 
     // ---- the notifier: the only call into `notify_kernel` ----------------------------------
 
+    /// S9 to S14: what the spec (N16 to N18) says of one step, read off the step's inputs and
+    /// outputs, never recomputed from the kernel's rules except through the spec's own table
+    /// ([`spec_retries`], [`spec_backoff_ms`]). Each attempt is judged when it begins, ends or
+    /// waits, so a later real use that rescues a lost notice cannot hide a bad step.
+    fn judge_notifier(
+        before: &nk::Job,
+        event: nk::Event,
+        now: u64,
+        next: &nk::Job,
+        actions: &[nk::Action],
+    ) -> u16 {
+        let mut bad = 0;
+        if before.removed {
+            return bad;
+        }
+        for a in actions {
+            // S9: no count makes more than the spec's limit of attempts.
+            if let nk::Action::Begin { attempt } = a
+                && *attempt > SPEC_MAX_ATTEMPTS
+            {
+                bad |= S9_LIMIT;
+            }
+        }
+        let owes_one_more = match event {
+            nk::Event::Keep { notify } => notify,
+            nk::Event::Change => before.notify,
+            _ => false,
+        };
+        // S14: a `keep` with notify, and a change under one, each owe one callback more.
+        if owes_one_more && next.owed != before.owed + 1 {
+            bad |= S14_NOT_OWED;
+        }
+        match event {
+            nk::Event::Wake => {
+                // S10: a wake before the time asked for begins nothing.
+                let early = before.wake_at.is_none_or(|at| now < at);
+                if early
+                    && actions
+                        .iter()
+                        .any(|a| matches!(a, nk::Action::Begin { .. }))
+                {
+                    bad |= S10_EARLY_WAKE;
+                }
+            }
+            nk::Event::AttemptEnded { outcome, .. } => {
+                let Some(carried) = before.in_flight else {
+                    return bad;
+                };
+                // S13: an answer settles what its attempt carried, nothing owed after.
+                if next.settled > before.settled.max(carried) {
+                    bad |= S13_FOREIGN_SETTLE;
+                }
+                // S12: an answer that settles is not sent again (what was owed after it is).
+                if !spec_retries(outcome) && carried == before.owed && !actions.is_empty() {
+                    bad |= S12_SETTLED_RETRIED;
+                }
+                // S11: the wait after failed attempt n lies in [d(n)/2, d(n)].
+                for a in actions {
+                    if let nk::Action::WakeAt(at) = a {
+                        let d = spec_backoff_ms(before.attempts);
+                        if *at < now + d / 2 || *at > now + d {
+                            bad |= S11_WAIT;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        bad
+    }
+
     fn notifier(&self, s: &mut St, j: usize, event: nk::Event) {
         if !s.sb_alive {
             return; // the supervisors died with the sandbox
         }
-        let now = match event {
-            nk::Event::Wake => s.nk[j].wake_at.unwrap_or(0),
-            _ => 0,
-        };
-        let (next, actions) = nk::step(s.nk[j], event, now);
+        let now = s.nnow;
+        let before = s.nk[j];
+        let (next, actions) = nk::step(before, event, now);
+        s.bad |= Self::judge_notifier(&before, event, now, &next, &actions);
         s.nk[j] = next;
         for a in actions {
             match a {
@@ -811,6 +954,7 @@ impl Model for Notify {
                 self.jobs
             ],
             nk: vec![nk::Job::default(); self.jobs],
+            nnow: 0,
             net: Vec::new(),
             ring: 0,
             up: [true; R],
@@ -842,11 +986,16 @@ impl Model for Notify {
                 }
             }
             if s.sb_alive
-                && s.nk[j].wake_at.is_some()
                 && s.nk[j].in_flight.is_none()
-                && s.nk[j].attempts < RETRY_CAP
+                && s.nk[j].attempts < self.retry_cap
+                && let Some(at) = s.nk[j].wake_at
             {
-                acts.push(Act::NotifierTimer(jb));
+                if s.nnow >= at {
+                    acts.push(Act::NotifierTimer(jb));
+                } else {
+                    acts.push(Act::NotifierAdvance(jb));
+                    acts.push(Act::NotifierEarly(jb));
+                }
             }
             if net && s.sb_alive && sj.phase != Phase::Unstarted && !sj.removed {
                 acts.push(Act::Replay(jb));
@@ -863,8 +1012,25 @@ impl Model for Notify {
             let ib = i as u8;
             match m.at {
                 At::Edge => acts.push(Act::Route(ib)),
-                At::Back(_) => acts.push(Act::Answer(ib)),
+                At::Back(_) => {
+                    let draws = if m.origin == Origin::Attempt {
+                        self.draws
+                    } else {
+                        1
+                    };
+                    for d in 0..draws {
+                        acts.push(Act::Answer(ib, d as u8));
+                    }
+                }
                 At::Waiting { .. } => {}
+            }
+            if chaos && self.adversary & RCV != 0 && m.origin == Origin::Attempt && m.at == At::Edge
+            {
+                for code in [404, 503] {
+                    for d in 0..self.draws {
+                        acts.push(Act::Reply(ib, code, d as u8));
+                    }
+                }
             }
             if net {
                 acts.push(Act::Lose(ib));
@@ -1037,7 +1203,12 @@ impl Model for Notify {
                 s.net
                     .retain(|m| !(m.origin == Origin::Orphan && matches!(m.at, At::Back(_))));
             }
-            Act::NotifierTimer(j) => self.notifier(&mut s, j as usize, nk::Event::Wake),
+            Act::NotifierAdvance(j) => {
+                s.nnow = s.nnow.max(s.nk[j as usize].wake_at?);
+            }
+            Act::NotifierEarly(j) | Act::NotifierTimer(j) => {
+                self.notifier(&mut s, j as usize, nk::Event::Wake)
+            }
             Act::Route(i) => {
                 // E3, in one step: the hashed target first, then the walk in ring order, all
                 // inside one request. A replica that is down, or holds no session task for the
@@ -1081,7 +1252,16 @@ impl Model for Notify {
                     s.net[i].at = At::Back(Some(503));
                 }
             }
-            Act::Answer(i) => {
+            Act::Reply(i, code, d) => {
+                spend(&mut s);
+                let m = s.net.remove(i as usize);
+                let event = nk::Event::AttemptEnded {
+                    outcome: nk::Outcome::Status(code),
+                    draw: DRAWS[d as usize],
+                };
+                self.notifier(&mut s, m.job as usize, event);
+            }
+            Act::Answer(i, d) => {
                 let m = s.net.remove(i as usize);
                 let At::Back(code) = m.at else { return None };
                 if m.origin == Origin::Attempt {
@@ -1089,7 +1269,8 @@ impl Model for Notify {
                         Some(c) => nk::Outcome::Status(c),
                         None => nk::Outcome::Failed,
                     };
-                    let event = nk::Event::AttemptEnded { outcome, draw: 0 };
+                    let draw = DRAWS[d as usize];
+                    let event = nk::Event::AttemptEnded { outcome, draw };
                     self.notifier(&mut s, m.job as usize, event);
                 }
             }
@@ -1426,6 +1607,12 @@ impl Model for Notify {
                 "S8: a report lands only in its job's own transcript",
                 |_, s| s.bad & S8_TRANSCRIPT == 0,
             ),
+            Property::<Self>::always(SAFETY[8], |_, s| s.bad & S9_LIMIT == 0),
+            Property::<Self>::always(SAFETY[9], |_, s| s.bad & S10_EARLY_WAKE == 0),
+            Property::<Self>::always(SAFETY[10], |_, s| s.bad & S11_WAIT == 0),
+            Property::<Self>::always(SAFETY[11], |_, s| s.bad & S12_SETTLED_RETRIED == 0),
+            Property::<Self>::always(SAFETY[12], |_, s| s.bad & S13_FOREIGN_SETTLE == 0),
+            Property::<Self>::always(SAFETY[13], |_, s| s.bad & S14_NOT_OWED == 0),
             Property::<Self>::always(
                 "L1: once settled, every end the open session tracks is reported",
                 |m, s| {
@@ -1502,7 +1689,7 @@ fn full() -> bool {
     std::env::var_os("NOTIFY_MODEL_FULL").is_some()
 }
 
-const SAFETY: [&str; 8] = [
+const SAFETY: [&str; 14] = [
     "S1: each end and shell exit is reported at most once per session task",
     "S2: a job is unheld only after keep with notify succeeded and a proof arrived in its window",
     "S3: a callback never opens a session",
@@ -1511,6 +1698,12 @@ const SAFETY: [&str; 8] = [
     "S6: nothing on a timer alone contacts the sandbox",
     "S7: at most one attempt per job in flight",
     "S8: a report lands only in its job's own transcript",
+    "S9: a count makes at most 12 attempts",
+    "S10: a wake before its time begins nothing",
+    "S11: the wait after failed attempt n lies in [d(n)/2, d(n)]",
+    "S12: an answer that settles is never retried",
+    "S13: an answer settles only its own attempt",
+    "S14: a keep with notify, and a change under one, each owe one callback more",
 ];
 
 /// The actions of `path` up to the first state that breaks `property` (the latches stay set, so
@@ -1615,6 +1808,21 @@ fn notify_one_job_two_sandbox_faults() {
         },
         "one job, two sandbox faults",
     );
+}
+
+/// The retry limit, for real: the receiver fails 12 attempts in a row (a `503`), and the count
+/// gives up at the twelfth. Every attempt is judged as it begins and every wake as it comes, with
+/// the clock moving only to the time asked for and a wake that may arrive before it.
+#[test]
+fn notify_one_job_retries_to_the_limit() {
+    check(Notify::deep(12), "one job, 12 failed attempts");
+}
+
+/// The backoff, over the shortest, the midpoint and the longest draw, with a receiver that
+/// answers `503` or `404` (which is never retried).
+#[test]
+fn notify_one_job_waits_over_every_draw() {
+    check(Notify::drawn(3), "one job, three answers, three draws");
 }
 
 /// Exhaustive (`NOTIFY_MODEL_FULL=1`): any two ownership moves.

@@ -84,10 +84,10 @@ description = "Prove every kernel crate (crates/exec-notify) with the pinned Ver
 run = ".github/scripts/verify-kernels.sh"
 
 [tasks."test:notify-model-mutants"]
-description = "The notify model (crates/agent/tests/notify_model.rs) under each exec-notify kernel mutation: every run must go red (S7). The model cannot see the other `mut_*` (a lost notice is rescued by the next real use, and the 12-attempt limit and the clock are outside its bounds): `verify:kernels` is their gate. Pairs with `verify:kernels -- --features <mut>`."
+description = "The notify model (crates/agent/tests/notify_model.rs) under each exec-notify kernel mutation: every run must go red, one property each: S7 (keep_keeps_in_flight, change_begins_in_flight), S9 (retry_unbounded), S10 (wake_early), S12 (stop_is_retried), S13 (answer_settles_all), S14 (change_not_owed). Pairs with `verify:kernels -- --features <mut>`."
 run = '''
 set -u
-for m in mut_keep_keeps_in_flight mut_change_begins_in_flight; do
+for m in mut_keep_keeps_in_flight mut_change_begins_in_flight mut_answer_settles_all mut_retry_unbounded mut_wake_early mut_stop_is_retried mut_change_not_owed; do
   if cargo test -p beyond-agent --test it --locked --features "beyond-agent/$m" -- notify_model::notify_one_job >/dev/null 2>&1; then
     echo "model stayed green under $m" >&2; exit 1
   fi

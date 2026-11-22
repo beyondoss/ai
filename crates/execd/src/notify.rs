@@ -132,8 +132,8 @@ pub(crate) fn feed(
         }
         _ => {}
     }
-    let now = u64::try_from(ctx.epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
-    let (next, actions) = exec_notify::step(j.notifier.kernel, event, now);
+    let now = exec_notify::clock(ctx.epoch.elapsed().as_millis());
+    let (next, actions) = exec_notify::step_checked(j.notifier.kernel, event, now);
     j.notifier.kernel = next;
     // The host's activity view includes the callbacks owed.
     ctx.activity_changed();
