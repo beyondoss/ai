@@ -222,21 +222,21 @@ cargo test -p beyond-execd --test job_model faithful          # both bounds, all
 cargo test -p beyond-execd --features <mut> --test job_model the_mutation   # each MUST pass only if its property is red
 ```
 
-| mutation                     | property it turns red                             |
-| ---------------------------- | ------------------------------------------------- |
-| `mut_start_overwrites`       | J1                                                |
-| `mut_scope_ignored`          | J2                                                |
-| `mut_remove_keeps_entry`     | J3                                                |
-| `mut_end_rewritten`          | J4 (`ended_is_final`, over every phase and event) |
-| `mut_read_before_base`       | J5                                                |
-| `mut_disconnect_kills_kept`  | J6                                                |
-| `mut_remove_live`            | J7                                                |
-| `mut_signal_ended`           | J8                                                |
-| `mut_ended_not_removable`    | L1                                                |
-| `mut_stream_follows_key`     | J9                                                |
-| `mut_take_by_key`            | J10                                               |
-| `mut_follow_waits_after_end` | L2                                                |
-| `mut_signal_after_reap`      | J11 (`os_model`, and Verus on `may_deliver`)      |
+| mutation                     | property it turns red                              |
+| ---------------------------- | -------------------------------------------------- |
+| `mut_start_overwrites`       | J1                                                 |
+| `mut_scope_ignored`          | J2                                                 |
+| `mut_remove_keeps_entry`     | J3                                                 |
+| `mut_end_rewritten`          | J4 (`ended_is_final`, over every phase and event)  |
+| `mut_read_before_base`       | J5                                                 |
+| `mut_disconnect_kills_kept`  | J6                                                 |
+| `mut_remove_live`            | J7                                                 |
+| `mut_signal_ended`           | J8                                                 |
+| `mut_ended_not_removable`    | L1                                                 |
+| `mut_stream_follows_key`     | J9                                                 |
+| `mut_take_by_key`            | J10                                                |
+| `mut_follow_waits_after_end` | L2                                                 |
+| `mut_signal_after_reap`      | J11 (`os_model`, and Verus on `may_deliver`)       |
 | `mut_held_forgets`           | J11-live (`os_model`, and Verus on `Held::insert`) |
 
 ### The OS boundary (J11)
