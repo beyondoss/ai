@@ -14,7 +14,8 @@
 //! and carry out the [`Action`]s: begin an attempt (with the job's notify as recorded *now*),
 //! abandon the one in flight, or be woken at a time and feed [`Event::Wake`]. The reference endpoint
 //! (`beyond-test-support`'s `exec_mock`) does exactly that. A model checker
-//! calls [`step`] as production does.
+//! calls [`step`] as production does, and Verus proves it (the `verus!` block below): the invariant
+//! `wf`, what `step` promises (`step_post`), and progress (`lemma_progress`). See the README.
 
 use vstd::prelude::*;
 
