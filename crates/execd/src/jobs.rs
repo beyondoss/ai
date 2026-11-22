@@ -362,7 +362,7 @@ impl Jobs {
         for cell in cells {
             let mut j = locked(&cell);
             if kernel::step(&mut j.k, Ev::Taken) == Act::Release {
-                j.notifier = Notifier::default();
+                j.notifier = Notifier::removed();
                 if let Some(s) = &j.stdin {
                     s.close();
                 }

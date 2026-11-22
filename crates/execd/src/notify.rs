@@ -109,6 +109,17 @@ pub(crate) struct Notifier {
 }
 
 impl Notifier {
+    /// The notifier of a job the table let go: the kernel's removed job, which owes nothing and
+    /// answers every later event (a `keep` that looked the job up before it left, a change) with no
+    /// action. Its tasks are dropped with the old notifier.
+    pub fn removed() -> Self {
+        Self {
+            kernel: exec_notify::step(exec_notify::Job::default(), exec_notify::Event::Removed, 0)
+                .0,
+            ..Self::default()
+        }
+    }
+
     /// A callback is owed and not settled: in flight, waiting on its backoff, or about to begin.
     /// Settled, abandoned at the attempt limit, or removed, it is not.
     pub fn owes(&self) -> bool {
@@ -411,6 +422,18 @@ mod owed_tests {
 
     fn kept() -> exec_notify::Job {
         step(exec_notify::Job::default(), Event::Keep { notify: true }, 0).0
+    }
+
+    /// A `keep` that reached a job after its removal begins nothing and owes nothing.
+    #[test]
+    fn a_removed_job_stays_silent_whatever_arrives() {
+        let n = Notifier::removed();
+        assert!(!n.owes());
+        for event in [Event::Keep { notify: true }, Event::Change, Event::Wake] {
+            let (next, actions) = step(n.kernel, event, 0);
+            assert!(actions.is_empty(), "{event:?}");
+            assert!(!owes(next), "{event:?}");
+        }
     }
 
     /// Owed from the keep, through every failed attempt and its backoff, until the twelfth failure

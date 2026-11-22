@@ -363,6 +363,7 @@ dependencies = [
  "base64 0.22.1",
  "beyond-agent-core",
  "beyond-exec-notify",
+ "beyond-execd-jobs",
  "beyond-providers",
  "beyond-sandbox",
  "beyond-test-support",

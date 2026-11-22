@@ -273,6 +273,11 @@ mut_retry_unbounded = ["beyond-exec-notify/mut_retry_unbounded"]
 mut_wake_early = ["beyond-exec-notify/mut_wake_early"]
 mut_stop_is_retried = ["beyond-exec-notify/mut_stop_is_retried"]
 mut_change_not_owed = ["beyond-exec-notify/mut_change_not_owed"]
+# Mutations of the job-table kernel (`crates/execd-jobs`), under which the notify model goes red where the table and the notifier meet.
+mut_remove_keeps_entry = ["beyond-execd-jobs/mut_remove_keeps_entry"]
+mut_remove_live = ["beyond-execd-jobs/mut_remove_live"]
+mut_stream_follows_key = ["beyond-execd-jobs/mut_stream_follows_key"]
+mut_scope_ignored = ["beyond-execd-jobs/mut_scope_ignored"]
 mut_no_stepup_backoff = [] # a transient step-up failure is not remembered (the #693 bug)
 mut_no_401_backoff = [] # a transient 401-refresh failure does not back off
 mut_stale_refresh = [] # a 401 for an already-replaced token refreshes again
@@ -310,6 +315,9 @@ path = "tests/code_mode_eval.rs"
 required-features = ["code-mode"]
 
 [dev-dependencies]
+# The job table's kernel (`execd::job_kernel`, the crate Verus proves), so `tests/notify_model.rs` runs the real table
+# next to the notifier: the same functions execd calls, not the stand-in the model had.
+beyond-execd-jobs = { path = "../execd-jobs" }
 # The mock model server and turn builders, shared with `crates/fleet-sim` — see that crate for why
 # they no longer live in `tests/common`.
 beyond-test-support = { path = "../test-support" }
