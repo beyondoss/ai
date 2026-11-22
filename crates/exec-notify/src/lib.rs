@@ -541,6 +541,73 @@ pub fn step(job: Job, event: Event, now: u64) -> (r: (Job, Vec<Action>))
     (j, out)
 }
 
+/// The latest clock [`step`] accepts (`requires now <= u64::MAX - MAX_WAIT_MS`), in milliseconds.
+pub const MAX_NOW_MS: u64 = u64::MAX - MAX_WAIT_MS;
+
+/// A caller's clock (milliseconds since its own epoch) as [`step`] needs it: saturating at
+/// [`MAX_NOW_MS`], never wrapping. Reaching it takes 5.8e8 years; if it ever did, time stops
+/// there and no wait wraps.
+pub fn clock(ms: u128) -> (r: u64)
+    ensures
+        r <= MAX_NOW_MS,
+        ms <= MAX_NOW_MS ==> r == ms,
+{
+    if ms > MAX_NOW_MS as u128 {
+        MAX_NOW_MS
+    } else {
+        ms as u64
+    }
+}
+
+/// The event owes one callback more (a `keep` with notify, a change under one).
+pub open spec fn owes_more(job: Job, event: Event) -> bool {
+    match event {
+        Event::Keep { notify } => notify,
+        Event::Change => job.notify,
+        _ => false,
+    }
+}
+
+/// [`step`] for a caller that cannot prove its clock and counter preconditions: `now` saturates
+/// at [`MAX_NOW_MS`], and an event that would owe one more callback when `owed` is within one of
+/// `u64::MAX` is refused (the job comes back as it was, nothing is sent), so `owed < u64::MAX`
+/// holds for ever. Neither is reachable: one callback is owed per `keep` with `notify` or state
+/// change. Otherwise exactly what `step` promises, at the saturated clock.
+pub fn step_checked(job: Job, event: Event, now: u64) -> (r: (Job, Vec<Action>))
+    requires
+        wf(job),
+        job.owed < u64::MAX,
+    ensures
+        wf(r.0),
+        r.0.owed < u64::MAX,
+        (!job.removed && owes_more(job, event) && job.owed >= u64::MAX - 1)
+            ==> (r.0 == job && r.1@.len() == 0),
+        !(!job.removed && owes_more(job, event) && job.owed >= u64::MAX - 1) ==> {
+            let n = if now < MAX_NOW_MS { now } else { MAX_NOW_MS };
+            &&& post_removed(job, event, r.0, r.1@)
+            &&& post_one(job, event, r.0, r.1@)
+            &&& post_owed(job, event, r.0)
+            &&& post_answer(job, event, n, r.0, r.1@)
+            &&& post_wake(job, event, n, r.0, r.1@)
+        },
+{
+    let owes = match event {
+        Event::Keep { notify } => notify,
+        Event::Change => job.notify,
+        _ => false,
+    };
+    if !job.removed && owes && job.owed >= u64::MAX - 1 {
+        return (job, Vec::new());
+    }
+    let n = if now < MAX_NOW_MS { now } else { MAX_NOW_MS };
+    let r = step(job, event, n);
+    proof {
+        // step's owed grows by at most one, from below u64::MAX - 1 when it grows.
+        assert(r.0.owed < u64::MAX);
+    }
+    r
+}
+
 // ---------------------------------------------------------------------------------------------
 // Liveness: a job that owes settles, in at most `rank` fair steps.
 // ---------------------------------------------------------------------------------------------
@@ -603,36 +670,6 @@ pub proof fn lemma_rank_bounded(j: Job)
 }
 
 } // verus!
-
-/// The latest clock [`step`] accepts (`requires now <= u64::MAX - MAX_WAIT_MS`), in milliseconds.
-pub const MAX_NOW_MS: u64 = u64::MAX - MAX_WAIT_MS;
-
-/// A caller's clock (milliseconds since its own epoch) as [`step`] needs it: saturating at
-/// [`MAX_NOW_MS`], never wrapping. Reaching it takes 5.8e8 years; if it ever did, time stops
-/// there and no wait wraps.
-pub fn clock(ms: u128) -> u64 {
-    if ms > MAX_NOW_MS as u128 {
-        MAX_NOW_MS
-    } else {
-        ms as u64
-    }
-}
-
-/// [`step`] for a caller that cannot prove its preconditions: `now` saturates ([`clock`]'s bound),
-/// and an event that would owe one more callback when `owed` is within one of `u64::MAX` is
-/// refused (the job is returned as it was, nothing is sent), so `owed < u64::MAX` always holds.
-/// Neither is reachable: one callback is owed per `keep` with `notify` or state change.
-pub fn step_checked(job: Job, event: Event, now: u64) -> (Job, Vec<Action>) {
-    let owes_more = match event {
-        Event::Keep { notify } => notify,
-        Event::Change => job.notify,
-        _ => false,
-    };
-    if !job.removed && owes_more && job.owed >= u64::MAX - 1 {
-        return (job, Vec::new());
-    }
-    step(job, event, now.min(MAX_NOW_MS))
-}
 
 /// `u` in `[0, 1)` for a draw.
 pub fn uniform(draw: u32) -> f64 {
