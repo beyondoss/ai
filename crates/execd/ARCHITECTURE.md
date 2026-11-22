@@ -211,7 +211,7 @@ seconds (CI kills a test at 180s): `REUSE` (one scope, one id, two jobs, one cli
 `SCOPES` (two scopes that both use one id), `IDS` (two ids in one scope), `STREAMS` (one job, two clients, a two-byte ring), `SLOW` (a `remove`/`wipe` that decides and takes as two steps, other clients' removals and restarts of the id between). Properties: J1 an id is the claim (a start never replaces a job in the table), J2 no
 operation resolves another scope's job, J3 a removed job never answers again (and a stream never follows a later job of its id),
 J4 an ended job never changes, J5 output offsets only move forward over what is held, J6 a kept job never dies with a held client,
-J7 a job leaves only with its group empty, J8 no signal reaches an ended job, J9 a stream follows the job it attached to, never a later job of its id, J10 a take removes only the job that was checked, never its key's successor, L1 an ended job can always be removed, L2 an ended
+J7 a job leaves only with its group empty, J8 no signal reaches an ended job, J9 a stream follows the job it attached to, never a later job of its id, J10 a take removes only the job that was checked, never its key's successor, J11 (OS boundary, below), L1 an ended job can always be removed, L2 an ended
 job's stream sends its final frame. `production_calls_the_kernel` fails if `jobs.rs` stops calling the kernel or writes job state
 outside it. `crates/execd-jobs/tests/production.rs` fails if `execd::job_kernel` stops being that crate, a decision leaves its `verus!` block, or a second copy of the state machine appears.
 
@@ -222,20 +222,42 @@ cargo test -p beyond-execd --test job_model faithful          # both bounds, all
 cargo test -p beyond-execd --features <mut> --test job_model the_mutation   # each MUST pass only if its property is red
 ```
 
-| mutation                     | property it turns red                             |
-| ---------------------------- | ------------------------------------------------- |
-| `mut_start_overwrites`       | J1                                                |
-| `mut_scope_ignored`          | J2                                                |
-| `mut_remove_keeps_entry`     | J3                                                |
-| `mut_end_rewritten`          | J4 (`ended_is_final`, over every phase and event) |
-| `mut_read_before_base`       | J5                                                |
-| `mut_disconnect_kills_kept`  | J6                                                |
-| `mut_remove_live`            | J7                                                |
-| `mut_signal_ended`           | J8                                                |
-| `mut_ended_not_removable`    | L1                                                |
-| `mut_stream_follows_key`     | J9                                                |
-| `mut_take_by_key`            | J10                                               |
-| `mut_follow_waits_after_end` | L2                                                |
+| mutation                     | property it turns red                              |
+| ---------------------------- | -------------------------------------------------- |
+| `mut_start_overwrites`       | J1                                                 |
+| `mut_scope_ignored`          | J2                                                 |
+| `mut_remove_keeps_entry`     | J3                                                 |
+| `mut_end_rewritten`          | J4 (`ended_is_final`, over every phase and event)  |
+| `mut_read_before_base`       | J5                                                 |
+| `mut_disconnect_kills_kept`  | J6                                                 |
+| `mut_remove_live`            | J7                                                 |
+| `mut_signal_ended`           | J8                                                 |
+| `mut_ended_not_removable`    | L1                                                 |
+| `mut_stream_follows_key`     | J9                                                 |
+| `mut_take_by_key`            | J10                                                |
+| `mut_follow_waits_after_end` | L2                                                 |
+| `mut_signal_after_reap`      | J11 (`os_model`, and Verus on `may_deliver`)       |
+| `mut_held_forgets`           | J11-live (`os_model`, and Verus on `Held::insert`) |
+
+### The OS boundary (J11)
+
+A group's number is free for any process the moment its last member is collected, and execd is the subreaper, so the reaper
+can collect it between the kernel's decision to signal (`Ev::Signal`, `Ev::Stop`, `Ev::Disconnect`) and the `kill` by number
+(the pump drain, the `kill` grace wait). Signalling it then would hit a group that is not the job's. So the numbers execd
+holds are a kernel ledger (`job_kernel::Held`, keyed by the number and the spawn): a spawn inserts its group under
+`SPAWNING` shared; each reaper pass, still under `SPAWNING` exclusive, frees every held number whose group no longer exists;
+every send by number (`proc::signal_job`, `proc::kill_group`) checks `may_deliver` under `SPAWNING` shared, so the group
+cannot be freed between the check and the `kill`. A refusal means the group is gone and nothing is left to signal
+(J11-live: a group with a member is always held). `tests/os_model.rs` model-checks the real ledger against an OS actor
+(about 500 states, under a second); its first version keyed the ledger by number only and the model found a stale decision
+reaching a later job's group on the same number, hence the spawn in the key. Not covered: a host without the subreaper,
+where init reaps orphans outside the exclusion; and the supervisor's end of a job whose number a foreign group now holds
+(`job_gone` observes by number, so the end waits for that group; a delay, not a stray signal).
+
+```sh
+cargo test -p beyond-execd --test os_model                              # J11, J11-live
+cargo test -p beyond-execd --features mut_signal_after_reap --test os_model the_mutation
+```
 
 ## Security
 
