@@ -1865,7 +1865,7 @@ impl Model for Notify {
             Act::StreamExit(r, j) => self.apply_exit(&mut s, r as usize, j as usize),
             Act::StreamEnd(r, j) => {
                 let (r, j) = (r as usize, j as usize);
-                let tj = s.task[r].as_ref()?.jobs[j].clone();
+                let tj = s.task[r].as_ref()?.jobs[j];
                 let c = self.followed(&s, &tj, j)?;
                 s.task[r].as_mut()?.jobs[j].link = Link::None;
                 self.report(&mut s, r, j, c);
