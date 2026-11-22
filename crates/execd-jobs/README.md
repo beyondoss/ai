@@ -34,8 +34,12 @@ proof red (`mise run verify:kernels -- --features mut_x`; execd forwards the fea
 
 ## What stays outside `verus!`
 
-Storage and string comparison, because Verus has no model of a `HashMap` keyed by strings (its hash
-axioms cover integers, and a key model for `String` would be an `assume`):
+Storage and string comparison. vstd's `HashMap` specs only mean something when the key type satisfies
+`obeys_key_model`, and vstd axiomatizes that only for `bool`, the integer types, and `Box`es of them
+(`vstd-0.0.0-2026-11-01-0251/std_specs/hash.rs` lines 13-18 say so, and the axioms are at lines 113-215).
+Neither `String` nor `(String, String)` is covered, and for any other key type vstd asks for an
+`assume(obeys_key_model::<K>())` in our code, which is not allowed. Re-keying on integers would change
+behaviour and cost (interning every wire string), so the storage stays outside:
 
 - `Table`'s `HashMap`: that `contains_key` finds the key, that `get` returns the entry under exactly
   that `(scope, id)`, and that `take` removes it. `admit` and `visible` take what the storage
