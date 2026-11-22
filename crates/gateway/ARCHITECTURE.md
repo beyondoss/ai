@@ -242,12 +242,24 @@ NATS (blackhole.*)     NATS (allowance.*)      NATS (aicapture.*)
                               first successful read
 ```
 
-**The cursor never runs ahead of its data.** `persist_batch` appends a batch's deltas and then
-checkpoints once. If any append or the checkpoint fails, the cursor is not recorded and the snapshot
-writer is dropped, so nothing is appended past the gap. The file keeps its last good cursor, older
-than the lost delta, and the next boot resumes from it and replays the delta (or rescans, if NATS
-has compacted past it). Nothing re-creates the writer within a process: the gateway runs
-snapshot-less until restart, while the in-memory set, fed by NATS, is unaffected.
+**The cursor never runs ahead of its data.** `SnapshotSink::persist` appends a batch's deltas and
+then checkpoints once. If any append, the checkpoint or a compaction fails, the cursor is not
+recorded and the snapshot writer is dropped, so nothing is appended past the gap. The file keeps its
+last good cursor, older than the lost delta.
+
+**A failed writer heals itself, without a restart and without a second copy of the set.** From the
+failure on, the sink keeps a backlog of the raw deltas applied since the file's last good checkpoint
+(starting with the failed batch), capped at 64 MiB (`SNAPSHOT_BACKLOG_MAX_BYTES`): memory is
+proportional to churn during the outage, never to set size. On a 1s-doubling, 60s-capped backoff,
+woken by a timer even when no delta arrives, the watch loop reopens the file (slipstream truncates a
+torn tail on open), appends the backlog in order and checkpoints the current cursor last. Records of
+the failed batch that half-landed are re-applied, which is idempotent. Past the cap the backlog is
+dropped and the heal is a fresh NATS scan through `rebuild_snapshot` instead. A failed writer open at
+boot takes the same path. `ai_snapshot_writer_healthy{set}` is 0 for the outage (an `error!` on the
+way down, an `info!` on recovery); `ai_snapshot_backlog_bytes{set}`,
+`ai_snapshot_write_failures_total{set}` and `ai_snapshot_rebuilds_total{set,result}` show the backlog
+and the attempts. The retry runs while the watch is connected; during a NATS outage the file stays
+at its last cursor, which is safe. The in-memory set, fed by NATS, is unaffected throughout.
 
 **One service per set, hence one NATS connection per set.** The extra connections buy independent
 failure domains: a capture-set scan that keeps failing backs off on its own schedule and cannot
@@ -271,7 +283,7 @@ separate test for every set: only an `is_resumable` cursor (revision > 0) does t
 `{path}.tmp`, fsyncs it, renames it over `path`, fsyncs the directory, and reopens `path` for
 appends. A crash leaves either the old complete file or the new complete one, never `Put`s without
 their cursor. A stale `{path}.tmp` from an earlier crash is removed first, and any failure (removal,
-rename) aborts the rebuild so the gateway runs snapshot-less rather than append to a stale log.
+rename) aborts the rebuild: the writer stays down (and is retried by scan) rather than append to a stale log.
 
 Deny is **fail-open** on an unread store (empty map = allow). Allowance is **fail-closed** until
 `from_entries` has run (even on an empty scan): managed traffic gets a retryable `503` with
@@ -3994,6 +4006,10 @@ Prometheus on the default registry, exposed at `/metrics` on `metrics_listen`.
 | `ai_requests_in_flight`               | Gauge     | —                    | All in-flight requests (streaming + non-streaming)                                                                                                                                                                                                                                                                                                                                 |
 | `ai_deny_set_size`                    | Gauge     | —                    | Current number of denied tenants                                                                                                                                                                                                                                                                                                                                                   |
 | `ai_nats_connected`                   | Gauge     | —                    | 1 if the **deny-set** watcher is connected, 0 otherwise                                                                                                                                                                                                                                                                                                                            |
+| `ai_snapshot_backlog_bytes`           | Gauge     | `set`                | Bytes of deltas held for replay while the snapshot writer is down; 0 when healthy                                                                                                                                                                                                                                                                                                  |
+| `ai_snapshot_writer_healthy`          | Gauge     | `set`                | 1 while the set's on-disk snapshot is current; 0 from a failed write/rebuild until a rebuild lands                                                                                                                                                                                                                                                                                 |
+| `ai_snapshot_write_failures_total`    | Counter   | `set`                | Failed snapshot appends, checkpoints and compactions                                                                                                                                                                                                                                                                                                                               |
+| `ai_snapshot_rebuilds_total`          | Counter   | `set`, `result`      | Snapshot rebuild attempts (`ok`\|`failed`)                                                                                                                                                                                                                                                                                                                                         |
 | `ai_allowance_set_size`               | Gauge     | —                    | Exhausted tenants + keys in the allowance-set                                                                                                                                                                                                                                                                                                                                      |
 | `ai_allowance_ready`                  | Gauge     | —                    | 1 after a successful allowance scan/snapshot (empty = remaining-ok); 0 = fail-closed                                                                                                                                                                                                                                                                                               |
 | `ai_allowance_nats_connected`         | Gauge     | —                    | 1 if the **allowance-set** watcher is connected                                                                                                                                                                                                                                                                                                                                    |

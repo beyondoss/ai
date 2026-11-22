@@ -451,6 +451,20 @@ pub struct Metrics {
     pub signing_keys_live: IntGauge,
     /// NATS connectivity for the **signing-key** watcher, separate from the other sets.
     pub signing_keys_nats_connected: IntGauge,
+    /// 1 while a set's on-disk snapshot is being kept current, 0 from the first failed write,
+    /// compaction or rebuild until a rebuild lands again (label `set`). The file is the restart
+    /// state, so a 0 that lasts means the next restart resumes from a stale cursor, and once NATS
+    /// retention passes it, rescans. Alert on `== 0` for more than a few minutes.
+    pub snapshot_writer_healthy: IntGaugeVec,
+    /// Bytes of raw deltas a down snapshot writer is holding for replay (label `set`); 0 while
+    /// healthy. Bounded by the backlog cap, past which the heal is a NATS rescan.
+    pub snapshot_backlog_bytes: IntGaugeVec,
+    /// Snapshot appends, checkpoints and compactions that failed (label `set`). Each one flips the
+    /// writer unhealthy and starts the rebuild retries counted by `snapshot_rebuilds_total`.
+    pub snapshot_write_failures_total: IntCounterVec,
+    /// Snapshot rebuild attempts (labels `set`, `result` = ok | failed). A `failed` rate that stays
+    /// flat at the backoff cap is a disk that is still bad.
+    pub snapshot_rebuilds_total: IntCounterVec,
     /// Exact-match cache hits that replayed a stored 2xx and never reached a provider.
     pub cache_hits_total: IntCounter,
     /// Constant `1` with `kind="process"`: the exact-match cache is this pod's table, not a fleet
@@ -570,6 +584,34 @@ impl Metrics {
             "ai_nats_connected",
             "Deny-set watcher NATS connectivity (1=connected, 0=disconnected)",
         ))?;
+        let snapshot_writer_healthy = IntGaugeVec::new(
+            Opts::new(
+                "ai_snapshot_writer_healthy",
+                "1 while the set's on-disk snapshot is current, 0 after a failed write until a rebuild lands",
+            ),
+            &["set"],
+        )?;
+        let snapshot_backlog_bytes = IntGaugeVec::new(
+            Opts::new(
+                "ai_snapshot_backlog_bytes",
+                "Bytes of deltas held for replay while the set's snapshot writer is down",
+            ),
+            &["set"],
+        )?;
+        let snapshot_write_failures_total = IntCounterVec::new(
+            Opts::new(
+                "ai_snapshot_write_failures_total",
+                "Failed snapshot appends, checkpoints and compactions, by set",
+            ),
+            &["set"],
+        )?;
+        let snapshot_rebuilds_total = IntCounterVec::new(
+            Opts::new(
+                "ai_snapshot_rebuilds_total",
+                "Snapshot rebuild attempts by set and result (ok|failed)",
+            ),
+            &["set", "result"],
+        )?;
         let capture_set_size = IntGauge::with_opts(Opts::new(
             "ai_capture_set_size",
             "Tenants with payload capture enabled",
@@ -689,6 +731,10 @@ impl Metrics {
         r.register(Box::new(allowance_nats_connected.clone()))?;
         r.register(Box::new(signing_keys_live.clone()))?;
         r.register(Box::new(signing_keys_nats_connected.clone()))?;
+        r.register(Box::new(snapshot_writer_healthy.clone()))?;
+        r.register(Box::new(snapshot_backlog_bytes.clone()))?;
+        r.register(Box::new(snapshot_write_failures_total.clone()))?;
+        r.register(Box::new(snapshot_rebuilds_total.clone()))?;
         r.register(Box::new(captures_total.clone()))?;
         r.register(Box::new(capture_bytes_total.clone()))?;
         r.register(Box::new(capture_dropped_total.clone()))?;
@@ -736,6 +782,10 @@ impl Metrics {
             allowance_nats_connected,
             signing_keys_live,
             signing_keys_nats_connected,
+            snapshot_writer_healthy,
+            snapshot_backlog_bytes,
+            snapshot_write_failures_total,
+            snapshot_rebuilds_total,
             captures_total,
             capture_bytes_total,
             capture_dropped_total,
