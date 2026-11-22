@@ -31,6 +31,9 @@ mod exec;
 mod frame;
 mod http;
 mod jobs;
+/// The job table's decisions; the model checks the function production calls.
+#[doc(hidden)]
+pub mod job_kernel;
 pub mod log;
 mod notify;
 mod proc;

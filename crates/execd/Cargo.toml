@@ -22,6 +22,17 @@ workspace = true
 # The global allocator under test in the Memory measurements; off in the shipped build unless the
 # numbers say otherwise.
 mimalloc = ["dep:mimalloc"]
+# Mutations of `job_kernel`, used only by `tests/job_model.rs`'s red runs: each removes one guard.
+mut_start_overwrites = [] # a start of a key in the table replaces it (J1)
+mut_scope_ignored = [] # a lookup by id alone, any scope (J2)
+mut_remove_keeps_entry = [] # a removed job stays in the table (J3)
+mut_end_rewritten = [] # a second end rewrites an ended job's code (J4)
+mut_read_before_base = [] # a read starts before the oldest byte held (J5)
+mut_disconnect_kills_kept = [] # a held start's client leaving kills a kept job (J6)
+mut_remove_live = [] # a job is taken out with its group alive (J7)
+mut_signal_ended = [] # `signal` reaches an ended job's group, whose number may be reused (J8)
+mut_ended_not_removable = [] # `remove` waits for the group to look empty, even for an ended job (L1)
+mut_follow_waits_after_end = [] # a stream never sends its final frame (L2)
 
 [dependencies]
 base64.workspace = true
