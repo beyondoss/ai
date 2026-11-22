@@ -94,6 +94,7 @@ mod mcp_message_cap;
 mod mcp_names;
 mod mcp_oauth;
 mod mcp_oauth_binding;
+mod mcp_oauth_model;
 mod mcp_oauth_refresh;
 mod mcp_oauth_routing;
 mod mcp_progress;

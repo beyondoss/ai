@@ -263,6 +263,17 @@ default = []
 # Links QuickJS-NG. Off by default and MUST stay off in `.github/workflows/release-agent.yml`.
 code-mode = ["dep:rquickjs"]
 
+# Mutations of the MCP OAuth kernel (`src/tools/mcp_oauth_kernel.rs`), for `tests/mcp_oauth_model.rs`'s
+# red runs: each removes ONE guard and MUST turn a named property red. Never enabled in a build.
+mut_no_stepup_backoff = [] # a transient step-up failure is not remembered (the #693 bug)
+mut_no_401_backoff = [] # a transient 401-refresh failure does not back off
+mut_stale_refresh = [] # a 401 for an already-replaced token refreshes again
+mut_no_definitive_latch = [] # a definitive failure does not stand
+mut_no_refused_memory = [] # a refused step-up is asked for again
+mut_backoff_never_ends = [] # a backoff never elapses (liveness)
+mut_reload_keeps_failed = [] # a changed stored token does not clear a failure (liveness)
+mut_unlocked = [] # the model lets two callers hold the lock at once (single flight)
+
 # Catalog-token + composition evals (and the ignored live Grok/OpenRouter eval). Requires the
 # feature so `CARGO_BIN_EXE_agent` is the binary that actually links QuickJS;
 # `--code-mode` on the density-default binary is a hard error.

@@ -37,6 +37,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::tools::mcp_oauth_kernel as kernel;
 use futures::stream::BoxStream;
 use http::{HeaderName, HeaderValue};
 use rmcp::model::ClientJsonRpcMessage;
@@ -102,6 +103,8 @@ pub(crate) struct ServerAuth {
     url: String,
     state: tokio::sync::Mutex<TokenState>,
     first_backoff: Duration,
+    /// The kernel's clock: its times are this long since `origin`.
+    origin: Instant,
     /// Set for a server configured with `client_credentials`: its token is acquired from the
     /// authorization server (in memory only), not read from the `mcp-login` store.
     cc: Option<crate::settings::McpClientCredentials>,
@@ -112,44 +115,8 @@ pub(crate) struct ServerAuth {
     fake_stored: Option<FakeStored>,
 }
 
-#[derive(Default)]
-struct TokenState {
-    /// What every request to the server sends; `None` when the stored login yields no usable token.
-    token: Option<String>,
-    /// The last refresh after `token` was rejected failed.
-    failed: Option<Failed>,
-    /// Client credentials only: when `token` expires (`None`: the AS did not say).
-    expires_at: Option<Instant>,
-    /// Client credentials only: the scopes `token` was requested with.
-    scopes: Vec<String>,
-    /// Client credentials only: scope sets a step-up failed for, and until when.
-    refused: Vec<RefusedScopes>,
-}
-
-/// A step-up to `scopes` failed. Same shape as [`Failed`]: for good when the authorization server
-/// refused it, or until `until` (doubling) when it was only unreachable.
-struct RefusedScopes {
-    scopes: Vec<String>,
-    /// `None`: for good. Otherwise when a step-up to `scopes` may be tried again.
-    until: Option<Instant>,
-    /// The backoff that produced `until`; the next transient failure doubles it.
-    backoff: Duration,
-}
-
-impl RefusedScopes {
-    fn stands(&self, now: Instant) -> bool {
-        self.until.is_none_or(|until| now < until)
-    }
-}
-
-struct Failed {
-    /// What a rejection of the same token returns while this stands.
-    message: String,
-    /// `None`: for good (a definitive failure). Otherwise when a refresh may be tried again.
-    until: Option<Instant>,
-    /// The backoff that produced `until`; the next transient failure doubles it.
-    backoff: Duration,
-}
+/// The token state, decided by [`kernel`]; touched only under [`ServerAuth::state`]'s lock.
+type TokenState = kernel::State;
 
 /// Every server's [`ServerAuth`] in this process, by `(name, url)`.
 static SERVERS: Mutex<Vec<Arc<ServerAuth>>> = Mutex::new(Vec::new());
@@ -161,6 +128,7 @@ impl ServerAuth {
             url: url.to_owned(),
             state: tokio::sync::Mutex::new(TokenState::default()),
             first_backoff: FIRST_BACKOFF,
+            origin: Instant::now(),
             cc: None,
             #[cfg(test)]
             fake_refresh: None,
@@ -241,13 +209,23 @@ impl ServerAuth {
             return; // client credentials: nothing stored to reload
         }
         let mut state = self.state.lock().await;
-        let Some(stored) = self.stored().await else {
-            return;
-        };
-        if state.token.as_deref() != Some(stored.as_str()) {
-            state.failed = None;
-            state.token = Some(stored);
+        let stored = self.stored().await;
+        kernel::step(&mut state, &self.config(), kernel::Event::Stored(stored));
+    }
+
+    /// The kernel's configuration for this server.
+    fn config(&self) -> kernel::Config {
+        kernel::Config {
+            cc: self.cc.is_some(),
+            first_backoff: self.first_backoff,
+            max_backoff: MAX_BACKOFF,
+            renew_skew: CC_RENEW_SKEW,
         }
+    }
+
+    /// The kernel's time: now, since this server's `origin`.
+    fn now(&self) -> Duration {
+        self.origin.elapsed()
     }
 
     async fn stored(&self) -> Option<String> {
@@ -283,20 +261,11 @@ impl ServerAuth {
     /// waiting for the server's 401 (which still works, see [`Self::after_rejection`]).
     pub(crate) async fn token(&self) -> Option<String> {
         let mut state = self.state.lock().await;
-        if self.cc.is_some() {
-            let now = Instant::now();
-            let stale = state.token.is_none()
-                || state.expires_at.is_some_and(|at| now + CC_RENEW_SKEW >= at);
-            let blocked = state
-                .failed
-                .as_ref()
-                .is_some_and(|f| f.until.is_none_or(|until| now < until));
-            if stale && !blocked {
-                let scopes = state.scopes.clone();
-                let _ = self.renew(&mut state, scopes).await;
-            }
+        let event = kernel::Event::Need { now: self.now() };
+        match self.drive(&mut state, event).await {
+            kernel::Reply::Token(token) => token,
+            _ => unreachable!("a Need is answered with a token"),
         }
-        state.token.clone()
     }
 
     /// `sent` was answered 401: the token to retry with. If another caller already replaced `sent`,
@@ -305,76 +274,139 @@ impl ServerAuth {
     /// `agent mcp-login`; for a doubling backoff when transient.
     pub(crate) async fn after_rejection(&self, sent: Option<&str>) -> Result<String, String> {
         let mut state = self.state.lock().await;
-        if let Some(current) = state.token.as_deref()
-            && Some(current) != sent
-        {
-            return Ok(current.to_owned());
+        let event = kernel::Event::Rejected {
+            now: self.now(),
+            sent,
+        };
+        match self.drive(&mut state, event).await {
+            kernel::Reply::Granted(token) => Ok(token),
+            kernel::Reply::Denied(denial) => Err(self.denial_message(&denial, "")),
+            kernel::Reply::Token(_) => {
+                unreachable!("a rejection is answered with a grant or a denial")
+            }
         }
-        let now = Instant::now();
-        if let Some(failed) = &state.failed
-            && failed.until.is_none_or(|until| now < until)
-        {
-            return Err(failed.message.clone());
-        }
-        let scopes = state.scopes.clone();
-        self.renew(&mut state, scopes).await
     }
 
-    /// One new token (`scopes` for client credentials), recorded; a failure is remembered as the
-    /// module doc says. `state` is the token's lock, held by the caller.
-    async fn renew(&self, state: &mut TokenState, scopes: Vec<String>) -> Result<String, String> {
-        let now = Instant::now();
-        match self.refresh(&scopes).await {
-            Ok((token, lifetime)) => {
-                tracing::info!(server = %self.server, "obtained a fresh MCP OAuth token");
-                state.install(token.clone(), lifetime, scopes);
-                state.failed = None;
-                Ok(token)
+    /// Feed `event` to the kernel and carry out what it asks, under the token's lock (`state` is
+    /// that lock's guard, held across the AS call: the single flight): an AS call is made and its
+    /// answer fed back, until the kernel replies.
+    async fn drive(&self, state: &mut TokenState, event: kernel::Event<'_>) -> kernel::Reply {
+        let cfg = self.config();
+        let mut action = kernel::step(state, &cfg, event);
+        loop {
+            match action {
+                kernel::Action::Reply(reply) => return reply,
+                kernel::Action::Nothing => unreachable!("only a reload has nothing to do"),
+                kernel::Action::Refresh { purpose, scopes } => {
+                    let started = self.now();
+                    let result = self.refresh(&scopes).await;
+                    self.log_refresh(purpose, &scopes, &result);
+                    action = kernel::step(
+                        state,
+                        &cfg,
+                        kernel::Event::Refreshed {
+                            started,
+                            done: self.now(),
+                            purpose,
+                            scopes,
+                            result: result.map_err(|e| kernel::Failure {
+                                definitive: e.definitive,
+                                reason: e.reason,
+                            }),
+                        },
+                    );
+                }
             }
-            Err(e) if e.definitive => {
-                let message = if self.cc.is_some() {
+        }
+    }
+
+    fn log_refresh(
+        &self,
+        purpose: kernel::Purpose,
+        scopes: &[String],
+        result: &Result<(String, Option<Duration>), RefreshError>,
+    ) {
+        match (purpose, result) {
+            (kernel::Purpose::StepUp, Ok(_)) => {
+                tracing::info!(server = %self.server, scope = %scopes.join(" "), "stepped up an MCP OAuth token");
+            }
+            (_, Ok(_)) => tracing::info!(server = %self.server, "obtained a fresh MCP OAuth token"),
+            (kernel::Purpose::StepUp, Err(_)) => {}
+            (_, Err(e)) if e.definitive => {
+                tracing::warn!(server = %self.server, error = %e.reason, "MCP OAuth refresh rejected");
+            }
+            (_, Err(e)) => {
+                tracing::warn!(server = %self.server, error = %e.reason, "MCP OAuth refresh failed");
+            }
+        }
+    }
+
+    /// The error text of the kernel's `denial`; `missing` is the scopes a 403's challenge named,
+    /// space-separated (empty for a 401).
+    fn denial_message(&self, denial: &kernel::Denial, missing: &str) -> String {
+        use kernel::Denial;
+        match denial {
+            Denial::Failed {
+                reason,
+                definitive: true,
+                ..
+            } => {
+                if self.cc.is_some() {
                     format!(
                         "mcp server `{}` needs an OAuth token and its authorization server refused \
-                         one ({}); check its `client_credentials` settings",
-                        self.server, e.reason
+                         one ({reason}); check its `client_credentials` settings",
+                        self.server
                     )
                 } else {
                     format!(
-                        "mcp server `{0}` rejected its OAuth token and it could not be refreshed ({1}); \
-                         run `{2} mcp-login {0}` again",
+                        "mcp server `{0}` rejected its OAuth token and it could not be refreshed ({reason}); \
+                         run `{1} mcp-login {0}` again",
                         self.server,
-                        e.reason,
                         crate::PROGRAM
                     )
-                };
-                tracing::warn!(server = %self.server, error = %e.reason, "MCP OAuth refresh rejected");
-                state.failed = Some(Failed {
-                    message: message.clone(),
-                    until: None,
-                    backoff: Duration::ZERO,
-                });
-                Err(message)
+                }
             }
-            Err(e) => {
-                let backoff = match &state.failed {
-                    Some(f) if f.until.is_some() => (f.backoff * 2).min(MAX_BACKOFF),
-                    _ => self.first_backoff,
-                };
-                let message = format!(
-                    "mcp server `{}` rejected its OAuth token and the refresh failed ({}); it will \
-                     be tried again in {}s",
-                    self.server,
-                    e.reason,
-                    backoff.as_secs()
-                );
-                tracing::warn!(server = %self.server, error = %e.reason, ?backoff, "MCP OAuth refresh failed");
-                state.failed = Some(Failed {
-                    message: message.clone(),
-                    until: Some(now + backoff),
-                    backoff,
-                });
-                Err(message)
-            }
+            Denial::Failed {
+                reason, backoff, ..
+            } => format!(
+                "mcp server `{}` rejected its OAuth token and the refresh failed ({reason}); it will \
+                 be tried again in {}s",
+                self.server,
+                backoff.as_secs()
+            ),
+            Denial::LoginCannotWiden if missing.is_empty() => format!(
+                "mcp server `{0}` answered 403 insufficient_scope without naming the scope it \
+                 needs; its login cannot widen mid-run, so run `{1} mcp-login {0} --scope \
+                 <scope>` with the scope the server documents",
+                self.server,
+                crate::PROGRAM
+            ),
+            Denial::LoginCannotWiden => format!(
+                "mcp server `{0}` needs scope `{missing}` that its login lacks, and no one is \
+                 present to approve it mid-run; run `{1} mcp-login {0} --scope \"{missing}\"` \
+                 and run again",
+                self.server,
+                crate::PROGRAM
+            ),
+            Denial::NoScope => format!(
+                "mcp server `{}` answered 403 insufficient_scope without naming the scope it needs; \
+                 nothing to step up to",
+                self.server
+            ),
+            Denial::AlreadyRequested => format!(
+                "mcp server `{}` still answers 403 insufficient_scope for `{missing}`, which was \
+                 already requested; not retried",
+                self.server
+            ),
+            Denial::RefusedEarlier { transient } => self.refused_message(
+                missing,
+                if *transient {
+                    "the authorization server failed it earlier and is not asked again yet"
+                } else {
+                    "refused it earlier"
+                },
+            ),
+            Denial::StepUpFailed { reason } => self.refused_message(missing, reason),
         }
     }
 
@@ -394,99 +426,27 @@ impl ServerAuth {
         sent: Option<&str>,
         challenged: &[String],
     ) -> Result<String, String> {
-        use crate::tools::mcp_client_credentials::{StepUp, step_up, union_scopes};
         let missing = challenged.join(" ");
-        if self.cc.is_none() {
-            return Err(if challenged.is_empty() {
-                format!(
-                    "mcp server `{0}` answered 403 insufficient_scope without naming the scope it \
-                     needs; its login cannot widen mid-run, so run `{1} mcp-login {0} --scope \
-                     <scope>` with the scope the server documents",
-                    self.server,
-                    crate::PROGRAM
-                )
-            } else {
-                format!(
-                    "mcp server `{0}` needs scope `{missing}` that its login lacks, and no one is \
-                     present to approve it mid-run; run `{1} mcp-login {0} --scope \"{missing}\"` \
-                     and run again",
-                    self.server,
-                    crate::PROGRAM
-                )
-            });
-        }
-        let mut state = self.state.lock().await;
-        // Another call already stepped up past the token `sent`: take its token, no second request.
-        if let Some(current) = state.token.as_deref()
-            && Some(current) != sent
-            && union_scopes(&state.scopes, challenged).len() == state.scopes.len()
-        {
-            return Ok(current.to_owned());
-        }
-        let now = Instant::now();
-        let standing: Vec<Vec<String>> = state
-            .refused
-            .iter()
-            .filter(|r| r.stands(now))
-            .map(|r| r.scopes.clone())
-            .collect();
-        match step_up(&state.scopes, challenged, &standing) {
-            StepUp::NoScope => Err(format!(
-                "mcp server `{}` answered 403 insufficient_scope without naming the scope it needs; \
-                 nothing to step up to",
-                self.server
-            )),
-            StepUp::AlreadyRequested => Err(format!(
-                "mcp server `{}` still answers 403 insufficient_scope for `{missing}`, which was \
-                 already requested; not retried",
-                self.server
-            )),
-            StepUp::Refused => {
-                let transient = state
-                    .refused
-                    .iter()
-                    .any(|r| r.until.is_some() && r.stands(now));
-                Err(self.refused_message(
-                    &missing,
-                    if transient {
-                        "the authorization server failed it earlier and is not asked again yet"
-                    } else {
-                        "refused it earlier"
-                    },
-                ))
+        let event = kernel::Event::Insufficient {
+            now: self.now(),
+            sent,
+            challenged,
+        };
+        let reply = if self.cc.is_none() {
+            // Decided without the lock, as before: an `mcp-login` server never waits on a refresh.
+            let action = kernel::step(&mut TokenState::default(), &self.config(), event);
+            match action {
+                kernel::Action::Reply(reply) => reply,
+                _ => unreachable!("a login's 403 is answered with a denial"),
             }
-            StepUp::Request(wanted) => match self.refresh(&wanted).await {
-                Ok((token, lifetime)) => {
-                    tracing::info!(server = %self.server, scope = %missing, "stepped up an MCP OAuth token");
-                    state.refused.retain(|r| r.scopes != wanted);
-                    state.install(token.clone(), lifetime, wanted);
-                    Ok(token)
-                }
-                Err(e) => {
-                    // Remembered either way, as `renew` does for a 401: for good when the AS
-                    // refused, a doubling backoff when it was only unreachable. The held token is
-                    // not touched.
-                    let previous = state.refused.iter().position(|r| r.scopes == wanted);
-                    let backoff = match previous.map(|i| &state.refused[i]) {
-                        Some(r) if r.until.is_some() => (r.backoff * 2).min(MAX_BACKOFF),
-                        _ => self.first_backoff,
-                    };
-                    let entry = RefusedScopes {
-                        scopes: wanted,
-                        until: if e.definitive {
-                            None
-                        } else {
-                            Some(now + backoff)
-                        },
-                        backoff,
-                    };
-                    match previous {
-                        Some(i) => state.refused[i] = entry,
-                        None => state.refused.push(entry),
-                    }
-                    Err(self.refused_message(&missing, &e.reason))
-                }
-            },
+        } else {
+            let mut state = self.state.lock().await;
+            self.drive(&mut state, event).await
+        };
+        match reply {
+            kernel::Reply::Granted(token) => Ok(token),
+            kernel::Reply::Denied(denial) => Err(self.denial_message(&denial, &missing)),
+            kernel::Reply::Token(_) => unreachable!("a 403 is answered with a grant or a denial"),
         }
     }
 
@@ -496,14 +456,6 @@ impl ServerAuth {
              could not be obtained ({why}); not retried",
             self.server
         )
-    }
-}
-
-impl TokenState {
-    fn install(&mut self, token: String, lifetime: Option<Duration>, scopes: Vec<String>) {
-        self.token = Some(token);
-        self.expires_at = lifetime.map(|l| Instant::now() + l);
-        self.scopes = scopes;
     }
 }
 
@@ -1028,6 +980,60 @@ impl ServerAuth {
 mod tests {
     use super::*;
 
+    /// The structure check (a source-text check: the repo has no other convention for this): the
+    /// token's decisions are made by `mcp_oauth_kernel::step`, which `tests/mcp_oauth_model.rs`
+    /// model-checks, and this file only performs what it asks. Each entry point feeds the kernel,
+    /// and nothing here writes the kernel's state or reads a clock for it.
+    #[test]
+    fn production_decides_through_the_kernel() {
+        let src = include_str!("mcp_oauth.rs");
+        let prod = &src[..src
+            .rfind("#[cfg(test)]\nmod tests {")
+            .expect("tests module")];
+        let body = |name: &str| {
+            let from = prod
+                .find(&format!("fn {name}("))
+                .unwrap_or_else(|| panic!("no fn {name}"));
+            let rest = &prod[from..];
+            &rest[..rest.find("\n    }\n").expect("fn end")]
+        };
+        for entry in ["token", "after_rejection", "after_insufficient_scope"] {
+            let b = body(entry);
+            assert!(
+                b.contains("kernel::Event::")
+                    && (b.contains("self.drive(") || b.contains("kernel::step(")),
+                "`{entry}` must feed the kernel"
+            );
+        }
+        assert!(
+            body("reload").contains("kernel::step("),
+            "`reload` must feed the kernel"
+        );
+        assert!(
+            body("drive").matches("kernel::step(").count() == 2,
+            "`drive` steps the kernel for the request and for the AS's answer"
+        );
+        // Nothing but the kernel changes its state.
+        for write in [
+            ".failed =",
+            ".refused =",
+            ".token =",
+            ".scopes =",
+            ".expires_at =",
+            ".refused.push",
+            ".install(",
+        ] {
+            assert!(
+                !prod.contains(write),
+                "`{write}`: only the kernel writes the token state"
+            );
+        }
+        assert!(
+            prod.matches("Instant::now()").count() == 1,
+            "the kernel's time comes from `now()`"
+        );
+    }
+
     /// Exactly the real fences close, no line break or bidi control from the server survives.
     fn assert_only_real_fences(text: &str, real: usize) {
         assert_eq!(
@@ -1480,7 +1486,7 @@ mod tests {
     #[tokio::test]
     async fn a_client_credentials_token_about_to_expire_is_replaced_before_the_next_request() {
         let auth = ServerAuth::fake_cc("old", &["read"], |_| Ok("new".into()));
-        auth.state.lock().await.expires_at = Some(Instant::now() + Duration::from_secs(1));
+        auth.state.lock().await.expires_at = Some(auth.now() + Duration::from_secs(1));
         assert_eq!(auth.token().await.as_deref(), Some("new"));
     }
 
