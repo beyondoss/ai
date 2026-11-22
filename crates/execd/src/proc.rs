@@ -67,6 +67,17 @@ fn held_groups() -> std::sync::MutexGuard<'static, Option<job_kernel::Held>> {
     g
 }
 
+/// The spawns execd has made, counted: each group's identity in [`OWNED_GROUPS`], so a number the
+/// OS hands to a later spawn is not taken for the earlier one's.
+static SPAWNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// One spawn's process group: its number and which spawn it belongs to (J11).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Pg {
+    pub id: i32,
+    pub sp: u64,
+}
+
 /// Whether this process is its descendants' subreaper, so every orphaned group member becomes its
 /// own child (see [`group_gone`]). Set by [`become_subreaper`].
 static SUBREAPER: AtomicBool = AtomicBool::new(false);
@@ -117,6 +128,8 @@ pub(crate) struct Proc {
     pub stderr: Option<tokio::process::ChildStderr>,
     /// The group's id, which is also the leader's pid.
     pub pgid: i32,
+    /// Which spawn it was.
+    pub sp: u64,
     exit: oneshot::Receiver<ExitStatus>,
     /// What `wait` answered, kept so that it can answer again: a oneshot receiver must not be
     /// polled after it completes.
@@ -124,6 +137,14 @@ pub(crate) struct Proc {
 }
 
 impl Proc {
+    /// The group, as a signal names it.
+    pub fn pg(&self) -> Pg {
+        Pg {
+            id: self.pgid,
+            sp: self.sp,
+        }
+    }
+
     /// The command's exit status, once the reaper has collected it. Cancel-safe, and callable again
     /// after it has answered.
     pub async fn wait(&mut self) -> io::Result<ExitStatus> {
@@ -161,7 +182,10 @@ pub(crate) fn spawn(cmd: &mut std::process::Command) -> io::Result<Proc> {
     };
     let (tx, exit) = oneshot::channel();
     children().as_mut().map(|m| m.insert(pid, tx));
-    held_groups().as_mut().map(|h| h.insert(pgid));
+    let sp = SPAWNS.fetch_add(1, Ordering::Relaxed);
+    if let Some(h) = held_groups().as_mut() {
+        h.insert(pgid, sp);
+    }
     let pipes = (|| -> io::Result<_> {
         Ok((
             child
@@ -187,6 +211,7 @@ pub(crate) fn spawn(cmd: &mut std::process::Command) -> io::Result<Proc> {
             stdout,
             stderr,
             pgid,
+            sp,
             exit,
             done: None,
         }),
@@ -199,9 +224,9 @@ pub(crate) fn spawn(cmd: &mut std::process::Command) -> io::Result<Proc> {
 }
 
 /// SIGKILL every member of group `pgid`. A group that is already gone is not an error.
-pub(crate) fn kill_group(pgid: i32) {
+pub(crate) fn kill_group(pg: Pg) {
     let _no_reaping = no_reaping();
-    signal_held_group(pgid, Signal::SIGKILL);
+    signal_held_group(pg, Signal::SIGKILL);
 }
 
 /// Keep the reaper from collecting anything until the guard drops (a pass takes [`SPAWNING`]
@@ -214,12 +239,12 @@ fn no_reaping() -> std::sync::RwLockReadGuard<'static, ()> {
 
 /// `sig` to group `pgid` if execd still holds it (J11). The caller holds [`no_reaping`]. A group
 /// that was freed is not ours any more: nothing is sent, and there is nothing of ours to send to.
-fn signal_held_group(pgid: i32, sig: Signal) {
+fn signal_held_group(pg: Pg, sig: Signal) {
     let ours = held_groups()
         .as_ref()
-        .is_some_and(|h| job_kernel::may_deliver(h, pgid));
-    if ours && pgid > 1 {
-        let _ = killpg(Pid::from_raw(pgid), sig);
+        .is_some_and(|h| job_kernel::may_deliver(h, pg.id, pg.sp));
+    if ours && pg.id > 1 {
+        let _ = killpg(Pid::from_raw(pg.id), sig);
     }
 }
 
@@ -393,10 +418,10 @@ pub(crate) async fn job_gone(pgid: i32, mark: &str, precise: bool) -> bool {
 
 /// `sig` to the job's group, and to each process that carries its mark and has left the group:
 /// every process of the job hears it exactly once (a `SIGINT` handler counts deliveries).
-pub(crate) fn signal_job(pgid: i32, mark: &str, sig: Signal) {
+pub(crate) fn signal_job(pg: Pg, mark: &str, sig: Signal) {
     let _no_reaping = no_reaping();
-    signal_held_group(pgid, sig);
-    for pid in members(pgid, mark, true) {
+    signal_held_group(pg, sig);
+    for pid in members(pg.id, mark, true) {
         if let Ok(raw) = i32::try_from(pid) {
             let _ = nix::sys::signal::kill(Pid::from_raw(raw), sig);
         }
@@ -456,23 +481,23 @@ pub(crate) struct Groups(Mutex<GroupSet>);
 
 #[derive(Default)]
 struct GroupSet {
-    live: BTreeSet<i32>,
+    live: BTreeSet<Pg>,
     closed: bool,
 }
 
 impl Groups {
-    pub fn insert(&self, pgid: i32) {
+    pub fn insert(&self, pg: Pg) {
         let mut g = locked(&self.0);
         if g.closed {
             drop(g);
-            kill_group(pgid);
+            kill_group(pg);
         } else {
-            g.live.insert(pgid);
+            g.live.insert(pg);
         }
     }
 
-    pub fn remove(&self, pgid: i32) {
-        locked(&self.0).live.remove(&pgid);
+    pub fn remove(&self, pg: Pg) {
+        locked(&self.0).live.remove(&pg);
     }
 
     /// SIGKILL every registered group, forget them, and close the set. How many it killed.
@@ -564,7 +589,7 @@ fn sweep() -> usize {
             // A group's number is free once its last member is collected: stop holding every group
             // that is gone, before the exclusion ends, so no signal can name it afterwards (J11).
             if let Some(h) = held_groups().as_mut() {
-                for g in h.ids() {
+                for g in h.numbers() {
                     if !group_exists(g) {
                         h.freed(g);
                     }
@@ -648,7 +673,9 @@ mod tests {
     static FORKS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn forking() -> std::sync::MutexGuard<'static, ()> {
-        FORKS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        FORKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     use super::*;
@@ -688,17 +715,23 @@ mod tests {
         let mut child = sleeper.spawn().unwrap();
         let pgid = child.id() as i32;
         // Not through `spawn`, so held by hand, as a spawn would.
-        held_groups().as_mut().map(|h| h.insert(pgid));
+        let pg = Pg { id: pgid, sp: 0 };
+        if let Some(h) = held_groups().as_mut() {
+            h.insert(pgid, 0);
+        }
         assert_eq!(live_members(pgid), vec![child.id()]);
-        kill_group(pgid);
+        kill_group(pg);
         child.wait().unwrap();
         assert!(live_members(pgid).is_empty());
         // A group that is gone is not an error, and nothing outside a real group is ever signalled.
         // The reaper has not run in this test, so the number is still held: free it as a pass does.
-        held_groups().as_mut().map(|h| h.freed(pgid));
-        kill_group(pgid);
-        kill_group(0);
-        kill_group(1);
+        if let Some(h) = held_groups().as_mut() {
+            h.freed(pgid);
+        }
+        kill_group(pg);
+        for id in [0, 1] {
+            kill_group(Pg { id, sp: 0 });
+        }
     }
 
     /// J11 on the real reaper: a group is held from its spawn until the pass that collects its last
@@ -706,29 +739,41 @@ mod tests {
     #[test]
     fn a_group_is_held_until_the_reaper_collects_it_and_never_signalled_after() {
         let _forking = forking();
-        let held_now = |pgid: i32| {
+        let held_now = |pg: Pg| {
             // Under the exclusion that keeps the reaper out, as a signal checks it.
             let _no_reaping = no_reaping();
             held_groups()
                 .as_ref()
-                .is_some_and(|h| job_kernel::may_deliver(h, pgid))
+                .is_some_and(|h| job_kernel::may_deliver(h, pg.id, pg.sp))
         };
         let mut cmd = std::process::Command::new("sleep");
         cmd.arg("30");
         let proc = spawn(&mut cmd).unwrap();
         let pgid = proc.pgid;
-        assert!(held_now(pgid), "a spawned group is held");
-        kill_group(pgid);
+        let pg = proc.pg();
+        assert!(held_now(pg), "a spawned group is held");
+        kill_group(pg);
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while held_now(pgid) {
+        while held_now(pg) {
             sweep();
-            assert!(std::time::Instant::now() < deadline, "the group was never freed");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the group was never freed"
+            );
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(!group_exists(pgid), "freed means the number is free");
         // A signal now names a number that is not ours: refused, whatever the number holds.
-        signal_job(pgid, "no-such-mark", Signal::SIGKILL);
-        kill_group(pgid);
+        signal_job(pg, "no-such-mark", Signal::SIGKILL);
+        kill_group(pg);
+        // The number taken by a later spawn is not the earlier one's group: its signal is refused.
+        if let Some(h) = held_groups().as_mut() {
+            h.insert(pgid, pg.sp + 1_000_000);
+        }
+        assert!(!held_now(pg));
+        if let Some(h) = held_groups().as_mut() {
+            h.freed(pgid);
+        }
     }
 
     #[test]

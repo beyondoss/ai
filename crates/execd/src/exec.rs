@@ -202,24 +202,24 @@ pub(crate) fn strip_os_code(e: &std::io::Error) -> String {
 /// therefore never leaves its command behind.
 pub(crate) struct GroupSlot {
     ctx: Arc<Ctx>,
-    pgid: i32,
+    pg: proc::Pg,
 }
 
 impl GroupSlot {
-    pub fn new(ctx: &Arc<Ctx>, pgid: i32) -> Self {
-        ctx.groups.insert(pgid);
+    pub fn new(ctx: &Arc<Ctx>, pg: proc::Pg) -> Self {
+        ctx.groups.insert(pg);
         Self {
             ctx: ctx.clone(),
-            pgid,
+            pg,
         }
     }
 }
 
 impl Drop for GroupSlot {
     fn drop(&mut self) {
-        self.ctx.groups.remove(self.pgid);
-        if proc::group_exists(self.pgid) {
-            proc::kill_group(self.pgid);
+        self.ctx.groups.remove(self.pg);
+        if proc::group_exists(self.pg.id) {
+            proc::kill_group(self.pg);
         }
     }
 }
@@ -349,7 +349,7 @@ async fn run_oneshot(ctx: Arc<Ctx>, req: Request) -> Resp {
     };
     // Killed on every way out, including this future being dropped when the client leaves (one-shot: a
     // SHOULD once it has answered; a MUST that nothing is left behind an abandoned request).
-    let _slot = GroupSlot::new(ctx, proc.pgid);
+    let _slot = GroupSlot::new(ctx, proc.pg());
     let feed = proc.stdin.take().zip(stdin);
     let feeder = tokio::spawn(async move {
         if let Some((mut pipe, bytes)) = feed {
@@ -393,7 +393,7 @@ async fn run_oneshot(ctx: Arc<Ctx>, req: Request) -> Resp {
             Ok(status) => status,
             Err(_) => {
                 timed_out = true;
-                proc::kill_group(proc.pgid);
+                proc::kill_group(proc.pg());
                 proc.wait().await
             }
         },
@@ -598,7 +598,7 @@ async fn run_stream(ctx: Arc<Ctx>, req: Request, out: mpsc::Sender<Bytes>) {
         }
     };
     let pgid = proc.pgid;
-    let slot = GroupSlot::new(&ctx, pgid);
+    let slot = GroupSlot::new(&ctx, proc.pg());
     let seq = ctx.next_seq.fetch_add(1, Ordering::Relaxed);
     if let Some(o) = &ctx.opts.observer {
         o.stream_started(&StreamStart {
@@ -658,7 +658,7 @@ async fn run_stream(ctx: Arc<Ctx>, req: Request, out: mpsc::Sender<Bytes>) {
     // Whatever the end, nothing of the command outlives its exchange. A clean finish left the group
     // empty already, and a dropped slot kills only a group that still exists.
     if !matches!(end, StreamEnd::Finished) {
-        proc::kill_group(pgid);
+        proc::kill_group(proc.pg());
         let _ = proc.wait().await;
     }
     drop(slot);
@@ -681,7 +681,7 @@ async fn timed_out(
     sink: &mut Sink,
     readers: &mut [tokio::task::JoinHandle<()>],
 ) -> StreamEnd {
-    proc::kill_group(proc.pgid);
+    proc::kill_group(proc.pg());
     let _ = proc.wait().await;
     for r in readers.iter() {
         r.abort();

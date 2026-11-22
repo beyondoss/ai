@@ -27,6 +27,7 @@ there are. A normal build erases the specs and proofs; `mise run verify:kernels`
 | J8 a signal reaches a group only while the job has one and has not ended                                                                                                                            | `post_act`                                                      |
 | J9 a stream goes on only with the job it attached to                                                                                                                                                | `bound`                                                         |
 | J10 a take removes only the job that was checked, not its key's successor                                                                                                                           | `takes`                                                         |
+| J11 a signal by number reaches only a group its spawn still holds: never one the reaper freed (its number is any process's), never a later spawn's group on the same number; a held group is always deliverable (the completeness half, J11's liveness partner: a refusal clears only when there is nothing left to signal) | `Held::{has, insert, freed, numbers}`, `may_deliver`                      |
 | L1 an ended job can always be removed (`Take` whatever `empty` says); a job ends in at most two fair steps (F1: the supervisor delivers the spawn and the group's emptying)                         | `post_act`, `lemma_end_progress`, `end_rank`                    |
 | L2 an ended job's stream sends the shell's exit once, then the final frame, never `Wait`; each frame lowers `follow_rank` (F2: a `Data` frame takes at least a byte; F3: the stream is scheduled)   | `post_follow`, `lemma_follow_progress`, `follow_rank`, `window` |
 
@@ -53,3 +54,10 @@ behaviour and cost (interning every wire string), so the storage stays outside:
 - That the shell calls the kernel for every decision, in the right order under the right lock: the
   structure test (`tests/production.rs`) and the model.
 - The fairness assumptions F1-F3 of L1 and L2: the environment delivers the events.
+- J11's ordering. The kernel proves the ledger (`Held`) and the check (`may_deliver`); that the reaper frees a number in the
+  same exclusion in which it collects the last member, and that a signal checks and sends inside the exclusion that keeps the
+  reaper out (`proc::sweep`, `proc::signal_job`), is the shell's: model-checked in `crates/execd/tests/os_model.rs` (the
+  real `Held` and `may_deliver` against an OS actor: exits, reaper passes, foreign reuse of the number, a later job on it, a
+  decision delivered late) and pinned by its source-text check `production_signals_only_held_groups`. Not covered: a host
+  without the subreaper (init reaps orphans outside the exclusion), and the supervisor's by-number observation of a group
+  while a foreign group holds the number (it delays the end, never a signal).
