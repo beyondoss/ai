@@ -1083,7 +1083,10 @@ fn the_mutation_turns_its_property_red() {
 fn production_calls_the_kernel() {
     // The job shell, and the output ring that holds a stream's window (`kernel::window(`, now
     // `execd_ring::window`); each without its test module.
-    let strip = |src: &'static str| src.find("#[cfg(test)]\n#[allow(").map_or(src, |i| &src[..i]);
+    let strip = |src: &'static str| {
+        src.find("#[cfg(test)]\n#[allow(")
+            .map_or(src, |i| &src[..i])
+    };
     let prod = format!(
         "{}{}",
         strip(include_str!("../src/jobs.rs")),
