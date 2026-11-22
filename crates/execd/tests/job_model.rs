@@ -34,6 +34,8 @@
 //! - J6 a kept job never dies with a held client's connection, and `Kept` never goes back to `Held`.
 //! - J7 no orphan: a job is taken out of the table only with its group empty, so nothing is left
 //!   running that the table cannot name.
+//! - J10 a take removes only the job that was checked (`remove`/`wipe` await the group between the
+//!   check and the take, and the key may hold a successor by then), never its key's successor.
 //! - J8 no signal reaches an ended job's group (its number may be reused).
 //! - L1 (bounded measure `k = 1`): an ended job can always be removed by `remove`, whatever its
 //!   group number now names.
@@ -62,6 +64,7 @@ const V_J6: u32 = 16;
 const V_J7: u32 = 32;
 const V_J8: u32 = 64;
 const V_J9: u32 = 128;
+const V_J10: u32 = 256;
 
 fn key(scope: u8, id: u8) -> Key {
     (format!("S{scope}"), format!("i{id}"))
@@ -208,6 +211,8 @@ struct Jobs {
     clients: usize,
     /// The ring holds at most this many bytes in all.
     max_end: u8,
+    /// `remove` and `wipe` may decide and take as two steps (the shell awaits the group between).
+    slow: bool,
 }
 
 /// One scope, one id, two jobs: a key is reused after a removal.
@@ -217,6 +222,17 @@ const REUSE: Jobs = Jobs {
     max_jobs: 2,
     clients: 1,
     max_end: 1,
+    slow: false,
+};
+/// One scope, one id, two jobs, no streams: a `remove`/`wipe` decides, other clients remove and
+/// restart the id, then it takes (J10).
+const SLOW: Jobs = Jobs {
+    scopes: 1,
+    ids: 1,
+    max_jobs: 2,
+    clients: 0,
+    max_end: 0,
+    slow: true,
 };
 /// Two scopes that both use one id (no ring: the ring is REUSE's and STREAMS').
 const SCOPES: Jobs = Jobs {
@@ -225,6 +241,7 @@ const SCOPES: Jobs = Jobs {
     max_jobs: 2,
     clients: 1,
     max_end: 0,
+    slow: false,
 };
 /// One scope, two ids: `kill` of one id leaves the other (no streams, no ring).
 const IDS: Jobs = Jobs {
@@ -233,6 +250,7 @@ const IDS: Jobs = Jobs {
     max_jobs: 2,
     clients: 0,
     max_end: 0,
+    slow: false,
 };
 /// One job, two clients, two bytes: streams and the ring (a gap, an eviction under a reader).
 const STREAMS: Jobs = Jobs {
@@ -241,6 +259,7 @@ const STREAMS: Jobs = Jobs {
     max_jobs: 1,
     clients: 2,
     max_end: 2,
+    slow: false,
 };
 
 impl St {
@@ -279,9 +298,12 @@ impl St {
 
     /// `Jobs::remove`: out of the table, then each job taken.
     fn take(&mut self, checked: &[(Key, usize)]) {
-        let keys: Vec<Key> = checked.iter().map(|(k, _)| k.clone()).collect();
-        let handles = self.table.take(&keys);
+        let handles = self.table.take(checked, |a, b| a == b);
         for h in handles {
+            // J10: only a job that was checked leaves.
+            if !checked.iter().any(|(_, c)| *c == h) {
+                self.bad |= V_J10;
+            }
             if self.sims[h].alive() {
                 self.bad |= V_J7;
             }
@@ -442,7 +464,7 @@ impl Model for Jobs {
                 out.push(A::Read(scope, id));
                 out.push(A::Signal(scope, id));
                 out.push(A::Remove(scope, id));
-                if s.pending.is_empty() {
+                if self.slow && s.pending.is_empty() {
                     out.push(A::SlowRemove(scope, id));
                 }
                 for remove in [false, true] {
@@ -455,7 +477,7 @@ impl Model for Jobs {
                 }
             }
             out.push(A::Wipe { scope });
-            if s.pending.is_empty() {
+            if self.slow && s.pending.is_empty() {
                 out.push(A::SlowWipe { scope });
             }
         }
@@ -776,6 +798,10 @@ impl Model for Jobs {
                 "J7: a job leaves the table only with its group empty",
                 |_, s: &St| s.bad & V_J7 == 0 && s.sims.iter().all(|x| !(x.k.removed && x.alive())),
             ),
+            Property::always(
+                "J10: a take removes only the job that was checked, not its key's successor",
+                |_, s: &St| s.bad & V_J10 == 0,
+            ),
             Property::always("J8: no signal reaches an ended job", |_, s: &St| {
                 s.bad & V_J8 == 0
             }),
@@ -847,6 +873,12 @@ fn check(m: Jobs) {
 #[test]
 fn faithful_reuse() {
     check(REUSE);
+}
+
+/// ... and with a `remove`/`wipe` that takes after the others moved.
+#[test]
+fn faithful_slow_remove() {
+    check(SLOW);
 }
 
 /// ... and with two scopes.
@@ -982,6 +1014,7 @@ fn ended_is_final() {
     feature = "mut_remove_live",
     feature = "mut_signal_ended",
     feature = "mut_ended_not_removable",
+    feature = "mut_take_by_key",
     feature = "mut_follow_waits_after_end"
 ))]
 #[test]
@@ -1008,13 +1041,15 @@ fn the_mutation_turns_its_property_red() {
         "J7: "
     } else if cfg!(feature = "mut_signal_ended") {
         "J8: "
+    } else if cfg!(feature = "mut_take_by_key") {
+        "J10: "
     } else if cfg!(feature = "mut_ended_not_removable") {
         "L1: "
     } else {
         "L2: "
     };
     let mut red: Vec<&str> = Vec::new();
-    for m in [REUSE, SCOPES, IDS, STREAMS] {
+    for m in [SLOW, REUSE, SCOPES, IDS, STREAMS] {
         // A red run stops when the named property fails: the counterexample is the evidence.
         let named: std::collections::BTreeSet<&'static str> = m
             .properties()
@@ -1066,7 +1101,7 @@ fn production_calls_the_kernel() {
         "kernel::bound(",
         "kernel::follow(",
         "Pick::",
-        ".take(keys)",
+        ".take(checked, Arc::ptr_eq)",
         ".in_scope(scope, pick)",
         ".alive()",
     ] {
@@ -1116,11 +1151,20 @@ fn a_take_removes_the_job_it_checked_not_its_keys_successor() {
     t.insert(k.clone(), 1);
     let checked = vec![(k.clone(), 1usize)];
     // Another client removes job 1 and starts job 2 under the key.
-    t.take(std::slice::from_ref(&k));
+    t.take(&checked, |a, b| a == b);
     assert_eq!(t.admit(&k), Admit::Fresh);
     t.insert(k.clone(), 2);
     // The slow take of what was checked.
-    let keys: Vec<Key> = checked.iter().map(|(k, _)| k.clone()).collect();
-    t.take(&keys);
-    assert_eq!(t.get(&k), Some(2), "J10: the take removed job 2, which was never checked");
+    t.take(&checked, |a, b| a == b);
+    assert_eq!(
+        t.get(&k),
+        Some(2),
+        "J10: the take removed job 2, which was never checked"
+    );
+    // The job that was checked and is still there goes.
+    t.take(&[(k.clone(), 2usize)], |a, b| a == b);
+    assert_eq!(t.get(&k), None);
+    // The decision on its own.
+    assert!(kernel::takes(true));
+    assert!(!kernel::takes(false) || cfg!(feature = "mut_take_by_key"));
 }

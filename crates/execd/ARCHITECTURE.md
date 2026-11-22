@@ -193,15 +193,17 @@ before. The two locks stay as they were, and the kernel follows them:
 
 A stream is bound to the job it attached to (`bound`): after that job is removed it is gone to the stream, and a later job of the same id is never followed or killed by it (the model found the by-key lookup that did, J9).
 
+`remove`, and `kill` with `remove` or `wipe`, check a job (`removable`, which may await its group) and take it later. The take is bound to the job checked (J10, `takes`, `Table::take` with the shell's `Arc::ptr_eq`): if the key was freed and started again in between, the successor stays, signalled by nobody and checked by nobody. So does the spawn failure's take, which names the cell it created.
+
 There is no cap and no expiry here (see Bounds): an ended job is freed only by `remove`, `kill` with `remove` or `wipe`.
 
 `tests/job_model.rs` is a Stateright model that calls these functions, never a copy, and an environment (the shell dying with or
-without a descendant, `kill`, pumps, eviction, a held connection dropping at any point). Four bounded configs, each under ten
+without a descendant, `kill`, pumps, eviction, a held connection dropping at any point). Five bounded configs, each under ten
 seconds (CI kills a test at 180s): `REUSE` (one scope, one id, two jobs, one client, a one-byte ring: an id reused after a removal),
-`SCOPES` (two scopes that both use one id), `IDS` (two ids in one scope), `STREAMS` (one job, two clients, a two-byte ring). Properties: J1 an id is the claim (a start never replaces a job in the table), J2 no
+`SCOPES` (two scopes that both use one id), `IDS` (two ids in one scope), `STREAMS` (one job, two clients, a two-byte ring), `SLOW` (a `remove`/`wipe` that decides and takes as two steps, other clients' removals and restarts of the id between). Properties: J1 an id is the claim (a start never replaces a job in the table), J2 no
 operation resolves another scope's job, J3 a removed job never answers again (and a stream never follows a later job of its id),
 J4 an ended job never changes, J5 output offsets only move forward over what is held, J6 a kept job never dies with a held client,
-J7 a job leaves only with its group empty, J8 no signal reaches an ended job, J9 a stream follows the job it attached to, never a later job of its id, L1 an ended job can always be removed, L2 an ended
+J7 a job leaves only with its group empty, J8 no signal reaches an ended job, J9 a stream follows the job it attached to, never a later job of its id, J10 a take removes only the job that was checked, never its key's successor, L1 an ended job can always be removed, L2 an ended
 job's stream sends its final frame. `production_calls_the_kernel` fails if `jobs.rs` stops calling the kernel or writes job state
 outside it. `crates/execd-jobs/tests/production.rs` fails if `execd::job_kernel` stops being that crate, a decision leaves its `verus!` block, or a second copy of the state machine appears.
 
@@ -224,6 +226,7 @@ cargo test -p beyond-execd --features <mut> --test job_model the_mutation   # ea
 | `mut_signal_ended`           | J8                                                |
 | `mut_ended_not_removable`    | L1                                                |
 | `mut_stream_follows_key`     | J9                                                |
+| `mut_take_by_key`            | J10                                               |
 | `mut_follow_waits_after_end` | L2                                                |
 
 ## Security

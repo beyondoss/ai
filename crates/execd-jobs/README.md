@@ -26,6 +26,7 @@ there are. A normal build erases the specs and proofs; `mise run verify:kernels`
 | J7 `Take` exactly when the group is observed empty or the ended job counts                                                                                                                          | `post_act`, `removable`                                         |
 | J8 a signal reaches a group only while the job has one and has not ended                                                                                                                            | `post_act`                                                      |
 | J9 a stream goes on only with the job it attached to                                                                                                                                                | `bound`                                                         |
+| J10 a take removes only the job that was checked, not its key's successor                                                                                                                           | `takes`                                                         |
 | L1 an ended job can always be removed (`Take` whatever `empty` says); a job ends in at most two fair steps (F1: the supervisor delivers the spawn and the group's emptying)                         | `post_act`, `lemma_end_progress`, `end_rank`                    |
 | L2 an ended job's stream sends the shell's exit once, then the final frame, never `Wait`; each frame lowers `follow_rank` (F2: a `Data` frame takes at least a byte; F3: the stream is scheduled)   | `post_follow`, `lemma_follow_progress`, `follow_rank`, `window` |
 
@@ -42,7 +43,7 @@ Neither `String` nor `(String, String)` is covered, and for any other key type v
 behaviour and cost (interning every wire string), so the storage stays outside:
 
 - `Table`'s `HashMap`: that `contains_key` finds the key, that `get` returns the entry under exactly
-  that `(scope, id)`, and that `take` removes it. `admit` and `visible` take what the storage
+  that `(scope, id)`, and that `take` removes it (the pointer-identity test `take` is handed is the shell's; whether to take is `takes`, proven). `admit` and `visible` take what the storage
   observed and are proven; the lookup itself is not. J3's "no operation resolves a removed job"
   (`mut_remove_keeps_entry`) and the exact-key half of J2 (`Table::get`) are **gaps** here, judged by
   the model only.

@@ -651,6 +651,17 @@ pub fn bound<C>(found: Option<C>, same: bool) -> (r: Option<C>)
     }
 }
 
+/// J10: a take goes through only for the job that was checked: the table holds it under the key
+/// still (`same`). Between `removable` (which awaits the group) and the take, the job may have been
+/// removed and its id started again: the successor was never checked, and taking it would leave
+/// its process group running with no entry.
+pub fn takes(same: bool) -> (r: bool)
+    ensures
+        r == same,
+{
+    same || cfg!(feature = "mut_take_by_key")
+}
+
 /// What a stream sends next.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Follow {
@@ -859,15 +870,23 @@ impl<C: Clone> Table<C> {
             .collect()
     }
 
-    /// Take `keys` out of the table; the jobs that were there. A key that is gone is skipped.
-    pub fn take(&mut self, keys: &[Key]) -> Vec<C> {
-        if cfg!(feature = "mut_remove_keeps_entry") {
-            return keys
-                .iter()
-                .filter_map(|k| self.entries.get(k).cloned())
-                .collect();
+    /// Take the `checked` jobs out of the table; the jobs that were taken. An entry is taken only if
+    /// the job under its key is still the one that was checked (`same`: the shell's pointer
+    /// identity), so a key that is gone, or now holds a successor, is skipped (J10).
+    pub fn take(&mut self, checked: &[(Key, C)], same: impl Fn(&C, &C) -> bool) -> Vec<C> {
+        let mut taken = Vec::new();
+        for (k, c) in checked {
+            let found = self.entries.get(k).is_some_and(|now| same(now, c));
+            if !takes(found) {
+                continue;
+            }
+            if cfg!(feature = "mut_remove_keeps_entry") {
+                taken.extend(self.entries.get(k).cloned());
+            } else {
+                taken.extend(self.entries.remove(k));
+            }
         }
-        keys.iter().filter_map(|k| self.entries.remove(k)).collect()
+        taken
     }
 
     /// Every job in the table, any scope.
