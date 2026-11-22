@@ -707,10 +707,10 @@ impl Notify {
                 ended_counts,
             };
             if jk::step(&mut cell.st, ev) == jk::Act::Take {
-                keys.push(k);
+                keys.push((k, c));
             }
         }
-        let gone = table.take(&keys);
+        let gone = table.take(&keys, |a, b| a == b);
         for c in gone {
             let c = c as usize;
             if expect.is_some_and(|e| e != c) {

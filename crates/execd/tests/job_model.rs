@@ -34,6 +34,8 @@
 //! - J6 a kept job never dies with a held client's connection, and `Kept` never goes back to `Held`.
 //! - J7 no orphan: a job is taken out of the table only with its group empty, so nothing is left
 //!   running that the table cannot name.
+//! - J10 a take removes only the job that was checked (`remove`/`wipe` await the group between the
+//!   check and the take, and the key may hold a successor by then), never its key's successor.
 //! - J8 no signal reaches an ended job's group (its number may be reused).
 //! - L1 (bounded measure `k = 1`): an ended job can always be removed by `remove`, whatever its
 //!   group number now names.
@@ -62,6 +64,7 @@ const V_J6: u32 = 16;
 const V_J7: u32 = 32;
 const V_J8: u32 = 64;
 const V_J9: u32 = 128;
+const V_J10: u32 = 256;
 
 fn key(scope: u8, id: u8) -> Key {
     (format!("S{scope}"), format!("i{id}"))
@@ -137,6 +140,9 @@ struct St {
     table: kernel::Table<usize>,
     sims: Vec<Sim>,
     clients: Vec<Client>,
+    /// A `remove`/`wipe` that decided (`removable`) and has not yet taken: the shell awaits the
+    /// group between the two, and other clients' operations run then.
+    pending: Vec<(Key, usize)>,
     bad: u32,
 }
 
@@ -145,7 +151,7 @@ impl std::hash::Hash for St {
         let mut all = self.table.all();
         all.sort();
         all.hash(h);
-        (&self.sims, &self.clients, self.bad).hash(h);
+        (&self.sims, &self.clients, &self.pending, self.bad).hash(h);
     }
 }
 
@@ -177,6 +183,14 @@ enum A {
         scope: u8,
     },
     Remove(u8, u8),
+    /// `remove` that decides now and takes later (`TakePending`).
+    SlowRemove(u8, u8),
+    /// `wipe` that decides now and takes later.
+    SlowWipe {
+        scope: u8,
+    },
+    /// The take of the slow operation in flight.
+    TakePending,
     Attach {
         client: usize,
         scope: u8,
@@ -197,6 +211,8 @@ struct Jobs {
     clients: usize,
     /// The ring holds at most this many bytes in all.
     max_end: u8,
+    /// `remove` and `wipe` may decide and take as two steps (the shell awaits the group between).
+    slow: bool,
 }
 
 /// One scope, one id, two jobs: a key is reused after a removal.
@@ -206,6 +222,17 @@ const REUSE: Jobs = Jobs {
     max_jobs: 2,
     clients: 1,
     max_end: 1,
+    slow: false,
+};
+/// One scope, one id, two jobs, no streams: a `remove`/`wipe` decides, other clients remove and
+/// restart the id, then it takes (J10).
+const SLOW: Jobs = Jobs {
+    scopes: 1,
+    ids: 1,
+    max_jobs: 2,
+    clients: 0,
+    max_end: 0,
+    slow: true,
 };
 /// Two scopes that both use one id (no ring: the ring is REUSE's and STREAMS').
 const SCOPES: Jobs = Jobs {
@@ -214,6 +241,7 @@ const SCOPES: Jobs = Jobs {
     max_jobs: 2,
     clients: 1,
     max_end: 0,
+    slow: false,
 };
 /// One scope, two ids: `kill` of one id leaves the other (no streams, no ring).
 const IDS: Jobs = Jobs {
@@ -222,6 +250,7 @@ const IDS: Jobs = Jobs {
     max_jobs: 2,
     clients: 0,
     max_end: 0,
+    slow: false,
 };
 /// One job, two clients, two bytes: streams and the ring (a gap, an eviction under a reader).
 const STREAMS: Jobs = Jobs {
@@ -230,6 +259,7 @@ const STREAMS: Jobs = Jobs {
     max_jobs: 1,
     clients: 2,
     max_end: 2,
+    slow: false,
 };
 
 impl St {
@@ -267,9 +297,13 @@ impl St {
     }
 
     /// `Jobs::remove`: out of the table, then each job taken.
-    fn take(&mut self, keys: &[Key]) {
-        let handles = self.table.take(keys);
+    fn take(&mut self, checked: &[(Key, usize)]) {
+        let handles = self.table.take(checked, |a, b| a == b);
         for h in handles {
+            // J10: only a job that was checked leaves.
+            if !checked.iter().any(|(_, c)| *c == h) {
+                self.bad |= V_J10;
+            }
             if self.sims[h].alive() {
                 self.bad |= V_J7;
             }
@@ -278,7 +312,7 @@ impl St {
     }
 
     /// The ids `kill`/`wipe` name in `scope`, as the shell passes them.
-    fn stop(&mut self, scope: u8, ids: &[String], all: bool, remove: bool) {
+    fn stop(&mut self, scope: u8, ids: &[String], all: bool, remove: bool, slow: bool) {
         let pick = if all { Pick::All } else { Pick::Ids(ids) };
         let named = self.table.in_scope(&scope_name(scope), pick);
         let mut stopping = Vec::new();
@@ -304,9 +338,18 @@ impl St {
             for (k, h) in named {
                 self.resolved(scope, h);
                 if self.removable(h, false) {
-                    gone.push(k);
+                    gone.push((k, h));
                 }
             }
+            self.finish(gone, slow);
+        }
+    }
+
+    /// The take of what was decided: now, or (slow) as a later step.
+    fn finish(&mut self, gone: Vec<(Key, usize)>, slow: bool) {
+        if slow {
+            self.pending = gone;
+        } else {
             self.take(&gone);
         }
     }
@@ -351,6 +394,7 @@ impl Model for Jobs {
         vec![St {
             table: kernel::Table::default(),
             sims: Vec::new(),
+            pending: Vec::new(),
             clients: vec![
                 Client {
                     st: Cl::Idle,
@@ -420,6 +464,9 @@ impl Model for Jobs {
                 out.push(A::Read(scope, id));
                 out.push(A::Signal(scope, id));
                 out.push(A::Remove(scope, id));
+                if self.slow && s.pending.is_empty() {
+                    out.push(A::SlowRemove(scope, id));
+                }
                 for remove in [false, true] {
                     out.push(A::Kill { scope, id, remove });
                 }
@@ -430,6 +477,12 @@ impl Model for Jobs {
                 }
             }
             out.push(A::Wipe { scope });
+            if self.slow && s.pending.is_empty() {
+                out.push(A::SlowWipe { scope });
+            }
+        }
+        if !s.pending.is_empty() {
+            out.push(A::TakePending);
         }
         for c in 0..self.clients {
             match s.clients[c].st {
@@ -507,7 +560,7 @@ impl Model for Jobs {
             }
             A::SpawnFail(i) => {
                 let k = key(s.sims[i].scope, s.sims[i].id);
-                s.take(&[k]);
+                s.take(&[(k, i)]);
                 for cl in &mut s.clients {
                     if cl.st == Cl::Pending && cl.job == i {
                         cl.st = Cl::Idle;
@@ -597,19 +650,27 @@ impl Model for Jobs {
                     s.bad |= V_J8;
                 }
             }
-            A::Kill { scope, id, remove } => s.stop(scope, &[format!("i{id}")], false, remove),
-            A::Wipe { scope } => s.stop(scope, &[], true, true),
-            A::Remove(scope, id) => {
+            A::Kill { scope, id, remove } => {
+                s.stop(scope, &[format!("i{id}")], false, remove, false);
+            }
+            A::Wipe { scope } => s.stop(scope, &[], true, true, false),
+            A::SlowWipe { scope } => s.stop(scope, &[], true, true, true),
+            A::TakePending => {
+                let checked = std::mem::take(&mut s.pending);
+                s.take(&checked);
+            }
+            A::Remove(scope, id) | A::SlowRemove(scope, id) => {
+                let slow = matches!(a, A::SlowRemove(..));
                 let ids = [format!("i{id}")];
                 let named = s.table.in_scope(&scope_name(scope), Pick::Ids(&ids));
                 let mut gone = Vec::new();
                 for (k, h) in named {
                     s.resolved(scope, h);
                     if s.removable(h, true) {
-                        gone.push(k);
+                        gone.push((k, h));
                     }
                 }
-                s.take(&gone);
+                s.finish(gone, slow);
             }
             A::Attach { client, scope, id } => {
                 let h = s.table.get(&key(scope, id))?;
@@ -737,6 +798,10 @@ impl Model for Jobs {
                 "J7: a job leaves the table only with its group empty",
                 |_, s: &St| s.bad & V_J7 == 0 && s.sims.iter().all(|x| !(x.k.removed && x.alive())),
             ),
+            Property::always(
+                "J10: a take removes only the job that was checked, not its key's successor",
+                |_, s: &St| s.bad & V_J10 == 0,
+            ),
             Property::always("J8: no signal reaches an ended job", |_, s: &St| {
                 s.bad & V_J8 == 0
             }),
@@ -808,6 +873,12 @@ fn check(m: Jobs) {
 #[test]
 fn faithful_reuse() {
     check(REUSE);
+}
+
+/// ... and with a `remove`/`wipe` that takes after the others moved.
+#[test]
+fn faithful_slow_remove() {
+    check(SLOW);
 }
 
 /// ... and with two scopes.
@@ -943,6 +1014,7 @@ fn ended_is_final() {
     feature = "mut_remove_live",
     feature = "mut_signal_ended",
     feature = "mut_ended_not_removable",
+    feature = "mut_take_by_key",
     feature = "mut_follow_waits_after_end"
 ))]
 #[test]
@@ -969,13 +1041,15 @@ fn the_mutation_turns_its_property_red() {
         "J7: "
     } else if cfg!(feature = "mut_signal_ended") {
         "J8: "
+    } else if cfg!(feature = "mut_take_by_key") {
+        "J10: "
     } else if cfg!(feature = "mut_ended_not_removable") {
         "L1: "
     } else {
         "L2: "
     };
     let mut red: Vec<&str> = Vec::new();
-    for m in [REUSE, SCOPES, IDS, STREAMS] {
+    for m in [SLOW, REUSE, SCOPES, IDS, STREAMS] {
         // A red run stops when the named property fails: the counterexample is the evidence.
         let named: std::collections::BTreeSet<&'static str> = m
             .properties()
@@ -1027,7 +1101,7 @@ fn production_calls_the_kernel() {
         "kernel::bound(",
         "kernel::follow(",
         "Pick::",
-        ".take(keys)",
+        ".take(checked, Arc::ptr_eq)",
         ".in_scope(scope, pick)",
         ".alive()",
     ] {
@@ -1065,4 +1139,32 @@ fn production_calls_the_kernel() {
             .is_some_and(|a| at - a < 1500),
         "the insert is no longer behind `admit`"
     );
+}
+
+/// J10 on the table itself: `remove` checked job 1 under a key, then job 1 was removed and a client
+/// started the same id again (job 2). Taking what was checked must leave job 2.
+#[test]
+fn a_take_removes_the_job_it_checked_not_its_keys_successor() {
+    let k = key(0, 0);
+    let mut t = kernel::Table::<usize>::default();
+    assert_eq!(t.admit(&k), Admit::Fresh);
+    t.insert(k.clone(), 1);
+    let checked = vec![(k.clone(), 1usize)];
+    // Another client removes job 1 and starts job 2 under the key.
+    t.take(&checked, |a, b| a == b);
+    assert_eq!(t.admit(&k), Admit::Fresh);
+    t.insert(k.clone(), 2);
+    // The slow take of what was checked.
+    t.take(&checked, |a, b| a == b);
+    assert_eq!(
+        t.get(&k),
+        Some(2),
+        "J10: the take removed job 2, which was never checked"
+    );
+    // The job that was checked and is still there goes.
+    t.take(&[(k.clone(), 2usize)], |a, b| a == b);
+    assert_eq!(t.get(&k), None);
+    // The decision on its own.
+    assert!(kernel::takes(true));
+    assert!(!kernel::takes(false) || cfg!(feature = "mut_take_by_key"));
 }

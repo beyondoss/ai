@@ -53,6 +53,9 @@ mut_ended_not_removable = [
 mut_stream_follows_key = [
   "beyond-execd-jobs/mut_stream_follows_key",
 ] # a stream goes on with whatever job holds its key now (J9)
+mut_take_by_key = [
+  "beyond-execd-jobs/mut_take_by_key",
+]
 mut_follow_waits_after_end = [
   "beyond-execd-jobs/mut_follow_waits_after_end",
 ] # a stream never sends its final frame (L2)

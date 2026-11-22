@@ -356,9 +356,10 @@ impl Jobs {
         locked(&self.map).in_scope(scope, pick)
     }
 
-    /// Take `keys` out of the table; their pumps and timers stop.
-    fn remove(&self, keys: &[Key]) {
-        let cells = locked(&self.map).take(keys);
+    /// Take the `checked` jobs out of the table; their pumps and timers stop. A key that now holds
+    /// another job than the one checked keeps it (J10).
+    fn remove(&self, checked: &[(Key, JobCell)]) {
+        let cells = locked(&self.map).take(checked, Arc::ptr_eq);
         for cell in cells {
             let mut j = locked(&cell);
             if kernel::step(&mut j.k, Ev::Taken) == Act::Release {
@@ -877,7 +878,7 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq, data: Vec<u8>) -> 
                 let mut gone = Vec::new();
                 for (k, c) in named {
                     if removable(&c, false).await {
-                        gone.push(k);
+                        gone.push((k, c));
                     }
                 }
                 jobs.remove(&gone);
@@ -890,7 +891,7 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq, data: Vec<u8>) -> 
             let mut gone = Vec::new();
             for (k, c) in named {
                 if removable(&c, true).await {
-                    gone.push(k);
+                    gone.push((k, c));
                 }
             }
             jobs.remove(&gone);
@@ -1046,7 +1047,7 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
     let mut proc = match proc::spawn(&mut cmd) {
         Ok(p) => p,
         Err(e) => {
-            ctx.jobs.remove(std::slice::from_ref(&key));
+            ctx.jobs.remove(&[(key, cell.clone())]);
             let (_, why) = exec::spawn_failure(ctx, req, &e);
             return http::error_response(500, why.trim_end());
         }
