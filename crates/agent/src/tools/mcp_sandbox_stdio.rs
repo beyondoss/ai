@@ -26,8 +26,8 @@
 //! The scope is the MCP one, not the `bash` table's: that table reads its scope back at every
 //! reopen and stops what nobody kept.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use sha2::Digest as _;
@@ -376,11 +376,7 @@ mod tests {
 
     /// The error as production delivers it: wrapped by the session's unreachable prefix.
     fn starting_wrapped() -> std::io::Error {
-        std::io::Error::other(format!(
-            "{}: {}",
-            crate::service::UNREACHABLE,
-            starting()
-        ))
+        std::io::Error::other(format!("{}: {}", crate::service::UNREACHABLE, starting()))
     }
 
     #[tokio::test]
@@ -390,7 +386,13 @@ mod tests {
             || {
                 calls += 1;
                 let n = calls;
-                async move { if n < 3 { Err(starting_wrapped()) } else { Ok(()) } }
+                async move {
+                    if n < 3 {
+                        Err(starting_wrapped())
+                    } else {
+                        Ok(())
+                    }
+                }
             },
             |_| async {},
         )
@@ -429,7 +431,13 @@ mod tests {
             || {
                 calls.set(calls.get() + 1);
                 let up = calls.get() > 3;
-                async move { if up { Ok(7) } else { Err(starting()) } }
+                async move {
+                    if up {
+                        Ok(7)
+                    } else {
+                        Err(starting())
+                    }
+                }
             },
             |_| async {},
         )
