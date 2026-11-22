@@ -207,29 +207,29 @@ const REUSE: Jobs = Jobs {
     clients: 1,
     max_end: 1,
 };
-/// Two scopes that both use one id.
+/// Two scopes that both use one id (no ring: the ring is REUSE's and STREAMS').
 const SCOPES: Jobs = Jobs {
     scopes: 2,
     ids: 1,
     max_jobs: 2,
     clients: 1,
-    max_end: 1,
+    max_end: 0,
 };
-/// One scope, two ids: `kill` of one id leaves the other.
+/// One scope, two ids: `kill` of one id leaves the other (no streams, no ring).
 const IDS: Jobs = Jobs {
     scopes: 1,
     ids: 2,
     max_jobs: 2,
-    clients: 1,
-    max_end: 1,
+    clients: 0,
+    max_end: 0,
 };
-/// Two clients and a ring of one byte (evicted before it is sent: a gap): streams.
+/// One job, two clients, two bytes: streams and the ring (a gap, an eviction under a reader).
 const STREAMS: Jobs = Jobs {
     scopes: 1,
     ids: 1,
-    max_jobs: 2,
+    max_jobs: 1,
     clients: 2,
-    max_end: 1,
+    max_end: 2,
 };
 
 impl St {
