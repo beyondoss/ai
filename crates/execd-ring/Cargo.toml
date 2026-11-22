@@ -1,0 +1,36 @@
+[package]
+name = "beyond-execd-ring"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+readme = "README.md"
+rust-version.workspace = true
+description = "execd's job-output ring kernel: the offset, retention and stderr-label decisions as pure functions, proven in Verus"
+
+[lib]
+name = "execd_ring"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+# Its one dependency is `vstd`, for the `verus!` macro: a normal build erases every proof and spec, and
+# only `cargo verus` (`mise run verify:kernels`) checks them. execd's `ring.rs` calls these functions for
+# every decision; it keeps only the I/O. The version is the one the pinned release ships
+# (`.github/scripts/verus.env`).
+[dependencies]
+vstd = "=0.0.0-2026-11-01-0251"
+
+[package.metadata.verus]
+verify = true
+
+[features]
+# Mutations of the kernel's decisions, each removing one guard. `execd` forwards them: its ring test
+# (`cargo test -p beyond-execd --features <mut> --lib ring::`) and the proof
+# (`mise run verify:kernels -- --features <mut>`) both go red under them.
+mut_window_before_base = [] # a read starts before the oldest byte held
+mut_seg_boundary_off_by_one = [] # the first tail byte is read as the last chunk file's
+mut_evict_one_extra = [] # retention drops one chunk too many (below the retention)
+mut_bits_shifted = [] # a chunk's stderr bits are taken one bit short, misaligning the rest
+mut_ranges_unbounded = [] # the window is not shortened at RANGES_MAX ranges
+mut_flush_fail_base = [] # a refused chunk moves `base` one chunk short, shifting every later offset

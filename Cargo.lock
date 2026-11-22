@@ -496,6 +496,7 @@ dependencies = [
  "beyond-agent",
  "beyond-exec-notify",
  "beyond-execd-jobs",
+ "beyond-execd-ring",
  "beyond-test-support",
  "bytes",
  "getrandom 0.3.4",
@@ -519,6 +520,13 @@ dependencies = [
 
 [[package]]
 name = "beyond-execd-jobs"
+version = "0.1.0"
+dependencies = [
+ "vstd",
+]
+
+[[package]]
+name = "beyond-execd-ring"
 version = "0.1.0"
 dependencies = [
  "vstd",

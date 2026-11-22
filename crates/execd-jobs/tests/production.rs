@@ -21,7 +21,7 @@ fn production_calls_the_verified_kernel() {
     let jobs = read("execd/src/jobs.rs");
     for needle in [
         "kernel::step(",
-        "kernel::window(",
+        // The read window is `execd_ring::window` now (`ring.rs`, checked by its own structure test).
         "kernel::follow(",
         "kernel::bound(",
         "kernel::State::new(",
