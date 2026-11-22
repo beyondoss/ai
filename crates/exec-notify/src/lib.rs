@@ -266,11 +266,10 @@ pub open spec fn post_one(job: Job, event: Event, j2: Job, out: Seq<Action>) -> 
 
 /// What is owed and settled: nothing is lost.
 pub open spec fn post_owed(job: Job, event: Event, j2: Job) -> bool {
-    // Owed only grows, by at most one per event, and only on a `keep` with notify or a change
-    // under one.
-    &&& (!job.removed && !(event is Removed) ==> (j2.owed == job.owed
-        || (j2.owed == job.owed + 1
-            && ((event is Keep && event->Keep_notify) || (event is Change && job.notify)))))
+    // Everything that happens is owed, exactly once: a `keep` with notify and a change under one
+    // each owe one callback more; nothing else changes what is owed.
+    &&& (!job.removed && !(event is Removed) ==> j2.owed == job.owed
+        + (if (event is Keep && event->Keep_notify) || (event is Change && job.notify) { 1int } else { 0int }))
     // Never lost: what an answer settles is what its attempt carried, and only for an answer
     // that settles (`Done`, `Stop`) or a count that ran out of attempts; a change, a wake or a
     // new `keep` with notify settles nothing; a `keep` without notify settles what was owed,
@@ -340,7 +339,7 @@ pub fn verdict(outcome: Outcome) -> (v: Verdict)
             if 200 <= s && s <= 299 {
                 Verdict::Done
             } else if s == 401 || s == 403 || s == 404 || s == 410 {
-                Verdict::Stop
+                if cfg!(feature = "mut_stop_is_retried") { Verdict::Retry } else { Verdict::Stop }
             } else if s == 407 || s == 408 || s == 425 || s == 429 || (500 <= s && s <= 599) {
                 Verdict::Retry
             } else {
@@ -439,7 +438,7 @@ pub fn step(job: Job, event: Event, now: u64) -> (r: (Job, Vec<Action>))
     }
     match event {
         Event::Keep { notify } => {
-            if j.in_flight.is_some() {
+            if j.in_flight.is_some() && !cfg!(feature = "mut_keep_keeps_in_flight") {
                 j.in_flight = None;
                 out.push(Action::Abandon);
             }
@@ -459,8 +458,10 @@ pub fn step(job: Job, event: Event, now: u64) -> (r: (Job, Vec<Action>))
             if !j.notify {
                 return (j, out);
             }
-            j.owed += 1;
-            if j.in_flight.is_none() {
+            if !cfg!(feature = "mut_change_not_owed") || j.in_flight.is_none() {
+                j.owed += 1;
+            }
+            if j.in_flight.is_none() || cfg!(feature = "mut_change_begins_in_flight") {
                 // Idle, or waiting out a retry: a new count begins now.
                 j.wake_at = None;
                 j.attempts = 0;
@@ -493,13 +494,19 @@ pub fn step(job: Job, event: Event, now: u64) -> (r: (Job, Vec<Action>))
             j.in_flight = None;
             match verdict(outcome) {
                 Verdict::Done | Verdict::Stop => {
-                    j.settled = if j.settled > carried { j.settled } else { carried };
+                    j.settled = if cfg!(feature = "mut_answer_settles_all") {
+                        j.owed
+                    } else if j.settled > carried {
+                        j.settled
+                    } else {
+                        carried
+                    };
                     j.attempts = 0;
                 },
                 Verdict::Retry => {
                     if j.owed > carried {
                         j.attempts = 0;
-                    } else if j.attempts >= MAX_ATTEMPTS {
+                    } else if j.attempts >= MAX_ATTEMPTS && !cfg!(feature = "mut_retry_unbounded") {
                         j.settled = if j.settled > carried { j.settled } else { carried };
                         j.attempts = 0;
                     } else {
@@ -519,7 +526,7 @@ pub fn step(job: Job, event: Event, now: u64) -> (r: (Job, Vec<Action>))
         Event::Wake => {
             if j.in_flight.is_none() && j.notify && j.owed > j.settled
                 && match j.wake_at {
-                    Some(at) => at <= now,
+                    Some(at) => at <= now || cfg!(feature = "mut_wake_early"),
                     None => false,
                 } {
                 let (b, a) = begin(j);
