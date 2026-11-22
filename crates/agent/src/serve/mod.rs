@@ -433,6 +433,7 @@ mod models;
 mod out;
 mod persistence;
 mod prompt;
+pub mod session_kernel;
 mod session_setup;
 mod stats;
 mod stdin;
