@@ -56,6 +56,8 @@ pub(crate) type JobCell = Arc<Mutex<Job>>;
 pub(crate) struct Job {
     /// What every process of the job carries in its environment ([`proc::JOB_MARK_ENV`]).
     mark: String,
+    /// Which spawn its process group is, for a signal by number ([`proc::Pg`]); 0 before the spawn.
+    sp: u64,
     label: String,
     out: Ring,
     k: kernel::State,
@@ -65,6 +67,16 @@ pub(crate) struct Job {
     pub notifier: Notifier,
     /// The job's open stdin, when it was started with `stdin_open`.
     stdin: Option<Arc<JobStdin>>,
+}
+
+impl Job {
+    /// The job's process group as a signal names it: the kernel's number and the spawn it is.
+    fn pg(&self) -> proc::Pg {
+        proc::Pg {
+            id: self.k.pgid(),
+            sp: self.sp,
+        }
+    }
 }
 
 /// `notify` reads the kernel's `removed` as a field of the job.
@@ -179,7 +191,7 @@ fn put_signal(j: &Job, obj: &mut Value) {
 
 /// `SIGTERM` the jobs (each `(pgid, mark)`), wait up to `grace` for them to empty, `SIGKILL` what is
 /// left, wait up to a second more (jobs `kill`).
-async fn stop_jobs(jobs: &[(i32, String)], grace: Duration) {
+async fn stop_jobs(jobs: &[(proc::Pg, String)], grace: Duration) {
     let jobs = jobs.to_vec();
     proc::off_runtime({
         let jobs = jobs.clone();
@@ -190,9 +202,11 @@ async fn stop_jobs(jobs: &[(i32, String)], grace: Duration) {
         }
     })
     .await;
-    let any_live = |jobs: &[(i32, String)]| {
+    let any_live = |jobs: &[(proc::Pg, String)]| {
         let jobs = jobs.to_vec();
-        async move { proc::off_runtime(move || jobs.iter().any(|(g, m)| !proc::job_empty(*g, m))).await }
+        async move {
+            proc::off_runtime(move || jobs.iter().any(|(g, m)| !proc::job_empty(g.id, m))).await
+        }
     };
     let deadline = tokio::time::Instant::now() + grace;
     while any_live(&jobs).await && tokio::time::Instant::now() < deadline {
@@ -202,7 +216,7 @@ async fn stop_jobs(jobs: &[(i32, String)], grace: Duration) {
         let jobs = jobs.clone();
         move || {
             for (g, m) in &jobs {
-                if !proc::job_empty(*g, m) {
+                if !proc::job_empty(g.id, m) {
                     proc::signal_job(*g, m, Signal::SIGKILL);
                 }
             }
@@ -534,7 +548,7 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq, data: Vec<u8>) -> 
                 let mut j = locked(&cell);
                 if kernel::step(&mut j.k, Ev::Signal) == Act::Signal {
                     sent.push(id.clone());
-                    targets.push((j.k.pgid(), j.mark.clone()));
+                    targets.push((j.pg(), j.mark.clone()));
                 }
             }
             proc::off_runtime(move || {
@@ -551,24 +565,24 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq, data: Vec<u8>) -> 
             let grace = Duration::from_millis(job.grace_ms.unwrap_or(300));
             // Never a group whose job has ended: its number may be reused.
             let pick = if wipe { Pick::All } else { Pick::Ids(&job.ids) };
-            let targets: Vec<(Key, JobCell, i32, String)> = jobs
+            let targets: Vec<(Key, JobCell, proc::Pg, String)> = jobs
                 .in_scope(&job.scope, pick)
                 .into_iter()
                 .filter_map(|(k, c)| {
                     let (stop, pgid, mark) = {
                         let mut j = locked(&c);
                         let act = kernel::step(&mut j.k, Ev::Stop);
-                        (act == Act::Stop, j.k.pgid(), j.mark.clone())
+                        (act == Act::Stop, j.pg(), j.mark.clone())
                     };
                     stop.then_some((k, c, pgid, mark))
                 })
                 .collect();
-            let stopping: Vec<(i32, String)> =
+            let stopping: Vec<(proc::Pg, String)> =
                 targets.iter().map(|(_, _, g, m)| (*g, m.clone())).collect();
             stop_jobs(&stopping, grace).await;
             let mut survivors = Vec::new();
             for ((_, id), _, g, m) in &targets {
-                let left = proc::job_members_async(*g, m).await;
+                let left = proc::job_members_async(g.id, m).await;
                 if !left.is_empty() {
                     survivors.push(json!({ "id": id, "pids": left }));
                 }
@@ -727,6 +741,7 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
         // starts of one id cannot both run.
         let cell = Arc::new(Mutex::new(Job {
             mark: proc::new_job_mark(ctx.next_seq.fetch_add(1, Ordering::Relaxed)),
+            sp: 0,
             label: job.label.clone(),
             out: Ring::new(ctx.opts.job_output_retention, ctx.spool.new_job()),
             k: kernel::State::new(epoch(), job.hold),
@@ -758,9 +773,10 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
     {
         let mut j = locked(&cell);
         kernel::step(&mut j.k, Ev::Spawned { pgid });
+        j.sp = proc.sp;
         j.stdin = stdin;
     }
-    ctx.groups.insert(pgid);
+    ctx.groups.insert(proc.pg());
     ctx.jobs.bump_activity();
 
     // Both pipes into one ring, in arrival order. `progress` counts what the pumps have read, so
@@ -966,7 +982,7 @@ async fn supervise(
             }
         }
     }
-    ctx.groups.remove(pgid);
+    ctx.groups.remove(proc.pg());
     ctx.jobs.bump();
 }
 
@@ -999,7 +1015,7 @@ async fn stream_job(
         let job = {
             let mut j = locked(&cell);
             match kernel::step(&mut j.k, Ev::Disconnect { hold }) {
-                Act::Kill { pgid } => Some((pgid, j.mark.clone())),
+                Act::Kill { .. } => Some((j.pg(), j.mark.clone())),
                 _ => None,
             }
         };

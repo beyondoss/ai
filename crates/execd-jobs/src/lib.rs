@@ -662,6 +662,169 @@ pub fn takes(same: bool) -> (r: bool)
     same || cfg!(feature = "mut_take_by_key")
 }
 
+// ---------------------------------------------------------------------------------------------
+// The OS boundary: process groups execd still holds.
+// ---------------------------------------------------------------------------------------------
+
+/// The process groups execd holds: spawned by it, and not yet seen gone by the reaper, each as its
+/// number and the spawn's `gen` (unique per spawn). A group's number is free for any other process
+/// to take the moment its last member is collected, and a later spawn of execd's own may take it:
+/// so a signal by number is the job's only while the number is held *by that spawn*. The reaper takes
+/// a number out (`freed`) in the same exclusion in which it collects the last member, and a signal
+/// checks (`may_deliver`) inside the exclusion that keeps the reaper from collecting: between the
+/// check and the `kill` the group cannot be freed, a number the reaper has freed is never signalled,
+/// and neither is a successor spawn's group that took the same number.
+#[verifier::allow(autoderive_clone_without_spec)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Held {
+    live: Vec<(i32, u64)>,
+}
+
+impl Held {
+    /// J11: spawn `sp` holds group `g`.
+    pub closed spec fn holds(&self, g: i32, sp: u64) -> bool {
+        self.live@.contains((g, sp))
+    }
+
+    pub fn new() -> (h: Held)
+        ensures
+            forall|g: i32, sp: u64| !h.holds(g, sp),
+    {
+        Held { live: Vec::new() }
+    }
+
+    /// Whether spawn `sp` holds `g`.
+    pub fn has(&self, g: i32, sp: u64) -> (r: bool)
+        ensures
+            r == self.holds(g, sp),
+    {
+        let mut i: usize = 0;
+        while i < self.live.len()
+            invariant
+                0 <= i <= self.live@.len(),
+                forall|j: int| 0 <= j < i ==> self.live@[j] != (g, sp),
+            decreases self.live@.len() - i,
+        {
+            let e = self.live[i];
+            if e.0 == g && e.1 == sp {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// A spawn registers its group: held from then on, and nothing else changes. Idempotent.
+    pub fn insert(&mut self, g: i32, sp: u64)
+        ensures
+            final(self).holds(g, sp),
+            forall|h: i32, t: u64| (h, t) != (g, sp) ==> final(self).holds(h, t) == old(self).holds(h, t),
+    {
+        broadcast use vstd::seq_lib::lemma_seq_contains_after_push;
+        if !self.has(g, sp) && !cfg!(feature = "mut_held_forgets") {
+            self.live.push((g, sp));
+        }
+    }
+
+    /// The reaper saw number `g` gone: no spawn holds it, and nothing else changes. Idempotent.
+    pub fn freed(&mut self, g: i32)
+        ensures
+            forall|t: u64| !final(self).holds(g, t),
+            forall|h: i32, t: u64| h != g ==> final(self).holds(h, t) == old(self).holds(h, t),
+    {
+        let mut out: Vec<(i32, u64)> = Vec::new();
+        let mut i: usize = 0;
+        while i < self.live.len()
+            invariant
+                0 <= i <= self.live@.len(),
+                forall|h: (i32, u64)| out@.contains(h) <==> (h.0 != g && exists|j: int| 0 <= j < i && self.live@[j] == h),
+            decreases self.live@.len() - i,
+        {
+            let v = self.live[i];
+            let ghost before = out@;
+            if v.0 != g {
+                out.push(v);
+            }
+            i += 1;
+            proof {
+                assert(self.live@[(i - 1) as int] == v);
+                assert forall|h: (i32, u64)| out@.contains(h) implies (h.0 != g && exists|j: int| 0 <= j < i && self.live@[j] == h) by {
+                    if h == v {
+                        assert(self.live@[(i - 1) as int] == h);
+                    } else {
+                        assert(before.contains(h));
+                    }
+                }
+                assert forall|h: (i32, u64)| (h.0 != g && exists|j: int| 0 <= j < i && self.live@[j] == h) implies out@.contains(h) by {
+                    let j = choose|j: int| 0 <= j < i && self.live@[j] == h;
+                    if j == i - 1 {
+                        assert(v == h);
+                        assert(v.0 != g);
+                        assert(out@ =~= before.push(v));
+                        assert(out@[out@.len() - 1] == h);
+                        assert(out@.contains(h));
+                    } else {
+                        assert(0 <= j < i - 1 && self.live@[j] == h);
+                        assert(exists|j2: int| 0 <= j2 < i - 1 && self.live@[j2] == h);
+                        assert(before.contains(h));
+                        if v.0 != g {
+                            assert(out@ =~= before.push(v));
+                            vstd::seq_lib::lemma_seq_contains_after_push(before, v, h);
+                            assert(out@.contains(h) == (v == h || before.contains(h)));
+                        } else {
+                            assert(out@ =~= before);
+                        }
+                        assert(out@.contains(h));
+                    }
+                }
+            }
+        }
+        self.live = out;
+    }
+
+    /// The numbers held, for the reaper to look each up.
+    pub fn numbers(&self) -> (r: Vec<i32>)
+        ensures
+            forall|g: i32, t: u64| self.holds(g, t) ==> r@.contains(g),
+    {
+        let mut r: Vec<i32> = Vec::new();
+        let mut i: usize = 0;
+        while i < self.live.len()
+            invariant
+                0 <= i <= self.live@.len(),
+                forall|g: i32| r@.contains(g) <==> exists|j: int| 0 <= j < i && (self.live@[j]).0 == g,
+            decreases self.live@.len() - i,
+        {
+            let v = self.live[i];
+            r.push(v.0);
+            i += 1;
+            proof {
+                broadcast use vstd::seq_lib::lemma_seq_contains_after_push;
+                assert(self.live@[(i - 1) as int] == v);
+            }
+        }
+        proof {
+            assert forall|g: i32, t: u64| self.holds(g, t) implies r@.contains(g) by {
+                let j = choose|j: int| 0 <= j < self.live@.len() && self.live@[j] == (g, t);
+                assert((self.live@[j]).0 == g);
+            }
+        }
+        r
+    }
+}
+
+/// J11: a signal by number is delivered only to the group of the spawn that holds the number: never
+/// to one the reaper has freed, whose number any other process may now carry, and never to a later
+/// spawn's group that took the same number. (Liveness, the completeness half: a held group is
+/// always deliverable, so a refusal clears only when the group is gone and there is nothing left
+/// to signal.)
+pub fn may_deliver(held: &Held, pgid: i32, sp: u64) -> (r: bool)
+    ensures
+        r == held.holds(pgid, sp),
+{
+    held.has(pgid, sp) || cfg!(feature = "mut_signal_after_reap")
+}
+
 /// What a stream sends next.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Follow {
