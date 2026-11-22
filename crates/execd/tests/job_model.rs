@@ -49,6 +49,8 @@
 //! `cargo test -p beyond-execd --features <mut> --test job_model the_mutation` MUST pass only when
 //! the named property is red: see `crates/execd/ARCHITECTURE.md` for the feature → property table.
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use execd::job_kernel::{self as kernel, Act, Admit, Alive, Ev, Follow, Key, Phase, Pick, State};
 use stateright::{Checker, Model, Property};
 
@@ -453,10 +455,10 @@ impl Model for Jobs {
                     return None;
                 }
                 // J1: the entry is the claim; a start never replaces a job still in the table.
-                if let Some(old) = s.table.get(&k) {
-                    if !s.sims[old].k.removed {
-                        s.bad |= V_J1;
-                    }
+                if let Some(old) = s.table.get(&k)
+                    && !s.sims[old].k.removed
+                {
+                    s.bad |= V_J1;
                 }
                 let h = s.sims.len();
                 s.sims.push(Sim {
@@ -671,22 +673,22 @@ impl Model for Jobs {
                     // reaped by the spawn's outcome, not by a connection that never ran.
                     return Some(s);
                 }
-                if cl.hold {
-                    if let Some(h) = s.bound(&cl) {
-                        s.resolved(cl.scope, h);
-                        if h != cl.job {
-                            s.bad |= V_J9;
+                if cl.hold
+                    && let Some(h) = s.bound(&cl)
+                {
+                    s.resolved(cl.scope, h);
+                    if h != cl.job {
+                        s.bad |= V_J9;
+                    }
+                    let kept_before = s.sims[h].k.kept();
+                    if let Act::Kill { .. } =
+                        kernel::step(&mut s.sims[h].k, Ev::Disconnect { hold: true })
+                    {
+                        if kept_before {
+                            s.bad |= V_J6;
                         }
-                        let kept_before = s.sims[h].k.kept();
-                        if let Act::Kill { .. } =
-                            kernel::step(&mut s.sims[h].k, Ev::Disconnect { hold: true })
-                        {
-                            if kept_before {
-                                s.bad |= V_J6;
-                            }
-                            s.sims[h].shell = false;
-                            s.sims[h].desc = false;
-                        }
+                        s.sims[h].shell = false;
+                        s.sims[h].desc = false;
                     }
                 }
             }
@@ -974,7 +976,18 @@ fn the_mutation_turns_its_property_red() {
     };
     let mut red: Vec<&str> = Vec::new();
     for m in [REUSE, SCOPES, IDS, STREAMS] {
-        let checker = m.checker().spawn_bfs().join();
+        // A red run stops when the named property fails: the counterexample is the evidence.
+        let named: std::collections::BTreeSet<&'static str> = m
+            .properties()
+            .iter()
+            .map(|p| p.name)
+            .filter(|n| n.starts_with(property))
+            .collect();
+        let checker = m
+            .checker()
+            .finish_when(stateright::HasDiscoveries::AnyOf(named))
+            .spawn_bfs()
+            .join();
         red.extend(
             m.properties()
                 .iter()

@@ -10,21 +10,21 @@ variables alone ([Configuration](#configuration)).
 
 ## Modules
 
-| file            | role                                                                                                     |
-| --------------- | -------------------------------------------------------------------------------------------------------- |
-| `src/lib.rs`    | `Options`, the `Observer` trait, `serve` and `Handle`, and the derived limits                            |
-| `src/main.rs`   | the binary: bearer sources and the environment scrub, fail-closed start, subreaper, signals              |
-| `src/config.rs` | the binary's settings: every `EXECD_*` variable, parsed once at startup, and the usage text              |
-| `src/log.rs`    | the logger: one text line per event to stderr, level via `EXECD_LOG` / `log::set_level`, no subscriber   |
-| `src/runas.rs`  | `EXECD_RUN_AS`: resolving the user, proving execd can switch, the switch helper                          |
-| `src/http.rs`   | hyper (HTTP/1.1 and h2c), routing, `/livez`, the bearer check, the request limit, the log line           |
-| `src/exec.rs`   | one-shot envelope and streams: pumps, the sink, heartbeat, leftovers, timeout, disconnect                |
-| `src/jobs.rs`   | jobs: the table, the output ring, the supervisor, job streams                                            |
+| file                | role                                                                                                     |
+| ------------------- | -------------------------------------------------------------------------------------------------------- |
+| `src/lib.rs`        | `Options`, the `Observer` trait, `serve` and `Handle`, and the derived limits                            |
+| `src/main.rs`       | the binary: bearer sources and the environment scrub, fail-closed start, subreaper, signals              |
+| `src/config.rs`     | the binary's settings: every `EXECD_*` variable, parsed once at startup, and the usage text              |
+| `src/log.rs`        | the logger: one text line per event to stderr, level via `EXECD_LOG` / `log::set_level`, no subscriber   |
+| `src/runas.rs`      | `EXECD_RUN_AS`: resolving the user, proving execd can switch, the switch helper                          |
+| `src/http.rs`       | hyper (HTTP/1.1 and h2c), routing, `/livez`, the bearer check, the request limit, the log line           |
+| `src/exec.rs`       | one-shot envelope and streams: pumps, the sink, heartbeat, leftovers, timeout, disconnect                |
+| `src/jobs.rs`       | jobs: the table, the output ring, the supervisor, job streams                                            |
 | `src/job_kernel.rs` | the job table's decisions, pure; `tests/job_model.rs` model-checks them                                  |
-| `src/notify.rs` | notify: the sender that drives the `exec-notify` kernel                                                  |
-| `src/proc.rs`   | spawning, the reaper that collects every child, process groups by syscall, the subreaper                 |
-| `src/spool.rs`  | the jobs directory: where a kept job's retained output lives as chunk files, and stale-directory cleanup |
-| `src/frame.rs`  | streaming frame encoding                                                                                 |
+| `src/notify.rs`     | notify: the sender that drives the `exec-notify` kernel                                                  |
+| `src/proc.rs`       | spawning, the reaper that collects every child, process groups by syscall, the subreaper                 |
+| `src/spool.rs`      | the jobs directory: where a kept job's retained output lives as chunk files, and stale-directory cleanup |
+| `src/frame.rs`      | streaming frame encoding                                                                                 |
 
 ## Configuration
 
@@ -181,15 +181,15 @@ before. The two locks stay as they were, and the kernel follows them:
 - output offsets: `window` (where a read starts, never before the oldest byte held) and `follow` (a stream's next frame: gap, data,
   the shell's exit, the end, or wait). The ring's bytes stay in the shell.
 
-| event | what the kernel decides |
-| --- | --- |
+| event                                | what the kernel decides                                                                                            |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------ |
 | `Spawned`, `ShellExit`, `GroupEmpty` | the phase advances once; an ended job never changes; a callback is owed for the end only if the job is not removed |
-| `Keep`, `Seen` | `Held` becomes `Kept` for good; `seen` is what the model was shown |
-| `Taken` | the table let the job go: removed, final |
-| `Push` | a pump's bytes are stored unless the job is removed |
-| `Signal`, `Stop` | a group is signalled only while the job has a group and has not ended (its number may be reused) |
-| `Remove` | out of the table only with its group observed empty, or, for `remove`, once ended |
-| `Disconnect` | a held job nobody kept, still running, dies with its client's connection; a kept one never does |
+| `Keep`, `Seen`                       | `Held` becomes `Kept` for good; `seen` is what the model was shown                                                 |
+| `Taken`                              | the table let the job go: removed, final                                                                           |
+| `Push`                               | a pump's bytes are stored unless the job is removed                                                                |
+| `Signal`, `Stop`                     | a group is signalled only while the job has a group and has not ended (its number may be reused)                   |
+| `Remove`                             | out of the table only with its group observed empty, or, for `remove`, once ended                                  |
+| `Disconnect`                         | a held job nobody kept, still running, dies with its client's connection; a kept one never does                    |
 
 There is no cap and no expiry here (see Bounds): an ended job is freed only by `remove`, `kill` with `remove` or `wipe`.
 
@@ -207,19 +207,19 @@ cargo test -p beyond-execd --test job_model faithful          # both bounds, all
 cargo test -p beyond-execd --features <mut> --test job_model the_mutation   # each MUST pass only if its property is red
 ```
 
-| mutation | property it turns red |
-| --- | --- |
-| `mut_start_overwrites` | J1 |
-| `mut_scope_ignored` | J2 |
-| `mut_remove_keeps_entry` | J3 |
-| `mut_end_rewritten` | J4 (`ended_is_final`, over every phase and event) |
-| `mut_read_before_base` | J5 |
-| `mut_disconnect_kills_kept` | J6 |
-| `mut_remove_live` | J7 |
-| `mut_signal_ended` | J8 |
-| `mut_ended_not_removable` | L1 |
-| `mut_stream_follows_key` | J9 |
-| `mut_follow_waits_after_end` | L2 |
+| mutation                     | property it turns red                             |
+| ---------------------------- | ------------------------------------------------- |
+| `mut_start_overwrites`       | J1                                                |
+| `mut_scope_ignored`          | J2                                                |
+| `mut_remove_keeps_entry`     | J3                                                |
+| `mut_end_rewritten`          | J4 (`ended_is_final`, over every phase and event) |
+| `mut_read_before_base`       | J5                                                |
+| `mut_disconnect_kills_kept`  | J6                                                |
+| `mut_remove_live`            | J7                                                |
+| `mut_signal_ended`           | J8                                                |
+| `mut_ended_not_removable`    | L1                                                |
+| `mut_stream_follows_key`     | J9                                                |
+| `mut_follow_waits_after_end` | L2                                                |
 
 ## Security
 
