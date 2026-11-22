@@ -482,8 +482,10 @@ mod tests {
         ring.push(data, stderr);
         m.all.extend(data.iter().map(|&b| (b, stderr)));
         let c = FRAME_MAX as u64;
-        if let Some((chunk, on_bits)) = m.planted {
-            if m.all.len() as u64 >= (chunk + 1) * c {
+        if let Some((chunk, on_bits)) = m.planted
+            && m.all.len() as u64 >= (chunk + 1) * c
+        {
+            {
                 let (a, z) = ((chunk * c) as usize, ((chunk + 1) * c) as usize);
                 // A bits file only refuses a chunk that has a stderr byte.
                 if !on_bits || m.all[a..z].iter().any(|b| b.1) {
