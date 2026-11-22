@@ -112,7 +112,9 @@ impl<C: Clone> Table<C> {
     pub fn in_scope(&self, scope: &str, pick: Pick<'_>) -> Vec<(Key, C)> {
         self.entries
             .iter()
-            .filter(|((sc, id), _)| (sc == scope || cfg!(feature = "mut_scope_ignored")) && pick.has(id))
+            .filter(|((sc, id), _)| {
+                (sc == scope || cfg!(feature = "mut_scope_ignored")) && pick.has(id)
+            })
             .map(|(k, c)| (k.clone(), c.clone()))
             .collect()
     }
@@ -143,7 +145,9 @@ impl<C: Clone> Table<C> {
 pub enum Phase {
     /// The entry holds its id; the process is not yet spawned.
     Spawning,
-    Running { pgid: i32 },
+    Running {
+        pgid: i32,
+    },
     /// The shell is gone and its group lives on. `signal` is what killed the shell, if one did.
     Exited {
         pgid: i32,
@@ -236,7 +240,9 @@ impl State {
     pub fn pgid(&self) -> i32 {
         match self.phase {
             Phase::Spawning => 0,
-            Phase::Running { pgid } | Phase::Exited { pgid, .. } | Phase::Ended { pgid, .. } => pgid,
+            Phase::Running { pgid } | Phase::Exited { pgid, .. } | Phase::Ended { pgid, .. } => {
+                pgid
+            }
         }
     }
 
@@ -370,11 +376,15 @@ pub enum Act {
     /// Stop the job's processes (`SIGTERM`, then `SIGKILL` after the grace).
     Stop,
     /// `SIGKILL` the job's group: its client left and nobody kept it.
-    Kill { pgid: i32 },
+    Kill {
+        pgid: i32,
+    },
     /// The job may leave the table.
     Take,
     /// Close the job's stdin; a callback is owed for the change unless the job is removed.
-    Ended { notify: bool },
+    Ended {
+        notify: bool,
+    },
     /// The shell's own exit is observable: a callback is owed.
     Exited,
     /// Drop the job's notifier, close its stdin.
@@ -454,7 +464,10 @@ pub fn step(s: &mut State, ev: Ev) -> Act {
                 Act::Stop
             }
         }
-        Ev::Remove { empty, ended_counts } => {
+        Ev::Remove {
+            empty,
+            ended_counts,
+        } => {
             let ended = ended_counts && s.ended() && !cfg!(feature = "mut_ended_not_removable");
             if ended || (s.pgid() != 0 && empty) || cfg!(feature = "mut_remove_live") {
                 Act::Take
@@ -481,7 +494,9 @@ pub fn window(offset: u64, base: u64, end: u64, max: usize) -> (u64, usize) {
     } else {
         offset.max(base)
     };
-    let want = usize::try_from(end.saturating_sub(from)).unwrap_or(usize::MAX).min(max);
+    let want = usize::try_from(end.saturating_sub(from))
+        .unwrap_or(usize::MAX)
+        .min(max);
     (from, want)
 }
 

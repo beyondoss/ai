@@ -149,7 +149,11 @@ impl std::hash::Hash for St {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum A {
-    Start { scope: u8, id: u8, client: Option<usize> },
+    Start {
+        scope: u8,
+        id: u8,
+        client: Option<usize>,
+    },
     SpawnOk(usize),
     SpawnFail(usize),
     ShellDies(usize),
@@ -162,10 +166,20 @@ enum A {
     Seen(u8, u8),
     Read(u8, u8),
     Signal(u8, u8),
-    Kill { scope: u8, id: u8, remove: bool },
-    Wipe { scope: u8 },
+    Kill {
+        scope: u8,
+        id: u8,
+        remove: bool,
+    },
+    Wipe {
+        scope: u8,
+    },
     Remove(u8, u8),
-    Attach { client: usize, scope: u8, id: u8 },
+    Attach {
+        client: usize,
+        scope: u8,
+        id: u8,
+    },
     Follow(usize),
     Disconnect(usize),
 }
@@ -207,13 +221,13 @@ const IDS: Jobs = Jobs {
     clients: 1,
     max_end: 1,
 };
-/// Two clients and a ring of two bytes: streams and the ring.
+/// Two clients and a ring of one byte (evicted before it is sent: a gap): streams.
 const STREAMS: Jobs = Jobs {
     scopes: 1,
     ids: 1,
     max_jobs: 2,
     clients: 2,
-    max_end: 2,
+    max_end: 1,
 };
 
 impl St {
@@ -241,7 +255,13 @@ impl St {
             return true;
         }
         let empty = sim.k.pgid() != 0 && !sim.alive();
-        kernel::step(&mut sim.k, Ev::Remove { empty, ended_counts }) == Act::Take
+        kernel::step(
+            &mut sim.k,
+            Ev::Remove {
+                empty,
+                ended_counts,
+            },
+        ) == Act::Take
     }
 
     /// `Jobs::remove`: out of the table, then each job taken.
@@ -311,7 +331,11 @@ impl St {
                     u64::from(sim.end),
                     cl.told,
                 );
-                if f == Follow::Wait { None } else { Some((Some(h), f)) }
+                if f == Follow::Wait {
+                    None
+                } else {
+                    Some((Some(h), f))
+                }
             }
         }
     }
@@ -463,7 +487,12 @@ impl Model for Jobs {
             }
             A::SpawnOk(i) => {
                 let sim = &mut s.sims[i];
-                kernel::step(&mut sim.k, Ev::Spawned { pgid: 100 + i as i32 });
+                kernel::step(
+                    &mut sim.k,
+                    Ev::Spawned {
+                        pgid: 100 + i as i32,
+                    },
+                );
                 sim.shell = true;
                 sim.desc = true;
                 sim.pumps = true;
@@ -551,7 +580,8 @@ impl Model for Jobs {
                 let h = s.table.get(&key(scope, id))?;
                 s.resolved(scope, h);
                 let sim = &s.sims[h];
-                let (from, want) = kernel::window(0, u64::from(sim.base), u64::from(sim.end), 1 << 20);
+                let (from, want) =
+                    kernel::window(0, u64::from(sim.base), u64::from(sim.end), 1 << 20);
                 // J5: never before the oldest byte held, and never more than is held after it.
                 if from < u64::from(sim.base) || from + want as u64 != u64::from(sim.end) {
                     s.bad |= V_J5;
@@ -648,7 +678,9 @@ impl Model for Jobs {
                             s.bad |= V_J9;
                         }
                         let kept_before = s.sims[h].k.kept();
-                        if let Act::Kill { .. } = kernel::step(&mut s.sims[h].k, Ev::Disconnect { hold: true }) {
+                        if let Act::Kill { .. } =
+                            kernel::step(&mut s.sims[h].k, Ev::Disconnect { hold: true })
+                        {
                             if kept_before {
                                 s.bad |= V_J6;
                             }
@@ -664,12 +696,14 @@ impl Model for Jobs {
 
     fn properties(&self) -> Vec<Property<Self>> {
         vec![
-            Property::always("J1: a start never replaces a job in the table", |_, s: &St| {
-                s.bad & V_J1 == 0
-            }),
-            Property::always("J2: no operation resolves a job of another scope", |_, s: &St| {
-                s.bad & V_J2 == 0
-            }),
+            Property::always(
+                "J1: a start never replaces a job in the table",
+                |_, s: &St| s.bad & V_J1 == 0,
+            ),
+            Property::always(
+                "J2: no operation resolves a job of another scope",
+                |_, s: &St| s.bad & V_J2 == 0,
+            ),
             Property::always("J3: a removed job never answers again", |_, s: &St| {
                 s.bad & V_J3 == 0
             }),
@@ -679,22 +713,28 @@ impl Model for Jobs {
             ),
             Property::always("J4: an ended job's end never changes", |_, s: &St| {
                 s.sims.iter().all(|x| match (&x.snap, &x.k.phase) {
-                    (Some((code, signal, end)), Phase::Ended { code: c, signal: g, .. }) => {
-                        code == c && signal == g && *end == x.end
-                    }
+                    (
+                        Some((code, signal, end)),
+                        Phase::Ended {
+                            code: c, signal: g, ..
+                        },
+                    ) => code == c && signal == g && *end == x.end,
                     (Some(_), _) => false,
                     (None, p) => !matches!(p, Phase::Ended { .. }),
                 })
             }),
-            Property::always("J5: output offsets only move forward over what is held", |_, s: &St| {
-                s.bad & V_J5 == 0
-            }),
-            Property::always("J6: a kept job never dies with a held client", |_, s: &St| {
-                s.bad & V_J6 == 0 && s.sims.iter().all(|x| !x.was_kept || x.k.kept())
-            }),
-            Property::always("J7: a job leaves the table only with its group empty", |_, s: &St| {
-                s.bad & V_J7 == 0 && s.sims.iter().all(|x| !(x.k.removed && x.alive()))
-            }),
+            Property::always(
+                "J5: output offsets only move forward over what is held",
+                |_, s: &St| s.bad & V_J5 == 0,
+            ),
+            Property::always(
+                "J6: a kept job never dies with a held client",
+                |_, s: &St| s.bad & V_J6 == 0 && s.sims.iter().all(|x| !x.was_kept || x.k.kept()),
+            ),
+            Property::always(
+                "J7: a job leaves the table only with its group empty",
+                |_, s: &St| s.bad & V_J7 == 0 && s.sims.iter().all(|x| !(x.k.removed && x.alive())),
+            ),
             Property::always("J8: no signal reaches an ended job", |_, s: &St| {
                 s.bad & V_J8 == 0
             }),
@@ -711,26 +751,39 @@ impl Model for Jobs {
                         ) == Act::Take
                 })
             }),
-            Property::always("L2: an ended job's stream sends its final frame", |_, s: &St| {
-                s.clients.iter().all(|cl| {
-                    if cl.st != Cl::Following {
-                        return true;
-                    }
-                    let Some(h) = s.bound(cl) else {
-                        return true;
-                    };
-                    let sim = &s.sims[h];
-                    // Everything sent, the shell's exit told (or never owed): the end is next.
-                    !(sim.k.ended()
-                        && cl.sent >= sim.end
-                        && (cl.told || sim.k.shell_code().is_none())
-                        && kernel::follow(&sim.k, u64::from(cl.sent), u64::from(sim.base), u64::from(sim.end), cl.told)
-                            == Follow::Wait)
-                })
-            }),
-            Property::always("alive: a job counts as alive only with a group", |_, s: &St| {
-                s.sims.iter().all(|x| x.k.alive() == Alive::No || x.k.pgid() != 0)
-            }),
+            Property::always(
+                "L2: an ended job's stream sends its final frame",
+                |_, s: &St| {
+                    s.clients.iter().all(|cl| {
+                        if cl.st != Cl::Following {
+                            return true;
+                        }
+                        let Some(h) = s.bound(cl) else {
+                            return true;
+                        };
+                        let sim = &s.sims[h];
+                        // Everything sent, the shell's exit told (or never owed): the end is next.
+                        !(sim.k.ended()
+                            && cl.sent >= sim.end
+                            && (cl.told || sim.k.shell_code().is_none())
+                            && kernel::follow(
+                                &sim.k,
+                                u64::from(cl.sent),
+                                u64::from(sim.base),
+                                u64::from(sim.end),
+                                cl.told,
+                            ) == Follow::Wait)
+                    })
+                },
+            ),
+            Property::always(
+                "alive: a job counts as alive only with a group",
+                |_, s: &St| {
+                    s.sims
+                        .iter()
+                        .all(|x| x.k.alive() == Alive::No || x.k.pgid() != 0)
+                },
+            ),
         ]
     }
 }
@@ -767,7 +820,7 @@ fn faithful_ids() {
     check(IDS);
 }
 
-/// ... and with two clients and a ring of two bytes.
+/// ... and with two clients.
 #[test]
 fn faithful_streams() {
     check(STREAMS);
@@ -783,7 +836,10 @@ fn a_stream_never_follows_a_successor() {
     let name = "J9: a stream follows the job it attached to, not a later job of its id";
     assert!(checker.discovery(name).is_none(), "J9 is red");
     // The kernel's rule, on its own: a lookup that finds another job finds nothing.
-    assert_eq!(kernel::bound(Some(2usize), false).filter(|_| !cfg!(feature = "mut_stream_follows_key")), None);
+    assert_eq!(
+        kernel::bound(Some(2usize), false).filter(|_| !cfg!(feature = "mut_stream_follows_key")),
+        None
+    );
     assert_eq!(kernel::bound(Some(1usize), true), Some(1));
     assert_eq!(kernel::bound::<usize>(None, false), None);
 }
@@ -991,7 +1047,9 @@ fn production_calls_the_kernel() {
     // The only insert is the kernel table's, after `admit` said fresh, under the same lock.
     let at = prod.find("map.insert(").expect("the table insert");
     assert!(
-        prod[..at].rfind("admit(&key)").is_some_and(|a| at - a < 1500),
+        prod[..at]
+            .rfind("admit(&key)")
+            .is_some_and(|a| at - a < 1500),
         "the insert is no longer behind `admit`"
     );
 }

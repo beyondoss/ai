@@ -30,10 +30,10 @@ use tokio_util::sync::CancellationToken;
 mod exec;
 mod frame;
 mod http;
-mod jobs;
 /// The job table's decisions; the model checks the function production calls.
 #[doc(hidden)]
 pub mod job_kernel;
+mod jobs;
 pub mod log;
 mod notify;
 mod proc;

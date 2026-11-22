@@ -957,7 +957,13 @@ async fn removable(cell: &JobCell, ended_counts: bool) -> bool {
     // A group exists from the spawn: before it there is nothing to observe.
     let empty = pgid != 0 && proc::job_members_async(pgid, &mark).await.is_empty();
     let mut j = locked(cell);
-    kernel::step(&mut j.k, Ev::Remove { empty, ended_counts }) == Act::Take
+    kernel::step(
+        &mut j.k,
+        Ev::Remove {
+            empty,
+            ended_counts,
+        },
+    ) == Act::Take
 }
 
 /// `keep` (the job is the endpoint's now, with its `notify`) and `seen` (how much output the model
