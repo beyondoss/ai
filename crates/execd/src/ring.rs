@@ -409,4 +409,222 @@ mod tests {
         assert!(!target.exists());
         assert_eq!(ring.base, 2 * FRAME_MAX as u64);
     }
+
+    // -- The differential test: the ring against a plain `Vec<(u8, bool)>` ---------------------------
+
+    /// A small deterministic generator (splitmix64): a failing case is reproduced by its seed.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n.max(1)
+        }
+        /// A length: often a boundary of a chunk, else small, else a few chunks.
+        fn len(&mut self) -> usize {
+            let c = FRAME_MAX;
+            match self.below(8) {
+                0 => 0,
+                1 => 1,
+                2 => c - 1,
+                3 => c,
+                4 => c + 1,
+                5 => self.below(100) as usize,
+                6 => self.below(c as u64) as usize,
+                _ => self.below(3 * c as u64) as usize,
+            }
+        }
+    }
+
+    /// The model: every byte ever pushed with its stream, the first offset a refused chunk left
+    /// readable, and the chunk (and file) a fault was planted for.
+    struct Model {
+        all: Vec<(u8, bool)>,
+        floor: u64,
+        planted: Option<(u64, bool)>,
+        /// Names of the directories planted where a chunk or its bits go (a directory refuses
+        /// `create_new` and reads back as no file).
+        blockers: std::collections::HashSet<String>,
+    }
+
+    impl Model {
+        /// The oldest offset held: whole chunks, the last one that still leaves `retain` bytes (the
+        /// retention), but never before the first chunk a refused write left.
+        fn base(&self, retain: usize) -> u64 {
+            let c = FRAME_MAX as u64;
+            let kept = (self.all.len() as u64).saturating_sub(retain as u64) / c * c;
+            kept.max(self.floor)
+        }
+
+        /// The maximal runs of stderr in `[from, to)`, as `(start, len)`.
+        fn runs(&self, from: u64, to: u64) -> Vec<(u64, u64)> {
+            let mut runs: Vec<(u64, u64)> = Vec::new();
+            for off in from..to {
+                if self.all[off as usize].1 {
+                    match runs.last_mut() {
+                        Some(l) if l.0 + l.1 == off => l.1 += 1,
+                        _ => runs.push((off, 1)),
+                    }
+                }
+            }
+            runs
+        }
+    }
+
+    /// Push `data`, then check what the planted fault (a file where a chunk or its bits go) did.
+    fn push(ring: &mut Ring, m: &mut Model, data: &[u8], stderr: bool) {
+        let before = m.all.len() as u64;
+        ring.push(data, stderr);
+        m.all.extend(data.iter().map(|&b| (b, stderr)));
+        let c = FRAME_MAX as u64;
+        if let Some((chunk, on_bits)) = m.planted {
+            if m.all.len() as u64 >= (chunk + 1) * c {
+                let (a, z) = ((chunk * c) as usize, ((chunk + 1) * c) as usize);
+                // A bits file only refuses a chunk that has a stderr byte.
+                if !on_bits || m.all[a..z].iter().any(|b| b.1) {
+                    m.floor = m.floor.max((chunk + 1) * c);
+                }
+                m.planted = None;
+            }
+        }
+        assert!(m.all.len() as u64 >= before);
+    }
+
+    fn check(ring: &Ring, m: &Model, retain: usize, rng: &mut Rng, what: &str) {
+        let end = m.all.len() as u64;
+        assert_eq!(ring.end(), end, "{what}: end");
+        assert_eq!(ring.base, m.base(retain), "{what}: base (retain {retain})");
+        // On disk: exactly the chunks held, and a sidecar only beside a chunk.
+        let mut chunks = 0;
+        for e in std::fs::read_dir(&ring.dir).into_iter().flatten() {
+            let name = e.unwrap().file_name().to_string_lossy().into_owned();
+            if m.blockers.contains(&name) {
+                continue;
+            }
+            if let Some(stem) = name.strip_suffix(".e") {
+                assert!(ring.dir.join(stem).exists(), "{what}: sidecar {name} without its chunk");
+            } else {
+                chunks += 1;
+            }
+        }
+        assert_eq!(chunks, ring.files, "{what}: chunk files");
+        let c = FRAME_MAX as u64;
+        for _ in 0..6 {
+            let offset = match rng.below(6) {
+                0 => 0,
+                1 => ring.base.saturating_sub(rng.below(3)),
+                2 => ring.base + rng.below(2 * c),
+                3 => end.saturating_sub(rng.below(2 * c)),
+                4 => end + rng.below(3),
+                _ => u64::MAX - rng.below(3),
+            };
+            let max = match rng.below(5) {
+                0 => rng.below(10) as usize,
+                1 => rng.below(2 * c) as usize,
+                2 => usize::MAX,
+                3 => c as usize,
+                _ => rng.below(8 * c) as usize,
+            };
+            let (from, data, ranges) = ring.read(offset, max);
+            assert_eq!(from, offset.max(ring.base), "{what}: from of read({offset}, {max})");
+            let to = end.max(from).min(from.saturating_add(max as u64));
+            let runs = m.runs(from, to.max(from));
+            // The window is cut before the first run past RANGES_MAX, and only then.
+            let (len, want_runs) = if runs.len() > RANGES_MAX {
+                (runs[RANGES_MAX].0 - from, runs[..RANGES_MAX].to_vec())
+            } else {
+                (to.max(from) - from, runs)
+            };
+            assert_eq!(data.len() as u64, len, "{what}: length of read({offset}, {max})");
+            let expect: Vec<u8> = (from..from + len).map(|o| m.all[o as usize].0).collect();
+            assert!(data == expect, "{what}: bytes of read({offset}, {max}) from {from}");
+            assert_eq!(ranges, want_runs, "{what}: stderr ranges of read({offset}, {max})");
+        }
+    }
+
+    /// The ring against a plain `Vec<(u8, bool)>` over random pushes, reads and refused chunks: every read
+    /// returns exactly the bytes of its window, in order, with exactly its stderr ranges; the ring holds
+    /// the oldest chunk boundary at or after `end - retain`; a refused chunk reads back as a gap.
+    #[test]
+    fn the_ring_matches_a_plain_buffer_under_random_pushes_reads_and_refused_chunks() {
+        for seed in 0..60u64 {
+            let mut rng = Rng(seed);
+            let retain = [0, 1, 1000, FRAME_MAX - 1, FRAME_MAX, FRAME_MAX + 1, 150_000, 300_000]
+                [rng.below(8) as usize];
+            let (mut ring, _d) = ring(retain);
+            let mut m = Model { all: Vec::new(), floor: 0, planted: None, blockers: Default::default() };
+            for step in 0..30 {
+                match rng.below(10) {
+                    // Plant a file where the next chunk (or its bits) will go: the write is refused.
+                    0 if m.planted.is_none() && step > 0 => {
+                        let chunk = m.all.len() as u64 / FRAME_MAX as u64;
+                        let on_bits = rng.below(2) == 0;
+                        let at = chunk * FRAME_MAX as u64;
+                        let path = if on_bits { ring.chunk_bits_path(at) } else { ring.chunk_path(at) };
+                        let _ = spool::make_job_dir(&ring.dir);
+                        if std::fs::create_dir(&path).is_ok() {
+                            m.blockers.insert(path.file_name().unwrap().to_string_lossy().into_owned());
+                            m.planted = Some((chunk, on_bits));
+                        }
+                    }
+                    // Many one-byte alternations of stderr and stdout: more runs than a read answers.
+                    1 => {
+                        for i in 0..rng.below(3000) {
+                            push(&mut ring, &mut m, &[i as u8], i % 2 == 0);
+                        }
+                    }
+                    2..=6 => {
+                        let n = rng.len();
+                        let data: Vec<u8> = (0..n).map(|i| (i as u64 ^ rng.below(251)) as u8).collect();
+                        let stderr = rng.below(3) == 0;
+                        push(&mut ring, &mut m, &data, stderr);
+                    }
+                    _ => {}
+                }
+                // A planted file is not a held chunk: it sits where a chunk has not been written.
+                check(&ring, &m, retain, &mut rng, &format!("seed {seed} step {step}"));
+            }
+        }
+    }
+
+    /// Production decides through the kernel and keeps no copy of its arithmetic.
+    #[test]
+    fn production_calls_the_kernel_for_every_decision() {
+        let src = include_str!("ring.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+        for call in [
+            "kernel::window(",
+            "kernel::seg(",
+            "kernel::evict(",
+            "kernel::after_flush(",
+            "kernel::set_bits(",
+            "kernel::take_chunk_bits(",
+            "kernel::scan(",
+        ] {
+            assert!(prod.contains(call), "ring.rs does not call {call}");
+        }
+        for copy in ["fn set_bits", "fn bit(", "const RANGES_MAX", "const CHUNK_BITS"] {
+            assert!(!prod.contains(copy), "ring.rs restates the kernel: {copy}");
+        }
+    }
+
+    /// A job whose first chunk the disk refuses leaves its directory behind when the ring is dropped:
+    /// the directory exists (it was made for that chunk), so `made` must say so.
+    #[test]
+    fn a_ring_whose_first_chunk_was_refused_still_removes_its_directory() {
+        let (mut ring, _d) = ring(10_000_000);
+        spool::make_job_dir(&ring.dir).unwrap();
+        std::fs::create_dir(ring.chunk_path(0)).unwrap();
+        ring.push(&vec![1u8; FRAME_MAX], false);
+        assert_eq!(ring.base, FRAME_MAX as u64, "the refused chunk reads back as a gap");
+        let dir = ring.dir.clone();
+        drop(ring);
+        assert!(!dir.exists(), "the job's directory outlives its ring");
+    }
 }
