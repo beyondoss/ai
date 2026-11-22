@@ -198,7 +198,7 @@ jobs, two stream clients, and an environment (the shell dying with or without a 
 a held connection dropping at any point). Properties: J1 an id is the claim (a start never replaces a job in the table), J2 no
 operation resolves another scope's job, J3 a removed job never answers again (and a stream never follows a later job of its id),
 J4 an ended job never changes, J5 output offsets only move forward over what is held, J6 a kept job never dies with a held client,
-J7 a job leaves only with its group empty, J8 no signal reaches an ended job, L1 an ended job can always be removed, L2 an ended
+J7 a job leaves only with its group empty, J8 no signal reaches an ended job, J9 a stream follows the job it attached to, never a later job of its id, L1 an ended job can always be removed, L2 an ended
 job's stream sends its final frame. `production_calls_the_kernel` fails if `jobs.rs` stops calling the kernel or writes job state
 outside it.
 
@@ -218,6 +218,7 @@ cargo test -p beyond-execd --features <mut> --test job_model the_mutation   # ea
 | `mut_remove_live` | J7 |
 | `mut_signal_ended` | J8 |
 | `mut_ended_not_removable` | L1 |
+| `mut_stream_follows_key` | J9 |
 | `mut_follow_waits_after_end` | L2 |
 
 ## Security

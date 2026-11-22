@@ -772,11 +772,19 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq, data: Vec<u8>) -> 
         "start" => start_job(ctx, req, &job).await,
         "attach" => {
             let k = key(&job.id);
-            if jobs.get(&k).is_none() {
+            let Some(cell) = jobs.get(&k) else {
                 return http::error_response(404, "no such job");
-            }
+            };
             let (resp, out) = http::stream_response();
-            tokio::spawn(stream_job(ctx.clone(), k, job.offset, false, None, out));
+            tokio::spawn(stream_job(
+                ctx.clone(),
+                k,
+                cell,
+                job.offset,
+                false,
+                None,
+                out,
+            ));
             resp
         }
         "read" => {
@@ -1105,7 +1113,7 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
         }
         let ctx2 = ctx.clone();
         tokio::spawn(async move {
-            let end = stream_job(ctx2.clone(), key, 0, true, Some((pgid, opened)), out).await;
+            let end = stream_job(ctx2.clone(), key, cell, 0, true, Some((pgid, opened)), out).await;
             if let Some(o) = &ctx2.opts.observer {
                 o.stream_ended(seq, end, std::time::Instant::now());
             }
@@ -1254,11 +1262,20 @@ async fn supervise(
     ctx.jobs.bump();
 }
 
+/// The job a stream attached to, while the table still holds that very job under `key`: a removed
+/// job is gone to its streams, and a later job of the same id is not its successor.
+fn bound(ctx: &Ctx, key: &Key, attached: &JobCell) -> Option<JobCell> {
+    let found = ctx.jobs.get(key);
+    let same = found.as_ref().is_some_and(|c| Arc::ptr_eq(c, attached));
+    kernel::bound(found, same)
+}
+
 /// Stream a job's output from `offset` to its end. `started`: a held start, which says so first and
 /// whose job dies with the connection unless it was kept by then. How the stream ended.
 async fn stream_job(
     ctx: Arc<Ctx>,
     key: Key,
+    attached: JobCell,
     offset: u64,
     hold: bool,
     started: Option<(i32, bool)>,
@@ -1266,11 +1283,11 @@ async fn stream_job(
 ) -> StreamEnd {
     // A job stream has no deadline of its own: it lives as long as the job or the connection.
     let mut sink = Sink::new(out, ctx.opts.heartbeat, None);
-    if let Ok(end) = follow(&ctx, &key, offset, started, &mut sink).await {
+    if let Ok(end) = follow(&ctx, &key, &attached, offset, started, &mut sink).await {
         return end;
     }
     // The connection is gone before the job's end: a held job nobody kept dies with it.
-    if hold && let Some(cell) = ctx.jobs.get(&key) {
+    if hold && let Some(cell) = bound(&ctx, &key, &attached) {
         let job = {
             let mut j = locked(&cell);
             match kernel::step(&mut j.k, Ev::Disconnect { hold }) {
@@ -1290,6 +1307,7 @@ async fn stream_job(
 async fn follow(
     ctx: &Arc<Ctx>,
     key: &Key,
+    attached: &JobCell,
     offset: u64,
     started: Option<(i32, bool)>,
     sink: &mut Sink,
@@ -1312,7 +1330,7 @@ async fn follow(
             Wait,
             Missing,
         }
-        let next = match ctx.jobs.get(key) {
+        let next = match bound(ctx, key, attached) {
             None => Next::Missing,
             Some(cell) => {
                 let j = locked(&cell);

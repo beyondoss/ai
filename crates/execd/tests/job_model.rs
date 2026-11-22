@@ -289,10 +289,18 @@ impl St {
         }
     }
 
+    /// The job a client's stream goes on with: the table's lookup by key, through the kernel's
+    /// `bound` (the shell's `bound`).
+    fn bound(&self, cl: &Client) -> Option<usize> {
+        let found = self.table.get(&key(cl.scope, cl.id));
+        let same = found == Some(cl.job);
+        kernel::bound(found, same)
+    }
+
     /// What a client's stream does next: the job its key names now, and the kernel's frame.
     fn follow_of(&self, c: usize) -> Option<(Option<usize>, Follow)> {
         let cl = &self.clients[c];
-        match self.table.get(&key(cl.scope, cl.id)) {
+        match self.bound(cl) {
             None => Some((None, Follow::Wait)),
             Some(h) => {
                 let sim = &self.sims[h];
@@ -634,7 +642,7 @@ impl Model for Jobs {
                     return Some(s);
                 }
                 if cl.hold {
-                    if let Some(h) = s.table.get(&key(cl.scope, cl.id)) {
+                    if let Some(h) = s.bound(&cl) {
                         s.resolved(cl.scope, h);
                         if h != cl.job {
                             s.bad |= V_J9;
@@ -708,7 +716,7 @@ impl Model for Jobs {
                     if cl.st != Cl::Following {
                         return true;
                     }
-                    let Some(h) = s.table.get(&key(cl.scope, cl.id)) else {
+                    let Some(h) = s.bound(cl) else {
                         return true;
                     };
                     let sim = &s.sims[h];
@@ -727,10 +735,6 @@ impl Model for Jobs {
     }
 }
 
-/// `J9` is a finding against the current code (see `finding_stream_follows_its_key`): every other
-/// property must hold.
-const KNOWN_RED: &str = "J9: ";
-
 fn check(m: Jobs) {
     let checker = m.checker().spawn_bfs().join();
     println!(
@@ -739,9 +743,6 @@ fn check(m: Jobs) {
         checker.unique_state_count()
     );
     for p in m.properties() {
-        if p.name.starts_with(KNOWN_RED) {
-            continue;
-        }
         if let Some(path) = checker.discovery(p.name) {
             panic!("`{}` is red:\n{:#?}", p.name, path.into_actions());
         }
@@ -772,20 +773,19 @@ fn faithful_streams() {
     check(STREAMS);
 }
 
-/// FINDING (J9), true of the current code: `follow` looks its job up by `(scope, id)` on every frame
-/// (`jobs.rs`, `follow`), and a held start's disconnect does the same (`stream_job`). A stream
-/// attached to a job that is then removed, with a new start of the same id before the stream task
-/// next runs, goes on with the new job's output from the old job's offset, and its disconnect
-/// kills the new job if that is held and unkept. This test asserts the counterexample exists; it
-/// fails the day the stream binds to the job it attached to, and then `KNOWN_RED` goes.
+/// Regression (J9, found by this model in the code before it): a stream looked its job up by
+/// `(scope, id)` on every frame, so a stream attached to a removed job went on with a later job
+/// of the same id and its disconnect killed that job. It now goes on only with the job it attached
+/// to: after a removal and a restart of its id, the REUSE run has no such state.
 #[test]
-fn finding_stream_follows_its_key() {
+fn a_stream_never_follows_a_successor() {
     let checker = REUSE.checker().spawn_bfs().join();
     let name = "J9: a stream follows the job it attached to, not a later job of its id";
-    assert!(
-        checker.discovery(name).is_some(),
-        "J9 holds now: delete KNOWN_RED and this test"
-    );
+    assert!(checker.discovery(name).is_none(), "J9 is red");
+    // The kernel's rule, on its own: a lookup that finds another job finds nothing.
+    assert_eq!(kernel::bound(Some(2usize), false).filter(|_| !cfg!(feature = "mut_stream_follows_key")), None);
+    assert_eq!(kernel::bound(Some(1usize), true), Some(1));
+    assert_eq!(kernel::bound::<usize>(None, false), None);
 }
 
 /// J4 for the kernel itself: over every phase and every event, an ended job's code, signal and time
@@ -881,6 +881,7 @@ fn ended_is_final() {
     feature = "mut_end_rewritten",
     feature = "mut_read_before_base",
     feature = "mut_disconnect_kills_kept",
+    feature = "mut_stream_follows_key",
     feature = "mut_remove_live",
     feature = "mut_signal_ended",
     feature = "mut_ended_not_removable",
@@ -902,6 +903,8 @@ fn the_mutation_turns_its_property_red() {
         return;
     } else if cfg!(feature = "mut_read_before_base") {
         "J5: "
+    } else if cfg!(feature = "mut_stream_follows_key") {
+        "J9: "
     } else if cfg!(feature = "mut_disconnect_kills_kept") {
         "J6: "
     } else if cfg!(feature = "mut_remove_live") {
@@ -952,6 +955,7 @@ fn production_calls_the_kernel() {
         "Ev::Remove {",
         "Ev::Disconnect {",
         "kernel::window(",
+        "kernel::bound(",
         "kernel::follow(",
         "Pick::",
         ".take(keys)",

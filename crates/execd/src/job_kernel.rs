@@ -29,6 +29,7 @@
 //! | [`Ev::Signal`] | a group is signalled only while the job is running and has a group (a number of an ended job may be reused) |
 //! | [`Ev::Stop`] | `kill` stops what has not ended, a job still spawning included |
 //! | [`Ev::Remove`] | a job leaves only once its group is observed empty, or (for `remove`) once it has ended |
+//! | [`bound`] | a stream goes on only with the job it attached to |
 //! | [`Ev::Disconnect`] | a held job nobody kept, still running, dies with its client's connection; a kept one never does |
 //!
 //! There is no cap and no expiry: the agent bounds its jobs, and an ended job is freed only by an
@@ -482,6 +483,13 @@ pub fn window(offset: u64, base: u64, end: u64, max: usize) -> (u64, usize) {
     };
     let want = usize::try_from(end.saturating_sub(from)).unwrap_or(usize::MAX).min(max);
     (from, want)
+}
+
+/// The job a stream may go on with: what the table holds under its key, if that is the job it
+/// attached to (`same`). A removed job is gone to its streams, and a later job of the same id is
+/// not its successor: the stream never reads it, and its client leaving never kills it.
+pub fn bound<C>(found: Option<C>, same: bool) -> Option<C> {
+    found.filter(|_| same || cfg!(feature = "mut_stream_follows_key"))
 }
 
 /// What a stream sends next.
