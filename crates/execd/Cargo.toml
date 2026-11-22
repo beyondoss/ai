@@ -74,9 +74,9 @@ beyond-agent = { path = "../agent" }
 beyond-test-support = { path = "../test-support" }
 hyper = { version = "1", features = ["client", "http2"] }
 memchr = "2"
-tempfile = "3"
 # The job table's model: `tests/job_model.rs` runs `job_kernel`, the function production calls.
 stateright = "0.31.0"
+tempfile = "3"
 
 # A/B comparison of execd against the reference endpoint, over HTTP on loopback.
 [[bench]]
