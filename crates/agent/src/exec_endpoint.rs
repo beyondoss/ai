@@ -67,17 +67,14 @@ impl ExecTarget {
     ) -> Result<Self, String> {
         let backend = crate::tools::fs::shell::ShellFs::connect(runner.clone())
             .await
-            .map_err(|e| format!("the sandbox did not answer: {e}"))?;
+            .map_err(|e| probe_error(&e))?;
         let backend = match home {
             Some(home) => backend.with_home(home),
             None => backend,
         };
         // The one probe of the sandbox's tools, here so an unreachable or refused endpoint fails the
         // attach with its own error rather than the first tool call.
-        let caps = backend
-            .capabilities()
-            .await
-            .map_err(|e| format!("the sandbox did not answer: {e}"))?;
+        let caps = backend.capabilities().await.map_err(|e| probe_error(&e))?;
         Ok(Self {
             runner,
             backend: std::sync::Arc::new(backend),
@@ -171,6 +168,19 @@ pub type UseHook = std::sync::Arc<dyn Fn() + Send + Sync>;
 pub type Connect = std::sync::Arc<
     dyn Fn() -> futures::future::BoxFuture<'static, Result<ExecTarget, String>> + Send + Sync,
 >;
+
+/// What a probe's error starts with when the endpoint answered 503: the front's "try again", the
+/// status it uses for a sandbox that is still being made (and for a tenant at its limit). Chosen by
+/// the typed status, never by the front's wording; a caller that may wait keys on this prefix.
+pub const SANDBOX_STARTING: &str = "the sandbox is starting";
+
+/// The probe's error for `e`: [`SANDBOX_STARTING`] when the endpoint said 503, else "did not answer".
+pub fn probe_error(e: &std::io::Error) -> String {
+    match endpoint_status(e) {
+        Some(s) if s.status == 503 => format!("{SANDBOX_STARTING}: {e}"),
+        _ => format!("the sandbox did not answer: {e}"),
+    }
+}
 
 /// A lazily attached target, not built yet (or to be built again).
 struct Lazy {
