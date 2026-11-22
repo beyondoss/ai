@@ -26,8 +26,8 @@
 //! The scope is the MCP one, not the `bash` table's: that table reads its scope back at every
 //! reopen and stops what nobody kept.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use sha2::Digest as _;
@@ -431,13 +431,7 @@ mod tests {
             || {
                 calls.set(calls.get() + 1);
                 let up = calls.get() > 3;
-                async move {
-                    if up {
-                        Ok(7)
-                    } else {
-                        Err(starting())
-                    }
-                }
+                async move { if up { Ok(7) } else { Err(starting()) } }
             },
             |_| async {},
         )
