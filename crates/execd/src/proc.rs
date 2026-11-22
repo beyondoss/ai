@@ -36,6 +36,8 @@ use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::Pid;
 use tokio::sync::{oneshot, watch};
 
+use crate::job_kernel;
+
 /// The children execd spawned and has not yet collected, each with the channel its exit status
 /// goes down.
 static CHILDREN: Mutex<Option<HashMap<u32, oneshot::Sender<ExitStatus>>>> = Mutex::new(None);
@@ -52,6 +54,18 @@ static CHILDREN: Mutex<Option<HashMap<u32, oneshot::Sender<ExitStatus>>>> = Mute
 /// inside the pass because a pid is reused as soon as it is collected: a later spawn may register
 /// the same number, and must not be handed this status.
 static SPAWNING: RwLock<()> = RwLock::new(());
+
+/// The groups execd holds (J11): inserted by a spawn under [`SPAWNING`] shared, taken out by the
+/// reaper in the pass that collected the group's last member (under [`SPAWNING`] exclusive). A
+/// signal by number reads it under [`SPAWNING`] shared, so the group cannot be freed between the
+/// check and the `kill`, and a freed number (any process may carry it now) is never signalled.
+static OWNED_GROUPS: Mutex<Option<job_kernel::Held>> = Mutex::new(None);
+
+fn held_groups() -> std::sync::MutexGuard<'static, Option<job_kernel::Held>> {
+    let mut g = locked(&OWNED_GROUPS);
+    g.get_or_insert_with(job_kernel::Held::new);
+    g
+}
 
 /// Whether this process is its descendants' subreaper, so every orphaned group member becomes its
 /// own child (see [`group_gone`]). Set by [`become_subreaper`].
@@ -147,6 +161,7 @@ pub(crate) fn spawn(cmd: &mut std::process::Command) -> io::Result<Proc> {
     };
     let (tx, exit) = oneshot::channel();
     children().as_mut().map(|m| m.insert(pid, tx));
+    held_groups().as_mut().map(|h| h.insert(pgid));
     let pipes = (|| -> io::Result<_> {
         Ok((
             child
@@ -185,11 +200,25 @@ pub(crate) fn spawn(cmd: &mut std::process::Command) -> io::Result<Proc> {
 
 /// SIGKILL every member of group `pgid`. A group that is already gone is not an error.
 pub(crate) fn kill_group(pgid: i32) {
-    signal_group(pgid, Signal::SIGKILL);
+    let _no_reaping = no_reaping();
+    signal_held_group(pgid, Signal::SIGKILL);
 }
 
-pub(crate) fn signal_group(pgid: i32, sig: Signal) {
-    if pgid > 1 {
+/// Keep the reaper from collecting anything until the guard drops (a pass takes [`SPAWNING`]
+/// exclusively): a group that is held now cannot be freed, and a pid found now cannot be reused.
+fn no_reaping() -> std::sync::RwLockReadGuard<'static, ()> {
+    SPAWNING
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// `sig` to group `pgid` if execd still holds it (J11). The caller holds [`no_reaping`]. A group
+/// that was freed is not ours any more: nothing is sent, and there is nothing of ours to send to.
+fn signal_held_group(pgid: i32, sig: Signal) {
+    let ours = held_groups()
+        .as_ref()
+        .is_some_and(|h| job_kernel::may_deliver(h, pgid));
+    if ours && pgid > 1 {
         let _ = killpg(Pid::from_raw(pgid), sig);
     }
 }
@@ -365,7 +394,8 @@ pub(crate) async fn job_gone(pgid: i32, mark: &str, precise: bool) -> bool {
 /// `sig` to the job's group, and to each process that carries its mark and has left the group:
 /// every process of the job hears it exactly once (a `SIGINT` handler counts deliveries).
 pub(crate) fn signal_job(pgid: i32, mark: &str, sig: Signal) {
-    signal_group(pgid, sig);
+    let _no_reaping = no_reaping();
+    signal_held_group(pgid, sig);
     for pid in members(pgid, mark, true) {
         if let Ok(raw) = i32::try_from(pid) {
             let _ = nix::sys::signal::kill(Pid::from_raw(raw), sig);
@@ -530,6 +560,17 @@ fn sweep() -> usize {
                 }
             }
         }
+        if n > 0 {
+            // A group's number is free once its last member is collected: stop holding every group
+            // that is gone, before the exclusion ends, so no signal can name it afterwards (J11).
+            if let Some(h) = held_groups().as_mut() {
+                for g in h.ids() {
+                    if !group_exists(g) {
+                        h.freed(g);
+                    }
+                }
+            }
+        }
     }
     for (tx, st) in delivered {
         let _ = tx.send(st);
@@ -602,12 +643,21 @@ impl ChildEvents {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+    /// One test forks at a time: a script written for another test's exec is still open for writing
+    /// in a forked child until it execs (`ETXTBSY`).
+    static FORKS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn forking() -> std::sync::MutexGuard<'static, ()> {
+        FORKS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     use super::*;
     use std::os::unix::process::CommandExt as _;
 
     /// A zombie is in the group for `kill(-pgid, 0)` and not for the spec: its group is empty.
     #[test]
     fn a_zombie_is_not_a_live_member() {
+        let _forking = forking();
         let mut leader = std::process::Command::new("true");
         leader.process_group(0);
         let mut child = leader.spawn().unwrap();
@@ -632,22 +682,58 @@ mod tests {
 
     #[test]
     fn a_live_process_is_a_member_and_a_kill_removes_it() {
+        let _forking = forking();
         let mut sleeper = std::process::Command::new("sleep");
         sleeper.arg("30").process_group(0);
         let mut child = sleeper.spawn().unwrap();
         let pgid = child.id() as i32;
+        // Not through `spawn`, so held by hand, as a spawn would.
+        held_groups().as_mut().map(|h| h.insert(pgid));
         assert_eq!(live_members(pgid), vec![child.id()]);
         kill_group(pgid);
         child.wait().unwrap();
         assert!(live_members(pgid).is_empty());
         // A group that is gone is not an error, and nothing outside a real group is ever signalled.
+        // The reaper has not run in this test, so the number is still held: free it as a pass does.
+        held_groups().as_mut().map(|h| h.freed(pgid));
         kill_group(pgid);
         kill_group(0);
         kill_group(1);
     }
 
+    /// J11 on the real reaper: a group is held from its spawn until the pass that collects its last
+    /// member, and a signal by number after that pass reaches nothing (its number is any process's).
+    #[test]
+    fn a_group_is_held_until_the_reaper_collects_it_and_never_signalled_after() {
+        let _forking = forking();
+        let held_now = |pgid: i32| {
+            // Under the exclusion that keeps the reaper out, as a signal checks it.
+            let _no_reaping = no_reaping();
+            held_groups()
+                .as_ref()
+                .is_some_and(|h| job_kernel::may_deliver(h, pgid))
+        };
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("30");
+        let proc = spawn(&mut cmd).unwrap();
+        let pgid = proc.pgid;
+        assert!(held_now(pgid), "a spawned group is held");
+        kill_group(pgid);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while held_now(pgid) {
+            sweep();
+            assert!(std::time::Instant::now() < deadline, "the group was never freed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!group_exists(pgid), "freed means the number is free");
+        // A signal now names a number that is not ours: refused, whatever the number holds.
+        signal_job(pgid, "no-such-mark", Signal::SIGKILL);
+        kill_group(pgid);
+    }
+
     #[test]
     fn the_pipe_capacity_is_the_kernels_number() {
+        let _forking = forking();
         let mut c = std::process::Command::new("true");
         c.stdout(std::process::Stdio::piped());
         let mut child = c.spawn().unwrap();
@@ -679,6 +765,7 @@ mod tests {
     /// another process's `comm`, so the byte is the executable's own name.
     #[test]
     fn a_comm_that_is_not_text_is_still_a_live_member() {
+        let _forking = forking();
         use std::os::unix::ffi::OsStringExt as _;
         use std::os::unix::fs::PermissionsExt as _;
         // A script named by the raw byte. The kernel takes `comm` from the file name, and the shell
@@ -721,7 +808,7 @@ mod tests {
     impl Drop for KillOnDrop<'_> {
         fn drop(&mut self) {
             // The group, not only the child: the script's `sleep` is still running in it.
-            kill_group(self.0.id() as i32);
+            let _ = killpg(Pid::from_raw(self.0.id() as i32), Signal::SIGKILL);
             let _ = self.0.wait();
         }
     }
