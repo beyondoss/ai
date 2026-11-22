@@ -20,6 +20,7 @@ variables alone ([Configuration](#configuration)).
 | `src/http.rs`   | hyper (HTTP/1.1 and h2c), routing, `/livez`, the bearer check, the request limit, the log line           |
 | `src/exec.rs`   | one-shot envelope and streams: pumps, the sink, heartbeat, leftovers, timeout, disconnect                |
 | `src/jobs.rs`   | jobs: the table, the output ring, the supervisor, job streams                                            |
+| `src/job_kernel.rs` | the job table's decisions, pure; `tests/job_model.rs` model-checks them                                  |
 | `src/notify.rs` | notify: the sender that drives the `exec-notify` kernel                                                  |
 | `src/proc.rs`   | spawning, the reaper that collects every child, process groups by syscall, the subreaper                 |
 | `src/spool.rs`  | the jobs directory: where a kept job's retained output lives as chunk files, and stale-directory cleanup |
@@ -166,6 +167,58 @@ attempt begins, when to wait, and when to stop; `notify` makes the request (one 
 verified, 30 s at most) and feeds back what happened. A job's latest `keep` governs, a `keep` abandons the attempt in flight,
 and a removed job's timers are dropped with it. The token is held in the job and in the request header, and appears in no log,
 no answer, no argument and no environment; `Debug` for it prints `<redacted>`.
+
+### The job kernel: `job_kernel`
+
+The job table's decisions are pure functions in `src/job_kernel.rs`: no I/O, no async, no clock (a time arrives in the event),
+no closure in a decision. `jobs.rs` takes a lock, calls the kernel, and performs the action it returns, in the same order as
+before. The two locks stay as they were, and the kernel follows them:
+
+- the table's (`Jobs::map`): `Table` (`admit`, `insert`, `get`, `in_scope`, `take`). A key in the table is `Exists` (409), a lookup
+  never leaves its scope, and `take` is the only way out.
+- one job's (`Job`'s mutex): `State` (`Phase`: `Spawning`, `Running`, `Exited`, `Ended`, one way only; `Claim`: `Held` or `Kept`,
+  never back; `seen`; `removed`, final), changed only by `step(&mut State, Ev) -> Act`.
+- output offsets: `window` (where a read starts, never before the oldest byte held) and `follow` (a stream's next frame: gap, data,
+  the shell's exit, the end, or wait). The ring's bytes stay in the shell.
+
+| event | what the kernel decides |
+| --- | --- |
+| `Spawned`, `ShellExit`, `GroupEmpty` | the phase advances once; an ended job never changes; a callback is owed for the end only if the job is not removed |
+| `Keep`, `Seen` | `Held` becomes `Kept` for good; `seen` is what the model was shown |
+| `Taken` | the table let the job go: removed, final |
+| `Push` | a pump's bytes are stored unless the job is removed |
+| `Signal`, `Stop` | a group is signalled only while the job has a group and has not ended (its number may be reused) |
+| `Remove` | out of the table only with its group observed empty, or, for `remove`, once ended |
+| `Disconnect` | a held job nobody kept, still running, dies with its client's connection; a kept one never does |
+
+There is no cap and no expiry here (see Bounds): an ended job is freed only by `remove`, `kill` with `remove` or `wipe`.
+
+`tests/job_model.rs` is a Stateright model that calls these functions, never a copy: two scopes with the same ids, up to three
+jobs, two stream clients, and an environment (the shell dying with or without a descendant, `kill` leaving survivors, pumps, eviction,
+a held connection dropping at any point). Properties: J1 an id is the claim (a start never replaces a job in the table), J2 no
+operation resolves another scope's job, J3 a removed job never answers again (and a stream never follows a later job of its id),
+J4 an ended job never changes, J5 output offsets only move forward over what is held, J6 a kept job never dies with a held client,
+J7 a job leaves only with its group empty, J8 no signal reaches an ended job, L1 an ended job can always be removed, L2 an ended
+job's stream sends its final frame. `production_calls_the_kernel` fails if `jobs.rs` stops calling the kernel or writes job state
+outside it.
+
+```sh
+cargo test -p beyond-execd --test job_model faithful          # both bounds, all properties
+cargo test -p beyond-execd --features <mut> --test job_model the_mutation   # each MUST pass only if its property is red
+```
+
+| mutation | property it turns red |
+| --- | --- |
+| `mut_start_overwrites` | J1 |
+| `mut_scope_ignored` | J2 |
+| `mut_remove_keeps_entry` | J3 |
+| `mut_end_rewritten` | J4 (`ended_is_final`, over every phase and event) |
+| `mut_read_before_base` | J5 |
+| `mut_disconnect_kills_kept` | J6 |
+| `mut_remove_live` | J7 |
+| `mut_signal_ended` | J8 |
+| `mut_ended_not_removable` | L1 |
+| `mut_follow_waits_after_end` | L2 |
 
 ## Security
 
