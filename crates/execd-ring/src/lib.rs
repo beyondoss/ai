@@ -29,7 +29,10 @@
     clippy::if_same_then_else,
     clippy::implicit_saturating_sub,
     clippy::needless_return,
-    unused_braces
+    unused_braces,
+    clippy::let_and_return,
+    clippy::manual_div_ceil,
+    clippy::manual_is_multiple_of
 )]
 
 use vstd::prelude::*;

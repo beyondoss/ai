@@ -104,7 +104,7 @@ impl Ring {
                     }
                     ok
                 });
-            self.made |= wrote;
+            self.made = made;
             self.tail.drain(..FRAME_MAX);
             if !wrote {
                 // The disk refused it: what was held and this chunk read back as a gap.
@@ -261,7 +261,6 @@ impl Drop for RemoveOnDrop {
 fn scopeguard_remove(p: PathBuf) -> RemoveOnDrop {
     RemoveOnDrop(p)
 }
-
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -508,7 +507,10 @@ mod tests {
                 continue;
             }
             if let Some(stem) = name.strip_suffix(".e") {
-                assert!(ring.dir.join(stem).exists(), "{what}: sidecar {name} without its chunk");
+                assert!(
+                    ring.dir.join(stem).exists(),
+                    "{what}: sidecar {name} without its chunk"
+                );
             } else {
                 chunks += 1;
             }
@@ -532,7 +534,11 @@ mod tests {
                 _ => rng.below(8 * c) as usize,
             };
             let (from, data, ranges) = ring.read(offset, max);
-            assert_eq!(from, offset.max(ring.base), "{what}: from of read({offset}, {max})");
+            assert_eq!(
+                from,
+                offset.max(ring.base),
+                "{what}: from of read({offset}, {max})"
+            );
             let to = end.max(from).min(from.saturating_add(max as u64));
             let runs = m.runs(from, to.max(from));
             // The window is cut before the first run past RANGES_MAX, and only then.
@@ -541,10 +547,20 @@ mod tests {
             } else {
                 (to.max(from) - from, runs)
             };
-            assert_eq!(data.len() as u64, len, "{what}: length of read({offset}, {max})");
+            assert_eq!(
+                data.len() as u64,
+                len,
+                "{what}: length of read({offset}, {max})"
+            );
             let expect: Vec<u8> = (from..from + len).map(|o| m.all[o as usize].0).collect();
-            assert!(data == expect, "{what}: bytes of read({offset}, {max}) from {from}");
-            assert_eq!(ranges, want_runs, "{what}: stderr ranges of read({offset}, {max})");
+            assert!(
+                data == expect,
+                "{what}: bytes of read({offset}, {max}) from {from}"
+            );
+            assert_eq!(
+                ranges, want_runs,
+                "{what}: stderr ranges of read({offset}, {max})"
+            );
         }
     }
 
@@ -555,10 +571,23 @@ mod tests {
     fn the_ring_matches_a_plain_buffer_under_random_pushes_reads_and_refused_chunks() {
         for seed in 0..60u64 {
             let mut rng = Rng(seed);
-            let retain = [0, 1, 1000, FRAME_MAX - 1, FRAME_MAX, FRAME_MAX + 1, 150_000, 300_000]
-                [rng.below(8) as usize];
+            let retain = [
+                0,
+                1,
+                1000,
+                FRAME_MAX - 1,
+                FRAME_MAX,
+                FRAME_MAX + 1,
+                150_000,
+                300_000,
+            ][rng.below(8) as usize];
             let (mut ring, _d) = ring(retain);
-            let mut m = Model { all: Vec::new(), floor: 0, planted: None, blockers: Default::default() };
+            let mut m = Model {
+                all: Vec::new(),
+                floor: 0,
+                planted: None,
+                blockers: Default::default(),
+            };
             for step in 0..30 {
                 match rng.below(10) {
                     // Plant a file where the next chunk (or its bits) will go: the write is refused.
@@ -566,10 +595,15 @@ mod tests {
                         let chunk = m.all.len() as u64 / FRAME_MAX as u64;
                         let on_bits = rng.below(2) == 0;
                         let at = chunk * FRAME_MAX as u64;
-                        let path = if on_bits { ring.chunk_bits_path(at) } else { ring.chunk_path(at) };
+                        let path = if on_bits {
+                            ring.chunk_bits_path(at)
+                        } else {
+                            ring.chunk_path(at)
+                        };
                         let _ = spool::make_job_dir(&ring.dir);
                         if std::fs::create_dir(&path).is_ok() {
-                            m.blockers.insert(path.file_name().unwrap().to_string_lossy().into_owned());
+                            m.blockers
+                                .insert(path.file_name().unwrap().to_string_lossy().into_owned());
                             m.planted = Some((chunk, on_bits));
                         }
                     }
@@ -581,14 +615,21 @@ mod tests {
                     }
                     2..=6 => {
                         let n = rng.len();
-                        let data: Vec<u8> = (0..n).map(|i| (i as u64 ^ rng.below(251)) as u8).collect();
+                        let data: Vec<u8> =
+                            (0..n).map(|i| (i as u64 ^ rng.below(251)) as u8).collect();
                         let stderr = rng.below(3) == 0;
                         push(&mut ring, &mut m, &data, stderr);
                     }
                     _ => {}
                 }
                 // A planted file is not a held chunk: it sits where a chunk has not been written.
-                check(&ring, &m, retain, &mut rng, &format!("seed {seed} step {step}"));
+                check(
+                    &ring,
+                    &m,
+                    retain,
+                    &mut rng,
+                    &format!("seed {seed} step {step}"),
+                );
             }
         }
     }
@@ -609,7 +650,12 @@ mod tests {
         ] {
             assert!(prod.contains(call), "ring.rs does not call {call}");
         }
-        for copy in ["fn set_bits", "fn bit(", "const RANGES_MAX", "const CHUNK_BITS"] {
+        for copy in [
+            "fn set_bits",
+            "fn bit(",
+            "const RANGES_MAX",
+            "const CHUNK_BITS",
+        ] {
             assert!(!prod.contains(copy), "ring.rs restates the kernel: {copy}");
         }
     }
@@ -622,7 +668,10 @@ mod tests {
         spool::make_job_dir(&ring.dir).unwrap();
         std::fs::create_dir(ring.chunk_path(0)).unwrap();
         ring.push(&vec![1u8; FRAME_MAX], false);
-        assert_eq!(ring.base, FRAME_MAX as u64, "the refused chunk reads back as a gap");
+        assert_eq!(
+            ring.base, FRAME_MAX as u64,
+            "the refused chunk reads back as a gap"
+        );
         let dir = ring.dir.clone();
         drop(ring);
         assert!(!dir.exists(), "the job's directory outlives its ring");

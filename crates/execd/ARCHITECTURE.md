@@ -19,7 +19,9 @@ variables alone ([Configuration](#configuration)).
 | `src/runas.rs`      | `EXECD_RUN_AS`: resolving the user, proving execd can switch, the switch helper                                   |
 | `src/http.rs`       | hyper (HTTP/1.1 and h2c), routing, `/livez`, the bearer check, the request limit, the log line                    |
 | `src/exec.rs`       | one-shot envelope and streams: pumps, the sink, heartbeat, leftovers, timeout, disconnect                         |
-| `src/jobs.rs`       | jobs: the table, the output ring, the supervisor, job streams                                                     |
+| `src/jobs.rs`       | jobs: the table, the supervisor, job streams                                                                      |
+| `src/ring.rs`       | the job output ring's I/O: chunk files, the tail, the bits' storage; every decision is `crates/execd-ring`        |
+| `crates/execd-ring` | the ring's offset, retention and stderr-label decisions, pure and proven in Verus (R1 to R6, `execd::ring`)       |
 | `crates/execd-jobs` | the job table's decisions, pure and proven in Verus (`execd::job_kernel`); `tests/job_model.rs` model-checks them |
 | `src/notify.rs`     | notify: the sender that drives the `exec-notify` kernel                                                           |
 | `src/proc.rs`       | spawning, the reaper that collects every child, process groups by syscall, the subreaper                          |
@@ -134,7 +136,7 @@ beside `code` 128 + S, set in the same step as `shell_exit` or the end, so no re
 in place of `{"exit_code": 128 + S}`, as a one-shot stream's is. A job stopped by `kill` therefore reports the signal that
 killed its shell (15, or 9 after the grace). Nothing is persisted: a job lives in the table and is gone with execd.
 
-**Output streams.** The ring keeps which pipe each byte came from, one bit per byte: an in-memory bitmap for the unfinished tail,
+**Output streams.** (`src/ring.rs` does the I/O; which offsets are held, where a read starts, which chunks retention drops and which bytes are stderr are the Verus-proven kernel `crates/execd-ring`, R1 to R6 in its docs, and `ring.rs`'s tests hold the whole to a plain `Vec` under random pushes, reads and refused chunks.) The ring keeps which pipe each byte came from, one bit per byte: an in-memory bitmap for the unfinished tail,
 allocated at the job's first stderr byte, and a `<chunk>.e` sidecar (8 KiB, same `0600`, `O_EXCL|O_NOFOLLOW`) beside each full
 chunk that holds any stderr. A job that never writes stderr allocates and writes nothing extra. Eviction removes the sidecar with
 its chunk; a sidecar that cannot be written turns its chunk into a gap, so bytes are never read back mislabelled. `read` answers

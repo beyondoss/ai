@@ -80,7 +80,7 @@ run = 'python3 crates/agent/eval/longctx/ab.py run --base "${BASE:?set BASE=<sha
 run = "cargo clippy --all-targets --locked -- -D warnings"
 
 [tasks."verify:kernels"]
-description = "Prove every kernel crate (crates/exec-notify, crates/execd-jobs) with the pinned Verus (.github/scripts/verus.env). Installs Verus under ~/.cache/verus on first use, sha256-checked. `mise run verify:kernels -- --features mut_x` must go red for each mutation of the kernel."
+description = "Prove every kernel crate (crates/exec-notify, crates/execd-jobs, crates/execd-ring) with the pinned Verus (.github/scripts/verus.env). Installs Verus under ~/.cache/verus on first use, sha256-checked. `mise run verify:kernels -- --features mut_x` must go red for each mutation of the kernel."
 run = ".github/scripts/verify-kernels.sh"
 
 [tasks."test:notify-model-mutants"]
