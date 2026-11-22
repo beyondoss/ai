@@ -428,6 +428,15 @@ pub(crate) fn clamp_max_tokens_to_context(req: &ModelRequest, caps: &ModelCaps) 
 /// Cheap when nothing needs fixing (the overwhelmingly common case): a first read-only pass decides
 /// whether any repair is needed at all before ever allocating; only a genuinely orphaned `tool_use`
 /// pays for the owned copy.
+/// The result given to a `tool_use` that has none. The call may well have run: the usual way here is
+/// a crash after a tool took effect but before its result was checkpointed (the checkpoint *before*
+/// a dispatch fails closed, so the call itself is always recorded first). Saying only "no result"
+/// reads as "it didn't run" and invites a blind re-run, repeating a side effect; this tells the model
+/// to look first.
+pub(crate) const ORPHANED_TOOL_RESULT: &str = "This tool call may have run, but its result was not \
+recorded (the session was interrupted before it was saved). Check whether its effects already \
+happened before running it again.";
+
 pub(crate) fn repair_orphaned_tool_use(messages: &[Message]) -> std::borrow::Cow<'_, [Message]> {
     if !messages
         .iter()
@@ -447,7 +456,7 @@ pub(crate) fn repair_orphaned_tool_use(messages: &[Message]) -> std::borrow::Cow
                 ContentBlock::ToolUse { id, .. } if !answered(messages, i, id) => {
                     Some(ContentBlock::ToolResult {
                         tool_use_id: id.clone(),
-                        content: "no result recorded for this tool call".into(),
+                        content: ORPHANED_TOOL_RESULT.into(),
                         is_error: true,
                         images: Vec::new(),
                     })
@@ -1470,12 +1479,18 @@ data: {"type":"message_stop"}
                 ContentBlock::ToolResult {
                     tool_use_id,
                     is_error,
+                    content,
                     ..
                 },
                 ContentBlock::Text { text, .. },
             ] => {
                 assert_eq!(tool_use_id, "t1");
                 assert!(*is_error);
+                // Never "it didn't run": the call may have taken effect before the interruption.
+                assert!(
+                    content.contains("may have run"),
+                    "the placeholder must not read as 'not run': {content:?}"
+                );
                 assert_eq!(text.as_ref(), "nevermind");
             }
             other => panic!("expected [synthetic ToolResult, original Text], got {other:?}"),
