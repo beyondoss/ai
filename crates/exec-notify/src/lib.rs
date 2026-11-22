@@ -330,6 +330,8 @@ pub open spec fn wait_ms_spec(n: u32, draw: u32) -> int {
 }
 
 /// The spec's table of answers (N17).
+// Verus does not take `RangeInclusive::contains` in code, so the comparisons are spelled out.
+#[allow(clippy::manual_range_contains)]
 pub fn verdict(outcome: Outcome) -> (v: Verdict)
     ensures
         v == verdict_spec(outcome),
