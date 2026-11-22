@@ -121,9 +121,12 @@ where
             Ok(v) => return Ok(v),
             Err(e) => e,
         };
+        // `contains`, not `starts_with`: the connect error reaches here wrapped by the session
+        // (service.rs: "this session's sandbox is unreachable: the sandbox is starting: ..."), and a
+        // prefix match never fired in production (I62 on AWS beyond, 11-22).
         let starting = e
             .to_string()
-            .starts_with(crate::exec_endpoint::SANDBOX_STARTING);
+            .contains(crate::exec_endpoint::SANDBOX_STARTING);
         match start_step(starting, n, waited) {
             StartStep::Retry(d) => {
                 pause(d).await;
@@ -369,6 +372,33 @@ mod tests {
             "{}: exec endpoint x returned 503",
             crate::exec_endpoint::SANDBOX_STARTING
         ))
+    }
+
+    /// The error as production delivers it: wrapped by the session's unreachable prefix.
+    fn starting_wrapped() -> std::io::Error {
+        std::io::Error::other(format!("{}: {}", crate::service::UNREACHABLE, starting()))
+    }
+
+    #[tokio::test]
+    async fn a_starting_error_wrapped_by_the_session_is_still_retried() {
+        let mut calls = 0u32;
+        let r: std::io::Result<()> = start_waiting(
+            || {
+                calls += 1;
+                let n = calls;
+                async move {
+                    if n < 3 {
+                        Err(starting_wrapped())
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+            |_| async {},
+        )
+        .await;
+        assert!(r.is_ok(), "a wrapped starting error must be retried: {r:?}");
+        assert_eq!(calls, 3);
     }
 
     #[test]
