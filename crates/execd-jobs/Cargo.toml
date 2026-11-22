@@ -1,0 +1,41 @@
+[package]
+name = "beyond-execd-jobs"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+readme = "README.md"
+rust-version.workspace = true
+description = "execd's job-table kernel: the decisions of the job table as pure functions, proven in Verus"
+
+[lib]
+name = "execd_jobs"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+# Its one dependency is `vstd`, for the `verus!` macro: a normal build erases every proof and spec, and
+# only `cargo verus` (`mise run verify:kernels`) checks them. execd re-exports this crate as
+# `execd::job_kernel`, so the table's model (`crates/execd/tests/job_model.rs`) and production call
+# the function Verus proves. The version is the one the pinned release ships (`.github/scripts/verus.env`).
+[dependencies]
+vstd = "=0.0.0-2026-11-01-0251"
+
+[package.metadata.verus]
+verify = true
+
+[features]
+# Mutations of the kernel's decisions, each removing one guard. `execd` forwards them: its model
+# (`cargo test -p beyond-execd --features <mut> --test job_model the_mutation`) and the proof
+# (`mise run verify:kernels -- --features <mut>`, which runs here) both go red under them.
+mut_start_overwrites = [] # a start of a key in the table replaces it (J1)
+mut_scope_ignored = [] # a lookup by id alone, any scope (J2)
+mut_remove_keeps_entry = [] # a removed job stays in the table (J3)
+mut_end_rewritten = [] # a second end rewrites an ended job's code (J4)
+mut_read_before_base = [] # a read starts before the oldest byte held (J5)
+mut_disconnect_kills_kept = [] # a held start's client leaving kills a kept job (J6)
+mut_remove_live = [] # a job is taken out with its group alive (J7)
+mut_signal_ended = [] # `signal` reaches an ended job's group, whose number may be reused (J8)
+mut_ended_not_removable = [] # `remove` waits for the group to look empty, even for an ended job (L1)
+mut_stream_follows_key = [] # a stream goes on with whatever job holds its key now (J9)
+mut_follow_waits_after_end = [] # a stream never sends its final frame (L2)

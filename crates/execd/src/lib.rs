@@ -30,9 +30,10 @@ use tokio_util::sync::CancellationToken;
 mod exec;
 mod frame;
 mod http;
-/// The job table's decisions; the model checks the function production calls.
+/// The job table's decisions, proven in Verus (`crates/execd-jobs`); the model checks the function
+/// production calls.
 #[doc(hidden)]
-pub mod job_kernel;
+pub use execd_jobs as job_kernel;
 mod jobs;
 pub mod log;
 mod notify;

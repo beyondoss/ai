@@ -494,6 +494,7 @@ dependencies = [
  "base64 0.22.1",
  "beyond-agent",
  "beyond-exec-notify",
+ "beyond-execd-jobs",
  "beyond-test-support",
  "bytes",
  "getrandom 0.3.4",
@@ -513,6 +514,13 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "beyond-execd-jobs"
+version = "0.1.0"
+dependencies = [
+ "vstd",
 ]
 
 [[package]]
