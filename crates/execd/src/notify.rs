@@ -424,8 +424,6 @@ mod owed_tests {
         step(exec_notify::Job::default(), Event::Keep { notify: true }, 0).0
     }
 
-    /// Owed from the keep, through every failed attempt and its backoff, until the twelfth failure
-    /// abandons the count; a settling answer and removal also end it.
     /// A `keep` that reached a job after its removal begins nothing and owes nothing.
     #[test]
     fn a_removed_job_stays_silent_whatever_arrives() {
@@ -438,6 +436,8 @@ mod owed_tests {
         }
     }
 
+    /// Owed from the keep, through every failed attempt and its backoff, until the twelfth failure
+    /// abandons the count; a settling answer and removal also end it.
     #[test]
     fn a_callback_is_owed_until_settled_abandoned_or_removed() {
         let mut k = kept();
