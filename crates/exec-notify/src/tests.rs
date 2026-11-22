@@ -359,3 +359,45 @@ fn production_calls_the_verified_step() {
         "a second copy of the notify kernel: {copies:?}"
     );
 }
+
+/// `step`'s preconditions fail closed at a call site: the clock saturates where the wait cannot
+/// wrap, and a job one event from `owed == u64::MAX` is refused one more callback.
+#[test]
+fn step_checked_never_wraps() {
+    assert_eq!(clock(5), 5);
+    assert_eq!(clock(u128::MAX), MAX_NOW_MS);
+    // Past the last clock step accepts, the clock saturates and the wait does not wrap.
+    let (job, _) = step_checked(Job::default(), Event::Keep { notify: true }, 0);
+    let ended = Event::AttemptEnded {
+        outcome: Outcome::Failed,
+        draw: 0,
+    };
+    let (job, actions) = step_checked(job, ended, u64::MAX);
+    assert_eq!(actions, [Action::WakeAt(MAX_NOW_MS + 1_000)]);
+    assert!(job.wake_at.is_some());
+
+    // One callback short of the counter's end: the next owes are refused, everything else runs.
+    let near = Job {
+        notify: true,
+        owed: u64::MAX - 1,
+        settled: u64::MAX - 1,
+        ..Job::default()
+    };
+    for event in [Event::Keep { notify: true }, Event::Change] {
+        let (same, actions) = step_checked(near, event, 0);
+        assert_eq!((same, actions.len()), (near, 0), "{event:?}");
+    }
+    let (off, _) = step_checked(near, Event::Keep { notify: false }, 0);
+    assert!(!off.notify);
+    assert!(step_checked(near, Event::Removed, 0).0.removed);
+    let (below, actions) = step_checked(
+        Job {
+            owed: u64::MAX - 3,
+            settled: u64::MAX - 3,
+            ..near
+        },
+        Event::Change,
+        0,
+    );
+    assert_eq!((below.owed, actions.len()), (u64::MAX - 2, 1));
+}

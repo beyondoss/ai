@@ -604,6 +604,32 @@ pub proof fn lemma_rank_bounded(j: Job)
 
 } // verus!
 
+/// The latest clock [`step`] accepts (`requires now <= u64::MAX - MAX_WAIT_MS`), in milliseconds.
+pub const MAX_NOW_MS: u64 = u64::MAX - MAX_WAIT_MS;
+
+/// A caller's clock (milliseconds since its own epoch) as [`step`] needs it: saturating at
+/// [`MAX_NOW_MS`], never wrapping. Reaching it takes 5.8e8 years; if it ever did, time stops
+/// there and no wait wraps.
+pub fn clock(ms: u128) -> u64 {
+    if ms > MAX_NOW_MS as u128 { MAX_NOW_MS } else { ms as u64 }
+}
+
+/// [`step`] for a caller that cannot prove its preconditions: `now` saturates ([`clock`]'s bound),
+/// and an event that would owe one more callback when `owed` is within one of `u64::MAX` is
+/// refused (the job is returned as it was, nothing is sent), so `owed < u64::MAX` always holds.
+/// Neither is reachable: one callback is owed per `keep` with `notify` or state change.
+pub fn step_checked(job: Job, event: Event, now: u64) -> (Job, Vec<Action>) {
+    let owes_more = match event {
+        Event::Keep { notify } => notify,
+        Event::Change => job.notify,
+        _ => false,
+    };
+    if !job.removed && owes_more && job.owed >= u64::MAX - 1 {
+        return (job, Vec::new());
+    }
+    step(job, event, now.min(MAX_NOW_MS))
+}
+
 /// `u` in `[0, 1)` for a draw.
 pub fn uniform(draw: u32) -> f64 {
     f64::from(draw) / 4_294_967_296.0
