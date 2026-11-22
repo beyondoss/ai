@@ -889,8 +889,10 @@ impl Agent {
         // `is_hard_overflow` recognizes), which needs its own flag rather than sharing the one above:
         // that check lives on the `Ok` path, *downstream* of the reset, so a shared flag is always false
         // by the time it's read and the guard it's supposed to provide can never fire. Read via
-        // `mem::replace` into a per-turn local instead (see the take below), which gives it a
-        // survives-exactly-one-iteration lifetime that no reset ordering can defeat.
+        // `mem::replace` into a per-turn local instead (see the take below), which gives it a lifetime
+        // of exactly one *landed* turn that no reset ordering can defeat. A context-overflow error on
+        // the retry compacts and re-sends without landing a turn, so the flag carries through it: the
+        // turn that finally lands is still the retry, and must not recover a second time.
         let mut truncation_recovered = false;
         // Steps taken *by this call*, distinct from `session.steps` (a lifetime total across every
         // call, used only for observability — the `step` field on emitted events). Checking the
