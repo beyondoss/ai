@@ -13,7 +13,7 @@
 //!   returns the [`Act`] the shell performs under the same lock.
 //!
 //! Output is bytes in a ring owned by the shell; the kernel owns the offset arithmetic that must
-//! hold whatever the ring does: [`window`] (where a read starts) and [`follow`] (what a stream
+//! hold whatever the ring does: `execd_ring::window` (where a read starts; the ring kernel's, R1) and [`follow`] (what a stream
 //! sends next). What the job's processes do, and what a pump reads, is the shell's: it passes the
 //! facts it observed in the event (`empty`).
 //!
@@ -610,30 +610,6 @@ pub proof fn lemma_end_progress(old: State, ev: Ev, s: State, act: Act)
 // Output offsets.
 // ---------------------------------------------------------------------------------------------
 
-/// Where a read from `offset` starts, for a ring that holds `[base, end)`, and how many bytes it
-/// may answer of at most `max`: from the oldest byte held when `offset` is older (J5).
-pub fn window(offset: u64, base: u64, end: u64, max: usize) -> (r: (u64, usize))
-    ensures
-        r.0 >= base,
-        r.0 >= offset,
-        r.0 == (if offset >= base { offset } else { base }),
-        r.1 <= max,
-        r.1 as int == (if end > r.0 { if (end - r.0) as int > max as int { max as int } else { (end - r.0) as int } } else { 0int }),
-        r.0 <= end ==> r.0 as int + r.1 as int <= end as int,
-        (r.0 < end && max > 0) ==> r.1 > 0,
-{
-    let from = if cfg!(feature = "mut_read_before_base") {
-        offset
-    } else if offset > base {
-        offset
-    } else {
-        base
-    };
-    let avail: u64 = if end > from { end - from } else { 0 };
-    let want: usize = if avail > max as u64 { max } else { avail as usize };
-    (from, want)
-}
-
 /// The job a stream may go on with: what the table holds under its key, if that is the job it
 /// attached to (`same`). A removed job is gone to its streams, and a later job of the same id is
 /// not its successor: the stream never reads it, and its client leaving never kills it (J9).
@@ -916,7 +892,7 @@ pub open spec fn follow_rank(s: State, sent: u64, base: u64, end: u64, told: boo
 /// L2, progress: for an ended job whose ring is well formed (`base <= end`), every frame but the
 /// last lowers `follow_rank`, and the last (`End`) is sent at rank 1. So a stream reaches its final
 /// frame in at most `follow_rank` frames, under F1 (the supervisor made the job end), F2 (each
-/// `Data` frame the shell sends takes at least one byte, `window` promises it can) and F3 (the
+/// `Data` frame the shell sends takes at least one byte: `execd_ring::window`'s R1 promises it can, `r.0 < end && max > 0 ==> r.1 > 0`) and F3 (the
 /// stream task is always scheduled). A frame is never `Wait` for an ended job.
 pub proof fn lemma_follow_progress(
     s: State,

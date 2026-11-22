@@ -636,7 +636,7 @@ impl Model for Jobs {
                 s.resolved(scope, h);
                 let sim = &s.sims[h];
                 let (from, want) =
-                    kernel::window(0, u64::from(sim.base), u64::from(sim.end), 1 << 20);
+                    execd_ring::window(0, u64::from(sim.base), u64::from(sim.end), 1 << 20);
                 // J5: never before the oldest byte held, and never more than is held after it.
                 if from < u64::from(sim.base) || from + want as u64 != u64::from(sim.end) {
                     s.bad |= V_J5;
@@ -1008,7 +1008,6 @@ fn ended_is_final() {
     feature = "mut_scope_ignored",
     feature = "mut_remove_keeps_entry",
     feature = "mut_end_rewritten",
-    feature = "mut_read_before_base",
     feature = "mut_disconnect_kills_kept",
     feature = "mut_stream_follows_key",
     feature = "mut_remove_live",
@@ -1031,8 +1030,6 @@ fn the_mutation_turns_its_property_red() {
         println!("red: [\"J4\"] kernel check failed: {}", r.is_err());
         assert!(r.is_err(), "no property `J4` went red");
         return;
-    } else if cfg!(feature = "mut_read_before_base") {
-        "J5: "
     } else if cfg!(feature = "mut_stream_follows_key") {
         "J9: "
     } else if cfg!(feature = "mut_disconnect_kills_kept") {

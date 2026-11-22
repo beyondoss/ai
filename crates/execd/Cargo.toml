@@ -35,9 +35,6 @@ mut_remove_keeps_entry = [
 mut_end_rewritten = [
   "beyond-execd-jobs/mut_end_rewritten",
 ] # a second end rewrites an ended job's code (J4)
-mut_read_before_base = [
-  "beyond-execd-jobs/mut_read_before_base",
-] # a read starts before the oldest byte held (J5)
 mut_disconnect_kills_kept = [
   "beyond-execd-jobs/mut_disconnect_kills_kept",
 ] # a held start's client leaving kills a kept job (J6)

@@ -188,8 +188,8 @@ before. The two locks stay as they were, and the kernel follows them:
   never leaves its scope, and `take` is the only way out.
 - one job's (`Job`'s mutex): `State` (`Phase`: `Spawning`, `Running`, `Exited`, `Ended`, one way only; `Claim`: `Held` or `Kept`,
   never back; `seen`; `removed`, final), changed only by `step(&mut State, Ev) -> Act`.
-- output offsets: `window` (where a read starts, never before the oldest byte held) and `follow` (a stream's next frame: gap, data,
-  the shell's exit, the end, or wait). The ring's bytes stay in the shell.
+- output offsets: `follow` (a stream's next frame: gap, data,
+  the shell's exit, the end, or wait; where a read starts is `execd_ring::window`, the ring kernel's). The ring's bytes stay in the shell.
 
 | event                                | what the kernel decides                                                                                            |
 | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------ |
@@ -230,7 +230,6 @@ cargo test -p beyond-execd --features <mut> --test job_model the_mutation   # ea
 | `mut_scope_ignored`          | J2                                                 |
 | `mut_remove_keeps_entry`     | J3                                                 |
 | `mut_end_rewritten`          | J4 (`ended_is_final`, over every phase and event)  |
-| `mut_read_before_base`       | J5                                                 |
 | `mut_disconnect_kills_kept`  | J6                                                 |
 | `mut_remove_live`            | J7                                                 |
 | `mut_signal_ended`           | J8                                                 |

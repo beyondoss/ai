@@ -45,7 +45,6 @@ fn the_decisions_are_in_the_verified_block() {
     let storage = &src[close..];
     for decision in [
         "pub fn step(",
-        "pub fn window(",
         "pub fn follow(",
         "pub fn bound<",
         "pub fn admit(",
@@ -89,14 +88,7 @@ fn the_decisions_are_in_the_verified_block() {
             "{stray} outside verus!: the table's storage is not the verified one"
         );
     }
-    for stray in [
-        "fn step(",
-        "fn window(",
-        "fn follow(",
-        "fn bound<",
-        "Ev::",
-        "Phase::",
-    ] {
+    for stray in ["fn step(", "fn follow(", "fn bound<", "Ev::", "Phase::"] {
         assert!(
             !storage.contains(stray),
             "{stray} outside verus!: a decision the proof does not see"
