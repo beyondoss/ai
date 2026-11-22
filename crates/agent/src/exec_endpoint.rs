@@ -169,15 +169,31 @@ pub type Connect = std::sync::Arc<
     dyn Fn() -> futures::future::BoxFuture<'static, Result<ExecTarget, String>> + Send + Sync,
 >;
 
-/// What a probe's error starts with when the endpoint answered 503: the front's "try again", the
-/// status it uses for a sandbox that is still being made (and for a tenant at its limit). Chosen by
-/// the typed status, never by the front's wording; a caller that may wait keys on this prefix.
+/// The body `code` the front answers 503 with while a sandbox is being made or woken
+/// (`execfront.CodeSandboxStarting`). Every other 503 (the tenant at its limit, a failed create)
+/// has its own code and is not waited on.
+pub const SANDBOX_STARTING_CODE: &str = "sandbox_starting";
+
+/// What a probe's error starts with when the front said the sandbox is starting, so a caller that
+/// may wait can tell it from every other failure.
 pub const SANDBOX_STARTING: &str = "the sandbox is starting";
 
-/// The probe's error for `e`: [`SANDBOX_STARTING`] when the endpoint said 503, else "did not answer".
+/// Whether the endpoint's answer is the front's `sandbox_starting`: a 503 whose JSON body carries
+/// that code. The sentence is never read.
+fn is_starting(s: &EndpointStatus) -> bool {
+    s.status == 503
+        && serde_json::from_str::<serde_json::Value>(&s.body)
+            .ok()
+            .and_then(|v| v.get("code").and_then(|c| c.as_str().map(str::to_owned)))
+            .as_deref()
+            == Some(SANDBOX_STARTING_CODE)
+}
+
+/// The probe's error for `e`: [`SANDBOX_STARTING`] when the front said `sandbox_starting`, else
+/// "did not answer".
 pub fn probe_error(e: &std::io::Error) -> String {
     match endpoint_status(e) {
-        Some(s) if s.status == 503 => format!("{SANDBOX_STARTING}: {e}"),
+        Some(s) if is_starting(s) => format!("{SANDBOX_STARTING}: {e}"),
         _ => format!("the sandbox did not answer: {e}"),
     }
 }

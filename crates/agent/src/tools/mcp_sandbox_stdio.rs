@@ -430,10 +430,61 @@ mod tests {
         assert!(e.to_string().contains("did not answer"));
     }
 
+    fn front_503(code: &str) -> std::io::Error {
+        let body = format!(r#"{{"code":"{code}","message":"words"}}"#);
+        std::io::Error::other(crate::exec_endpoint::EndpointStatus::new(
+            503,
+            body.clone(),
+            format!("exec endpoint x returned 503: {body}"),
+        ))
+    }
+
+    #[tokio::test]
+    async fn only_the_starting_code_is_waited_on_an_at_limit_503_fails_at_once() {
+        // Through the probe's own classification: what the front's body says, not its sentence.
+        let calls = std::cell::Cell::new(0);
+        let e = start_waiting(
+            || {
+                calls.set(calls.get() + 1);
+                let err = crate::exec_endpoint::probe_error(&front_503("sandbox_limit_reached"));
+                async move { Err::<(), _>(std::io::Error::other(err)) }
+            },
+            |_| async {},
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(calls.get(), 1);
+        assert!(e.to_string().contains("sandbox_limit_reached"), "{e}");
+
+        let calls = std::cell::Cell::new(0);
+        let r = start_waiting(
+            || {
+                calls.set(calls.get() + 1);
+                let up = calls.get() > 2;
+                let err = crate::exec_endpoint::probe_error(&front_503("sandbox_starting"));
+                async move {
+                    if up {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::other(err))
+                    }
+                }
+            },
+            |_| async {},
+        )
+        .await;
+        assert!(r.is_ok());
+        assert_eq!(calls.get(), 3);
+    }
+
     #[test]
-    fn a_probe_failure_that_is_not_a_503_is_did_not_answer() {
-        let e = std::io::Error::other("boom");
-        assert!(crate::exec_endpoint::probe_error(&e).starts_with("the sandbox did not answer"));
+    fn a_bare_503_without_the_starting_code_is_not_starting() {
+        let bare = std::io::Error::other(crate::exec_endpoint::EndpointStatus::new(
+            503,
+            "the sandbox is starting",
+            "x",
+        ));
+        assert!(crate::exec_endpoint::probe_error(&bare).starts_with("the sandbox did not answer"));
     }
 
     #[test]
