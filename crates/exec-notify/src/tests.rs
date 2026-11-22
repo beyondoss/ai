@@ -314,3 +314,48 @@ fn the_notify_grammar_is_the_vectors() {
         assert!(check_notify(bad, "t").is_err(), "{bad}");
     }
 }
+
+/// Production runs the code Verus proves: the three endpoints that decide when to call back all
+/// call this crate's `step`, and no other source in the workspace carries a second copy of its
+/// state (`Job`'s `wake_at`/`in_flight` pair) or of its answer table.
+#[test]
+fn production_calls_the_verified_step() {
+    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let read = |p: &str| std::fs::read_to_string(crates.join(p)).unwrap();
+    for caller in ["execd/src/notify.rs", "test-support/src/exec_mock.rs"] {
+        assert!(
+            read(caller).contains("exec_notify::step("),
+            "{caller} must feed events to exec_notify::step"
+        );
+    }
+    assert!(
+        read("agent/src/exec_endpoint.rs").contains("pub use exec_notify as notify_kernel;"),
+        "the agent's notify_kernel is the shared kernel, not a copy"
+    );
+    let mut copies = Vec::new();
+    let mut dirs = vec![crates.clone()];
+    while let Some(d) = dirs.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                if !matches!(
+                    p.file_name().and_then(|n| n.to_str()),
+                    Some("target" | "node_modules" | ".git")
+                ) {
+                    dirs.push(p);
+                }
+            } else if p.extension().is_some_and(|x| x == "rs")
+                && !p.starts_with(crates.join("exec-notify"))
+                && std::fs::read_to_string(&p).is_ok_and(|s| {
+                    s.contains("pub in_flight: Option<u64>") || s.contains("s == 407 || s == 408")
+                })
+            {
+                copies.push(p);
+            }
+        }
+    }
+    assert!(
+        copies.is_empty(),
+        "a second copy of the notify kernel: {copies:?}"
+    );
+}

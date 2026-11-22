@@ -265,6 +265,14 @@ code-mode = ["dep:rquickjs"]
 
 # Mutations of the MCP OAuth kernel (`src/tools/mcp_oauth_kernel.rs`), for `tests/mcp_oauth_model.rs`'s
 # red runs: each removes ONE guard and MUST turn a named property red. Never enabled in a build.
+# Mutations of the exec-notify kernel (`crates/exec-notify`): `tests/notify_model.rs` and `mise run verify:kernels` must both go red under each.
+mut_keep_keeps_in_flight = ["beyond-exec-notify/mut_keep_keeps_in_flight"]
+mut_change_begins_in_flight = ["beyond-exec-notify/mut_change_begins_in_flight"]
+mut_answer_settles_all = ["beyond-exec-notify/mut_answer_settles_all"]
+mut_retry_unbounded = ["beyond-exec-notify/mut_retry_unbounded"]
+mut_wake_early = ["beyond-exec-notify/mut_wake_early"]
+mut_stop_is_retried = ["beyond-exec-notify/mut_stop_is_retried"]
+mut_change_not_owed = ["beyond-exec-notify/mut_change_not_owed"]
 mut_no_stepup_backoff = [] # a transient step-up failure is not remembered (the #693 bug)
 mut_no_401_backoff = [] # a transient 401-refresh failure does not back off
 mut_stale_refresh = [] # a 401 for an already-replaced token refreshes again

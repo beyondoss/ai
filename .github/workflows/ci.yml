@@ -732,6 +732,27 @@ jobs:
       - run: mise run check:py
       - run: mise run test:py
   # Advisories only: no license or duplicate-version checks. Ignores live in .cargo/audit.toml.
+  # The kernel proofs (Verus, the release pinned in .github/scripts/verus.env), apart from the test
+  # shards: the install is cached and the proof is seconds, so it never slows them. A kernel crate
+  # joins by being added to KERNELS in .github/scripts/verify-kernels.sh.
+  verus:
+    name: verus (kernel proofs)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - name: Pinned Verus version
+        id: pin
+        run: |
+          . .github/scripts/verus.env
+          echo "version=$VERUS_VERSION" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/verus
+          key: verus-${{ steps.pin.outputs.version }}
+      # Downloads the pinned release (sha256-checked) and its Rust toolchain on a cache miss, then
+      # runs `cargo verus verify` on each kernel crate.
+      - run: .github/scripts/verify-kernels.sh
   advisories:
     name: advisories
     needs: changes
@@ -754,19 +775,20 @@ jobs:
   Check:
     name: Check
     runs-on: ubuntu-24.04
-    needs: [fmt, clippy, archive, test, gateway-stress, build, changes, advisories, execd-arm64, clients, mcp-apps-interop, sdk-ts, sdk-python, mcp-events-conformance]
+    needs: [fmt, clippy, verus, archive, test, gateway-stress, build, changes, advisories, execd-arm64, clients, mcp-apps-interop, sdk-ts, sdk-python, mcp-events-conformance]
     if: always()
     steps:
       - name: Gate on all checks
         env:
           EVENT: ${{ github.event_name }}
         run: |
-          echo "event=$EVENT fmt=${{ needs.fmt.result }} clippy=${{ needs.clippy.result }} archive=${{ needs.archive.result }} test=${{ needs.test.result }} gateway-stress=${{ needs.gateway-stress.result }} build=${{ needs.build.result }} changes=${{ needs.changes.result }} advisories=${{ needs.advisories.result }} execd-arm64=${{ needs.execd-arm64.result }} clients=${{ needs.clients.result }} mcp-apps-interop=${{ needs.mcp-apps-interop.result }} sdk-ts=${{ needs.sdk-ts.result }} sdk-python=${{ needs.sdk-python.result }} mcp-events-conformance=${{ needs.mcp-events-conformance.result }}"
+          echo "event=$EVENT fmt=${{ needs.fmt.result }} clippy=${{ needs.clippy.result }} verus=${{ needs.verus.result }} archive=${{ needs.archive.result }} test=${{ needs.test.result }} gateway-stress=${{ needs.gateway-stress.result }} build=${{ needs.build.result }} changes=${{ needs.changes.result }} advisories=${{ needs.advisories.result }} execd-arm64=${{ needs.execd-arm64.result }} clients=${{ needs.clients.result }} mcp-apps-interop=${{ needs.mcp-apps-interop.result }} sdk-ts=${{ needs.sdk-ts.result }} sdk-python=${{ needs.sdk-python.result }} mcp-events-conformance=${{ needs.mcp-events-conformance.result }}"
           # gateway-stress and build are skipped on a pull_request and nowhere else: a skip on the
           # merge queue or a dispatch is a job that never ran, which must not read as green.
           pr_only() { [ "$1" = "success" ] || { [ "$EVENT" = pull_request ] && [ "$1" = "skipped" ]; }; }
           [ "${{ needs.fmt.result }}" = "success" ] \
             && [ "${{ needs.clippy.result }}" = "success" ] \
+            && [ "${{ needs.verus.result }}" = "success" ] \
             && [ "${{ needs.archive.result }}" = "success" ] \
             && [ "${{ needs.test.result }}" = "success" ] \
             && pr_only "${{ needs.gateway-stress.result }}" \

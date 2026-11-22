@@ -14,13 +14,21 @@
 //! and carry out the [`Action`]s: begin an attempt (with the job's notify as recorded *now*),
 //! abandon the one in flight, or be woken at a time and feed [`Event::Wake`]. The reference endpoint
 //! (`beyond-test-support`'s `exec_mock`) does exactly that. A model checker
-//! calls [`step`] as production does.
+//! calls [`step`] as production does, and Verus proves it (the `verus!` block below): the invariant
+//! `wf`, what `step` promises (`step_post`), and progress (`lemma_progress`). See the README.
+
+use vstd::prelude::*;
+
+verus! {
 
 /// The most attempts one count makes (N18).
 pub const MAX_ATTEMPTS: u32 = 12;
 
 /// How long one attempt may take before it counts as a connection error, in milliseconds (N16).
 pub const ATTEMPT_TIMEOUT_MS: u64 = 30_000;
+
+/// The longest wait [`wait_ms`] returns, in milliseconds: `d(n)` is capped at 60 s.
+pub const MAX_WAIT_MS: u64 = 60_000;
 
 /// One job's notification state. `Default` is a job never kept with `notify`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -91,20 +99,257 @@ pub enum Verdict {
     Retry,
 }
 
-/// The spec's table of answers.
-pub fn verdict(outcome: Outcome) -> Verdict {
+// ---------------------------------------------------------------------------------------------
+// Specs: what the code promises. A normal build erases everything in this block that is a spec or
+// a proof; `mise run verify:kernels` checks it.
+// ---------------------------------------------------------------------------------------------
+
+/// The spec's table of answers (N17), as a spec.
+pub open spec fn verdict_spec(outcome: Outcome) -> Verdict {
     match outcome {
         Outcome::Failed => Verdict::Retry,
-        Outcome::Status(200..=299) => Verdict::Done,
-        Outcome::Status(401 | 403 | 404 | 410) => Verdict::Stop,
-        Outcome::Status(407 | 408 | 425 | 429 | 500..=599) => Verdict::Retry,
-        Outcome::Status(_) => Verdict::Stop,
+        Outcome::Status(s) => {
+            if 200 <= s && s <= 299 {
+                Verdict::Done
+            } else if s == 401 || s == 403 || s == 404 || s == 410 {
+                Verdict::Stop
+            } else if s == 407 || s == 408 || s == 425 || s == 429 || (500 <= s && s <= 599) {
+                Verdict::Retry
+            } else {
+                Verdict::Stop
+            }
+        },
     }
 }
 
-/// `u` in `[0, 1)` for a draw.
-pub fn uniform(draw: u32) -> f64 {
-    f64::from(draw) / 4_294_967_296.0
+/// `d(n)` in seconds: `min(2^(n-1), 60)`, and 1 for `n` 0 or 1 (N18).
+pub open spec fn base_s(n: u32) -> int {
+    if n <= 1 {
+        1
+    } else if n == 2 {
+        2
+    } else if n == 3 {
+        4
+    } else if n == 4 {
+        8
+    } else if n == 5 {
+        16
+    } else if n == 6 {
+        32
+    } else {
+        60
+    }
+}
+
+/// `d(n)` in milliseconds: the longest wait after failed attempt `n`.
+pub open spec fn backoff_ms(n: u32) -> int {
+    base_s(n) * 1000
+}
+
+/// The job owes a callback: its latest `keep` carries `notify` and something is owed that no
+/// answer has settled.
+pub open spec fn pending(j: Job) -> bool {
+    j.notify && j.owed > j.settled
+}
+
+/// The invariant every job `step` is given and returns satisfies, from `Job::default()` on. It
+/// is the safety half of the contract:
+///
+/// * `owed` and `settled` only move together (`settled <= owed`), and a job whose latest `keep`
+///   has no `notify` owes nothing;
+/// * a count never exceeds [`MAX_ATTEMPTS`] attempts;
+/// * the attempt in flight carries something owed and unsettled (`settled < carried <= owed`),
+///   exists only under a `notify` keep, and is the count's attempt (`attempts >= 1`), with no
+///   wake waiting beside it (one notification per job at a time);
+/// * a wait for a retry exists only while the job still owes, between attempts, with the count
+///   short of its limit;
+/// * **never lost**: a job that owes is either in flight or waiting for a wake. No state of a
+///   live job owes a callback and has nothing that will send it;
+/// * a removed job is the empty job: nothing owed, in flight or waiting, ever.
+pub open spec fn wf(j: Job) -> bool {
+    &&& j.settled <= j.owed
+    &&& !j.notify ==> j.owed == j.settled
+    &&& j.attempts <= MAX_ATTEMPTS
+    &&& j.removed ==> (!j.notify && j.owed == 0 && j.in_flight is None && j.attempts == 0 && j.wake_at is None)
+    &&& j.in_flight is Some ==> (j.notify && j.settled < j.in_flight->Some_0 && j.in_flight->Some_0 <= j.owed
+        && j.attempts >= 1 && j.wake_at is None)
+    &&& j.wake_at is Some ==> (j.in_flight is None && pending(j) && 1 <= j.attempts && j.attempts < MAX_ATTEMPTS)
+    &&& (!j.removed && pending(j)) ==> (j.in_flight is Some || j.wake_at is Some)
+}
+
+/// The only shapes of `step`'s actions: none, one of each kind, or an abandon then a begin (a
+/// `keep` replacing the attempt in flight). So an attempt begins at most once per step, last.
+pub open spec fn shape(out: Seq<Action>) -> bool {
+    out.len() == 0
+    || (out.len() == 1 && (out[0] is Abandon || out[0] is Begin || out[0] is WakeAt))
+    || (out.len() == 2 && out[0] is Abandon && out[1] is Begin)
+}
+
+/// An attempt begins (in a `shape`d `out`, the last action).
+pub open spec fn has_begin(out: Seq<Action>) -> bool {
+    out.len() > 0 && out[out.len() - 1] is Begin
+}
+
+/// The kernel asks to be woken (alone in `out`).
+pub open spec fn has_wake(out: Seq<Action>) -> bool {
+    out.len() == 1 && out[0] is WakeAt
+}
+
+/// The attempt in flight is abandoned (first in `out`).
+pub open spec fn has_abandon(out: Seq<Action>) -> bool {
+    out.len() > 0 && out[0] is Abandon
+}
+
+/// The event is one the job's own timers and attempts cause: the in-flight attempt ending, or
+/// the asked-for wake arriving when its time has come. These are the fair steps of the liveness
+/// argument; a `Keep`, `Change` or `Removed` is the environment's, and a quiet job gets none.
+pub open spec fn fair(job: Job, event: Event, now: u64) -> bool {
+    match event {
+        Event::AttemptEnded { .. } => job.in_flight is Some,
+        Event::Wake => job.in_flight is None && job.wake_at is Some && job.wake_at->Some_0 <= now,
+        _ => false,
+    }
+}
+
+/// The ranking function of the liveness proof: an upper bound, in steps of the fair kind, on
+/// how many it takes the job to settle. Zero exactly when nothing is owed.
+///
+/// Each count has `MAX_ATTEMPTS - attempts` attempts left, and each costs a wake (while waiting)
+/// and an end (in flight); an attempt that carries less than is owed costs one more whole count,
+/// because its end begins a fresh one.
+pub open spec fn rank(j: Job) -> int {
+    if !pending(j) {
+        0
+    } else {
+        let left = (MAX_ATTEMPTS - j.attempts) as int;
+        match j.in_flight {
+            Some(c) => if c < j.owed {
+                2 * (MAX_ATTEMPTS as int) + 2 + 2 * left
+            } else {
+                2 * left + 1
+            },
+            None => 2 * left,
+        }
+    }
+}
+
+/// What `step` promises, event by event. See the proof functions below for the liveness half
+/// that reads it.
+pub open spec fn step_post(job: Job, event: Event, now: u64, j2: Job, out: Seq<Action>) -> bool {
+    &&& post_removed(job, event, j2, out)
+    &&& post_one(job, event, j2, out)
+    &&& post_owed(job, event, j2)
+    &&& post_answer(job, event, now, j2, out)
+    &&& post_wake(job, event, now, j2, out)
+}
+
+/// Removal: nothing more, ever.
+pub open spec fn post_removed(job: Job, event: Event, j2: Job, out: Seq<Action>) -> bool {
+    &&& shape(out)
+    // Nothing more, ever, once removed; `Removed` makes a job so, abandoning what was in flight.
+    &&& (job.removed ==> (j2 == job && out.len() == 0))
+    &&& (!job.removed && event is Removed ==> (j2.removed && !has_begin(out) && !has_wake(out)
+        && (has_abandon(out) <==> job.in_flight is Some)))
+    &&& (j2.removed ==> (job.removed || event is Removed))
+}
+
+/// One notification per job.
+pub open spec fn post_one(job: Job, event: Event, j2: Job, out: Seq<Action>) -> bool {
+    // One notification per job: an attempt begins only when none is in flight (the one in flight
+    // having just ended, or a `keep` abandoning it first), only with something owed, and carries all of it.
+    &&& (has_begin(out) ==> (j2.in_flight == Some(j2.owed) && pending(j2) && j2.wake_at is None
+        && (job.in_flight is None || event is AttemptEnded || (event is Keep && out[0] is Abandon))
+        && out[out.len() - 1] == (Action::Begin { attempt: j2.attempts })))
+    // A notice that was delivered (nothing owed) is not sent again unless something new is owed.
+    &&& ((!pending(job) && !(event is Keep && event->Keep_notify) && !(event is Change && job.notify))
+        ==> !has_begin(out))
+}
+
+/// What is owed and settled: nothing is lost.
+pub open spec fn post_owed(job: Job, event: Event, j2: Job) -> bool {
+    // Everything that happens is owed, exactly once: a `keep` with notify and a change under one
+    // each owe one callback more; nothing else changes what is owed.
+    &&& (!job.removed && !(event is Removed) ==> j2.owed == job.owed
+        + (if (event is Keep && event->Keep_notify) || (event is Change && job.notify) { 1int } else { 0int }))
+    // Never lost: what an answer settles is what its attempt carried, and only for an answer
+    // that settles (`Done`, `Stop`) or a count that ran out of attempts; a change, a wake or a
+    // new `keep` with notify settles nothing; a `keep` without notify settles what was owed,
+    // because nothing more is to be sent.
+    &&& (!job.removed && (event is Change || event is Wake || (event is Keep && event->Keep_notify))
+        ==> j2.settled == job.settled)
+    &&& (!job.removed && event is Keep && !event->Keep_notify ==> (j2.settled == j2.owed && !j2.notify
+        && j2.in_flight is None && j2.wake_at is None))
+}
+
+/// An answer, and the retry schedule.
+pub open spec fn post_answer(job: Job, event: Event, now: u64, j2: Job, out: Seq<Action>) -> bool {
+    &&& (!job.removed && event is AttemptEnded && job.in_flight is None ==> (j2 == job && out.len() == 0))
+    &&& (!job.removed && event is AttemptEnded && job.in_flight is Some ==> {
+        let c = job.in_flight->Some_0;
+        let v = verdict_spec(event->AttemptEnded_outcome);
+        &&& ((v is Done || v is Stop) ==> j2.settled == c)
+        &&& (v is Retry ==> (j2.settled == job.settled
+            || (j2.settled == c && c == job.owed && job.attempts >= MAX_ATTEMPTS)))
+        // What an answer leaves owed starts a fresh count at once.
+        &&& ((j2.settled == c && c < job.owed) ==> (j2.in_flight == Some(job.owed) && j2.attempts == 1))
+        &&& ((v is Retry && c < job.owed) ==> (j2.in_flight == Some(job.owed) && j2.attempts == 1))
+        &&& (c == job.owed && (v is Done || v is Stop || job.attempts >= MAX_ATTEMPTS) ==> j2.settled == j2.owed)
+        // The retry schedule: after failed attempt n (the count's), wait d(n)·(1 − u/2) ms, and
+        // never past the count's limit.
+        &&& (c == job.owed && v is Retry && job.attempts < MAX_ATTEMPTS ==> {
+            let at = (now + wait_ms_spec(job.attempts, event->AttemptEnded_draw)) as u64;
+            &&& out =~= seq![Action::WakeAt(at)]
+            &&& j2.wake_at == Some(at)
+            &&& j2.in_flight is None
+            &&& j2.attempts == job.attempts
+            &&& j2.settled == job.settled
+            &&& now + backoff_ms(job.attempts) / 2 <= at
+            &&& at <= now + backoff_ms(job.attempts)
+        })
+        &&& (has_wake(out) ==> (c == job.owed && v is Retry && job.attempts < MAX_ATTEMPTS))
+    })
+}
+
+/// A wake.
+pub open spec fn post_wake(job: Job, event: Event, now: u64, j2: Job, out: Seq<Action>) -> bool {
+    // A wake begins the next attempt once its time has come, and not before; it never sends
+    // when nothing is owed.
+    &&& (!job.removed && event is Wake && job.in_flight is None && job.wake_at is Some
+        && job.wake_at->Some_0 <= now ==> (j2.in_flight == Some(job.owed) && j2.attempts == job.attempts + 1))
+    &&& (event is Wake && has_begin(out) ==> (job.wake_at is Some && job.wake_at->Some_0 <= now))
+    // The wake the kernel asked for is the one it keeps.
+    &&& (has_wake(out) ==> (out.len() == 1 && j2.wake_at == Some(out[0]->WakeAt_0)))
+}
+
+// The wait after failed attempt `n` in ms: `a - ⌊a·draw / 2³³⌋`, less one more when the remainder
+// is over 2³², with `a = d(n)` in ms, rounding `d(n) · (1 − u/2)` to the nearest millisecond (half up).
+pub open spec fn wait_ms_spec(n: u32, draw: u32) -> int {
+    let a = backoff_ms(n);
+    let t = a * (draw as int);
+    a - t / 8589934592 - (if t % 8589934592 > 4294967296 { 1int } else { 0int })
+}
+
+/// The spec's table of answers (N17).
+// Verus does not take `RangeInclusive::contains` in code, so the comparisons are spelled out.
+#[allow(clippy::manual_range_contains)]
+pub fn verdict(outcome: Outcome) -> (v: Verdict)
+    ensures
+        v == verdict_spec(outcome),
+{
+    match outcome {
+        Outcome::Failed => Verdict::Retry,
+        Outcome::Status(s) => {
+            if 200 <= s && s <= 299 {
+                Verdict::Done
+            } else if s == 401 || s == 403 || s == 404 || s == 410 {
+                if cfg!(feature = "mut_stop_is_retried") { Verdict::Retry } else { Verdict::Stop }
+            } else if s == 407 || s == 408 || s == 425 || s == 429 || (500 <= s && s <= 599) {
+                Verdict::Retry
+            } else {
+                Verdict::Stop
+            }
+        },
+    }
 }
 
 /// The wait after failed attempt `n` (1 … 11), in milliseconds: `d(n) · (1 − u/2)` with
@@ -112,10 +357,256 @@ pub fn uniform(draw: u32) -> f64 {
 /// (half up). Integer arithmetic only, so any implementation computes exactly the same number:
 /// with `a = d(n)` in ms and `t = a · draw`, it is `a − ⌊t / 2³³⌋`, less one more when the remainder
 /// is over `2³²`.
-pub fn wait_ms(n: u32, draw: u32) -> u64 {
-    let a: u64 = (1u64 << n.saturating_sub(1).min(6)).min(60) * 1000;
-    let t = a * u64::from(draw);
-    a - (t >> 33) - u64::from((t & ((1 << 33) - 1)) > (1 << 32))
+///
+/// Between half of `d(n)` (draw `u32::MAX`) and all of it (draw 0).
+pub fn wait_ms(n: u32, draw: u32) -> (r: u64)
+    ensures
+        r == wait_ms_spec(n, draw),
+        r <= backoff_ms(n),
+        2 * r >= backoff_ms(n),
+{
+    let a: u64 = if n <= 1 {
+        1000
+    } else if n == 2 {
+        2000
+    } else if n == 3 {
+        4000
+    } else if n == 4 {
+        8000
+    } else if n == 5 {
+        16000
+    } else if n == 6 {
+        32000
+    } else {
+        60000
+    };
+    let t: u64 = a * (draw as u64);
+    let q: u64 = t / 8589934592;
+    let rem: u64 = t % 8589934592;
+    let carry: u64 = if rem > 4294967296 { 1 } else { 0 };
+    proof {
+        assert(a == backoff_ms(n));
+        assert(a % 2 == 0 && 0 < a && a <= 60000);
+        assert(t <= a * 4294967295) by (nonlinear_arith)
+            requires t == a * (draw as u64), draw <= 4294967295u32;
+        // q·2³³ <= t < a·2³²: so 2q < a, and q <= a/2 - 1.
+        assert(q * 8589934592 <= t) by (nonlinear_arith)
+            requires q == t / 8589934592;
+        assert(q < a / 2) by (nonlinear_arith)
+            requires q * 8589934592 <= t, t <= a * 4294967295, a % 2 == 0, 0 < a;
+    }
+    a - q - carry
+}
+
+/// An attempt begins: the job's next state and the action. Only called with something owed.
+fn begin(j: Job) -> (r: (Job, Action))
+    requires
+        j.notify,
+        j.owed > j.settled,
+        j.attempts < MAX_ATTEMPTS,
+    ensures
+        r.0 == (Job { wake_at: None, attempts: (j.attempts + 1) as u32, in_flight: Some(j.owed), ..j }),
+        r.1 == (Action::Begin { attempt: (j.attempts + 1) as u32 }),
+{
+    let mut j = j;
+    j.wake_at = None;
+    j.attempts += 1;
+    j.in_flight = Some(j.owed);
+    let a = Action::Begin { attempt: j.attempts };
+    (j, a)
+}
+
+/// One step: the job's next state, and what to do. Pure: the same inputs give the same outputs.
+///
+/// `requires`: a job this function (or `Job::default()`) made (`wf`), and a clock and a count
+/// that cannot wrap (`now` within 60 s of `u64::MAX`; `owed` below `u64::MAX`): a millisecond
+/// clock and a count of events, neither reachable.
+pub fn step(job: Job, event: Event, now: u64) -> (r: (Job, Vec<Action>))
+    requires
+        wf(job),
+        job.owed < u64::MAX,
+        now <= u64::MAX - MAX_WAIT_MS,
+    ensures
+        wf(r.0),
+        post_removed(job, event, r.0, r.1@),
+        post_one(job, event, r.0, r.1@),
+        post_owed(job, event, r.0),
+        post_answer(job, event, now, r.0, r.1@),
+        post_wake(job, event, now, r.0, r.1@),
+{
+    let mut j = job;
+    let mut out: Vec<Action> = Vec::new();
+    if j.removed {
+        return (j, out);
+    }
+    match event {
+        Event::Keep { notify } => {
+            if j.in_flight.is_some() && !cfg!(feature = "mut_keep_keeps_in_flight") {
+                j.in_flight = None;
+                out.push(Action::Abandon);
+            }
+            j.wake_at = None;
+            j.attempts = 0;
+            j.notify = notify;
+            if notify {
+                j.owed += 1;
+                let (b, a) = begin(j);
+                j = b;
+                out.push(a);
+            } else {
+                j.settled = j.owed;
+            }
+        },
+        Event::Change => {
+            if !j.notify {
+                return (j, out);
+            }
+            if !cfg!(feature = "mut_change_not_owed") || j.in_flight.is_none() {
+                j.owed += 1;
+            }
+            if j.in_flight.is_none() || cfg!(feature = "mut_change_begins_in_flight") {
+                // Idle, or waiting out a retry: a new count begins now.
+                j.wake_at = None;
+                j.attempts = 0;
+                let (b, a) = begin(j);
+                j = b;
+                out.push(a);
+            }
+        },
+        Event::Removed => {
+            if j.in_flight.is_some() {
+                out.push(Action::Abandon);
+            }
+            j = Job {
+                notify: false,
+                removed: true,
+                owed: 0,
+                settled: 0,
+                in_flight: None,
+                attempts: 0,
+                wake_at: None,
+            };
+        },
+        Event::AttemptEnded { outcome, draw } => {
+            let carried = match j.in_flight {
+                Some(c) => c,
+                None => {
+                    return (j, out);
+                },
+            };
+            j.in_flight = None;
+            match verdict(outcome) {
+                Verdict::Done | Verdict::Stop => {
+                    j.settled = if cfg!(feature = "mut_answer_settles_all") {
+                        j.owed
+                    } else if j.settled > carried {
+                        j.settled
+                    } else {
+                        carried
+                    };
+                    j.attempts = 0;
+                },
+                Verdict::Retry => {
+                    if j.owed > carried {
+                        j.attempts = 0;
+                    } else if j.attempts >= MAX_ATTEMPTS && !cfg!(feature = "mut_retry_unbounded") {
+                        j.settled = if j.settled > carried { j.settled } else { carried };
+                        j.attempts = 0;
+                    } else {
+                        let at = now + wait_ms(j.attempts, draw);
+                        j.wake_at = Some(at);
+                        out.push(Action::WakeAt(at));
+                        return (j, out);
+                    }
+                },
+            }
+            if j.notify && j.owed > j.settled {
+                let (b, a) = begin(j);
+                j = b;
+                out.push(a);
+            }
+        },
+        Event::Wake => {
+            if j.in_flight.is_none() && j.notify && j.owed > j.settled
+                && match j.wake_at {
+                    Some(at) => at <= now || cfg!(feature = "mut_wake_early"),
+                    None => false,
+                } {
+                let (b, a) = begin(j);
+                j = b;
+                out.push(a);
+            }
+        },
+    }
+    (j, out)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Liveness: a job that owes settles, in at most `rank` fair steps.
+// ---------------------------------------------------------------------------------------------
+
+/// **Progress.** Under fairness, every step the job's own timers and attempts cause (`fair`)
+/// strictly lowers [`rank`] while the job owes, and rank 0 is exactly "nothing owed": the
+/// callback was delivered (`Done`), refused for good (`Stop`), or given up after
+/// [`MAX_ATTEMPTS`]. The fairness assumptions, all of them the environment's, none a bound
+/// the kernel supplies:
+///
+/// * **F1, attempts end**: the attempt in flight ends, with the answer or, after
+///   [`ATTEMPT_TIMEOUT_MS`], as `Failed`. The caller owes that event.
+/// * **F2, time advances**: a wake the kernel asked for is fed at or after its time.
+/// * **F3, the job quiesces**: after some point no `Keep` or `Change` arrives. (A job
+///   that keeps changing is owed a new callback each time; the rank restarts.)
+///
+/// Not an `assume`: `step_post`, which `step` proves of the code, is all it uses.
+pub proof fn lemma_progress(job: Job, event: Event, now: u64, j2: Job, out: Seq<Action>)
+    requires
+        wf(job),
+        wf(j2),
+        job.owed < u64::MAX,
+        pending(job),
+        fair(job, event, now),
+        step_post(job, event, now, j2, out),
+    ensures
+        rank(j2) < rank(job),
+{
+    match event {
+        Event::AttemptEnded { outcome, draw } => {
+            let c = job.in_flight->Some_0;
+            let v = verdict_spec(outcome);
+            assert(!job.removed);
+            if c < job.owed {
+                assert(j2.in_flight == Some(job.owed));
+            } else {
+                assert(c == job.owed);
+            }
+        },
+        Event::Wake => {
+            assert(!job.removed);
+        },
+        _ => {},
+    }
+}
+
+/// The rank is bounded: a job that owes settles in at most this many fair steps.
+pub open spec fn rank_bound() -> int {
+    2 * (MAX_ATTEMPTS as int) + 2 + 2 * (MAX_ATTEMPTS as int)
+}
+
+/// Every job of the invariant has a bounded rank, and rank 0 is exactly nothing owed.
+pub proof fn lemma_rank_bounded(j: Job)
+    requires
+        wf(j),
+    ensures
+        0 <= rank(j) <= rank_bound(),
+        rank(j) == 0 <==> !pending(j),
+{
+}
+
+} // verus!
+
+/// `u` in `[0, 1)` for a draw.
+pub fn uniform(draw: u32) -> f64 {
+    f64::from(draw) / 4_294_967_296.0
 }
 
 /// `keep`'s `notify` grammar (N4): `url` absolute, at most 2048 bytes, a non-empty host, no
@@ -243,96 +734,6 @@ fn json_string(out: &mut String, s: &str) {
         }
     }
     out.push('"');
-}
-
-/// One step: the job's next state, and what to do. Pure: the same inputs give the same outputs.
-pub fn step(job: Job, event: Event, now: u64) -> (Job, Vec<Action>) {
-    let mut j = job;
-    let mut out = Vec::new();
-    if j.removed {
-        return (j, out);
-    }
-    match event {
-        Event::Keep { notify } => {
-            if j.in_flight.take().is_some() {
-                out.push(Action::Abandon);
-            }
-            j.wake_at = None;
-            j.attempts = 0;
-            j.notify = notify;
-            if notify {
-                j.owed += 1;
-                begin(&mut j, &mut out);
-            } else {
-                j.settled = j.owed;
-            }
-        }
-        Event::Change => {
-            if !j.notify {
-                return (j, out);
-            }
-            j.owed += 1;
-            if j.in_flight.is_none() {
-                // Idle, or waiting out a retry: a new count begins now.
-                j.wake_at = None;
-                j.attempts = 0;
-                begin(&mut j, &mut out);
-            }
-        }
-        Event::Removed => {
-            if j.in_flight.take().is_some() {
-                out.push(Action::Abandon);
-            }
-            j = Job {
-                removed: true,
-                ..Job::default()
-            };
-        }
-        Event::AttemptEnded { outcome, draw } => {
-            let Some(carried) = j.in_flight.take() else {
-                return (j, out);
-            };
-            match verdict(outcome) {
-                Verdict::Done | Verdict::Stop => {
-                    j.settled = j.settled.max(carried);
-                    j.attempts = 0;
-                }
-                Verdict::Retry if j.owed > carried => j.attempts = 0,
-                Verdict::Retry if j.attempts >= MAX_ATTEMPTS => {
-                    j.settled = j.settled.max(carried);
-                    j.attempts = 0;
-                }
-                Verdict::Retry => {
-                    let at = now + wait_ms(j.attempts, draw);
-                    j.wake_at = Some(at);
-                    out.push(Action::WakeAt(at));
-                    return (j, out);
-                }
-            }
-            if j.notify && j.owed > j.settled {
-                begin(&mut j, &mut out);
-            }
-        }
-        Event::Wake => {
-            if j.in_flight.is_none()
-                && j.notify
-                && j.owed > j.settled
-                && j.wake_at.is_some_and(|at| at <= now)
-            {
-                begin(&mut j, &mut out);
-            }
-        }
-    }
-    (j, out)
-}
-
-fn begin(j: &mut Job, out: &mut Vec<Action>) {
-    j.wake_at = None;
-    j.attempts += 1;
-    j.in_flight = Some(j.owed);
-    out.push(Action::Begin {
-        attempt: j.attempts,
-    });
 }
 
 #[cfg(test)]

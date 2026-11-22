@@ -67,6 +67,31 @@ Also exported: `check_notify(url, token)`, which applies the `keep` grammar
 fragment; token of 1 to 512 `token68` bytes); `body(scope, id)`, the callback
 body.
 
+## Proven
+
+`step` and its helpers (`verdict`, `wait_ms`) are written inside `verus!`, so the
+function production runs is the one [Verus](https://github.com/verus-lang/verus)
+checks, with no bound on how long a job lives. A normal build erases the specs
+and proofs; `mise run verify:kernels` (`.github/scripts/verify-kernels.sh`, the
+release pinned in `.github/scripts/verus.env`, run by CI's `verus` job) checks
+them. What it proves, in `src/lib.rs`:
+
+| Property                                                                                                                                                | Where                                          |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------- |
+| The invariant holds from `Job::default()` on, through every event                                                                                       | `wf`, `step`'s `wf(r.0)`                       |
+| Never lost: a live job that owes a callback is in flight or waiting for a wake; settling takes an answer or a spent count                               | `wf`, `post_owed`, `post_answer`               |
+| One notification per job: an attempt begins only when none is in flight; a delivered notice is not sent again unless new owed                           | `post_one`                                     |
+| Retries are bounded: at most `MAX_ATTEMPTS` per count; each wait is `d(n)·(1 − u/2)`, between `d(n)/2` and `d(n)` ms                                    | `wf`, `post_answer`, `wait_ms`                 |
+| Nothing after removal                                                                                                                                   | `post_removed`                                 |
+| Liveness: under F1 (attempts end), F2 (time advances, wakes arrive), F3 (the job quiesces) a job that owes settles in at most `rank_bound()` fair steps | `lemma_progress`, `lemma_rank_bounded`, `rank` |
+
+`step` requires a job that `step` or `Default` made, `owed < u64::MAX` and `now`
+within a minute of `u64::MAX`; a millisecond clock and a count of events reach
+neither. Each `mut_*` feature breaks one decision and turns the proof red
+(`mise run verify:kernels -- --features mut_x`); the agent forwards them, and
+`mise run test:notify-model-mutants` turns the notify model red under those it
+can see.
+
 ## Reference
 
 The normative spec is the "Sandbox job notify" section of the module doc
