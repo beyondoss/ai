@@ -14,10 +14,20 @@ path = "src/lib.rs"
 [lints]
 workspace = true
 
-# Deliberately zero-dependency: a pure function of (state, event, time) that an endpoint on either
-# side of the repo boundary — the reference mock here, a vendor's adapter, the platform's own
-# sandbox service — can link, and that a model checker can call exactly as production does.
+# A pure function of (state, event, time) that an endpoint on either side of the repo boundary — the
+# reference mock here, a vendor's adapter, the platform's own sandbox service — can link, and that a
+# model checker can call exactly as production does. Its one dependency is `vstd`, for the `verus!`
+# macro: a normal build erases every proof and spec, and only `cargo verus` (`mise run verify:kernels`)
+# checks them. The version is the one the pinned Verus release ships (`.github/scripts/verus.env`).
 [dependencies]
+vstd = "=0.0.0-2026-11-01-0251"
+
+[package.metadata.verus]
+verify = true
+
+[features]
+# Mutations of the kernel's decisions: `mise run verify:kernels -- --features mut_x` and the notify model
+# (`mise run test:notify-model-mutants`) must both go red under each. The agent forwards them.
 
 [dev-dependencies]
 serde_json.workspace = true
