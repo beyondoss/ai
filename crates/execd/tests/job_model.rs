@@ -1081,8 +1081,14 @@ fn the_mutation_turns_its_property_red() {
 /// kernel's state.
 #[test]
 fn production_calls_the_kernel() {
-    let src = include_str!("../src/jobs.rs");
-    let prod = &src[..src.find("#[cfg(test)]\n#[allow(").expect("test module")];
+    // The job shell, and the output ring that holds a stream's window (`kernel::window(`, now
+    // `execd_ring::window`); each without its test module.
+    let strip = |src: &'static str| src.find("#[cfg(test)]\n#[allow(").map_or(src, |i| &src[..i]);
+    let prod = format!(
+        "{}{}",
+        strip(include_str!("../src/jobs.rs")),
+        strip(include_str!("../src/ring.rs"))
+    );
     for needle in [
         "admit(&key)",
         "kernel::State::new(",
