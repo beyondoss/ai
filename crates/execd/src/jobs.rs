@@ -372,7 +372,7 @@ impl Jobs {
     /// another job than the one checked keeps it (J10).
     fn remove(&self, checked: &[(Key, JobCell)]) {
         let cells = locked(&self.map).take(checked, Arc::ptr_eq);
-        for cell in cells {
+        for (_, cell) in cells {
             let mut j = locked(&cell);
             if kernel::step(&mut j.k, Ev::Taken) == Act::Release {
                 j.notifier = Notifier::removed();

@@ -299,7 +299,7 @@ impl St {
     /// `Jobs::remove`: out of the table, then each job taken.
     fn take(&mut self, checked: &[(Key, usize)]) {
         let handles = self.table.take(checked, |a, b| a == b);
-        for h in handles {
+        for (_, h) in handles {
             // J10: only a job that was checked leaves.
             if !checked.iter().any(|(_, c)| *c == h) {
                 self.bad |= V_J10;
@@ -1102,11 +1102,14 @@ fn production_calls_the_kernel() {
         "kernel::follow(",
         "Pick::",
         ".take(checked, Arc::ptr_eq)",
+        "map: Mutex<kernel::Table<JobCell>>",
         ".in_scope(scope, pick)",
         ".alive()",
     ] {
         assert!(prod.contains(needle), "jobs.rs no longer calls {needle}");
     }
+    // The table is the kernel's verified storage, not a map of the shell's.
+    assert!(!prod.contains("HashMap<Key"), "jobs.rs keeps its own map");
     // No decision of the job's life is made outside the kernel: its state is only written there.
     for banned in [
         ".removed =",

@@ -215,7 +215,7 @@ J7 a job leaves only with its group empty, J8 no signal reaches an ended job, J9
 job's stream sends its final frame. `production_calls_the_kernel` fails if `jobs.rs` stops calling the kernel or writes job state
 outside it. `crates/execd-jobs/tests/production.rs` fails if `execd::job_kernel` stops being that crate, a decision leaves its `verus!` block, or a second copy of the state machine appears.
 
-The kernel is a crate of its own because Verus verifies a crate whole, and execd's async stack is not Verus's to build. `mise run verify:kernels` proves it (CI's `verus` job); `mise run verify:kernels -- --features mut_x` must go red for each mutation below except `mut_remove_keeps_entry`, whose decision is the `HashMap`'s (the crate README names what stays outside).
+The kernel is a crate of its own because Verus verifies a crate whole, and execd's async stack is not Verus's to build. `mise run verify:kernels` proves it (CI's `verus` job); `mise run verify:kernels -- --features mut_x` must go red for each mutation below (the table's storage is a `Vec` inside `verus!`, so `mut_remove_keeps_entry` and `mut_scope_ignored` are proven too; the crate README names what stays outside).
 
 ```sh
 cargo test -p beyond-execd --test job_model faithful          # both bounds, all properties

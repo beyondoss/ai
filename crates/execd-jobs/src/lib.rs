@@ -5,7 +5,7 @@
 //!
 //! No I/O, no async, no clock (a time arrives in the event), no closure or trait object in a
 //! decision, so a model checker calls exactly what production calls (`tests/job_model.rs`) and a
-//! proof takes it as it is: every decision below is written inside `verus!`, so the function production runs is the one [Verus](https://github.com/verus-lang/verus) checks (see the README's Proven section). What stays outside it is the table's storage and string comparisons (the `HashMap`, `Pick::has`, the accessors that only reshape a field). Production keeps two locks and the kernel follows them:
+//! proof takes it as it is: every decision below is written inside `verus!`, so the function production runs is the one [Verus](https://github.com/verus-lang/verus) checks (see the README's Proven section). The table's storage is inside it too: a `Vec` of `(key, job)` that Verus checks (lookup, insert, take, scope), so no `HashMap` stands behind a proven decision. Outside it are only the accessors that reshape a field and the table's `Clone`, `Debug` and `Eq`. Production keeps two locks and the kernel follows them:
 //!
 //! - **the table's** (`Jobs::map`): [`Table`], the `(scope, id)` → job map: [`Table::admit`],
 //!   [`Table::get`], [`Table::in_scope`], [`Table::insert`], [`Table::take`];
@@ -42,18 +42,16 @@
     clippy::match_like_matches_macro,
     clippy::if_same_then_else,
     clippy::implicit_saturating_sub,
-    clippy::single_match
+    clippy::single_match,
+    clippy::collapsible_if
 )]
-
-use std::collections::HashMap;
 
 use vstd::prelude::*;
 
 verus! {
 
 // ---------------------------------------------------------------------------------------------
-// The table: its decisions, as functions of what the storage observed. The `HashMap` and the string
-// comparisons are outside `verus!` (below); each decision they feed is here.
+// The table: its decisions, as functions of what the storage observed. The storage is below.
 // ---------------------------------------------------------------------------------------------
 
 /// Whether a start may take its key.
@@ -943,6 +941,436 @@ pub proof fn lemma_follow_progress(
 {
 }
 
+
+// ---------------------------------------------------------------------------------------------
+// The table's storage: a `Vec` of `(key, job)` with the keys distinct. Verus knows `String`'s
+// equality and clone (`vstd/string.rs`), so lookup, insert and take are proven here, with no
+// `HashMap` (whose key model vstd axiomatizes only for integers and bools:
+// `vstd/std_specs/hash.rs` 13-18, 113-215).
+// ---------------------------------------------------------------------------------------------
+
+/// `(scope, id)`: a job's address.
+pub type Key = (String, String);
+
+pub open spec fn key_eq(a: Key, b: Key) -> bool {
+    a.0@ == b.0@ && a.1@ == b.1@
+}
+
+/// Which ids of a scope an operation names.
+#[derive(Clone, Copy, Debug)]
+pub enum Pick<'a> {
+    /// Every job of the scope (`list`, `wipe`).
+    All,
+    /// The jobs whose id is one of these (`signal`, `kill`, `remove`).
+    Ids(&'a [String]),
+}
+
+/// Is `id` one of `ids`?
+pub open spec fn ids_name(ids: Seq<String>, id: Seq<char>) -> bool {
+    exists|i: int| 0 <= i < ids.len() && (#[trigger] ids[i])@ == id
+}
+
+impl<'a> Pick<'a> {
+    /// Is `id` one of the ids this names?
+    pub open spec fn names(self, id: Seq<char>) -> bool {
+        match self {
+            Pick::All => true,
+            Pick::Ids(ids) => ids_name(ids@, id),
+        }
+    }
+
+    fn has(self, id: &str) -> (r: bool)
+        ensures
+            r == self.names(id@),
+    {
+        match self {
+            Pick::All => true,
+            Pick::Ids(ids) => {
+                let mut n = 0;
+                while n < ids.len()
+                    invariant
+                        self == Pick::Ids(ids),
+                        n <= ids@.len(),
+                        forall|i: int| 0 <= i < n ==> (#[trigger] ids@[i])@ != id@,
+                    decreases ids@.len() - n,
+                {
+                    if ids[n].as_str() == id {
+                        assert(ids@[n as int]@ == id@);
+                        assert(ids_name(ids@, id@));
+                        return true;
+                    }
+                    n += 1;
+                }
+                false
+            },
+        }
+    }
+}
+
+/// Every job by `(scope, id)`. `C` is what the shell keeps per job (a shared cell in production, a
+/// handle in the model): the kernel never looks inside it. The keys are distinct (the type
+/// invariant), so a key names at most one job.
+pub struct Table<C> {
+    entries: Vec<(Key, C)>,
+}
+
+impl<C> Table<C> {
+    /// The keys are distinct. `new` makes a table that satisfies it and every method that changes
+    /// the table keeps it; the field is private, so no other table exists.
+    pub closed spec fn wf(self) -> bool {
+        forall|i: int, j: int|
+            0 <= i < j < self.entries@.len() ==> !key_eq(
+                (#[trigger] self.entries@[i]).0,
+                (#[trigger] self.entries@[j]).0,
+            )
+    }
+
+    /// Some job is under `k`.
+    pub closed spec fn holds(self, k: Key) -> bool {
+        exists|i: int| 0 <= i < self.entries@.len() && key_eq((#[trigger] self.entries@[i]).0, k)
+    }
+
+    /// The job under `k` is `v`.
+    pub closed spec fn at(self, k: Key, v: C) -> bool {
+        exists|i: int|
+            0 <= i < self.entries@.len() && key_eq((#[trigger] self.entries@[i]).0, k)
+                && self.entries@[i].1 == v
+    }
+
+    /// The entries, in order.
+    pub closed spec fn rows(self) -> Seq<(Key, C)> {
+        self.entries@
+    }
+
+    pub fn new() -> (r: Self)
+        ensures
+            r.wf(),
+            forall|k: Key| !r.holds(k),
+    {
+        Table { entries: Vec::new() }
+    }
+
+    /// Where `key` is: the first (and only) entry whose scope and id both equal. (`scope_matters`
+    /// is false only under the `mut_scope_ignored` mutation, which looks an id up in any scope.)
+    fn locate(&self, key: &Key, scope_matters: bool) -> (r: Option<usize>)
+        ensures
+            scope_matters ==> (r is Some ==> r.unwrap() < self.entries@.len() && key_eq(
+                self.entries@[r.unwrap() as int].0,
+                *key,
+            )),
+            scope_matters ==> (r is None ==> !self.holds(*key)),
+            r is Some ==> r.unwrap() < self.entries@.len(),
+    {
+        let mut n = 0;
+        while n < self.entries.len()
+            invariant
+                n <= self.entries@.len(),
+                scope_matters ==> forall|i: int|
+                    0 <= i < n ==> !key_eq((#[trigger] self.entries@[i]).0, *key),
+            decreases self.entries@.len() - n,
+        {
+            let e = &self.entries[n];
+            if (!scope_matters || e.0.0 == key.0) && e.0.1 == key.1 {
+                return Some(n);
+            }
+            n += 1;
+        }
+        None
+    }
+
+    fn position(&self, key: &Key) -> (r: Option<usize>)
+        ensures
+            r is Some ==> r.unwrap() < self.entries@.len() && key_eq(
+                self.entries@[r.unwrap() as int].0,
+                *key,
+            ),
+            r is None ==> !self.holds(*key),
+    {
+        self.locate(key, true)
+    }
+
+    /// J1's observation: is the key in the table.
+    pub fn is_held(&self, key: &Key) -> (r: bool)
+        ensures
+            r == self.holds(*key),
+    {
+        self.position(key).is_some()
+    }
+
+    pub fn admit(&self, key: &Key) -> (r: Admit)
+        ensures
+            self.holds(*key) ==> r is Exists,
+            !self.holds(*key) ==> r is Fresh,
+    {
+        admit(self.is_held(key))
+    }
+
+    /// Put a job in its key: only after [`Table::admit`] said `Fresh`, under the same lock. An
+    /// occupied key is replaced (the old job is dropped), never duplicated.
+    pub fn insert(&mut self, key: Key, job: C)
+        requires
+            old(self).wf(),
+        ensures
+            final(self).wf(),
+            final(self).at(key, job),
+            forall|k: Key| !key_eq(k, key) ==> (final(self).holds(k) == old(self).holds(k)),
+    {
+        let ghost before = self.entries@;
+        match self.position(&key) {
+            Some(i) => {
+                let ghost old_key = before[i as int].0;
+                let _ = self.entries.remove(i);
+                self.entries.insert(i, (key, job));
+                proof {
+                    assert(self.entries@ =~= before.update(i as int, (key, job)));
+                    assert(key_eq(old_key, key));
+                    assert(self.entries@[i as int] == (key, job));
+                    assert(self.at(key, job));
+                    assert forall|k: Key| !key_eq(k, key) implies (self.holds(k) == old(self).holds(k)) by {
+                        if self.holds(k) {
+                            let j = choose|j: int| 0 <= j < self.entries@.len() && key_eq(self.entries@[j].0, k);
+                            assert(j != i as int);
+                            assert(before[j] == self.entries@[j]);
+                        }
+                        if old(self).holds(k) {
+                            let j = choose|j: int| 0 <= j < before.len() && key_eq(before[j].0, k);
+                            assert(j != i as int);
+                            assert(self.entries@[j] == before[j]);
+                        }
+                    }
+                    assert forall|a: int, b: int| 0 <= a < b < self.entries@.len() implies !key_eq(
+                        (#[trigger] self.entries@[a]).0,
+                        (#[trigger] self.entries@[b]).0,
+                    ) by {
+                        if a == i as int {
+                            assert(before[b] == self.entries@[b]);
+                            assert(!key_eq(before[a].0, before[b].0));
+                        } else if b == i as int {
+                            assert(before[a] == self.entries@[a]);
+                        } else {
+                            assert(before[a] == self.entries@[a]);
+                            assert(before[b] == self.entries@[b]);
+                        }
+                    }
+                }
+            },
+            None => {
+                self.entries.push((key, job));
+                proof {
+                    assert(self.entries@ =~= before.push((key, job)));
+                    assert(self.entries@[before.len() as int] == (key, job));
+                    assert(self.at(key, job));
+                    assert forall|k: Key| !key_eq(k, key) implies (self.holds(k) == old(self).holds(k)) by {
+                        if self.holds(k) {
+                            let j = choose|j: int| 0 <= j < self.entries@.len() && key_eq(self.entries@[j].0, k);
+                            assert(j < before.len());
+                            assert(before[j] == self.entries@[j]);
+                        }
+                        if old(self).holds(k) {
+                            let j = choose|j: int| 0 <= j < before.len() && key_eq(before[j].0, k);
+                            assert(self.entries@[j] == before[j]);
+                        }
+                    }
+                    assert forall|a: int, b: int| 0 <= a < b < self.entries@.len() implies !key_eq(
+                        (#[trigger] self.entries@[a]).0,
+                        (#[trigger] self.entries@[b]).0,
+                    ) by {
+                        if b == before.len() as int {
+                            assert(before[a] == self.entries@[a]);
+                            assert(!old(self).holds(key));
+                        } else {
+                            assert(before[a] == self.entries@[a]);
+                            assert(before[b] == self.entries@[b]);
+                        }
+                    }
+                }
+            },
+        }
+    }
+
+    /// J2 (exact key): the job at `key` and no other (`None` for a free key, and for a key whose
+    /// scope or id differs).
+    pub fn get(&self, key: &Key) -> (r: Option<C>)
+        where
+            C: Clone,
+        ensures
+            r is None <==> !self.holds(*key),
+            r is Some ==> exists|v: C| self.at(*key, v) && cloned::<C>(v, r.unwrap()),
+    {
+        match self.locate(key, !cfg!(feature = "mut_scope_ignored")) {
+            Some(i) => {
+                let c = self.entries[i].1.clone();
+                proof {
+                    assert(self.at(*key, self.entries@[i as int].1));
+                }
+                Some(c)
+            },
+            None => None,
+        }
+    }
+
+    /// J2: the jobs of `scope` that `pick` names, and no other scope's: each result is an entry of
+    /// the table, in the scope and named; each such entry is a result.
+    pub fn in_scope(&self, scope: &str, pick: Pick<'_>) -> (r: Vec<(Key, C)>)
+        where
+            C: Clone,
+        ensures
+            forall|j: int|
+                0 <= j < r@.len() ==> {
+                    &&& (#[trigger] r@[j]).0.0@ == scope@
+                    &&& pick.names(r@[j].0.1@)
+                    &&& exists|v: C| self.at(r@[j].0, v) && cloned::<C>(v, r@[j].1)
+                },
+            forall|i: int|
+                0 <= i < self.rows().len() && (#[trigger] self.rows()[i]).0.0@ == scope@
+                    && pick.names(self.rows()[i].0.1@) ==> exists|j: int|
+                    0 <= j < r@.len() && key_eq((#[trigger] r@[j]).0, self.rows()[i].0),
+    {
+        let mut out: Vec<(Key, C)> = Vec::new();
+        let mut n = 0;
+        while n < self.entries.len()
+            invariant
+                n <= self.entries@.len(),
+                forall|j: int|
+                    0 <= j < out@.len() ==> {
+                        &&& (#[trigger] out@[j]).0.0@ == scope@
+                        &&& pick.names(out@[j].0.1@)
+                        &&& exists|v: C| self.at(out@[j].0, v) && cloned::<C>(v, out@[j].1)
+                    },
+                forall|i: int|
+                    0 <= i < n && (#[trigger] self.entries@[i]).0.0@ == scope@ && pick.names(
+                        self.entries@[i].0.1@,
+                    ) ==> exists|j: int|
+                        0 <= j < out@.len() && key_eq((#[trigger] out@[j]).0, self.entries@[i].0),
+            decreases self.entries@.len() - n,
+        {
+            let e = &self.entries[n];
+            let ghost old_out = out@;
+            if visible(e.0.0.as_str() == scope, pick.has(e.0.1.as_str())) {
+                let k = (e.0.0.clone(), e.0.1.clone());
+                let c = e.1.clone();
+                out.push((k, c));
+                proof {
+                    let v = self.entries@[n as int].1;
+                    assert(self.at(out@[old_out.len() as int].0, v));
+                    assert(key_eq(out@[old_out.len() as int].0, self.entries@[n as int].0));
+                    assert(cloned::<C>(v, out@[old_out.len() as int].1));
+                    assert(out@[old_out.len() as int].0.0@ == scope@);
+                    assert(pick.names(out@[old_out.len() as int].0.1@));
+                    assert forall|j: int| 0 <= j < out@.len() implies {
+                        &&& (#[trigger] out@[j]).0.0@ == scope@
+                        &&& pick.names(out@[j].0.1@)
+                        &&& exists|v: C| self.at(out@[j].0, v) && cloned::<C>(v, out@[j].1)
+                    } by {
+                        if j < old_out.len() {
+                            assert(out@[j] == old_out[j]);
+                        }
+                    }
+                    assert forall|i: int|
+                        0 <= i < n + 1 && (#[trigger] self.entries@[i]).0.0@ == scope@ && pick.names(
+                            self.entries@[i].0.1@,
+                        ) implies exists|j: int|
+                        0 <= j < out@.len() && key_eq((#[trigger] out@[j]).0, self.entries@[i].0) by {
+                        if i < n as int {
+                            let j = choose|j: int| 0 <= j < old_out.len() && key_eq(old_out[j].0, self.entries@[i].0);
+                            assert(out@[j] == old_out[j]);
+                        } else {
+                            assert(key_eq(out@[old_out.len() as int].0, self.entries@[i].0));
+                        }
+                    }
+                }
+            }
+            n += 1;
+        }
+        out
+    }
+
+    /// J3 and J10: take the `checked` jobs out of the table; the jobs that were taken, each with
+    /// its key. An entry is taken only if the job under its key is still the one that was checked
+    /// (`same`: the shell's pointer identity), so a key that is gone, or now holds a successor, is
+    /// skipped (J10). A job that was taken is gone: its key resolves to nothing afterwards (J3).
+    pub fn take(&mut self, checked: &[(Key, C)], same: impl Fn(&C, &C) -> bool) -> (taken: Vec<(Key, C)>)
+        where
+            C: Clone,
+        requires
+            old(self).wf(),
+            forall|a: &C, b: &C| same.requires((a, b)),
+        ensures
+            final(self).wf(),
+            forall|k: Key| final(self).holds(k) ==> old(self).holds(k),
+            forall|j: int|
+                0 <= j < taken@.len() ==> {
+                    &&& !final(self).holds((#[trigger] taken@[j]).0)
+                    &&& exists|n: int, v: C|
+                        0 <= n < checked@.len() && key_eq(checked@[n].0, taken@[j].0)
+                            && old(self).at(taken@[j].0, v) && cloned::<C>(v, taken@[j].1)
+                            && same.ensures((&v, &checked@[n].1), true)
+                },
+    {
+        let ghost start = *self;
+        let mut taken: Vec<(Key, C)> = Vec::new();
+        let mut n = 0;
+        while n < checked.len()
+            invariant
+                n <= checked@.len(),
+                self.wf(),
+                forall|a: &C, b: &C| same.requires((a, b)),
+                forall|k: Key| self.holds(k) ==> start.holds(k),
+                forall|k: Key, v: C| self.at(k, v) ==> start.at(k, v),
+                forall|j: int|
+                    0 <= j < taken@.len() ==> {
+                        &&& !self.holds((#[trigger] taken@[j]).0)
+                        &&& exists|m: int, v: C|
+                            0 <= m < n && key_eq(checked@[m].0, taken@[j].0) && start.at(
+                                taken@[j].0,
+                                v,
+                            ) && cloned::<C>(v, taken@[j].1) && same.ensures(
+                                (&v, &checked@[m].1),
+                                true,
+                            )
+                    },
+            decreases checked.len() - n,
+        {
+            let ghost before = *self;
+            let (k, c) = &checked[n];
+            if let Some(i) = self.position(k) {
+                if takes(same(&self.entries[i].1, c)) {
+                    if cfg!(feature = "mut_remove_keeps_entry") {
+                        taken.push(((k.0.clone(), k.1.clone()), self.entries[i].1.clone()));
+                    } else {
+                        let (key, job) = self.entries.remove(i);
+                        taken.push((key, job));
+                    }
+                }
+            }
+            n += 1;
+        }
+        taken
+    }
+
+    /// Every job in the table, any scope.
+    pub fn all(&self) -> (r: Vec<(Key, C)>)
+        where
+            C: Clone,
+        ensures
+            r@.len() == self.rows().len(),
+    {
+        let mut out = Vec::new();
+        let mut n = 0;
+        while n < self.entries.len()
+            invariant
+                n <= self.entries@.len(),
+                out@.len() == n,
+            decreases self.entries@.len() - n,
+        {
+            let e = &self.entries[n];
+            out.push(((e.0.0.clone(), e.0.1.clone()), e.1.clone()));
+            n += 1;
+        }
+        out
+    }
+}
+
 } // verus!
 
 impl Named {
@@ -964,99 +1392,37 @@ impl State {
     }
 }
 
-/// `(scope, id)`: a job's address.
-pub type Key = (String, String);
-
-/// Which ids of a scope an operation names.
-#[derive(Clone, Copy, Debug)]
-pub enum Pick<'a> {
-    /// Every job of the scope (`list`, `wipe`).
-    All,
-    /// The jobs whose id is one of these (`signal`, `kill`, `remove`).
-    Ids(&'a [String]),
-}
-
-impl Pick<'_> {
-    fn has(&self, id: &str) -> bool {
-        match self {
-            Pick::All => true,
-            Pick::Ids(ids) => ids.iter().any(|i| i == id),
-        }
-    }
-}
-
-/// Every job by `(scope, id)`: the storage, which is not verified (a `HashMap` of string keys; see the
-/// README). What it observes (is the key there, is the entry in the scope, is its id named) is
-/// handed to [`admit`] and [`visible`], where the decision is proven. `C` is what the shell keeps per
-/// job (a shared cell in production, a handle in the model): the kernel never looks inside it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Table<C> {
-    entries: HashMap<Key, C>,
-}
-
 impl<C> Default for Table<C> {
     fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<C: Clone> Clone for Table<C> {
+    fn clone(&self) -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: self.entries.clone(),
         }
     }
 }
 
-impl<C: Clone> Table<C> {
-    pub fn admit(&self, key: &Key) -> Admit {
-        admit(self.entries.contains_key(key))
+impl<C: std::fmt::Debug> std::fmt::Debug for Table<C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map()
+            .entries(self.entries.iter().map(|(k, c)| (k, c)))
+            .finish()
     }
+}
 
-    /// Put a job in its key: only after [`Table::admit`] said `Fresh`, under the same lock.
-    pub fn insert(&mut self, key: Key, job: C) {
-        self.entries.insert(key, job);
-    }
-
-    /// The job at `key`, in its scope only.
-    pub fn get(&self, key: &Key) -> Option<C> {
-        if cfg!(feature = "mut_scope_ignored") {
-            return self
+/// Two tables are equal when they hold the same jobs under the same keys, whatever order they came in.
+impl<C: PartialEq> PartialEq for Table<C> {
+    fn eq(&self, other: &Self) -> bool {
+        self.entries.len() == other.entries.len()
+            && self
                 .entries
                 .iter()
-                .find(|((_, id), _)| *id == key.1)
-                .map(|(_, c)| c.clone());
-        }
-        self.entries.get(key).cloned()
-    }
-
-    /// The jobs of `scope` that `pick` names, and no other scope's.
-    pub fn in_scope(&self, scope: &str, pick: Pick<'_>) -> Vec<(Key, C)> {
-        self.entries
-            .iter()
-            .filter(|((sc, id), _)| visible(sc == scope, pick.has(id)))
-            .map(|(k, c)| (k.clone(), c.clone()))
-            .collect()
-    }
-
-    /// Take the `checked` jobs out of the table; the jobs that were taken. An entry is taken only if
-    /// the job under its key is still the one that was checked (`same`: the shell's pointer
-    /// identity), so a key that is gone, or now holds a successor, is skipped (J10).
-    pub fn take(&mut self, checked: &[(Key, C)], same: impl Fn(&C, &C) -> bool) -> Vec<C> {
-        let mut taken = Vec::new();
-        for (k, c) in checked {
-            let found = self.entries.get(k).is_some_and(|now| same(now, c));
-            if !takes(found) {
-                continue;
-            }
-            if cfg!(feature = "mut_remove_keeps_entry") {
-                taken.extend(self.entries.get(k).cloned());
-            } else {
-                taken.extend(self.entries.remove(k));
-            }
-        }
-        taken
-    }
-
-    /// Every job in the table, any scope.
-    pub fn all(&self) -> Vec<(Key, C)> {
-        self.entries
-            .iter()
-            .map(|(k, c)| (k.clone(), c.clone()))
-            .collect()
+                .all(|(k, c)| other.entries.iter().any(|(k2, c2)| k == k2 && c == c2))
     }
 }
+
+impl<C: Eq> Eq for Table<C> {}

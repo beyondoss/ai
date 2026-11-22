@@ -36,19 +36,26 @@ proof red (`mise run verify:kernels -- --features mut_x`; execd forwards the fea
 
 ## What stays outside `verus!`
 
-Storage and string comparison. vstd's `HashMap` specs only mean something when the key type satisfies
-`obeys_key_model`, and vstd axiomatizes that only for `bool`, the integer types, and `Box`es of them
-(`vstd-0.0.0-2026-11-01-0251/std_specs/hash.rs` lines 13-18 say so, and the axioms are at lines 113-215).
-Neither `String` nor `(String, String)` is covered, and for any other key type vstd asks for an
-`assume(obeys_key_model::<K>())` in our code, which is not allowed. Re-keying on integers would change
-behaviour and cost (interning every wire string), so the storage stays outside:
+Not the storage any more. `Table` is a `Vec<(Key, C)>` inside `verus!`: vstd specifies `String`'s equality and
+clone (`vstd-0.0.0-2026-11-01-0251/string.rs` 369-377, 411-421) and `Vec`'s push, remove and insert
+(`std_specs/vec.rs` 149, 211, 230), so Verus proves what a `HashMap` could not (its key model is axiomatized
+only for `bool` and the integers, `std_specs/hash.rs` 13-18, 113-215; an interning map would only move the
+gap). Proven in `src/lib.rs`: the keys are distinct (`Table::wf`, kept by `new` and `insert`); `get` is `None`
+exactly for a free key and otherwise returns a clone of the job under that exact `(scope, id)` (J2's
+exact-key half, `mut_scope_ignored`); `in_scope` returns exactly the entries in the scope whose id is named
+(`Pick::has`); `insert` puts the job under its key and changes no other key; `take` takes only a job whose
+key was checked and `same`, and leaves its key resolving to nothing (J3, `mut_remove_keeps_entry`; J10).
+Lookup is a linear scan (execd has no job cap; measured below).
 
-- `Table`'s `HashMap`: that `contains_key` finds the key, that `get` returns the entry under exactly
-  that `(scope, id)`, and that `take` removes it (the pointer-identity test `take` is handed is the shell's; whether to take is `takes`, proven). `admit` and `visible` take what the storage
-  observed and are proven; the lookup itself is not. J3's "no operation resolves a removed job"
-  (`mut_remove_keeps_entry`) and the exact-key half of J2 (`Table::get`) are **gaps** here, judged by
-  the model only.
-- `Pick::has` (is this id one of the named ones: a string comparison).
+What stays outside:
+
+- `Table::wf` is a precondition of `insert` and `take` that no unverified caller discharges: it holds
+  because `new` makes a table that satisfies it, every method keeps it, and the field is private. (A type
+  invariant would be the checked form; Verus asks `no_unwind` of every function that then mutates the field,
+  and vstd's `Vec::push` and `remove` unwind.)
+- `same`, the pointer-identity test `take` is handed, is the shell's (its result is opaque to the proof; the
+  decision to take on it is `takes`, proven).
+- The table's `Clone`, `Debug` and `Eq` (the model's state), which only copy or print the entries.
 - Accessors that only reshape a field (`State::kind`, `Named::as_str`) and the one-line `Table`
   methods that call the proven decisions.
 - That the shell calls the kernel for every decision, in the right order under the right lock: the
