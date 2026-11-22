@@ -509,6 +509,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "stateright",
  "tempfile",
  "tokio",
  "tokio-util",

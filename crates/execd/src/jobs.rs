@@ -24,7 +24,6 @@
 //! - *Pumps*: two per job, freed when their pipes close, when the job is removed, or when the
 //!   supervisor lets go of a pipe a descendant holds open after the grace.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -41,13 +40,14 @@ use tokio_util::sync::CancellationToken;
 use crate::exec::{self, AfterExit, Cut, PIPE_GRACE, Sink};
 use crate::frame::{self, FRAME_MAX};
 use crate::http::{self, Line, Request, Resp};
+use crate::job_kernel::{self as kernel, Act, Admit, Alive, Ev, Follow, Pick};
 use crate::notify::{self, Notifier, NotifyTarget};
 use crate::proc::{self, locked};
 use crate::spool;
 use crate::{Ctx, StreamEnd, StreamStart};
 
 /// `(scope, id)`: a job's address.
-pub(crate) type Key = (String, String);
+pub(crate) type Key = kernel::Key;
 
 /// One job, shared between its supervisor, its pumps and the requests that name it.
 pub(crate) type JobCell = Arc<Mutex<Job>>;
@@ -191,8 +191,7 @@ impl Ring {
     /// they start, and the absolute `(from, len)` ranges of them that came from stderr: ascending,
     /// disjoint, at most [`RANGES_MAX`] (the window is cut before the range that would exceed it).
     pub fn read(&self, offset: u64, max: usize) -> (u64, Vec<u8>, Vec<(u64, u64)>) {
-        let from = offset.max(self.base);
-        let want = (self.end().saturating_sub(from) as usize).min(max);
+        let (from, want) = kernel::window(offset, self.base, self.end(), max);
         let mut out = vec![0u8; want];
         let mut ranges: Vec<(u64, u64)> = Vec::new();
         let mut done = 0;
@@ -268,37 +267,34 @@ impl Drop for Ring {
     }
 }
 
-/// One job, as the endpoint keeps it.
+/// One job, as the endpoint keeps it. Its life (phase, who owns it, what was seen, removed) is
+/// [`kernel::State`], changed only by [`kernel::step`]; the rest is what the shell holds for it.
 pub(crate) struct Job {
-    pgid: i32,
     /// What every process of the job carries in its environment ([`proc::JOB_MARK_ENV`]).
     mark: String,
     label: String,
-    started: u64,
-    ended: u64,
     out: Ring,
-    shell_exit: Option<i32>,
-    end: Option<i32>,
-    /// The signal that killed the shell, once it is dead; `None` if it exited (or is running). Set
-    /// together with `shell_exit` / `end`, whose code is then `128 + signal`.
-    signal: Option<i32>,
-    kept: bool,
-    num: Option<u64>,
-    kind: Option<String>,
-    seen: u64,
+    k: kernel::State,
     /// The latest `keep`'s `notify` (notify), if it carried one.
     pub notify: Option<NotifyTarget>,
     /// When it calls back.
     pub notifier: Notifier,
-    /// Taken out of the table: its pumps and timers stop.
-    pub removed: bool,
     /// The job's open stdin, when it was started with `stdin_open`.
     stdin: Option<Arc<JobStdin>>,
 }
 
+/// `notify` reads the kernel's `removed` as a field of the job.
+impl std::ops::Deref for Job {
+    type Target = kernel::State;
+
+    fn deref(&self) -> &kernel::State {
+        &self.k
+    }
+}
+
 /// Every job, by `(scope, id)`, and a counter bumped on every change a stream may be waiting for.
 pub(crate) struct Jobs {
-    map: Mutex<HashMap<Key, JobCell>>,
+    map: Mutex<kernel::Table<JobCell>>,
     changed: watch::Sender<u64>,
     /// [`crate::Handle::activity_changed`]'s counter.
     activity: Arc<watch::Sender<u64>>,
@@ -325,10 +321,7 @@ impl Jobs {
     /// Every job in the table that has not ended (held or kept, any scope), and the kept ones of them.
     /// And how many jobs are owed a notify callback that is neither settled nor abandoned.
     pub fn alive(&self) -> (usize, Vec<crate::KeptJob>, usize) {
-        let cells: Vec<(Key, JobCell)> = locked(&self.map)
-            .iter()
-            .map(|(k, c)| (k.clone(), c.clone()))
-            .collect();
+        let cells = locked(&self.map).all();
         let mut alive = 0;
         let mut owed = 0;
         let mut kept = Vec::new();
@@ -338,46 +331,41 @@ impl Jobs {
             if !j.removed && j.notifier.owes() {
                 owed += 1;
             }
-            if j.end.is_some() || j.removed || j.pgid == 0 {
-                continue;
-            }
-            alive += 1;
-            if j.kept {
-                kept.push(crate::KeptJob {
-                    pgid: j.pgid,
-                    scope,
-                    id,
-                });
+            match j.k.alive() {
+                Alive::No => {}
+                Alive::Yes => alive += 1,
+                Alive::Kept => {
+                    alive += 1;
+                    kept.push(crate::KeptJob {
+                        pgid: j.k.pgid(),
+                        scope,
+                        id,
+                    });
+                }
             }
         }
         (alive, kept, owed)
     }
 
     fn get(&self, key: &Key) -> Option<JobCell> {
-        locked(&self.map).get(key).cloned()
+        locked(&self.map).get(key)
     }
 
-    /// The jobs of `scope` matching `pick`.
-    fn in_scope(&self, scope: &str, pick: impl Fn(&str) -> bool) -> Vec<(Key, JobCell)> {
-        let map = locked(&self.map);
-        map.iter()
-            .filter(|((sc, id), _)| sc == scope && pick(id))
-            .map(|(k, c)| (k.clone(), c.clone()))
-            .collect()
+    /// The jobs of `scope` that `pick` names.
+    fn in_scope(&self, scope: &str, pick: Pick<'_>) -> Vec<(Key, JobCell)> {
+        locked(&self.map).in_scope(scope, pick)
     }
 
     /// Take `keys` out of the table; their pumps and timers stop.
     fn remove(&self, keys: &[Key]) {
-        let cells: Vec<JobCell> = {
-            let mut map = locked(&self.map);
-            keys.iter().filter_map(|k| map.remove(k)).collect()
-        };
+        let cells = locked(&self.map).take(keys);
         for cell in cells {
             let mut j = locked(&cell);
-            j.removed = true;
-            j.notifier = Notifier::default();
-            if let Some(s) = &j.stdin {
-                s.close();
+            if kernel::step(&mut j.k, Ev::Taken) == Act::Release {
+                j.notifier = Notifier::default();
+                if let Some(s) = &j.stdin {
+                    s.close();
+                }
             }
         }
         self.bump();
@@ -392,20 +380,14 @@ fn epoch() -> u64 {
 }
 
 fn state_of(j: &Job) -> (&'static str, Value) {
-    match (j.end, j.shell_exit) {
-        (Some(c), _) => ("ended", json!(c)),
-        (None, Some(c)) => ("exited", json!(c)),
-        (None, None) => ("running", Value::Null),
-    }
+    let (state, code) = j.k.named();
+    (state.as_str(), code.map_or(Value::Null, |c| json!(c)))
 }
 
 /// `signal`, when a signal killed the shell: a member of `read` and `list` answers only once the
 /// job has a code.
 fn put_signal(j: &Job, obj: &mut Value) {
-    if let Some(sig) = j
-        .signal
-        .filter(|_| j.end.is_some() || j.shell_exit.is_some())
-    {
+    if let Some(sig) = j.k.signal() {
         obj["signal"] = json!(sig);
     }
 }
@@ -790,11 +772,19 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq, data: Vec<u8>) -> 
         "start" => start_job(ctx, req, &job).await,
         "attach" => {
             let k = key(&job.id);
-            if jobs.get(&k).is_none() {
+            let Some(cell) = jobs.get(&k) else {
                 return http::error_response(404, "no such job");
-            }
+            };
             let (resp, out) = http::stream_response();
-            tokio::spawn(stream_job(ctx.clone(), k, job.offset, false, None, out));
+            tokio::spawn(stream_job(
+                ctx.clone(),
+                k,
+                cell,
+                job.offset,
+                false,
+                None,
+                out,
+            ));
             resp
         }
         "read" => {
@@ -839,13 +829,10 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq, data: Vec<u8>) -> 
                 let Some(cell) = jobs.get(&key(id)) else {
                     continue;
                 };
-                let (running, pgid, mark) = {
-                    let j = locked(&cell);
-                    (j.end.is_none() && j.pgid != 0, j.pgid, j.mark.clone())
-                };
-                if running {
+                let mut j = locked(&cell);
+                if kernel::step(&mut j.k, Ev::Signal) == Act::Signal {
                     sent.push(id.clone());
-                    targets.push((pgid, mark));
+                    targets.push((j.k.pgid(), j.mark.clone()));
                 }
             }
             proc::off_runtime(move || {
@@ -861,15 +848,17 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq, data: Vec<u8>) -> 
             let wipe = job.op == "wipe";
             let grace = Duration::from_millis(job.grace_ms.unwrap_or(300));
             // Never a group whose job has ended: its number may be reused.
+            let pick = if wipe { Pick::All } else { Pick::Ids(&job.ids) };
             let targets: Vec<(Key, JobCell, i32, String)> = jobs
-                .in_scope(&job.scope, |id| wipe || job.ids.iter().any(|i| i == id))
+                .in_scope(&job.scope, pick)
                 .into_iter()
                 .filter_map(|(k, c)| {
-                    let (running, pgid, mark) = {
-                        let j = locked(&c);
-                        (j.end.is_none(), j.pgid, j.mark.clone())
+                    let (stop, pgid, mark) = {
+                        let mut j = locked(&c);
+                        let act = kernel::step(&mut j.k, Ev::Stop);
+                        (act == Act::Stop, j.k.pgid(), j.mark.clone())
                     };
-                    running.then_some((k, c, pgid, mark))
+                    stop.then_some((k, c, pgid, mark))
                 })
                 .collect();
             let stopping: Vec<(i32, String)> =
@@ -884,15 +873,10 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq, data: Vec<u8>) -> 
             }
             if wipe || job.remove {
                 // Every named job whose group is empty goes, the ended ones included.
-                let named = jobs.in_scope(&job.scope, |id| wipe || job.ids.iter().any(|i| i == id));
+                let named = jobs.in_scope(&job.scope, pick);
                 let mut gone = Vec::new();
                 for (k, c) in named {
-                    let (pgid, mark) = {
-                        let j = locked(&c);
-                        (j.pgid, j.mark.clone())
-                    };
-                    // pgid 0: still being spawned, so not yet a job that can be taken out.
-                    if pgid != 0 && proc::job_members_async(pgid, &mark).await.is_empty() {
+                    if removable(&c, false).await {
                         gone.push(k);
                     }
                 }
@@ -902,14 +886,10 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq, data: Vec<u8>) -> 
             http::json_response(200, &json!({ "survivors": survivors }))
         }
         "remove" => {
-            let named = jobs.in_scope(&job.scope, |id| job.ids.iter().any(|i| i == id));
+            let named = jobs.in_scope(&job.scope, Pick::Ids(&job.ids));
             let mut gone = Vec::new();
             for (k, c) in named {
-                let (ended, pgid, mark) = {
-                    let j = locked(&c);
-                    (j.end.is_some(), j.pgid, j.mark.clone())
-                };
-                if ended || (pgid != 0 && proc::job_members_async(pgid, &mark).await.is_empty()) {
+                if removable(&c, true).await {
                     gone.push(k);
                 }
             }
@@ -918,7 +898,7 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq, data: Vec<u8>) -> 
         }
         "list" => {
             let list: Vec<Value> = jobs
-                .in_scope(&job.scope, |_| true)
+                .in_scope(&job.scope, Pick::All)
                 .into_iter()
                 .map(|((_, id), c)| {
                     let j = locked(&c);
@@ -927,12 +907,12 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq, data: Vec<u8>) -> 
                         "id": id,
                         "state": state,
                         "code": code,
-                        "kept": j.kept,
-                        "num": j.num,
-                        "kind": j.kind,
-                        "seen": j.seen,
-                        "started": j.started,
-                        "ended": j.ended,
+                        "kept": j.k.kept(),
+                        "num": j.k.num(),
+                        "kind": j.k.kind(),
+                        "seen": j.k.seen,
+                        "started": j.k.started,
+                        "ended": j.k.ended_at(),
                         "label": j.label,
                     });
                     put_signal(&j, &mut entry);
@@ -957,6 +937,35 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq, data: Vec<u8>) -> 
     }
 }
 
+/// Whether the kernel lets `cell`'s job leave the table. Asked first without looking at its
+/// processes (an ended job needs none, for `remove`), then with what the shell sees of its group.
+async fn removable(cell: &JobCell, ended_counts: bool) -> bool {
+    let (act, pgid, mark) = {
+        let mut j = locked(cell);
+        let act = kernel::step(
+            &mut j.k,
+            Ev::Remove {
+                empty: false,
+                ended_counts,
+            },
+        );
+        (act, j.k.pgid(), j.mark.clone())
+    };
+    if act == Act::Take {
+        return true;
+    }
+    // A group exists from the spawn: before it there is nothing to observe.
+    let empty = pgid != 0 && proc::job_members_async(pgid, &mark).await.is_empty();
+    let mut j = locked(cell);
+    kernel::step(
+        &mut j.k,
+        Ev::Remove {
+            empty,
+            ended_counts,
+        },
+    ) == Act::Take
+}
+
 /// `keep` (the job is the endpoint's now, with its `notify`) and `seen` (how much output the model
 /// has been shown).
 fn keep_or_seen(ctx: &Arc<Ctx>, job: &JobReq) -> Resp {
@@ -978,10 +987,14 @@ fn keep_or_seen(ctx: &Arc<Ctx>, job: &JobReq) -> Resp {
     };
     let mut j = locked(&cell);
     if keep {
-        j.kept = true;
-        j.num = job.num;
-        j.kind = job.kind.clone();
-        j.seen = job.seen.unwrap_or(j.seen);
+        kernel::step(
+            &mut j.k,
+            Ev::Keep {
+                num: job.num,
+                kind: job.kind.clone(),
+                seen: job.seen,
+            },
+        );
         // The latest keep governs (N6): with notify it replaces the job's (and its proof abandons
         // whatever was in flight), without it removes it.
         let event = exec_notify::Event::Keep {
@@ -990,7 +1003,7 @@ fn keep_or_seen(ctx: &Arc<Ctx>, job: &JobReq) -> Resp {
         j.notify = notify;
         notify::feed(ctx, &cell, &key, &mut j, event);
     } else {
-        j.seen = job.offset;
+        kernel::step(&mut j.k, Ev::Seen { offset: job.offset });
     }
     drop(j);
     if keep {
@@ -1005,28 +1018,18 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
     let key = (job.scope.clone(), job.id.clone());
     let cell: JobCell = {
         let mut map = locked(&ctx.jobs.map);
-        if map.contains_key(&key) {
+        if map.admit(&key) == Admit::Exists {
             return http::error_response(409, "the job exists");
         }
         // Placeholder until the spawn gives the group: the entry is the claim on the id, so two
         // starts of one id cannot both run.
         let cell = Arc::new(Mutex::new(Job {
-            pgid: 0,
             mark: proc::new_job_mark(ctx.next_seq.fetch_add(1, Ordering::Relaxed)),
             label: job.label.clone(),
-            started: epoch(),
-            ended: 0,
             out: Ring::new(ctx.opts.job_output_retention, ctx.spool.new_job()),
-            shell_exit: None,
-            signal: None,
-            end: None,
-            kept: !job.hold,
-            num: None,
-            kind: (!job.hold).then(|| "background".to_string()),
-            seen: 0,
+            k: kernel::State::new(epoch(), job.hold),
             notify: None,
             notifier: Notifier::default(),
-            removed: false,
             stdin: None,
         }));
         map.insert(key.clone(), cell.clone());
@@ -1052,7 +1055,7 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
     let stdin = proc.stdin.take().map(JobStdin::new);
     {
         let mut j = locked(&cell);
-        j.pgid = pgid;
+        kernel::step(&mut j.k, Ev::Spawned { pgid });
         j.stdin = stdin;
     }
     ctx.groups.insert(pgid);
@@ -1116,7 +1119,7 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
         }
         let ctx2 = ctx.clone();
         tokio::spawn(async move {
-            let end = stream_job(ctx2.clone(), key, 0, true, Some((pgid, opened)), out).await;
+            let end = stream_job(ctx2.clone(), key, cell, 0, true, Some((pgid, opened)), out).await;
             if let Some(o) = &ctx2.opts.observer {
                 o.stream_ended(seq, end, std::time::Instant::now());
             }
@@ -1145,7 +1148,7 @@ fn pump<R: tokio::io::AsyncRead + std::os::fd::AsFd + Unpin + Send + 'static>(
         while let Some(n) = after.read(&mut pipe, &mut buf).await {
             {
                 let mut j = locked(&cell);
-                if j.removed {
+                if kernel::step(&mut j.k, Ev::Push) == Act::Discard {
                     return;
                 }
                 j.out.push(&buf[..n], stderr);
@@ -1220,9 +1223,9 @@ async fn supervise(
         // The moment a held stream would send `shell_exit`: notify calls back.
         {
             let mut j = locked(&cell);
-            j.shell_exit = Some(code);
-            j.signal = signal;
-            notify::change(&ctx, &cell, &key, &mut j);
+            if kernel::step(&mut j.k, Ev::ShellExit { code, signal }) == Act::Exited {
+                notify::change(&ctx, &cell, &key, &mut j);
+            }
         }
         ctx.jobs.bump();
         loop {
@@ -1244,18 +1247,33 @@ async fn supervise(
     // The end is observable from here on: notify calls back.
     {
         let mut j = locked(&cell);
-        j.end = Some(code);
-        j.signal = signal;
-        j.ended = epoch();
-        if let Some(s) = &j.stdin {
-            s.close();
-        }
-        if !j.removed {
-            notify::change(&ctx, &cell, &key, &mut j);
+        let act = kernel::step(
+            &mut j.k,
+            Ev::GroupEmpty {
+                code,
+                signal,
+                now: epoch(),
+            },
+        );
+        if let Act::Ended { notify } = act {
+            if let Some(s) = &j.stdin {
+                s.close();
+            }
+            if notify {
+                notify::change(&ctx, &cell, &key, &mut j);
+            }
         }
     }
     ctx.groups.remove(pgid);
     ctx.jobs.bump();
+}
+
+/// The job a stream attached to, while the table still holds that very job under `key`: a removed
+/// job is gone to its streams, and a later job of the same id is not its successor.
+fn bound(ctx: &Ctx, key: &Key, attached: &JobCell) -> Option<JobCell> {
+    let found = ctx.jobs.get(key);
+    let same = found.as_ref().is_some_and(|c| Arc::ptr_eq(c, attached));
+    kernel::bound(found, same)
 }
 
 /// Stream a job's output from `offset` to its end. `started`: a held start, which says so first and
@@ -1263,6 +1281,7 @@ async fn supervise(
 async fn stream_job(
     ctx: Arc<Ctx>,
     key: Key,
+    attached: JobCell,
     offset: u64,
     hold: bool,
     started: Option<(i32, bool)>,
@@ -1270,14 +1289,17 @@ async fn stream_job(
 ) -> StreamEnd {
     // A job stream has no deadline of its own: it lives as long as the job or the connection.
     let mut sink = Sink::new(out, ctx.opts.heartbeat, None);
-    if let Ok(end) = follow(&ctx, &key, offset, started, &mut sink).await {
+    if let Ok(end) = follow(&ctx, &key, &attached, offset, started, &mut sink).await {
         return end;
     }
     // The connection is gone before the job's end: a held job nobody kept dies with it.
-    if hold && let Some(cell) = ctx.jobs.get(&key) {
+    if hold && let Some(cell) = bound(&ctx, &key, &attached) {
         let job = {
-            let j = locked(&cell);
-            (!j.kept && j.end.is_none()).then(|| (j.pgid, j.mark.clone()))
+            let mut j = locked(&cell);
+            match kernel::step(&mut j.k, Ev::Disconnect { hold }) {
+                Act::Kill { pgid } => Some((pgid, j.mark.clone())),
+                _ => None,
+            }
         };
         if let Some((g, m)) = job {
             proc::off_runtime(move || proc::signal_job(g, &m, Signal::SIGKILL)).await;
@@ -1291,6 +1313,7 @@ async fn stream_job(
 async fn follow(
     ctx: &Arc<Ctx>,
     key: &Key,
+    attached: &JobCell,
     offset: u64,
     started: Option<(i32, bool)>,
     sink: &mut Sink,
@@ -1313,44 +1336,45 @@ async fn follow(
             Wait,
             Missing,
         }
-        let next = match ctx.jobs.get(key) {
+        let next = match bound(ctx, key, attached) {
             None => Next::Missing,
             Some(cell) => {
                 let j = locked(&cell);
                 let total = j.out.end();
-                if sent < j.out.base {
-                    let n = j.out.base - sent;
-                    sent = j.out.base;
-                    Next::Frame(frame::json(&json!({ "gap": n })))
-                } else if sent < total {
-                    let (_, mut piece, ranges) = j.out.read(sent, FRAME_MAX);
-                    // A frame never spans a stream change: it is the stderr run at its start, or
-                    // the stdout before the first stderr run.
-                    let mut key = "stdout";
-                    if let Some(&(a, n)) = ranges.first() {
-                        if a == sent {
-                            key = "stderr";
-                            piece.truncate(usize::try_from(n).unwrap_or(usize::MAX));
+                match kernel::follow(&j.k, sent, j.out.base, total, shell_told) {
+                    Follow::Gap(n) => {
+                        sent = j.out.base;
+                        Next::Frame(frame::json(&json!({ "gap": n })))
+                    }
+                    Follow::Data => {
+                        let (_, mut piece, ranges) = j.out.read(sent, FRAME_MAX);
+                        // A frame never spans a stream change: it is the stderr run at its start,
+                        // or the stdout before the first stderr run.
+                        let mut key = "stdout";
+                        if let Some(&(a, n)) = ranges.first() {
+                            if a == sent {
+                                key = "stderr";
+                                piece.truncate(usize::try_from(n).unwrap_or(usize::MAX));
+                            } else {
+                                piece.truncate(usize::try_from(a - sent).unwrap_or(usize::MAX));
+                            }
+                        }
+                        if piece.is_empty() {
+                            // The chunk went away under us: the rest is a gap.
+                            let n = total - sent;
+                            sent = total;
+                            Next::Frame(frame::json(&json!({ "gap": n })))
                         } else {
-                            piece.truncate(usize::try_from(a - sent).unwrap_or(usize::MAX));
+                            sent += piece.len() as u64;
+                            Next::Frame(frame::output(key, &piece))
                         }
                     }
-                    if piece.is_empty() {
-                        // The chunk went away under us: the rest is a gap.
-                        let n = total - sent;
-                        sent = total;
-                        Next::Frame(frame::json(&json!({ "gap": n })))
-                    } else {
-                        sent += piece.len() as u64;
-                        Next::Frame(frame::output(key, &piece))
+                    Follow::ShellExit(c) => {
+                        shell_told = true;
+                        Next::Frame(frame::json(&json!({ "shell_exit": c })))
                     }
-                } else if let (Some(c), false) = (j.shell_exit, shell_told) {
-                    shell_told = true;
-                    Next::Frame(frame::json(&json!({ "shell_exit": c })))
-                } else if let Some(c) = j.end {
-                    Next::End(c, j.signal)
-                } else {
-                    Next::Wait
+                    Follow::End(c, signal) => Next::End(c, signal),
+                    Follow::Wait => Next::Wait,
                 }
             }
         };
