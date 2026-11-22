@@ -135,7 +135,7 @@ enum Drain {
     Closed,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct St {
     k: kernel::Table,
     now: u8,
@@ -144,6 +144,19 @@ struct St {
     drain: Drain,
     deadline: bool,
     bad: u32,
+}
+
+/// The kernel's table holds a `HashMap`, which is not `Hash`: hash its entries in id order.
+impl std::hash::Hash for St {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        let mut slots: Vec<_> = self.k.slots.iter().collect();
+        slots.sort_by_key(|(id, _)| *id);
+        slots.hash(h);
+        self.k.next_incarnation.hash(h);
+        self.k.lifecycle.hash(h);
+        (self.now, &self.conns, &self.tasks, self.drain).hash(h);
+        (self.deadline, self.bad).hash(h);
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -735,16 +748,20 @@ fn the_mutation_turns_its_property_red() {
     } else {
         (false, "L2: ")
     };
-    let model = Serve {
+    let checker = Serve {
         other_tenant: other,
-    };
-    let checker = model.checker().spawn_bfs().join();
-    let red: Vec<&str> = model
-        .properties()
-        .iter()
-        .filter(|p| p.name.starts_with(property) && checker.discovery(p.name).is_some())
-        .map(|p| p.name)
-        .collect();
+    }
+    .checker()
+    .spawn_bfs()
+    .join();
+    let red: Vec<&str> = Serve {
+        other_tenant: other,
+    }
+    .properties()
+    .iter()
+    .filter(|p| p.name.starts_with(property) && checker.discovery(p.name).is_some())
+    .map(|p| p.name)
+    .collect();
     println!("red: {red:?}");
     assert!(!red.is_empty(), "no property `{property}` went red");
 }
@@ -772,7 +789,7 @@ fn the_leak_also_turns_l3_red() {
 #[test]
 fn production_calls_the_kernel() {
     let src = include_str!("../src/serve_ws.rs");
-    let prod = &src[..src.find("#[cfg(test)]\nmod tests").expect("test module")];
+    let prod = &src[..src.find("#[cfg(test)]\n#[allow(").expect("test module")];
     for needle in [
         "kernel::Event::Pin {",
         "kernel::Event::Unpin {",
