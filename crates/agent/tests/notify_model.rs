@@ -41,8 +41,36 @@
 //! [`Notify::replica`] (and [`Notify::slow_reconcile`] asks the kernel, without keeping its
 //! answer, whether a tick would time a callback out). What the environment adds is what lives
 //! outside both kernels in production too: the network and the edge, the storage fence, the
-//! sandbox's truth, today's stream and follow, today's job table (the [`kernel::Facts`] a callback
-//! carries) and today's per-job record of what was reported (`JobShared`).
+//! sandbox's truth, today's stream and follow, the replica's table (the [`kernel::Facts`] a
+//! callback carries) and today's per-job record of what was reported (`JobShared`).
+//!
+//! The sandbox's job table is the REAL one too: [`execd_jobs`] (`execd::job_kernel`, the crate
+//! Verus proves). Starts go through `Table::admit`, a lookup through `Table::get`, a `list`
+//! through `Table::in_scope`, `remove` and `wipe` through `Ev::Remove` and `Table::take`, a job's
+//! life (`Spawned`, `ShellExit`, `GroupEmpty`, `Keep`, `Stop`, `Taken`) through `step`, and a
+//! stream follows a job through `bound`. The environment adds only what execd's shell does around
+//! the kernel: one notifier per job cell (feeding it what `jobs.rs` and `notify.rs` feed it:
+//! `Change` when `step` answers `Exited` or `Ended { notify }`, `Keep` after a `keep`'s step, a
+//! drop of its tasks at `Taken`, and no `Wake` or answer for a removed job), and the `keep`
+//! request's two steps (the table lookup, then the job's lock). Each job is a cell, a notifier is
+//! tied to its cell and never to its `(scope, id)` (`notify.rs`: the attempt holds the cell; the
+//! key only names the callback), and a cell is not its id: when `reuse` is on, another client may
+//! start an id again once its job left the table.
+//!
+//! ### The seam: X1 to X4
+//!
+//! (X1) a callback's answer, a report, a stream's end, a `keep` or a removal for a job is never
+//! applied to another job that reuses its id; (X2) a removed job is never notified again and owes
+//! nothing (nothing in flight, nothing waiting, no callback owed); (X3) one session task commits a
+//! job's end once, whichever of stream, callback-driven follow, read-back or `bash_job` call
+//! carried it; (X4, checked in every settled state like L1) every job the replica kept has had its
+//! end reported, read off the table's own claim rather than the task's tracking.
+//!
+//! What the agent guarantees and the table does not: the agent mints a random id per job
+//! (`JobId::fresh`), so no id is reused by the agent; the table admits a start of any key not in
+//! it. A `keep` or a garbage-collecting `remove` is by id, so with a reusing client in play they
+//! land on the successor. `reuse` therefore offers the move only when no `keep` or removal of the
+//! old job is outstanding (the discipline a reusing client owes), and X1 holds under it.
 //!
 //! ## Time
 //!
@@ -60,8 +88,8 @@
 //!
 //! - **Today's code is modelled, not called.** The stream and today's follow deliver a job's
 //!   `shell_exit` and end; `JobShared`'s once-record keeps a session task from reporting either
-//!   twice; a report commits to the transcript through the epoch fence and then removes the job's
-//!   record from the sandbox. These are pre-notify behaviour with their own tests. S1 and S5 hold
+//!   twice; a report commits to the transcript through the epoch fence and the host removes the
+//!   job's record from the sandbox later (`Act::Collect`, by id; lost if the task ends first). These are pre-notify behaviour with their own tests. S1 and S5 hold
 //!   because of them; their mutations show the properties are not vacuous and that notify's new
 //!   sources really lean on them.
 //! - **The receiver's checks before the kernel** (N21–N24: classify, verify the token, look up the
@@ -70,6 +98,9 @@
 //!   `serve_job_ended.rs` and `notify_token.rs`.
 //! - **No output is modelled.** Offsets, exit codes and a listing's times are 0. The kernels pass
 //!   them through without deciding on them.
+//! - **Spawning, the kill ops and the remove's two steps are not modelled.** A job is spawned when
+//!   started; `kill` is only the wipe's `Stop`; `remove` decides on the cell and takes by key in
+//!   one step (execd awaits between the two), which only a reusing client could split.
 //! - **One session.** Sessions share nothing in either kernel (a kernel per session, a notifier
 //!   per job), so one session is the sound unit.
 //! - **One real use per end, and it must be enough.** The session's current owner makes one real
@@ -114,6 +145,7 @@ use std::collections::BTreeMap;
 
 use beyond_agent::exec_endpoint::notify_kernel as nk;
 use beyond_agent::tools::job_notify::kernel;
+use execd_jobs as jk;
 use stateright::{Checker, Model, Property};
 
 /// Replicas in the ring.
@@ -158,7 +190,6 @@ const SPEC_USE_QUIET_MS: u64 = 30_000;
 /// A job's truth in the sandbox: what `list` would report.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Phase {
-    Unstarted,
     Running,
     /// The shell exited and a member of its group runs on (`exited`).
     Exited,
@@ -174,15 +205,46 @@ impl Phase {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-struct SbJob {
-    phase: Phase,
+/// One job of the sandbox, as execd holds it: the real kernel's state ([`jk::State`], changed only
+/// by [`jk::step`]), and what only the shell and the environment know.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+struct Cell {
+    st: jk::State,
+    /// The id it was started under (a key is `("s", id)`; a cell's index is `id + jobs * generation`).
+    id: u8,
     /// The transcript the job was started on.
     transcript: u8,
-    /// Its record is gone from the sandbox: removed once its end was reported, or wiped.
-    removed: bool,
+    /// The table's entry for its key is this cell (what [`jk::Table`] left in it).
+    in_table: bool,
     /// Wiped by a transcript switch: no report is owed for it anywhere.
     wiped: bool,
+    /// Its processes were stopped (`kill`, `wipe`): the group is empty, whatever `st` has seen.
+    killed: bool,
+    /// The sandbox died under it.
+    lost: bool,
+    /// Ghost: ends of this cell committed to a transcript, by any task (X3).
+    commits: u8,
+    /// Ghost: a `keep` of the replica's took effect on it (X4).
+    kept_ok: bool,
+}
+
+impl Cell {
+    /// What `list` would report.
+    fn phase(&self) -> Phase {
+        if self.lost {
+            return Phase::Lost;
+        }
+        match self.st.phase {
+            jk::Phase::Spawning | jk::Phase::Running { .. } => Phase::Running,
+            jk::Phase::Exited { .. } => Phase::Exited,
+            jk::Phase::Ended { .. } => Phase::Ended,
+        }
+    }
+
+    /// The group is observably empty to the shell.
+    fn empty(&self) -> bool {
+        self.phase().over() || self.killed
+    }
 }
 
 /// Who sent a callback.
@@ -210,7 +272,10 @@ enum At {
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 struct Msg {
+    /// The id the callback names (its body is `(scope, id)`).
     job: u8,
+    /// The cell whose notifier made the attempt (an attempt's answer goes back to that one).
+    cell: u8,
     origin: Origin,
     at: At,
 }
@@ -240,7 +305,16 @@ enum Recon {
 struct TaskJob {
     /// Today's job table tracks it (this task started it, or its open reconcile adopted it).
     tracked: bool,
+    /// The cell it tracks: what its start made, or its open reconcile listed under the id.
+    cell: u8,
+    /// A `keep`'s table lookup: `None` before it, `Some(None)` a `404`, else the cell it found.
+    keep_cell: Option<Option<u8>>,
     link: Link,
+    /// Cells of this job's id whose end this task committed (a bit per cell): X3.
+    reported: u8,
+    /// Its end is reported; the host's garbage collection will remove the record by id
+    /// (`discard_later`, `collect_garbage`), later, and a task that ends first never does.
+    garbage: bool,
     /// A `keep` in flight, with `notify` or not.
     keep: Option<bool>,
     /// Ghost: a `keep` with notify was sent, so its window is open until 30 s after the answer.
@@ -281,7 +355,9 @@ struct Task {
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 struct St {
     sb_alive: bool,
-    job: Vec<SbJob>,
+    /// The sandbox's jobs, by cell (see [`Cell`]): `None` is a cell never started.
+    cell: Vec<Option<Cell>>,
+    /// The notifier of each cell (a job's `Notifier`, which lives in its cell).
     nk: Vec<nk::Job>,
     /// The notifier's clock, in ms. It moves only to a time the notifier asked for.
     nnow: u64,
@@ -293,25 +369,29 @@ struct St {
     transcript: u8,
     chaos: u8,
     calls: u8,
-    bad: u16,
+    bad: u32,
     saw: u16,
 }
 
 // Safety latches.
-const S1_TWICE: u16 = 1 << 0;
-const S2_EARLY: u16 = 1 << 1;
-const S3_OPENED: u16 = 1 << 2;
-const S4_FORGED: u16 = 1 << 3;
-const S5_FENCED: u16 = 1 << 4;
-const S6_TIMER: u16 = 1 << 5;
-const S7_TWO: u16 = 1 << 6;
-const S8_TRANSCRIPT: u16 = 1 << 7;
-const S9_LIMIT: u16 = 1 << 8;
-const S10_EARLY_WAKE: u16 = 1 << 9;
-const S11_WAIT: u16 = 1 << 10;
-const S12_SETTLED_RETRIED: u16 = 1 << 11;
-const S13_FOREIGN_SETTLE: u16 = 1 << 12;
-const S14_NOT_OWED: u16 = 1 << 13;
+const S1_TWICE: u32 = 1 << 0;
+const S2_EARLY: u32 = 1 << 1;
+const S3_OPENED: u32 = 1 << 2;
+const S4_FORGED: u32 = 1 << 3;
+const S5_FENCED: u32 = 1 << 4;
+const S6_TIMER: u32 = 1 << 5;
+const S7_TWO: u32 = 1 << 6;
+const S8_TRANSCRIPT: u32 = 1 << 7;
+const S9_LIMIT: u32 = 1 << 8;
+const S10_EARLY_WAKE: u32 = 1 << 9;
+const S11_WAIT: u32 = 1 << 10;
+const S12_SETTLED_RETRIED: u32 = 1 << 11;
+const S13_FOREIGN_SETTLE: u32 = 1 << 12;
+const S14_NOT_OWED: u32 = 1 << 13;
+// The seam: the job table and the notifier.
+const X1_ATTRIBUTED: u32 = 1 << 14;
+const X2_REMOVED_NOTIFIED: u32 = 1 << 15;
+const X3_END_TWICE: u32 = 1 << 16;
 
 // Witnesses.
 const W_UNHELD: u16 = 1 << 0;
@@ -321,6 +401,7 @@ const W_WALK: u16 = 1 << 3;
 const W_FORGED_REFUSED: u16 = 1 << 4;
 const W_TAKEOVER_ADOPTS: u16 = 1 << 5;
 const W_CALL_ON_UNHELD: u16 = 1 << 6;
+const W_REUSED_WITH_MSG: u16 = 1 << 7;
 
 // ---------------------------------------------------------------------------------------------
 // The model
@@ -346,12 +427,19 @@ enum Mutation {
     PollTimer,
     /// S7: tell the notifier its attempt ended while it is still in flight.
     EarlyAnswer,
-    /// S8: never tell the replica kernel the transcript switched.
+    /// S8: never tell the replica kernel the transcript switched, and never wipe the old
+    /// transcript's jobs: what the sandbox still lists reaches the new transcript.
     HideSwitch,
     /// L1: drop a real use that arrives while a reconcile runs.
     DropUseDuringReconcile,
     /// L1: drop a real use that arrives less than 30 s after a reconcile ended, none running.
     DropEarlyUse,
+    /// X2: a removed job's notifier is reset to its default, as shipped before the fix, so a
+    /// `keep` that reached the job after its removal begins a callback for it.
+    RemoveResetsNotifier,
+    /// X1: a notify attempt outlives its job's removal and its answer goes to whichever job holds
+    /// the key now, not the job whose notifier made the attempt (the notifier's own J9).
+    AnswerByKey,
 }
 
 // Adversary classes: which moves the chaos budget may buy.
@@ -381,6 +469,12 @@ struct Notify {
     retry_cap: u32,
     /// How many of [`DRAWS`] an answer may carry: 1 (the longest wait) or 3.
     draws: usize,
+    /// A `keep` looks its job up and takes the job's lock in two steps ([`Act::KeepResolve`]), so
+    /// the job can leave between them; off, the two are one step.
+    keep_race: bool,
+    /// Another client may start an id again once its job was removed (the table admits it: J9's
+    /// scenario). Each id then has two cells.
+    reuse: bool,
     /// Let the one real use come less than 30 s after a reconcile ended (N29 then asks for one at
     /// the 30 s mark). On in every faithful config; off only to compare.
     use_in_quiet_window: bool,
@@ -396,6 +490,8 @@ impl Notify {
             calls: 1,
             retry_cap: RETRY_CAP,
             draws: 1,
+            reuse: false,
+            keep_race: false,
             use_in_quiet_window: true,
             mutation: Mutation::None,
         }
@@ -454,6 +550,12 @@ enum Act {
     Answer(u8, u8),
     /// The receiver answers an attempt itself with this status ([`RCV`]).
     Reply(u8, u16, u8),
+    /// A `keep` request looks its job up (`Jobs::get`), before it takes the job's lock.
+    KeepResolve(u8, u8),
+    /// Another client starts id `j` again, once its job left the table.
+    Reuse(u8),
+    /// A task's host collects its garbage: the reported job's record is removed, by id.
+    Collect(u8, u8),
     Lose(u8),
     Abandon(u8),
     Replay(u8),
@@ -500,6 +602,129 @@ impl Notify {
         t.transcript == 0
     }
 
+    // ---- the job table: every decision is the real `execd_jobs` kernel's -------------------
+
+    fn key(j: usize) -> jk::Key {
+        ("s".to_string(), job_id(j))
+    }
+
+    /// Cells in the model: each id has a second one when another client may start it again.
+    fn cells(&self) -> usize {
+        self.jobs * if self.reuse { 2 } else { 1 }
+    }
+
+    fn id_of(&self, c: usize) -> usize {
+        c % self.jobs
+    }
+
+    /// The table, as the cells' `in_table` left it (the storage is not state: its entries are).
+    fn table(&self, s: &St) -> jk::Table<u8> {
+        let mut t = jk::Table::default();
+        for (c, cell) in s.cell.iter().enumerate() {
+            if let Some(cell) = cell
+                && cell.in_table
+            {
+                t.insert(Self::key(cell.id as usize), c as u8);
+            }
+        }
+        t
+    }
+
+    /// The cell the table holds under id `j`: a read of the model's own state, for enabling an
+    /// action. A decision about it goes through [`Notify::table`].
+    fn cur(&self, s: &St, j: usize) -> Option<usize> {
+        s.cell
+            .iter()
+            .position(|c| c.as_ref().is_some_and(|c| c.id as usize == j && c.in_table))
+    }
+
+    fn removed(s: &St, c: usize) -> bool {
+        s.cell[c].as_ref().is_some_and(|x| x.st.removed)
+    }
+
+    /// The job a task's stream goes on with: execd's `bound`, the table's entry under the id kept
+    /// only if it is the very job the stream attached to (J9).
+    fn followed(&self, s: &St, tj: &TaskJob, j: usize) -> Option<usize> {
+        // The table's entry under the id: a read of the model's state (the decision is `bound`).
+        let found = self.cur(s, j).map(|c| c as u8);
+        let same = found == Some(tj.cell);
+        jk::bound(found, same).map(usize::from)
+    }
+
+    /// The requests a notifier's job had on the wire are no longer waited for: its attempt task
+    /// is dropped (an abandoned request may still arrive, late).
+    fn abandon_net(s: &mut St, c: usize) {
+        for m in s.net.iter_mut() {
+            if m.cell as usize == c && m.origin == Origin::Attempt {
+                m.origin = Origin::Orphan;
+            }
+        }
+        s.net
+            .retain(|m| !(m.origin == Origin::Orphan && matches!(m.at, At::Back(_))));
+    }
+
+    /// `Jobs::remove` for one cell the table let go: the kernel's `Taken`, then the shell drops
+    /// the job's notifier and leaves the kernel's removed job (`Notifier::removed`). Before the
+    /// fix it reset it to its default, whose `removed` (the one a late `keep` meets) was false.
+    fn taken(&self, s: &mut St, c: usize) {
+        let Some(cell) = s.cell[c].as_mut() else {
+            return;
+        };
+        if jk::step(&mut cell.st, jk::Ev::Taken) != jk::Act::Release {
+            return;
+        }
+        if self.mutation != Mutation::AnswerByKey {
+            Self::abandon_net(s, c);
+        }
+        s.nk[c] = if self.mutation == Mutation::RemoveResetsNotifier {
+            nk::Job::default()
+        } else {
+            nk::step(s.nk[c], nk::Event::Removed, 0).0
+        };
+    }
+
+    /// execd's `remove` and `wipe` on the sandbox: the kernel says which named jobs may leave
+    /// (`Ev::Remove`), the table lets them go (`take`), each is told `Taken`. `expect` is the job
+    /// the caller means to remove: another one leaving under its id is X1.
+    fn remove(&self, s: &mut St, pick: Option<usize>, ended_counts: bool, expect: Option<usize>) {
+        let mut table = self.table(s);
+        let ids: Vec<String> = pick.map(job_id).into_iter().collect();
+        let named = table.in_scope(
+            "s",
+            if pick.is_some() {
+                jk::Pick::Ids(&ids)
+            } else {
+                jk::Pick::All
+            },
+        );
+        let mut keys = Vec::new();
+        for (k, c) in named {
+            let Some(cell) = s.cell[c as usize].as_mut() else {
+                continue;
+            };
+            let ev = jk::Ev::Remove {
+                empty: cell.empty(),
+                ended_counts,
+            };
+            if jk::step(&mut cell.st, ev) == jk::Act::Take {
+                keys.push(k);
+            }
+        }
+        let gone = table.take(&keys);
+        for c in gone {
+            let c = c as usize;
+            if expect.is_some_and(|e| e != c) {
+                s.bad |= X1_ATTRIBUTED;
+            }
+            self.taken(s, c);
+        }
+        for (c, cell) in s.cell.iter_mut().enumerate() {
+            if let Some(cell) = cell {
+                cell.in_table = table.get(&Self::key(cell.id as usize)) == Some(c as u8);
+            }
+        }
+    }
+
     // ---- the notifier: the only call into `notify_kernel` ----------------------------------
 
     /// S9 to S14: what the spec (N16 to N18) says of one step, read off the step's inputs and
@@ -512,7 +737,7 @@ impl Notify {
         now: u64,
         next: &nk::Job,
         actions: &[nk::Action],
-    ) -> u16 {
+    ) -> u32 {
         let mut bad = 0;
         if before.removed {
             return bad;
@@ -573,9 +798,15 @@ impl Notify {
         bad
     }
 
+    /// Feed cell `j`'s notifier. execd feeds a timer's wake and an attempt's answer only to a job
+    /// that is not removed (`notify.rs`); a `keep` and a change are fed as they come.
     fn notifier(&self, s: &mut St, j: usize, event: nk::Event) {
         if !s.sb_alive {
             return; // the supervisors died with the sandbox
+        }
+        let removed = Self::removed(s, j);
+        if removed && matches!(event, nk::Event::Wake | nk::Event::AttemptEnded { .. }) {
+            return;
         }
         let now = s.nnow;
         let before = s.nk[j];
@@ -585,27 +816,26 @@ impl Notify {
         for a in actions {
             match a {
                 nk::Action::Begin { .. } => {
+                    // X2: a removed job is never notified again.
+                    if removed {
+                        s.bad |= X2_REMOVED_NOTIFIED;
+                    }
                     if s.net
                         .iter()
-                        .any(|m| m.job as usize == j && m.origin == Origin::Attempt)
+                        .any(|m| m.cell as usize == j && m.origin == Origin::Attempt)
                     {
                         s.bad |= S7_TWO;
                     }
                     s.net.push(Msg {
-                        job: j as u8,
+                        job: self.id_of(j) as u8,
+                        cell: j as u8,
                         origin: Origin::Attempt,
                         at: At::Edge,
                     });
                 }
                 nk::Action::Abandon => {
                     // The connection is dropped; the request may already be on its way.
-                    for m in s.net.iter_mut() {
-                        if m.job as usize == j && m.origin == Origin::Attempt {
-                            m.origin = Origin::Orphan;
-                        }
-                    }
-                    s.net
-                        .retain(|m| !(m.origin == Origin::Orphan && matches!(m.at, At::Back(_))));
+                    Self::abandon_net(s, j);
                 }
                 nk::Action::WakeAt(_) => {} // `Act::NotifierTimer` is enabled while it waits
             }
@@ -726,7 +956,10 @@ impl Notify {
 
     /// Today's report of job `j`'s end by task `r`: `JobShared`'s once-record, the commit to the
     /// transcript under the epoch fence, then the record's removal from the sandbox.
-    fn report(&self, s: &mut St, r: usize, j: usize) {
+    ///
+    /// `c` is the job whose end the task read: the cell the stream followed, or listed under the
+    /// id. The report is the task's job `j`'s, so a different job's end is X1.
+    fn report(&self, s: &mut St, r: usize, j: usize, c: usize) {
         let epoch = s.epoch;
         let Some(t) = s.task[r].as_mut() else { return };
         if t.jobs[j].reports > 0 && self.mutation != Mutation::NoOnceRecord {
@@ -746,15 +979,24 @@ impl Notify {
         if t.jobs[j].reports > 1 {
             s.bad |= S1_TWICE;
         }
-        if s.job[j].transcript != t.transcript {
-            s.bad |= S8_TRANSCRIPT;
+        // X3: this task commits a job's end once, whichever path carried it.
+        if t.jobs[j].reported & (1 << c) != 0 {
+            s.bad |= X3_END_TWICE;
+        }
+        t.jobs[j].reported |= 1 << c;
+        t.jobs[j].garbage = s.sb_alive;
+        if t.jobs[j].cell as usize != c {
+            s.bad |= X1_ATTRIBUTED;
         }
         if t.jobs[j].was_unheld {
             s.saw |= W_UNHELD_END_REPORTED;
         }
-        if s.sb_alive && !s.job[j].removed {
-            s.job[j].removed = true;
-            self.notifier(s, j, nk::Event::Removed);
+        let tr = t.transcript;
+        if let Some(cell) = s.cell[c].as_mut() {
+            if cell.transcript != tr {
+                s.bad |= S8_TRANSCRIPT;
+            }
+            cell.commits += 1;
         }
     }
 
@@ -780,6 +1022,10 @@ impl Notify {
             jobs: vec![
                 TaskJob {
                     tracked: false,
+                    cell: 0,
+                    keep_cell: None,
+                    reported: 0,
+                    garbage: false,
                     link: Link::None,
                     keep: None,
                     window: false,
@@ -800,9 +1046,10 @@ impl Notify {
         }
     }
 
-    fn mark_use_due(s: &mut St, j: usize) {
+    fn mark_use_due(&self, s: &mut St, c: usize) {
+        let j = self.id_of(c);
         for t in s.task.iter_mut().flatten() {
-            if t.jobs[j].tracked {
+            if t.jobs[j].tracked && t.jobs[j].cell as usize == c {
                 t.use_due = true;
             }
         }
@@ -876,6 +1123,18 @@ impl Notify {
 
     /// After every step: S2, and the witnesses that read the kernel's public state.
     fn observe(&self, s: &mut St) {
+        // X2: a removed job owes nothing: nothing in flight, nothing waiting, no callback owed.
+        for c in 0..self.cells() {
+            if Self::removed(s, c) {
+                let k = s.nk[c];
+                if k.in_flight.is_some()
+                    || k.wake_at.is_some()
+                    || (!k.removed && k.notify && k.owed > k.settled)
+                {
+                    s.bad |= X2_REMOVED_NOTIFIED;
+                }
+            }
+        }
         for t in s.task.iter_mut().flatten() {
             for j in 0..self.jobs {
                 if matches!(
@@ -892,21 +1151,21 @@ impl Notify {
         }
     }
 
+    /// `list`: the table's jobs of the scope, as the kernel's `in_scope` names them.
     fn listing(&self, s: &St) -> Vec<(usize, kernel::Listed)> {
-        (0..self.jobs)
-            .filter_map(|j| {
-                let sj = s.job[j];
-                if sj.removed {
-                    return None;
-                }
-                let l = match sj.phase {
-                    Phase::Unstarted => return None,
+        let table = self.table(s);
+        table
+            .in_scope("s", jk::Pick::All)
+            .into_iter()
+            .filter_map(|((_, id), c)| {
+                let cell = s.cell[c as usize].as_ref()?;
+                let l = match cell.phase() {
                     Phase::Running => kernel::Listed::Running,
                     Phase::Exited => kernel::Listed::Exited { code: 0 },
                     Phase::Ended => kernel::Listed::Ended { code: 0, at: 0 },
                     Phase::Lost => kernel::Listed::Lost { at: 0 },
                 };
-                Some((j, l))
+                Some((job_index(&id), l))
             })
             .collect()
     }
@@ -944,16 +1203,8 @@ impl Model for Notify {
     fn init_states(&self) -> Vec<St> {
         vec![St {
             sb_alive: true,
-            job: vec![
-                SbJob {
-                    phase: Phase::Unstarted,
-                    transcript: 0,
-                    removed: false,
-                    wiped: false,
-                };
-                self.jobs
-            ],
-            nk: vec![nk::Job::default(); self.jobs],
+            cell: vec![None; self.cells()],
+            nk: vec![nk::Job::default(); self.cells()],
             nnow: 0,
             net: Vec::new(),
             ring: 0,
@@ -974,35 +1225,55 @@ impl Model for Notify {
         let own = chaos && self.adversary & OWN != 0;
         let sbx = chaos && self.adversary & SBX != 0;
         let slow = chaos && self.adversary & SLOW != 0;
-        for j in 0..self.jobs {
-            let jb = j as u8;
-            let sj = s.job[j];
-            if s.sb_alive && !sj.removed {
-                if sj.phase == Phase::Running {
-                    acts.push(Act::ShellExit(jb));
+        // The sandbox's own moves, per cell: the shell exits and the group empties (a removed
+        // job's processes still end, and the supervisor still observes it), and the notifier's
+        // timer.
+        for c in 0..self.cells() {
+            let cb = c as u8;
+            let Some(cell) = &s.cell[c] else { continue };
+            if s.sb_alive {
+                if cell.phase() == Phase::Running {
+                    acts.push(Act::ShellExit(cb));
                 }
-                if matches!(sj.phase, Phase::Running | Phase::Exited) {
-                    acts.push(Act::JobEnd(jb));
+                if matches!(cell.phase(), Phase::Running | Phase::Exited) {
+                    acts.push(Act::JobEnd(cb));
                 }
             }
             if s.sb_alive
-                && s.nk[j].in_flight.is_none()
-                && s.nk[j].attempts < self.retry_cap
-                && let Some(at) = s.nk[j].wake_at
+                && s.nk[c].in_flight.is_none()
+                && s.nk[c].attempts < self.retry_cap
+                && let Some(at) = s.nk[c].wake_at
             {
                 if s.nnow >= at {
-                    acts.push(Act::NotifierTimer(jb));
+                    acts.push(Act::NotifierTimer(cb));
                 } else {
-                    acts.push(Act::NotifierAdvance(jb));
-                    acts.push(Act::NotifierEarly(jb));
+                    acts.push(Act::NotifierAdvance(cb));
+                    acts.push(Act::NotifierEarly(cb));
                 }
             }
-            if net && s.sb_alive && sj.phase != Phase::Unstarted && !sj.removed {
+        }
+        for j in 0..self.jobs {
+            let jb = j as u8;
+            if net && s.sb_alive && self.cur(s, j).is_some() {
                 acts.push(Act::Replay(jb));
                 acts.push(Act::Forge(jb));
             }
+            // Another client starts the id again, once its job left the table (the table's `admit`
+            // is the decision; this is only whether the move is offered).
+            if self.reuse
+                && s.sb_alive
+                && self.cur(s, j).is_none()
+                && s.cell[j].is_some()
+                && s.cell[j + self.jobs].is_none()
+                // A client that reuses an id owes the table that nothing of the old job's is still
+                // addressed to it by id: no `keep` in flight, no record left to remove. (The agent
+                // mints a random id per job, so it never reuses one.)
+                && s.task.iter().flatten().all(|t| !t.jobs[j].garbage && t.jobs[j].keep.is_none())
+            {
+                acts.push(Act::Reuse(jb));
+            }
         }
-        if sbx && s.sb_alive && s.job.iter().any(|j| j.phase != Phase::Unstarted) {
+        if sbx && s.sb_alive && s.cell.iter().any(|c| c.is_some()) {
             acts.push(Act::SandboxDies);
         }
         for (i, m) in s.net.iter().enumerate() {
@@ -1077,29 +1348,63 @@ impl Model for Notify {
             for j in 0..self.jobs {
                 let jb = j as u8;
                 let tj = &t.jobs[j];
-                let sj = s.job[j];
                 if s.sb_alive
-                    && sj.phase == Phase::Unstarted
+                    && s.cell[j].is_none()
                     && t.transcript == s.transcript
                     && t.epoch == s.epoch
                 {
                     acts.push(Act::StartJob(rb, jb));
                 }
+                if tj.garbage && s.sb_alive {
+                    acts.push(Act::Collect(rb, jb));
+                }
                 if let Some(notify) = tj.keep {
-                    acts.push(Act::KeepAnswer(rb, jb, Keep::Ok));
-                    if sbx {
-                        if notify {
-                            acts.push(Act::KeepAnswer(rb, jb, Keep::Refused));
+                    if tj.keep_cell.is_none() && s.sb_alive && self.keep_race {
+                        acts.push(Act::KeepResolve(rb, jb));
+                    }
+                    // Without the split, the lookup is part of the answer.
+                    let keep_cell = if self.keep_race || !s.sb_alive {
+                        tj.keep_cell
+                    } else {
+                        tj.keep_cell.or(Some(self.cur(s, j).map(|c| c as u8)))
+                    };
+                    match keep_cell {
+                        // Found: the request answers once it has taken the job's lock.
+                        Some(Some(_)) => {
+                            acts.push(Act::KeepAnswer(rb, jb, Keep::Ok));
+                            if sbx {
+                                if notify {
+                                    acts.push(Act::KeepAnswer(rb, jb, Keep::Refused));
+                                }
+                                acts.push(Act::KeepAnswer(rb, jb, Keep::FailedUnrecorded));
+                                acts.push(Act::KeepAnswer(rb, jb, Keep::FailedRecorded));
+                            }
                         }
-                        acts.push(Act::KeepAnswer(rb, jb, Keep::FailedUnrecorded));
-                        acts.push(Act::KeepAnswer(rb, jb, Keep::FailedRecorded));
+                        // `404`: an answer the protocol gives, no adversary needed.
+                        Some(None) => acts.push(Act::KeepAnswer(rb, jb, Keep::FailedUnrecorded)),
+                        // The request never reached a live sandbox: an error, no adversary needed.
+                        None if !s.sb_alive => {
+                            acts.push(Act::KeepAnswer(rb, jb, Keep::FailedUnrecorded))
+                        }
+                        None => {
+                            if sbx {
+                                if notify {
+                                    acts.push(Act::KeepAnswer(rb, jb, Keep::Refused));
+                                }
+                                acts.push(Act::KeepAnswer(rb, jb, Keep::FailedUnrecorded));
+                            }
+                        }
                     }
                 }
-                if matches!(tj.link, Link::Stream | Link::Closing) && !tj.in_call {
-                    if sj.phase == Phase::Exited && tj.exits == 0 {
+                if matches!(tj.link, Link::Stream | Link::Closing)
+                    && !tj.in_call
+                    && let Some(c) = self.followed(s, tj, j)
+                    && let Some(cell) = &s.cell[c]
+                {
+                    if cell.phase() == Phase::Exited && tj.exits == 0 {
                         acts.push(Act::StreamExit(rb, jb));
                     }
-                    if sj.phase.over() {
+                    if cell.phase().over() {
                         acts.push(Act::StreamEnd(rb, jb));
                     }
                 }
@@ -1162,10 +1467,27 @@ impl Model for Notify {
         match a {
             Act::StartJob(r, j) => {
                 let (r, j) = (r as usize, j as usize);
-                s.job[j].phase = Phase::Running;
-                s.job[j].transcript = s.transcript;
+                // A held start: the table admits the key (J1), the job is spawned. The replica
+                // mints a fresh id for every job, so this is the id's first cell.
+                if self.table(&s).admit(&Self::key(j)) != jk::Admit::Fresh {
+                    return None;
+                }
+                let mut st = jk::State::new(0, true);
+                jk::step(&mut st, jk::Ev::Spawned { pgid: 1 });
+                s.cell[j] = Some(Cell {
+                    st,
+                    id: j as u8,
+                    transcript: s.transcript,
+                    in_table: true,
+                    wiped: false,
+                    killed: false,
+                    lost: false,
+                    commits: 0,
+                    kept_ok: false,
+                });
                 let t = s.task[r].as_mut()?;
                 t.jobs[j].tracked = true;
+                t.jobs[j].cell = j as u8;
                 t.jobs[j].link = Link::Stream;
                 let event = kernel::Event::Kept {
                     job: job_id(j),
@@ -1174,24 +1496,46 @@ impl Model for Notify {
                 };
                 self.replica(&mut s, r, event, false, None);
             }
-            Act::ShellExit(j) => {
-                let j = j as usize;
-                s.job[j].phase = Phase::Exited;
-                self.notifier(&mut s, j, nk::Event::Change);
+            Act::ShellExit(c) => {
+                // `supervise`: the shell exited with its group alive; a callback is owed whenever
+                // the kernel says the exit is observable (`Act::Exited`), a removed job included.
+                let c = c as usize;
+                let cell = s.cell[c].as_mut()?;
+                let ev = jk::Ev::ShellExit {
+                    code: 0,
+                    signal: None,
+                };
+                if jk::step(&mut cell.st, ev) == jk::Act::Exited {
+                    self.notifier(&mut s, c, nk::Event::Change);
+                }
             }
-            Act::JobEnd(j) => {
-                let j = j as usize;
-                s.job[j].phase = Phase::Ended;
-                self.notifier(&mut s, j, nk::Event::Change);
-                Self::mark_use_due(&mut s, j);
+            Act::JobEnd(c) => {
+                // `supervise`: the group is empty. A callback is owed only if the kernel says so
+                // (`Ended { notify }`: not for a removed job).
+                let c = c as usize;
+                let cell = s.cell[c].as_mut()?;
+                let ev = jk::Ev::GroupEmpty {
+                    code: 0,
+                    signal: None,
+                    now: 0,
+                };
+                if let jk::Act::Ended { notify } = jk::step(&mut cell.st, ev) {
+                    if notify {
+                        self.notifier(&mut s, c, nk::Event::Change);
+                    }
+                    self.mark_use_due(&mut s, c);
+                }
             }
             Act::SandboxDies => {
                 spend(&mut s);
                 s.sb_alive = false;
-                for j in 0..self.jobs {
-                    if matches!(s.job[j].phase, Phase::Running | Phase::Exited) {
-                        s.job[j].phase = Phase::Lost;
-                        Self::mark_use_due(&mut s, j);
+                for c in 0..self.cells() {
+                    let Some(cell) = s.cell[c].as_mut() else {
+                        continue;
+                    };
+                    if matches!(cell.phase(), Phase::Running | Phase::Exited) {
+                        cell.lost = true;
+                        self.mark_use_due(&mut s, c);
                     }
                 }
                 // Its supervisors die with it: nobody waits for an answer any more.
@@ -1203,11 +1547,52 @@ impl Model for Notify {
                 s.net
                     .retain(|m| !(m.origin == Origin::Orphan && matches!(m.at, At::Back(_))));
             }
-            Act::NotifierAdvance(j) => {
-                s.nnow = s.nnow.max(s.nk[j as usize].wake_at?);
+            Act::NotifierAdvance(c) => {
+                s.nnow = s.nnow.max(s.nk[c as usize].wake_at?);
             }
-            Act::NotifierEarly(j) | Act::NotifierTimer(j) => {
-                self.notifier(&mut s, j as usize, nk::Event::Wake)
+            Act::NotifierEarly(c) | Act::NotifierTimer(c) => {
+                self.notifier(&mut s, c as usize, nk::Event::Wake)
+            }
+            Act::KeepResolve(r, j) => {
+                // `keep_or_seen`: `ctx.jobs.get(&key)`, the table's lock released; the job's lock
+                // comes later, and the job may have left the table in between.
+                let (r, j) = (r as usize, j as usize);
+                let found = self.table(&s).get(&Self::key(j));
+                let t = s.task[r].as_mut()?;
+                t.jobs[j].keep_cell = Some(found);
+            }
+            Act::Collect(r, j) => {
+                let (r, j) = (r as usize, j as usize);
+                let own = {
+                    let tj = &mut s.task[r].as_mut()?.jobs[j];
+                    tj.garbage = false;
+                    tj.cell as usize
+                };
+                self.remove(&mut s, Some(j), true, Some(own));
+            }
+            Act::Reuse(j) => {
+                // Another client starts the id again. Only the table's `admit` decides it.
+                let j = j as usize;
+                if self.table(&s).admit(&Self::key(j)) != jk::Admit::Fresh {
+                    return None;
+                }
+                let mut st = jk::State::new(0, false);
+                jk::step(&mut st, jk::Ev::Spawned { pgid: 2 });
+                let c = j + self.jobs;
+                if s.net.iter().any(|m| m.job as usize == j) {
+                    s.saw |= W_REUSED_WITH_MSG;
+                }
+                s.cell[c] = Some(Cell {
+                    st,
+                    id: j as u8,
+                    transcript: s.transcript,
+                    in_table: true,
+                    wiped: false,
+                    killed: false,
+                    lost: false,
+                    commits: 0,
+                    kept_ok: false,
+                });
             }
             Act::Route(i) => {
                 // E3, in one step: the hashed target first, then the walk in ring order, all
@@ -1259,7 +1644,7 @@ impl Model for Notify {
                     outcome: nk::Outcome::Status(code),
                     draw: DRAWS[d as usize],
                 };
-                self.notifier(&mut s, m.job as usize, event);
+                self.notifier(&mut s, m.cell as usize, event);
             }
             Act::Answer(i, d) => {
                 let m = s.net.remove(i as usize);
@@ -1271,7 +1656,17 @@ impl Model for Notify {
                     };
                     let draw = DRAWS[d as usize];
                     let event = nk::Event::AttemptEnded { outcome, draw };
-                    self.notifier(&mut s, m.job as usize, event);
+                    let mut c = m.cell as usize;
+                    if self.mutation == Mutation::AnswerByKey
+                        && let Some(now) = self.cur(&s, m.job as usize)
+                    {
+                        c = now;
+                    }
+                    // X1: an answer settles the notifier of the job whose attempt it answers.
+                    if c != m.cell as usize {
+                        s.bad |= X1_ATTRIBUTED;
+                    }
+                    self.notifier(&mut s, c, event);
                 }
             }
             Act::Lose(i) => {
@@ -1297,7 +1692,7 @@ impl Model for Notify {
                         outcome: nk::Outcome::Failed,
                         draw: 0,
                     };
-                    self.notifier(&mut s, copy.job as usize, event);
+                    self.notifier(&mut s, copy.cell as usize, event);
                 } else {
                     s.net[i] = copy;
                     s.net.push(Msg {
@@ -1309,16 +1704,20 @@ impl Model for Notify {
             }
             Act::Replay(j) => {
                 spend(&mut s);
+                let cell = self.cur(&s, j as usize)? as u8;
                 s.net.push(Msg {
                     job: j,
+                    cell,
                     origin: Origin::Orphan,
                     at: At::Edge,
                 });
             }
             Act::Forge(j) => {
                 spend(&mut s);
+                let cell = self.cur(&s, j as usize)? as u8;
                 s.net.push(Msg {
                     job: j,
+                    cell,
                     origin: Origin::Forged,
                     at: At::Edge,
                 });
@@ -1362,17 +1761,25 @@ impl Model for Notify {
                 t.open_ok = alive;
                 let transcript = t.transcript;
                 if alive {
+                    // `list` of the scope: every job the table holds, read by id.
+                    let listed = self.table(&s);
                     for j in 0..self.jobs {
-                        let sj = s.job[j];
-                        if sj.phase == Phase::Unstarted || sj.removed || sj.transcript != transcript
-                        {
+                        let Some(c) = listed.get(&Self::key(j)).map(usize::from) else {
+                            continue;
+                        };
+                        let Some(sj) = s.cell[c].as_ref() else {
+                            continue;
+                        };
+                        if sj.transcript != transcript {
                             continue;
                         }
+                        let over = sj.phase().over();
                         let Some(t) = s.task[r].as_mut() else { break };
                         t.jobs[j].tracked = true;
-                        if sj.phase.over() {
+                        t.jobs[j].cell = c as u8;
+                        if over {
                             // Read back what ended, as today's reattach does.
-                            self.report(&mut s, r, j);
+                            self.report(&mut s, r, j, c);
                         } else {
                             // Adopt a kept job that runs; its follow stands for the stream (N42).
                             t.jobs[j].link = Link::Stream;
@@ -1391,24 +1798,53 @@ impl Model for Notify {
             }
             Act::KeepAnswer(r, j, outcome) => {
                 let (r, j) = (r as usize, j as usize);
-                if outcome != Keep::Ok {
+                // A `404` and an error from a dead sandbox are the protocol's; the rest is a move.
+                let free = s.task[r].as_ref()?.jobs[j].keep_cell == Some(None)
+                    || !s.sb_alive
+                    || (!self.keep_race && self.cur(&s, j).is_none());
+                if outcome != Keep::Ok && !free {
                     spend(&mut s);
                 }
-                let reachable = s.sb_alive && !s.job[j].removed;
+                // The request found its job (`KeepResolve`) and takes its lock: the job may have left
+                // the table since, but the request answers `200` all the same (`keep_or_seen`).
+                let found = match s.task[r].as_ref()?.jobs[j].keep_cell {
+                    Some(f) => f,
+                    None if self.keep_race => None,
+                    None => self.table(&s).get(&Self::key(j)),
+                };
+                // X1: a `keep` is by id, so it lands on whatever job holds the id now.
+                let own = s.task[r].as_ref()?.jobs[j].cell;
+                if found.is_some_and(|c| c != own) {
+                    s.bad |= X1_ATTRIBUTED;
+                }
+                let applied = s.sb_alive && found.is_some();
                 let outcome = match outcome {
-                    Keep::Ok if !reachable => Keep::FailedUnrecorded,
+                    Keep::Ok | Keep::FailedRecorded if !applied => Keep::FailedUnrecorded,
                     o => o,
                 };
                 let t = s.task[r].as_mut()?;
                 let now = t.now;
                 let notify = t.jobs[j].keep.take()?;
+                t.jobs[j].keep_cell = None;
                 if notify {
                     t.jobs[j].keep_answered_at = Some(now);
                     t.jobs[j].keep_notify_ok = outcome == Keep::Ok;
                 }
-                if matches!(outcome, Keep::Ok | Keep::FailedRecorded) {
-                    self.notifier(&mut s, j, nk::Event::Keep { notify });
+                if matches!(outcome, Keep::Ok | Keep::FailedRecorded)
+                    && let Some(c) = found.map(usize::from)
+                {
+                    if let Some(cell) = s.cell[c].as_mut() {
+                        let ev = jk::Ev::Keep {
+                            num: None,
+                            kind: None,
+                            seen: None,
+                        };
+                        jk::step(&mut cell.st, ev);
+                        cell.kept_ok = true;
+                    }
+                    self.notifier(&mut s, c, nk::Event::Keep { notify });
                 }
+
                 if notify {
                     let told = match outcome {
                         Keep::Ok => kernel::KeepOutcome::Succeeded,
@@ -1429,8 +1865,10 @@ impl Model for Notify {
             Act::StreamExit(r, j) => self.apply_exit(&mut s, r as usize, j as usize),
             Act::StreamEnd(r, j) => {
                 let (r, j) = (r as usize, j as usize);
+                let tj = s.task[r].as_ref()?.jobs[j];
+                let c = self.followed(&s, &tj, j)?;
                 s.task[r].as_mut()?.jobs[j].link = Link::None;
-                self.report(&mut s, r, j);
+                self.report(&mut s, r, j, c);
                 let event = kernel::Event::StreamEnded { job: job_id(j) };
                 self.replica(&mut s, r, event, false, None);
             }
@@ -1531,9 +1969,13 @@ impl Model for Notify {
                 // with its end, which it reports.
                 let (r, j) = (r as usize, j as usize);
                 s.task[r].as_mut()?.jobs[j].in_call = false;
-                let ended = s.job[j].phase.over();
-                if ended {
-                    self.report(&mut s, r, j);
+                // The call reads the job by id.
+                let c = self.cur(&s, j);
+                let ended = c.is_some_and(|c| s.cell[c].as_ref().is_some_and(|x| x.phase().over()));
+                if let Some(c) = c
+                    && ended
+                {
+                    self.report(&mut s, r, j, c);
                 }
                 let event = kernel::Event::PutBack {
                     job: job_id(j),
@@ -1547,16 +1989,23 @@ impl Model for Notify {
                 let r = r as usize;
                 let old = s.task[r].as_ref()?.transcript;
                 s.transcript += 1;
-                // The switch kills and wipes the old transcript's jobs.
-                for j in 0..self.jobs {
-                    let sj = s.job[j];
-                    if sj.transcript == old && sj.phase != Phase::Unstarted && !sj.removed {
-                        if !sj.phase.over() {
-                            s.job[j].phase = Phase::Ended;
+                // The switch kills and wipes the old transcript's jobs: `Stop` (their processes are
+                // killed), then every one whose group is empty leaves the table. What the processes
+                // do next (the shell's exit, the group's end) the supervisors still observe.
+                for c in 0..self.cells() {
+                    let Some(cell) = s.cell[c].as_mut() else {
+                        continue;
+                    };
+                    if cell.transcript != old || !cell.in_table {
+                        continue;
+                    }
+                    cell.wiped = true;
+                    if s.sb_alive && self.mutation != Mutation::HideSwitch {
+                        if jk::step(&mut cell.st, jk::Ev::Stop) == jk::Act::Stop {
+                            cell.killed = true;
                         }
-                        s.job[j].removed = true;
-                        s.job[j].wiped = true;
-                        self.notifier(&mut s, j, nk::Event::Removed);
+                        let id = self.id_of(c);
+                        self.remove(&mut s, Some(id), false, Some(c));
                     }
                 }
                 let tr = s.transcript;
@@ -1566,6 +2015,8 @@ impl Model for Notify {
                     tj.tracked = false;
                     tj.link = Link::None;
                     tj.keep = None;
+                    tj.keep_cell = None;
+                    tj.garbage = false;
                 }
                 if self.mutation != Mutation::HideSwitch {
                     self.replica(&mut s, r, kernel::Event::TranscriptSwitched, false, None);
@@ -1625,9 +2076,29 @@ impl Model for Notify {
                         return true;
                     };
                     (0..m.jobs).all(|j| {
-                        let sj = s.job[j];
-                        !(sj.phase.over() && !sj.wiped && t.jobs[j].tracked)
-                            || t.jobs[j].reports > 0
+                        let tj = &t.jobs[j];
+                        let Some(cell) = &s.cell[tj.cell as usize] else {
+                            return true;
+                        };
+                        !(cell.phase().over() && !cell.wiped && tj.tracked) || tj.reports > 0
+                    })
+                },
+            ),
+            Property::<Self>::always(SAFETY[14], |_, s| s.bad & X1_ATTRIBUTED == 0),
+            Property::<Self>::always(SAFETY[15], |_, s| s.bad & X2_REMOVED_NOTIFIED == 0),
+            Property::<Self>::always(SAFETY[16], |_, s| s.bad & X3_END_TWICE == 0),
+            // X4, in every settled state like L1, and over the table's own claim rather than the
+            // task's tracking: a job the replica kept has had its end reported.
+            Property::<Self>::always(
+                "X4: once settled, every kept job's end is reported",
+                |m, s| {
+                    let mut acts = Vec::new();
+                    m.actions(s, &mut acts);
+                    if !acts.is_empty() || m.current_task(s).is_none() {
+                        return true;
+                    }
+                    s.cell.iter().flatten().all(|c| {
+                        !(c.kept_ok && c.st.kept() && c.phase().over() && !c.wiped) || c.commits > 0
                     })
                 },
             ),
@@ -1656,6 +2127,12 @@ impl Model for Notify {
             props.push(Property::<Self>::sometimes(
                 "W: a new owner adopts and keeps again",
                 |_, s| s.saw & W_TAKEOVER_ADOPTS != 0,
+            ));
+        }
+        if self.reuse {
+            props.push(Property::<Self>::sometimes(
+                "W: an id is reused while a message for its old job is on the wire",
+                |_, s| s.saw & W_REUSED_WITH_MSG != 0,
             ));
         }
         if self.calls > 0 {
@@ -1689,7 +2166,7 @@ fn full() -> bool {
     std::env::var_os("NOTIFY_MODEL_FULL").is_some()
 }
 
-const SAFETY: [&str; 14] = [
+const SAFETY: [&str; 17] = [
     "S1: each end and shell exit is reported at most once per session task",
     "S2: a job is unheld only after keep with notify succeeded and a proof arrived in its window",
     "S3: a callback never opens a session",
@@ -1704,6 +2181,9 @@ const SAFETY: [&str; 14] = [
     "S12: an answer that settles is never retried",
     "S13: an answer settles only its own attempt",
     "S14: a keep with notify, and a change under one, each owe one callback more",
+    "X1: a callback, answer, report or removal for a job is never applied to another job that reuses its id",
+    "X2: a removed job is never notified again and owes nothing",
+    "X3: each job's end is committed at most once, stream, callback and read-back together",
 ];
 
 /// The actions of `path` up to the first state that breaks `property` (the latches stay set, so
@@ -1764,6 +2244,7 @@ fn notify_one_job_any_single_fault() {
     check(
         Notify {
             calls: 0,
+            keep_race: true,
             ..Notify::new(1, 1)
         },
         "one job, any single fault",
@@ -1774,13 +2255,16 @@ fn notify_one_job_any_single_fault() {
 #[test]
 fn notify_one_job_with_a_bash_job_call() {
     check(Notify::new(1, 0), "one job, a bash_job call");
-    check(
-        Notify {
-            adversary: NET,
-            ..Notify::new(1, 1)
-        },
-        "one job, a bash_job call, one network fault",
-    );
+    // The network faults with a call are 9 M states: exhaustive only.
+    if full() {
+        check(
+            Notify {
+                adversary: NET,
+                ..Notify::new(1, 1)
+            },
+            "one job, a bash_job call, one network fault",
+        );
+    }
 }
 
 /// Any two network faults: the callback lost, late and duplicated, replayed or forged, timed out.
@@ -1823,6 +2307,36 @@ fn notify_one_job_retries_to_the_limit() {
 #[test]
 fn notify_one_job_waits_over_every_draw() {
     check(Notify::drawn(3), "one job, three answers, three draws");
+}
+
+/// The seam: the real job table with the notifier. One job whose id another client may start
+/// again once the job left the table, under any one network or sandbox move (a lost, late or
+/// replayed callback while the id is reused; a wipe; the sandbox's death with a kept job).
+#[test]
+fn notify_one_job_id_reuse() {
+    check(
+        Notify {
+            reuse: true,
+            keep_race: true,
+            adversary: NET | SBX,
+            calls: 0,
+            ..Notify::new(1, 1)
+        },
+        "one job, its id reused, one network or sandbox fault",
+    );
+}
+
+/// The seam without a fault: a `keep` that looked its job up before the job's report removed it
+/// takes the job's lock afterwards, with a `bash_job` call about it too.
+#[test]
+fn notify_one_job_keep_races_removal() {
+    check(
+        Notify {
+            keep_race: true,
+            ..Notify::new(1, 0)
+        },
+        "one job, a keep racing its removal",
+    );
 }
 
 /// Exhaustive (`NOTIFY_MODEL_FULL=1`): any two ownership moves.
@@ -1881,7 +2395,8 @@ fn mutation_no_once_record_reports_twice() {
     mutant(
         Notify::new(1, 0).mutated(Mutation::NoOnceRecord),
         SAFETY[0],
-        &[],
+        // The same missing record commits one cell's end twice.
+        &[SAFETY[16]],
     );
 }
 
@@ -2002,6 +2517,39 @@ fn mutation_hidden_switch_reports_into_the_wrong_transcript() {
         }
         .mutated(Mutation::HideSwitch),
         SAFETY[7],
+        &[],
+    );
+}
+
+/// X2: a `keep` that looked its job up, then waited for its lock while the job's end was reported
+/// and the job removed, found a notifier reset to its default (`removed` false): the kernel begins
+/// a callback for a job that is gone. Reached with no fault.
+#[test]
+fn mutation_remove_resets_notifier_notifies_a_removed_job() {
+    mutant(
+        Notify {
+            keep_race: true,
+            ..Notify::new(1, 0)
+        }
+        .mutated(Mutation::RemoveResetsNotifier),
+        SAFETY[15],
+        &[],
+    );
+}
+
+/// X1: an attempt that outlives its job's removal and answers to the key's holder now, a job
+/// another client started under the same id.
+#[test]
+fn mutation_answer_by_key_settles_the_successor() {
+    mutant(
+        Notify {
+            reuse: true,
+            adversary: NET,
+            calls: 0,
+            ..Notify::new(1, 1)
+        }
+        .mutated(Mutation::AnswerByKey),
+        SAFETY[14],
         &[],
     );
 }
