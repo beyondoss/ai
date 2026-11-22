@@ -10,21 +10,21 @@ variables alone ([Configuration](#configuration)).
 
 ## Modules
 
-| file                | role                                                                                                     |
-| ------------------- | -------------------------------------------------------------------------------------------------------- |
-| `src/lib.rs`        | `Options`, the `Observer` trait, `serve` and `Handle`, and the derived limits                            |
-| `src/main.rs`       | the binary: bearer sources and the environment scrub, fail-closed start, subreaper, signals              |
-| `src/config.rs`     | the binary's settings: every `EXECD_*` variable, parsed once at startup, and the usage text              |
-| `src/log.rs`        | the logger: one text line per event to stderr, level via `EXECD_LOG` / `log::set_level`, no subscriber   |
-| `src/runas.rs`      | `EXECD_RUN_AS`: resolving the user, proving execd can switch, the switch helper                          |
-| `src/http.rs`       | hyper (HTTP/1.1 and h2c), routing, `/livez`, the bearer check, the request limit, the log line           |
-| `src/exec.rs`       | one-shot envelope and streams: pumps, the sink, heartbeat, leftovers, timeout, disconnect                |
-| `src/jobs.rs`       | jobs: the table, the output ring, the supervisor, job streams                                            |
-| `src/job_kernel.rs` | the job table's decisions, pure; `tests/job_model.rs` model-checks them                                  |
-| `src/notify.rs`     | notify: the sender that drives the `exec-notify` kernel                                                  |
-| `src/proc.rs`       | spawning, the reaper that collects every child, process groups by syscall, the subreaper                 |
-| `src/spool.rs`      | the jobs directory: where a kept job's retained output lives as chunk files, and stale-directory cleanup |
-| `src/frame.rs`      | streaming frame encoding                                                                                 |
+| file                | role                                                                                                              |
+| ------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `src/lib.rs`        | `Options`, the `Observer` trait, `serve` and `Handle`, and the derived limits                                     |
+| `src/main.rs`       | the binary: bearer sources and the environment scrub, fail-closed start, subreaper, signals                       |
+| `src/config.rs`     | the binary's settings: every `EXECD_*` variable, parsed once at startup, and the usage text                       |
+| `src/log.rs`        | the logger: one text line per event to stderr, level via `EXECD_LOG` / `log::set_level`, no subscriber            |
+| `src/runas.rs`      | `EXECD_RUN_AS`: resolving the user, proving execd can switch, the switch helper                                   |
+| `src/http.rs`       | hyper (HTTP/1.1 and h2c), routing, `/livez`, the bearer check, the request limit, the log line                    |
+| `src/exec.rs`       | one-shot envelope and streams: pumps, the sink, heartbeat, leftovers, timeout, disconnect                         |
+| `src/jobs.rs`       | jobs: the table, the output ring, the supervisor, job streams                                                     |
+| `crates/execd-jobs` | the job table's decisions, pure and proven in Verus (`execd::job_kernel`); `tests/job_model.rs` model-checks them |
+| `src/notify.rs`     | notify: the sender that drives the `exec-notify` kernel                                                           |
+| `src/proc.rs`       | spawning, the reaper that collects every child, process groups by syscall, the subreaper                          |
+| `src/spool.rs`      | the jobs directory: where a kept job's retained output lives as chunk files, and stale-directory cleanup          |
+| `src/frame.rs`      | streaming frame encoding                                                                                          |
 
 ## Configuration
 
@@ -170,7 +170,7 @@ no answer, no argument and no environment; `Debug` for it prints `<redacted>`.
 
 ### The job kernel: `job_kernel`
 
-The job table's decisions are pure functions in `src/job_kernel.rs`: no I/O, no async, no clock (a time arrives in the event),
+The job table's decisions are pure functions in `crates/execd-jobs` (re-exported as `execd::job_kernel`, so the model and production call the same code; written inside `verus!` and proven for every J and L below with no bound, see its README): no I/O, no async, no clock (a time arrives in the event),
 no closure in a decision. `jobs.rs` takes a lock, calls the kernel, and performs the action it returns, in the same order as
 before. The two locks stay as they were, and the kernel follows them:
 
@@ -203,7 +203,9 @@ operation resolves another scope's job, J3 a removed job never answers again (an
 J4 an ended job never changes, J5 output offsets only move forward over what is held, J6 a kept job never dies with a held client,
 J7 a job leaves only with its group empty, J8 no signal reaches an ended job, J9 a stream follows the job it attached to, never a later job of its id, L1 an ended job can always be removed, L2 an ended
 job's stream sends its final frame. `production_calls_the_kernel` fails if `jobs.rs` stops calling the kernel or writes job state
-outside it.
+outside it. `crates/execd-jobs/tests/production.rs` fails if `execd::job_kernel` stops being that crate, a decision leaves its `verus!` block, or a second copy of the state machine appears.
+
+The kernel is a crate of its own because Verus verifies a crate whole, and execd's async stack is not Verus's to build. `mise run verify:kernels` proves it (CI's `verus` job); `mise run verify:kernels -- --features mut_x` must go red for each mutation below except `mut_remove_keeps_entry`, whose decision is the `HashMap`'s (the crate README names what stays outside).
 
 ```sh
 cargo test -p beyond-execd --test job_model faithful          # both bounds, all properties
