@@ -96,10 +96,10 @@ done
 '''
 
 [tasks."test:notify-model-job-mutants"]
-description = "The notify model under each job-table kernel mutation that touches the seam (crates/execd-jobs): every run must go red."
+description = "The notify model under the job-table kernel mutation that touches the seam (crates/execd-jobs): a removed job that stays in the table (J3) must turn the model red. The other table mutations (J7, J9) need a stream on a removed job or a live removal, which no agent flow reaches; the table's own model (crates/execd/tests/job_model.rs) covers them."
 run = '''
 set -u
-for m in mut_remove_keeps_entry mut_remove_live mut_stream_follows_key mut_scope_ignored; do
+for m in mut_remove_keeps_entry; do
   if cargo test -p beyond-agent --test it --locked --features "beyond-agent/$m" -- notify_model::notify_one_job >/dev/null 2>&1; then
     echo "model stayed green under $m" >&2; exit 1
   fi
