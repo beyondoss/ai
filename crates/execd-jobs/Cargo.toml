@@ -40,3 +40,5 @@ mut_ended_not_removable = [] # `remove` waits for the group to look empty, even 
 mut_stream_follows_key = [] # a stream goes on with whatever job holds its key now (J9)
 mut_take_by_key = [] # a take removes whatever job holds the key now, not the job checked (J10)
 mut_follow_waits_after_end = [] # a stream never sends its final frame (L2)
+mut_signal_after_reap = [] # a signal by number is sent to a group the reaper has freed (J11)
+mut_held_forgets = [] # a spawn's group is not held, so a live group is never signalled (J11 liveness)

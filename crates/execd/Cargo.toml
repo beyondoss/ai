@@ -59,6 +59,12 @@ mut_take_by_key = [
 mut_follow_waits_after_end = [
   "beyond-execd-jobs/mut_follow_waits_after_end",
 ] # a stream never sends its final frame (L2)
+mut_signal_after_reap = [
+  "beyond-execd-jobs/mut_signal_after_reap",
+] # a signal by number reaches a group the reaper has freed (J11)
+mut_held_forgets = [
+  "beyond-execd-jobs/mut_held_forgets",
+] # a spawn's group is never held, so a live group is refused every signal (J11 liveness)
 
 [dependencies]
 base64.workspace = true
