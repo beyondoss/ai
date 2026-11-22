@@ -27,8 +27,7 @@ verify = true
 
 [features]
 # Mutations of the kernel's decisions: `mise run verify:kernels -- --features mut_x` and the notify model
-# (`mise run test:notify-model-mutants`) go red under them: the proof under every one, the model under
-# `mut_keep_keeps_in_flight` and `mut_change_begins_in_flight` (S7; it is blind to the rest by design). The agent forwards them.
+# (`mise run test:notify-model-mutants`) go red under every one of them. The agent forwards them.
 mut_keep_keeps_in_flight = []
 mut_change_begins_in_flight = []
 mut_answer_settles_all = []

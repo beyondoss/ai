@@ -324,8 +324,8 @@ fn production_calls_the_verified_step() {
     let read = |p: &str| std::fs::read_to_string(crates.join(p)).unwrap();
     for caller in ["execd/src/notify.rs", "test-support/src/exec_mock.rs"] {
         assert!(
-            read(caller).contains("exec_notify::step("),
-            "{caller} must feed events to exec_notify::step"
+            read(caller).contains("exec_notify::step_checked("),
+            "{caller} must feed events to exec_notify::step_checked (which calls step)"
         );
     }
     assert!(

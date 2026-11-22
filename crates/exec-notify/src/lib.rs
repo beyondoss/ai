@@ -611,7 +611,11 @@ pub const MAX_NOW_MS: u64 = u64::MAX - MAX_WAIT_MS;
 /// [`MAX_NOW_MS`], never wrapping. Reaching it takes 5.8e8 years; if it ever did, time stops
 /// there and no wait wraps.
 pub fn clock(ms: u128) -> u64 {
-    if ms > MAX_NOW_MS as u128 { MAX_NOW_MS } else { ms as u64 }
+    if ms > MAX_NOW_MS as u128 {
+        MAX_NOW_MS
+    } else {
+        ms as u64
+    }
 }
 
 /// [`step`] for a caller that cannot prove its preconditions: `now` saturates ([`clock`]'s bound),

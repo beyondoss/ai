@@ -16,7 +16,11 @@
 //! callback changes no state; (S5) a superseded owner never commits a report; (S6) nothing on a
 //! timer alone contacts the sandbox: every `list` answers a callback, a release or a real use;
 //! (S7) a job has at most one attempt in flight; (S8) a report lands only in its job's own
-//! transcript.
+//! transcript; and, read off every step of the notifier's kernel as it is taken (so a later real
+//! use that rescues a lost notice cannot hide a bad step): (S9) a count makes at most 12 attempts;
+//! (S10) a wake before its time begins nothing; (S11) the wait after failed attempt n lies in
+//! [d(n)/2, d(n)]; (S12) an answer that settles is never retried; (S13) an answer settles only its
+//! own attempt; (S14) a `keep` with notify, and a change under one, each owe one callback more.
 //!
 //! Liveness (L1), checked in every settled state (no action left): every end the open session
 //! tracks has been reported, by its stream, a callback or the next real use after it. A session that is not open
@@ -45,8 +49,10 @@
 //! Both kernels read no clock: time is an input. Each replica has its own clock, which moves only
 //! to the replica kernel's `next_wake()` ([`Act::Advance`]) or before a real use; [`Act::Tick`]
 //! then delivers a deadline, so a callback can also arrive after its deadline passed and before
-//! its tick, as a late timer allows. The notifier's waits end when [`Act::NotifierTimer`] says (it
-//! wakes at exactly the time the kernel asked for, on a clock of 0, with a draw of 0). Every other
+//! its tick, as a late timer allows. The notifier has its own clock, which moves only to the time the
+//! kernel asked to be woken at ([`Act::NotifierAdvance`]); a wake can also arrive early
+//! ([`Act::NotifierEarly`]). An answer's draw is the longest wait, or in [`Notify::drawn`] the
+//! shortest, the midpoint or the longest. Every other
 //! timer (the edge's 25 s, the supervisor's 30 s, a session's idle reap) is a nondeterministic
 //! action, so the model covers every order of them.
 //!
@@ -88,11 +94,12 @@
 //!   seconds). `NOTIFY_MODEL_FULL=1` adds any two moves of any class (about 85 M states), two
 //!   ownership moves (25 M) and two jobs (46 M), each minutes. Every mutation's
 //!   counterexample needs at most one move, so the default budget reaches every guard.
-//! - **A count of attempts runs to [`RETRY_CAP`] (3), not 12.** The kernel resets a count on
+//! - **The capped configs run a count to [`RETRY_CAP`] (3), not 12.** The kernel resets a count on
 //!   every answer that settles it, so a success at attempt 5 leaves the state a success at
 //!   attempt 2 leaves; a reopen re-keeps the job, which abandons the count and begins a new one;
 //!   and a count that never succeeds is the spec's accepted loss either way. Attempts 4 to 12 add
-//!   only later instances of what attempts 2 and 3 already cover.
+//!   only later instances of what attempts 2 and 3 already cover. [`Notify::deep`] does run to 12,
+//!   with only the receiver failing, so the limit itself (S9) is checked.
 //!
 //! ## Faithful vs mutated
 //!
@@ -531,7 +538,11 @@ impl Notify {
             nk::Event::Wake => {
                 // S10: a wake before the time asked for begins nothing.
                 let early = before.wake_at.is_none_or(|at| now < at);
-                if early && actions.iter().any(|a| matches!(a, nk::Action::Begin { .. })) {
+                if early
+                    && actions
+                        .iter()
+                        .any(|a| matches!(a, nk::Action::Begin { .. }))
+                {
                     bad |= S10_EARLY_WAKE;
                 }
             }
@@ -544,10 +555,7 @@ impl Notify {
                     bad |= S13_FOREIGN_SETTLE;
                 }
                 // S12: an answer that settles is not sent again (what was owed after it is).
-                if !spec_retries(outcome)
-                    && carried == before.owed
-                    && !actions.is_empty()
-                {
+                if !spec_retries(outcome) && carried == before.owed && !actions.is_empty() {
                     bad |= S12_SETTLED_RETRIED;
                 }
                 // S11: the wait after failed attempt n lies in [d(n)/2, d(n)].
@@ -1005,14 +1013,19 @@ impl Model for Notify {
             match m.at {
                 At::Edge => acts.push(Act::Route(ib)),
                 At::Back(_) => {
-                    let draws = if m.origin == Origin::Attempt { self.draws } else { 1 };
+                    let draws = if m.origin == Origin::Attempt {
+                        self.draws
+                    } else {
+                        1
+                    };
                     for d in 0..draws {
                         acts.push(Act::Answer(ib, d as u8));
                     }
                 }
                 At::Waiting { .. } => {}
             }
-            if chaos && self.adversary & RCV != 0 && m.origin == Origin::Attempt && m.at == At::Edge {
+            if chaos && self.adversary & RCV != 0 && m.origin == Origin::Attempt && m.at == At::Edge
+            {
                 for code in [404, 503] {
                     for d in 0..self.draws {
                         acts.push(Act::Reply(ib, code, d as u8));
