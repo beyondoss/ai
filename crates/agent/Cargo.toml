@@ -274,6 +274,20 @@ mut_backoff_never_ends = [] # a backoff never elapses (liveness)
 mut_reload_keeps_failed = [] # a changed stored token does not clear a failure (liveness)
 mut_unlocked = [] # the model lets two callers hold the lock at once (single flight)
 
+# Mutations of the serve session kernel (`src/serve/session_kernel.rs`), for `tests/serve_session_model.rs`'s
+# red runs: each removes ONE guard and MUST turn a named property red. Never enabled in a build.
+mut_no_incarnation_guard = [] # an unpin touches whatever incarnation holds the id now (P3)
+mut_no_unpin_on_abort = [] # the model's aborted connection never unpins: the #693 leak (P2, L3)
+mut_reap_ignores_queued = [] # the reaper stops a session with a command still queued: #696 (P4)
+mut_reap_ignores_running = [] # the reaper stops a session mid-run (P4)
+mut_reap_ignores_keep_alive = [] # the reaper stops a session with a live subscription (P4)
+mut_spawn_while_stopping = [] # a pin spawns while the old incarnation is still stopping (P1)
+mut_admit_while_draining = [] # a draining replica spawns a new id (P5)
+mut_end_reason_overwritten = [] # a later stop overwrites the first end reason (P7)
+mut_no_tenant_check = [] # a pin from another tenant attaches (P8)
+mut_exit_keeps_entry = [] # an exit never frees its id, so a waiting pin never respawns (L1)
+mut_drain_never_done = [] # a drain never finishes (L2)
+
 # Catalog-token + composition evals (and the ignored live Grok/OpenRouter eval). Requires the
 # feature so `CARGO_BIN_EXE_agent` is the binary that actually links QuickJS;
 # `--code-mode` on the density-default binary is a hard error.

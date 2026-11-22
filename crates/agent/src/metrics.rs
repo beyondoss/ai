@@ -47,7 +47,7 @@ const MAX_REQUEST_BYTES: usize = 8 * 1024;
 const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Why a session's task ended — the closed label set of `agent_sessions_ended_total`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SessionEnd {
     /// The idle reaper reclaimed a detached session.
     IdleReap,

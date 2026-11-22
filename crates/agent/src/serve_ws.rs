@@ -117,6 +117,7 @@ use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
 use tokio_tungstenite::tungstenite::{Message, Utf8Bytes};
 use tokio_util::sync::CancellationToken;
 
+use crate::serve::session_kernel as kernel;
 use crate::serve::{
     OutFanout, OutFrame, OutSink, ServeConfig, SharedOutConn, Signal, UpstreamHttp2, conn_channel,
     conn_channel_marked, frame_to_line, lock_ignoring_poison, serve_session,
@@ -271,7 +272,7 @@ const DEFAULT_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 /// reconnecting to *this process*, so the window has to outlast a tunnel or a lunch break. On a
 /// replica that is not what re-attaching means. The session lives on shared storage, so any replica
 /// respawns it from disk and replays — and a session mid-run is never reaped at all
-/// ([`is_reapable`] requires `!running`), so what the window actually governs is how long a
+/// ([`kernel::is_reapable`] requires `!running`), so what the window actually governs is how long a
 /// **detached, idle** session keeps its lock.
 ///
 /// Holding that lock for an hour is how a failed-over session gets stranded. After a failover the
@@ -306,59 +307,22 @@ const JOIN_GRACE: Duration = Duration::from_secs(10);
 /// a client that never answers must not hold the task open.
 const CLOSE_HANDSHAKE_WAIT: Duration = Duration::from_secs(2);
 
-/// Where an id's session task is in its life: `Starting → Live → Stopping → (removed)`, one way only.
+/// The shell half of one id's session: what the kernel ([`kernel::Slot`]) cannot hold because it is
+/// a channel, a token or an atomic the session task shares. Keyed by the same id as the slot and
+/// inserted and removed in step with it, under the same lock.
 ///
-/// The entry stays in the map for its task's **whole** life — inserted when the task is spawned,
+/// The entry stays in the table for its task's **whole** life — inserted when the task is spawned,
 /// removed by that task as it exits ([`ExitGuard`]) — so "the id has an entry" means exactly "a task
 /// owns this id's session file". It used to mean only "attachable": a reap removed the entry first and
 /// the task persisted and exited afterwards, so a reconnect in that window found nothing and spawned a
 /// second writer on a file the first was still appending to.
-///
-/// The retained input sender lives inside the attachable phases, so a stopping session structurally
-/// has none to hand out.
-enum Phase {
-    /// Spawned, not yet running its body. Attachable: a command queues on the input channel exactly as
-    /// it does while `serve_session` opens persistence. This is the slot for start-up work that must
-    /// finish before the session touches storage — in service mode, taking the session's advisory
-    /// lock. The task does that work itself, awaited, with the map lock **not** held; the `Starting`
-    /// entry is what keeps a concurrent pin from spawning a rival meanwhile, and the pin that spawned
-    /// it waits on the outcome so "held on another replica" is a real HTTP status rather than a
-    /// session that comes up and immediately dies ([`ExitGuard::go_live`]).
-    Starting(mpsc::Sender<String>),
-    /// Running its body ([`serve_session`]).
-    Live(mpsc::Sender<String>),
-    /// Told to exit and not yet gone: reaped, shut down, or its loop already ended on its own. The
-    /// retained input is dropped, so the session observes EOF, persists, and exits. Not attachable — a
-    /// pin waits for [`SessionHandle::exited`] and then spawns a fresh incarnation.
-    Stopping,
-}
-
-impl Phase {
-    /// The session's input, while it's attachable.
-    fn input(&self) -> Option<&mpsc::Sender<String>> {
-        match self {
-            Phase::Starting(tx) | Phase::Live(tx) => Some(tx),
-            Phase::Stopping => None,
-        }
-    }
-}
-
-/// One id's session task, reachable across connections. The input sender retained in its [`Phase`]
-/// is what makes a dropped socket *not* an EOF — the session's `input_rx.recv()` pends until the next
-/// command instead of shutting down (see the module doc).
-struct SessionHandle {
-    /// Which spawn of this id this is. Whatever acts on the entry later — the task removing it on exit,
-    /// a connection unpinning — carries the incarnation it was handed, so a stale actor can never touch
-    /// a newer session under the same id.
-    incarnation: u64,
-    /// Every attached connection feeds the one input channel held here (its `mpsc` is multi-sender), so
-    /// any device can drive the session.
-    phase: Phase,
-    /// Whose session this is, in service mode. A session id is an address, and an address alone must
-    /// never be enough: a grant for tenant B naming tenant A's live id is refused (403) at the slot
-    /// rather than being allowed to attach to — and drive — a task running under A's sandbox and
-    /// credentials. `None` outside service mode, where there is one tenant by construction.
-    tenant: Option<String>,
+struct Shell {
+    /// The retained input sender, present exactly while the slot is attachable (`Starting` or
+    /// `Live`; see [`kernel::Phase`]). Every attached connection feeds the one input channel held
+    /// here (its `mpsc` is multi-sender), so any device can drive the session — and holding it is what
+    /// makes a dropped socket *not* an EOF (see the module doc). Dropped when the slot stops, so the
+    /// session observes EOF (once no connection holds a clone either), persists, and exits.
+    input: Option<mpsc::Sender<String>>,
     /// The session's set of attached connections — its output is **broadcast** to all of them, so a
     /// phone and a TUI (or any N of the user's devices) on one session all see the live stream at once
     /// (see [`crate::serve::OutFanout`]). Each connection registers its sink on attach and removes it on
@@ -367,12 +331,6 @@ struct SessionHandle {
     /// A latch, never a request: cancelled once the task has exited **and** removed this entry. What a
     /// pin on a `Stopping` id, and a graceful shutdown, wait on.
     exited: CancellationToken,
-    /// How many connections are currently attached. The idle reaper only considers a session for
-    /// reclamation when this reaches `0` (see [`Self::last_detached_at`]).
-    attached: usize,
-    /// When the last connection detached (`attached` reached `0`), for the idle reaper's clock. `None`
-    /// while any connection is attached, or on a fresh session — either way it isn't reap-eligible yet.
-    last_detached_at: Option<Instant>,
     /// `true` exactly while the session's [`serve_session`] loop is running a `prompt`, a host `bash`
     /// command or a manual `compact`. The reaper and the drain read it so a detached session is never
     /// stopped out from under work a client started and walked away from.
@@ -380,58 +338,48 @@ struct SessionHandle {
     /// `true` while the session holds a live MCP Events subscription (and `--mcp-events-reapable`
     /// is off): a background trigger, so the idle reaper leaves the session alone.
     keep_alive: Arc<AtomicBool>,
-    /// Why this session ended, shared with its [`ExitGuard`]. Written by whoever stops it, read once
-    /// as the task exits — so the reason is recorded by the code that knows it, rather than guessed
-    /// at the point of exit where every ending looks alike.
-    end_reason: Arc<Mutex<crate::metrics::SessionEnd>>,
 }
 
-impl SessionHandle {
-    /// → `Stopping`: drop the retained input so the session observes EOF (once no connection holds a
-    /// clone either), persists, and exits. Idempotent. The entry stays until the task has gone.
-    fn stop(&mut self, reason: crate::metrics::SessionEnd) {
-        // First writer wins: a session the reaper already claimed that then meets a shutdown ended
-        // because it was idle, not because of the deploy. Idempotent, like the phase change itself.
-        {
-            let mut slot = lock_ignoring_poison(&self.end_reason);
-            if *slot == crate::metrics::SessionEnd::Client {
-                *slot = reason;
-            }
+impl Shell {
+    /// What the session task changes without the table lock, as the kernel's decisions read it.
+    fn obs(&self) -> kernel::Obs {
+        kernel::Obs {
+            running: self.running.load(Ordering::Relaxed),
+            keep_alive: self.keep_alive.load(Ordering::Acquire),
+            // A command the client sent that the loop has not taken: the channel is where a prompt
+            // accepted but not yet started already shows (`running` flips only once the loop starts it).
+            queued: self
+                .input
+                .as_ref()
+                .is_some_and(|tx| tx.capacity() < tx.max_capacity()),
+            input_closed: self.input.as_ref().is_some_and(mpsc::Sender::is_closed),
         }
-        self.phase = Phase::Stopping;
     }
 }
 
-/// What this replica will still accept.
-///
-/// Three states, not two, and the middle one is the whole point of a drain: a replica that has been
-/// told to go away must stop taking **new** sessions while still serving the ones it already holds.
-/// Collapsing `Draining` into `Closed` is what makes a rolling deploy cut live conversations.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum Lifecycle {
-    /// Serving normally.
-    #[default]
-    Open,
-    /// SIGTERM arrived. New sessions are refused (503, so the edge retries elsewhere), `/readyz`
-    /// answers 503 so the load balancer stops choosing this replica, and `/livez` stays 200 so the
-    /// orchestrator does not kill it mid-drain. **Reconnects to sessions this replica still owns are
-    /// accepted** — those clients have nowhere else to go until this replica lets the session's lock
-    /// go, and refusing them is precisely the outage a drain exists to avoid.
-    Draining,
-    /// Sessions are being stopped. Nothing attaches.
-    Closed,
-}
-
-/// The supervisor's `session id → session task` map, with the state that must change atomically
-/// alongside it.
+/// The supervisor's `session id → session task` table: the kernel's [`kernel::Table`] (every
+/// decision) and the shell half of each entry. Whatever changes the one changes the other under the
+/// same lock.
 #[derive(Default)]
 struct Table {
-    sessions: HashMap<String, SessionHandle>,
-    /// Stamped on the next spawn (see [`SessionHandle::incarnation`]).
-    next_incarnation: u64,
-    /// Set once, by graceful shutdown: from then on nothing is spawned or attached, so the sessions
-    /// shutdown is waiting on are the last ones.
-    lifecycle: Lifecycle,
+    k: kernel::Table,
+    shells: HashMap<String, Shell>,
+}
+
+impl Table {
+    /// [`kernel::Obs`] for `id`: no shell means no session task to observe.
+    fn obs(&self, id: &str) -> kernel::Obs {
+        self.shells.get(id).map(Shell::obs).unwrap_or_default()
+    }
+
+    /// Drop the retained input of every id the kernel stopped, so each session observes EOF.
+    fn drop_inputs(&mut self, stopped: &[String]) {
+        for id in stopped {
+            if let Some(sh) = self.shells.get_mut(id) {
+                sh.input = None;
+            }
+        }
+    }
 }
 
 /// What a session task runs once it goes live, given its id, input, output fan-out, and `running`
@@ -741,8 +689,6 @@ struct ExitGuard {
     /// Counted down here rather than at any of the places a session can end, because this guard is
     /// the one thing that runs on every path out — including a panic.
     metrics: Option<Arc<crate::metrics::Metrics>>,
-    /// Why this session ended, set by whoever ended it; `Client` unless something else claims it.
-    end_reason: Arc<Mutex<crate::metrics::SessionEnd>>,
 }
 
 impl ExitGuard {
@@ -753,41 +699,40 @@ impl ExitGuard {
     /// call, awaited on the task — never under the map lock.
     fn go_live(&self) -> bool {
         let mut table = lock_ignoring_poison(&self.table);
-        let Some(h) = table
-            .sessions
-            .get_mut(&self.id)
-            .filter(|h| h.incarnation == self.incarnation)
-        else {
-            return false;
+        let event = kernel::Event::GoLive {
+            id: &self.id,
+            incarnation: self.incarnation,
         };
-        match std::mem::replace(&mut h.phase, Phase::Stopping) {
-            Phase::Starting(tx) => {
-                h.phase = Phase::Live(tx);
-                true
-            }
-            other => {
-                h.phase = other;
-                false
-            }
-        }
+        kernel::step(&mut table.k, event) == kernel::Action::Live(true)
     }
 }
 
 impl Drop for ExitGuard {
     fn drop(&mut self) {
+        // The kernel removes this incarnation's entry (a stale guard leaves a newer one alone) and
+        // names why the session ended: the reason the first stopper claimed, `Client` otherwise.
+        let reason = {
+            let mut table = lock_ignoring_poison(&self.table);
+            let action = kernel::step(
+                &mut table.k,
+                kernel::Event::Exited {
+                    id: &self.id,
+                    incarnation: self.incarnation,
+                },
+            );
+            match action {
+                kernel::Action::Exited { reason, removed } => {
+                    if removed {
+                        table.shells.remove(&self.id);
+                    }
+                    reason
+                }
+                _ => crate::metrics::SessionEnd::Client,
+            }
+        };
         if let Some(m) = &self.metrics {
             m.sessions_live.dec();
-            m.session_ended(*lock_ignoring_poison(&self.end_reason));
-        }
-        {
-            let mut table = lock_ignoring_poison(&self.table);
-            if table
-                .sessions
-                .get(&self.id)
-                .is_some_and(|h| h.incarnation == self.incarnation)
-            {
-                table.sessions.remove(&self.id);
-            }
+            m.session_ended(reason);
         }
         self.exited.cancel();
     }
@@ -975,88 +920,64 @@ impl Supervisor {
     /// `.await`): attach to its session — spawning it, `Starting`, if the id is free — or report that
     /// its previous task is still exiting.
     fn try_pin(&self, id: &str, service: Option<&Arc<ServiceSession>>) -> TryPin {
-        let tenant = service.map(|svc| svc.tenant().to_owned());
+        let tenant = service.map(|svc| svc.tenant());
         let mut table = lock_ignoring_poison(&self.table);
-        if table.lifecycle == Lifecycle::Closed {
-            return TryPin::Closed;
-        }
-        if let Some(h) = table.sessions.get_mut(id) {
-            // Checked before anything else about the slot: an id alone never grants access to a
-            // running session. A `Stopping` slot is refused just the same — its successor would
-            // otherwise be spawned by, and inherit the grant of, the wrong tenant.
-            if h.tenant != tenant {
-                return TryPin::Forbidden;
+        let event = kernel::Event::Pin {
+            id,
+            tenant,
+            cap: self.live_session_cap(),
+            input_closed: table.obs(id).input_closed,
+        };
+        let incarnation = match kernel::step(&mut table.k, event) {
+            kernel::Action::Closed => return TryPin::Closed,
+            kernel::Action::Forbidden => return TryPin::Forbidden,
+            kernel::Action::AtCapacity => return TryPin::AtCapacity,
+            kernel::Action::Wait => {
+                // The kernel marked the slot stopping: drop its retained input so the session
+                // observes EOF, and wait for it to be gone.
+                let Some(sh) = table.shells.get_mut(id) else {
+                    return TryPin::Closed;
+                };
+                sh.input = None;
+                return TryPin::Wait(sh.exited.clone());
             }
-            return match h.phase.input() {
-                // Register, don't evict: one more attached connection, and clear any detach timestamp
-                // so the reaper's clock only runs while genuinely detached (`attached == 0`).
-                Some(tx) if !tx.is_closed() => {
-                    let input_tx = tx.clone();
-                    h.attached += 1;
-                    h.last_detached_at = None;
-                    // No `Started`: this task is already running (or already past its own lock), so
-                    // there is nothing for the caller to wait on.
-                    TryPin::Attached(
-                        h.incarnation,
-                        input_tx,
-                        h.out_conn.clone(),
-                        h.exited.clone(),
-                        None,
-                    )
-                }
-                // Stopping — or attachable in name only: a closed input means its loop already ended on
-                // its own (SIGTERM, an internal error) and the task is on its way out, possibly still
-                // persisting. Respawning now would put two writers on one session file; mark it
-                // stopping (idempotent) and wait for it to be gone.
-                _ => {
-                    h.stop(crate::metrics::SessionEnd::Error);
-                    TryPin::Wait(h.exited.clone())
-                }
-            };
-        }
-
-        // Nothing owns this id, so this look is about to spawn one. Everything from here is a
-        // *new-session* gate, which is why the drain check sits here and not at the top of this
-        // function: a draining replica still owns live sessions, and a reconnect to one of those
-        // took the `get_mut` branch above and never reaches this line. Refusing at the top — which
-        // an earlier draft did — would refuse exactly the clients the drain exists to protect.
-        if table.lifecycle != Lifecycle::Open {
-            return TryPin::Closed;
-        }
-
-        // Checked here, under the same lock the insert happens under, so two simultaneous
-        // connections can't both see room for the last slot.
-        if let Some(max) = self.live_session_cap()
-            && table.sessions.len() >= max
-        {
-            return TryPin::AtCapacity;
-        }
-
-        let incarnation = table.next_incarnation;
-        table.next_incarnation += 1;
+            kernel::Action::Attached { incarnation } => {
+                // Register, don't evict: one more attached connection (the kernel cleared any detach
+                // timestamp). No `Started`: this task is already running (or already past its own
+                // lock), so there is nothing for the caller to wait on.
+                let Some(sh) = table.shells.get(id) else {
+                    return TryPin::Closed;
+                };
+                let Some(input_tx) = sh.input.clone() else {
+                    return TryPin::Closed;
+                };
+                return TryPin::Attached(
+                    incarnation,
+                    input_tx,
+                    sh.out_conn.clone(),
+                    sh.exited.clone(),
+                    None,
+                );
+            }
+            // The id was free: the kernel inserted its slot, so this look is about to spawn the task.
+            kernel::Action::Spawned { incarnation } => incarnation,
+            _ => unreachable!("a pin is answered by a pin action"),
+        };
         let (input_tx, input_rx) = mpsc::channel::<String>(crate::serve::IN_CHANNEL_BOUND);
-        // Made before the entry so the handle and the exit guard share one slot: whoever ends the
-        // session writes the reason here, and the guard reports it on the way out.
-        let end_reason = Arc::new(Mutex::new(crate::metrics::SessionEnd::Client));
         let out_conn: SharedOutConn = Arc::new(Mutex::new(OutFanout::default()));
         // Shared with the session loop: `true` only while it's running a `prompt`. The reaper reads
-        // this handle-side clone to never reclaim a mid-run background session.
+        // this shell-side clone to never reclaim a mid-run background session.
         let running = Arc::new(AtomicBool::new(false));
         let keep_alive = Arc::new(AtomicBool::new(false));
         let exited = CancellationToken::new();
-        table.sessions.insert(
+        table.shells.insert(
             id.to_owned(),
-            SessionHandle {
-                incarnation,
-                phase: Phase::Starting(input_tx.clone()),
-                tenant,
+            Shell {
+                input: Some(input_tx.clone()),
                 out_conn: out_conn.clone(),
                 exited: exited.clone(),
-                attached: 1,
-                last_detached_at: None,
                 running: running.clone(),
                 keep_alive: keep_alive.clone(),
-                end_reason: Arc::clone(&end_reason),
             },
         );
         // The entry now owns the id; everything below runs unlocked. That includes the spawn itself: a
@@ -1078,7 +999,6 @@ impl Supervisor {
             incarnation,
             exited,
             metrics: self.metrics.clone(),
-            end_reason: Arc::clone(&end_reason),
         };
         // Service mode: this task must own the session's storage before it goes live. The lock is
         // liveness only — correctness is the epoch fence — so it is what keeps two replicas sharing a
@@ -1194,14 +1114,14 @@ impl Supervisor {
     /// next one under the same id.
     fn unpin(&self, id: &str, incarnation: u64) {
         let mut table = lock_ignoring_poison(&self.table);
-        if let Some(h) = table.sessions.get_mut(id)
-            && h.incarnation == incarnation
-        {
-            h.attached = h.attached.saturating_sub(1);
-            if h.attached == 0 {
-                h.last_detached_at = Some(Instant::now());
-            }
-        }
+        kernel::step(
+            &mut table.k,
+            kernel::Event::Unpin {
+                id,
+                incarnation,
+                now: now(),
+            },
+        );
     }
 
     /// Drive `ws` against an **already pinned** session until the socket closes — the session itself
@@ -1488,7 +1408,7 @@ impl Supervisor {
     ///    replica releases the session's lock.
     /// 2. **Wait for in-flight runs**, bounded by `grace`. The wait is on each session's `running`
     ///    flag — true exactly while a prompt, host `bash` or `compact` is executing. It is
-    ///    deliberately **not** `is_reapable`, which additionally requires `attached == 0`: a client
+    ///    deliberately **not** `kernel::is_reapable`, which additionally requires `attached == 0`: a client
     ///    watching its own run keeps a socket attached throughout, so a drain gated on that would burn its entire grace every time and
     ///    then kill the run anyway.
     /// 3. **Then the ordinary shutdown**, which stops every session and waits for the tasks.
@@ -1496,22 +1416,29 @@ impl Supervisor {
     /// `grace` of zero skips step 2 entirely, which is the behaviour a single-user daemon had before
     /// this existed: Ctrl-C ends it now, not in thirty seconds.
     fn begin_drain(&self) {
-        lock_ignoring_poison(&self.table).lifecycle = Lifecycle::Draining;
+        kernel::step(
+            &mut lock_ignoring_poison(&self.table).k,
+            kernel::Event::BeginDrain,
+        );
     }
 
-    /// Is any session still executing a prompt (or a host `bash` or `compact`)?
+    /// One poll of the drain: is it over, because the grace is spent or no run is in flight?
     ///
-    /// Reads each session's `running` flag — true exactly while one is executing — and whether a
-    /// command the client sent is still queued on its input (see [`has_queued_input`]): a prompt
-    /// accepted but not yet started is work the client was told was taken. Deliberately
-    /// **not** `is_reapable`, which additionally requires `attached == 0`: a client watching its own
-    /// run holds a socket open throughout, so a drain gated on that would burn its whole grace every
-    /// time and then cut the run anyway.
-    fn any_run_in_flight(&self) -> bool {
-        lock_ignoring_poison(&self.table)
-            .sessions
-            .values()
-            .any(|h| h.running.load(Ordering::Relaxed) || has_queued_input(h))
+    /// A run is in flight when a session's `running` flag is set (true exactly while a prompt, host
+    /// `bash` or `compact` is executing), or a command the client sent is still queued on its input:
+    /// a prompt accepted but not yet started is work the client was told was taken. Deliberately
+    /// **not** the reaper's test, which additionally requires `attached == 0`: a client watching its
+    /// own run holds a socket open throughout, so a drain gated on that would burn its whole grace
+    /// every time and then cut the run anyway.
+    fn drain_done(&self, deadline_passed: bool) -> bool {
+        let mut table = lock_ignoring_poison(&self.table);
+        let table = &mut *table;
+        let obs = |id: &str| table.shells.get(id).map(Shell::obs).unwrap_or_default();
+        let event = kernel::Event::DrainTick {
+            deadline_passed,
+            obs: &obs,
+        };
+        kernel::step(&mut table.k, event) == kernel::Action::DrainDone
     }
 
     /// Graceful shutdown: close the table to new attachments, stop every session (dropping each
@@ -1523,15 +1450,13 @@ impl Supervisor {
     async fn shutdown(&self) {
         let exits: Vec<CancellationToken> = {
             let mut table = lock_ignoring_poison(&self.table);
-            table.lifecycle = Lifecycle::Closed;
-            table
-                .sessions
-                .values_mut()
-                .map(|h| {
-                    h.stop(crate::metrics::SessionEnd::Drain);
-                    h.exited.clone()
-                })
-                .collect()
+            match kernel::step(&mut table.k, kernel::Event::Shutdown) {
+                kernel::Action::Stopped(ids) => {
+                    table.drop_inputs(&ids);
+                    table.shells.values().map(|sh| sh.exited.clone()).collect()
+                }
+                _ => Vec::new(),
+            }
         };
         await_exits_within(exits, JOIN_GRACE).await;
     }
@@ -1557,10 +1482,11 @@ impl Supervisor {
         let live: HashSet<String> = {
             let table = lock_ignoring_poison(&self.table);
             table
-                .sessions
+                .k
+                .slots
                 .iter()
-                .filter(|(_, h)| h.tenant.as_deref() == tenant)
-                .filter(|(_, h)| h.phase.input().is_some_and(|tx| !tx.is_closed()))
+                .filter(|(_, s)| s.tenant.as_deref() == tenant)
+                .filter(|(id, s)| s.attachable() && !table.obs(id).input_closed)
                 .map(|(id, _)| id.clone())
                 .collect()
         };
@@ -1617,50 +1543,24 @@ impl Supervisor {
     /// reconnect to it then respawns and replays from disk.
     fn reap_idle(&self, timeout: Duration) {
         let mut table = lock_ignoring_poison(&self.table);
-        for h in table.sessions.values_mut() {
-            if is_reapable(h, timeout) {
-                h.stop(crate::metrics::SessionEnd::IdleReap);
-            }
+        let table = &mut *table;
+        let obs = |id: &str| table.shells.get(id).map(Shell::obs).unwrap_or_default();
+        let event = kernel::Event::Reap {
+            now: now(),
+            timeout,
+            obs: &obs,
+        };
+        if let kernel::Action::Stopped(ids) = kernel::step(&mut table.k, event) {
+            table.drop_inputs(&ids);
         }
     }
 }
 
-/// Whether the reaper should stop this session.
-///
-/// A `Stopping` session is already on its way out: nothing to do.
-///
-/// A command is sitting on the session's input channel, not yet taken by its loop. `running` flips
-/// only once the loop starts a command, so a prompt a reconnect sent while the drain was on (a
-/// `Draining` replica still accepts them) is invisible to it until then; the channel is where it
-/// already shows. Without this the drain would skip its grace and stop the session under it.
-fn has_queued_input(h: &SessionHandle) -> bool {
-    h.phase
-        .input()
-        .is_some_and(|tx| tx.capacity() < tx.max_capacity())
-}
-
-/// A **closed input** is the strongest reason of all: the session's loop is already gone (it returned
-/// early — no credential, an unwritable session dir — or hit an internal error), so nothing will ever
-/// read its input again. Stop it whatever its attach state or clock says — a live connection still
-/// pinned to it is no reason to keep a corpse attachable (that connection's next command fails its
-/// send and tears the socket down; a reconnect waits for the task to finish and respawns the id).
-///
-/// Otherwise the session is alive, and the ordinary conditions apply: **detached** (`attached == 0`) for
-/// at least `timeout`, and not mid-`prompt` (or mid host `bash`/`compact`) — a detached background run
-/// is exactly what this design exists to keep alive, so `running` is never reaped out from under it. Nor is a
-/// session with a live MCP Events subscription (`keep_alive`): its triggers fire with no client
-/// attached, which is the point of them.
-fn is_reapable(h: &SessionHandle, timeout: Duration) -> bool {
-    match h.phase.input() {
-        None => false,
-        Some(tx) if tx.is_closed() => true,
-        Some(_) => {
-            h.attached == 0
-                && h.last_detached_at.is_some_and(|d| d.elapsed() >= timeout)
-                && !h.running.load(Ordering::Relaxed)
-                && !h.keep_alive.load(Ordering::Acquire)
-        }
-    }
+/// The kernel's clock: a monotonic [`Duration`] since the first call, from a base a day in, so a
+/// test can place a detach time in the past without underflowing.
+fn now() -> Duration {
+    static ORIGIN: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    Duration::from_secs(24 * 60 * 60) + ORIGIN.get_or_init(Instant::now).elapsed()
 }
 
 /// Wait for a batch of session tasks to exit — each one's [`SessionHandle::exited`] latch — bounded by
@@ -2260,7 +2160,7 @@ pub async fn serve_ws(
                 // The `if` guard already proved this is `Some`; destructured rather than unwrapped so
                 // the guard and the read cannot drift apart.
                 if let Some((sig, deadline)) = draining
-                    && (Instant::now() >= deadline || !supervisor.any_run_in_flight())
+                    && supervisor.drain_done(Instant::now() >= deadline)
                 {
                     // Stop every session (its retained input dropped, so it observes EOF and
                     // cancels+persists+exits), then wait for each task to be gone so persistence
@@ -2588,7 +2488,7 @@ async fn handle_health<S: AsyncWrite + Unpin>(
     // probe after SIGTERM — that answer is the entire mechanism by which the load balancer stops
     // sending it new sessions. Read before the probe, and out of the lock, so a slow mount cannot
     // delay the one answer that has to be immediate.
-    let draining = lock_ignoring_poison(&supervisor.table).lifecycle != Lifecycle::Open;
+    let draining = lock_ignoring_poison(&supervisor.table).k.lifecycle != kernel::Lifecycle::Open;
     if draining {
         let body = json!({ "status": "not ready", "reason": "draining" }).to_string();
         return write_http_ok(stream, 503, "Service Unavailable", None, body.as_bytes()).await;
@@ -3702,26 +3602,34 @@ mod tests {
         assert!(check_listen_pid(Some("not-a-pid"), 4242).is_err());
     }
 
-    /// Build a `Live` handle with no session behind it. The input receiver is returned and must be held
-    /// to keep the session "alive"; dropping it is how a test models a session whose loop ended.
+    /// Build a `Live` slot and its shell with no session behind it. The input receiver is returned
+    /// and must be held to keep the session "alive"; dropping it is how a test models a session whose
+    /// loop ended.
     fn handle(
         attached: usize,
         detached_ago: Option<Duration>,
-    ) -> (SessionHandle, mpsc::Receiver<String>) {
+    ) -> (kernel::Slot, Shell, mpsc::Receiver<String>) {
         let (input_tx, input_rx) = mpsc::channel::<String>(crate::serve::IN_CHANNEL_BOUND);
-        let h = SessionHandle {
+        let slot = kernel::Slot {
             incarnation: 0,
-            phase: Phase::Live(input_tx),
+            phase: kernel::Phase::Live,
             tenant: None,
+            attached,
+            last_detached_at: detached_ago.and_then(|d| now().checked_sub(d)),
+            end_reason: crate::metrics::SessionEnd::Client,
+        };
+        let shell = Shell {
+            input: Some(input_tx),
             out_conn: Arc::new(Mutex::new(OutFanout::default())),
             exited: CancellationToken::new(),
-            attached,
-            last_detached_at: detached_ago.and_then(|d| Instant::now().checked_sub(d)),
             running: Arc::new(AtomicBool::new(false)),
             keep_alive: Arc::new(AtomicBool::new(false)),
-            end_reason: Arc::new(Mutex::new(crate::metrics::SessionEnd::Client)),
         };
-        (h, input_rx)
+        (slot, shell, input_rx)
+    }
+
+    fn is_reapable(slot: &kernel::Slot, shell: &Shell, timeout: Duration) -> bool {
+        kernel::is_reapable(slot, shell.obs(), now(), timeout)
     }
 
     #[test]
@@ -3772,44 +3680,48 @@ mod tests {
         // Its loop ended (input receiver gone) while a connection is *still attached* and its idle clock
         // never started: every ordinary condition says "keep", and it must still be stopped — it is no
         // longer attachable in any useful sense, and its task is on its way out.
-        let (h, input_rx) = handle(1, None);
+        let (slot, shell, input_rx) = handle(1, None);
         drop(input_rx);
-        assert!(is_reapable(&h, Duration::from_secs(3600)));
+        assert!(is_reapable(&slot, &shell, Duration::from_secs(3600)));
     }
 
     #[test]
     fn a_live_session_is_reapable_only_once_detached_past_the_timeout() {
         let timeout = Duration::from_secs(60);
 
-        let (attached, _rx) = handle(1, None);
-        assert!(!is_reapable(&attached, timeout), "attached: never");
+        let (attached, shell, _rx) = handle(1, None);
+        assert!(!is_reapable(&attached, &shell, timeout), "attached: never");
 
-        let (fresh, _rx) = handle(0, None);
+        let (fresh, shell, _rx) = handle(0, None);
         assert!(
-            !is_reapable(&fresh, timeout),
+            !is_reapable(&fresh, &shell, timeout),
             "detached but no clock started: never"
         );
 
-        let (recent, _rx) = handle(0, Some(Duration::from_secs(10)));
+        let (recent, shell, _rx) = handle(0, Some(Duration::from_secs(10)));
         assert!(
-            !is_reapable(&recent, timeout),
+            !is_reapable(&recent, &shell, timeout),
             "detached, but not past the timeout"
         );
 
-        let (idle, _rx) = handle(0, Some(Duration::from_secs(120)));
-        assert!(is_reapable(&idle, timeout), "detached past the timeout");
-
-        let (mid_run, _rx) = handle(0, Some(Duration::from_secs(120)));
-        mid_run.running.store(true, Ordering::Relaxed);
+        let (idle, shell, _rx) = handle(0, Some(Duration::from_secs(120)));
         assert!(
-            !is_reapable(&mid_run, timeout),
+            is_reapable(&idle, &shell, timeout),
+            "detached past the timeout"
+        );
+
+        let (mid_run, shell, _rx) = handle(0, Some(Duration::from_secs(120)));
+        shell.running.store(true, Ordering::Relaxed);
+        assert!(
+            !is_reapable(&mid_run, &shell, timeout),
             "a detached background run must never be reaped out from under its turn"
         );
 
-        let (mut stopping, _rx) = handle(0, Some(Duration::from_secs(120)));
+        let (mut stopping, mut shell, _rx) = handle(0, Some(Duration::from_secs(120)));
         stopping.stop(crate::metrics::SessionEnd::Client);
+        shell.input = None;
         assert!(
-            !is_reapable(&stopping, timeout),
+            !is_reapable(&stopping, &shell, timeout),
             "already on its way out: nothing left to reap"
         );
     }
@@ -3926,7 +3838,7 @@ mod tests {
         });
         let p = sup.pin(Some("s1".into()), None).await.unwrap();
         assert!(
-            !sup.any_run_in_flight(),
+            sup.drain_done(false),
             "idle: nothing queued, nothing running"
         );
         p.input_tx
@@ -3934,7 +3846,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            sup.any_run_in_flight(),
+            !sup.drain_done(false),
             "a prompt accepted but not yet started is work in flight, not an idle session"
         );
     }
@@ -4046,10 +3958,10 @@ mod tests {
         sup.unpin(&first.id, first.incarnation);
         sup.reap_idle(Duration::ZERO);
         let table = lock_ignoring_poison(&sup.table);
-        let h = &table.sessions["s1"];
+        let h = &table.k.slots["s1"];
         assert_eq!(h.incarnation, second.incarnation);
         assert_eq!(h.attached, 1);
-        assert!(h.phase.input().is_some(), "still attached, so not reaped");
+        assert!(h.attachable(), "still attached, so not reaped");
     }
 
     /// A connection that is cancelled mid-session (the future dropped, as a panic unwind or an aborted
@@ -4066,11 +3978,11 @@ mod tests {
             async move { sup.attach(pinned, None, ws).await }
         });
         settle().await;
-        assert_eq!(lock_ignoring_poison(&sup.table).sessions["s1"].attached, 1);
+        assert_eq!(lock_ignoring_poison(&sup.table).k.slots["s1"].attached, 1);
         attach.abort();
         let _ = attach.await;
         assert_eq!(
-            lock_ignoring_poison(&sup.table).sessions["s1"].attached,
+            lock_ignoring_poison(&sup.table).k.slots["s1"].attached,
             0,
             "the aborted attach left its pin behind"
         );
@@ -4114,7 +4026,7 @@ mod tests {
 
         probe.release.cancel();
         shutdown.await.unwrap();
-        assert!(lock_ignoring_poison(&sup.table).sessions.is_empty());
+        assert!(lock_ignoring_poison(&sup.table).k.slots.is_empty());
     }
 
     /// A session stopped while still `Starting` never runs its body — it never touches storage — and
@@ -4127,7 +4039,7 @@ mod tests {
         attach_and_detach(&sup, "s1").await;
         sup.reap_idle(Duration::ZERO);
         until("the id is freed", || {
-            lock_ignoring_poison(&sup.table).sessions.is_empty()
+            lock_ignoring_poison(&sup.table).k.slots.is_empty()
         })
         .await;
         assert_eq!(probe.started(), 0);
@@ -4138,11 +4050,13 @@ mod tests {
     #[test]
     fn an_exit_only_removes_its_own_incarnation() {
         let table: Arc<Mutex<Table>> = Arc::default();
-        let (mut newer, _rx) = handle(1, None);
+        let (mut newer, shell, _rx) = handle(1, None);
         newer.incarnation = 7;
-        lock_ignoring_poison(&table)
-            .sessions
-            .insert("s1".into(), newer);
+        {
+            let mut t = lock_ignoring_poison(&table);
+            t.k.slots.insert("s1".into(), newer);
+            t.shells.insert("s1".into(), shell);
+        }
 
         let stale_exited = CancellationToken::new();
         drop(ExitGuard {
@@ -4151,10 +4065,9 @@ mod tests {
             incarnation: 6,
             exited: stale_exited.clone(),
             metrics: None,
-            end_reason: Arc::new(Mutex::new(crate::metrics::SessionEnd::Client)),
         });
         assert!(stale_exited.is_cancelled());
-        assert!(lock_ignoring_poison(&table).sessions.contains_key("s1"));
+        assert!(lock_ignoring_poison(&table).k.slots.contains_key("s1"));
 
         drop(ExitGuard {
             table: table.clone(),
@@ -4162,9 +4075,8 @@ mod tests {
             incarnation: 7,
             exited: CancellationToken::new(),
             metrics: None,
-            end_reason: Arc::new(Mutex::new(crate::metrics::SessionEnd::Client)),
         });
-        assert!(!lock_ignoring_poison(&table).sessions.contains_key("s1"));
+        assert!(!lock_ignoring_poison(&table).k.slots.contains_key("s1"));
     }
 
     #[test]

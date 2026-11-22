@@ -222,6 +222,7 @@ mod serve_session_density;
 mod serve_session_isolation;
 mod serve_session_lifecycle;
 mod serve_session_memory;
+mod serve_session_model;
 mod serve_session_title;
 mod serve_session_tree;
 mod serve_shared_client;
