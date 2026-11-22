@@ -947,6 +947,17 @@ pub struct EndpointStatus {
     text: String,
 }
 
+impl EndpointStatus {
+    /// An answer as the endpoint gave it: `text` is what `Display` shows.
+    pub fn new(status: u16, body: impl Into<String>, text: impl Into<String>) -> Self {
+        Self {
+            status,
+            body: body.into(),
+            text: text.into(),
+        }
+    }
+}
+
 impl std::fmt::Display for EndpointStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.text)

@@ -463,7 +463,7 @@ impl ServiceSession {
                 PROBE_TIMEOUT,
             )
             .await
-            .map_err(|e| format!("the sandbox did not answer: {e}"))?;
+            .map_err(|e| crate::exec_endpoint::probe_error(&e))?;
         if home.code != Some(0) || home.stdout_text().trim().is_empty() {
             return Err(format!(
                 "the sandbox did not report a home directory (exit {:?})",

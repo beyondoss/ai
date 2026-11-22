@@ -67,17 +67,14 @@ impl ExecTarget {
     ) -> Result<Self, String> {
         let backend = crate::tools::fs::shell::ShellFs::connect(runner.clone())
             .await
-            .map_err(|e| format!("the sandbox did not answer: {e}"))?;
+            .map_err(|e| probe_error(&e))?;
         let backend = match home {
             Some(home) => backend.with_home(home),
             None => backend,
         };
         // The one probe of the sandbox's tools, here so an unreachable or refused endpoint fails the
         // attach with its own error rather than the first tool call.
-        let caps = backend
-            .capabilities()
-            .await
-            .map_err(|e| format!("the sandbox did not answer: {e}"))?;
+        let caps = backend.capabilities().await.map_err(|e| probe_error(&e))?;
         Ok(Self {
             runner,
             backend: std::sync::Arc::new(backend),
@@ -171,6 +168,35 @@ pub type UseHook = std::sync::Arc<dyn Fn() + Send + Sync>;
 pub type Connect = std::sync::Arc<
     dyn Fn() -> futures::future::BoxFuture<'static, Result<ExecTarget, String>> + Send + Sync,
 >;
+
+/// The body `code` the front answers 503 with while a sandbox is being made or woken
+/// (`execfront.CodeSandboxStarting`). Every other 503 (the tenant at its limit, a failed create)
+/// has its own code and is not waited on.
+pub const SANDBOX_STARTING_CODE: &str = "sandbox_starting";
+
+/// What a probe's error starts with when the front said the sandbox is starting, so a caller that
+/// may wait can tell it from every other failure.
+pub const SANDBOX_STARTING: &str = "the sandbox is starting";
+
+/// Whether the endpoint's answer is the front's `sandbox_starting`: a 503 whose JSON body carries
+/// that code. The sentence is never read.
+fn is_starting(s: &EndpointStatus) -> bool {
+    s.status == 503
+        && serde_json::from_str::<serde_json::Value>(&s.body)
+            .ok()
+            .and_then(|v| v.get("code").and_then(|c| c.as_str().map(str::to_owned)))
+            .as_deref()
+            == Some(SANDBOX_STARTING_CODE)
+}
+
+/// The probe's error for `e`: [`SANDBOX_STARTING`] when the front said `sandbox_starting`, else
+/// "did not answer".
+pub fn probe_error(e: &std::io::Error) -> String {
+    match endpoint_status(e) {
+        Some(s) if is_starting(s) => format!("{SANDBOX_STARTING}: {e}"),
+        _ => format!("the sandbox did not answer: {e}"),
+    }
+}
 
 /// A lazily attached target, not built yet (or to be built again).
 struct Lazy {

@@ -72,6 +72,75 @@ while [ ! -p "$1" ] && [ "$i" -lt 100 ]; do sleep 0.05; i=$((i + 1)); done
 [ -p "$1" ] || exit 3
 cat >> "$1""#;
 
+/// How long a connect waits for a sandbox that is still starting (the front answers 503 once its
+/// wake budget is spent while the VM is still being made) before it gives up and says so.
+pub(crate) const STARTING_WAIT: Duration = Duration::from_secs(60);
+
+/// The longest pause between two attempts.
+const STARTING_BACKOFF_CAP: Duration = Duration::from_secs(5);
+
+/// What to do with a failed start.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StartStep {
+    /// Wait this long, then try again.
+    Retry(Duration),
+    /// Report the failure.
+    GiveUp,
+}
+
+/// The decision, with no I/O: `starting` is whether the failure is the sandbox still starting
+/// ([`crate::exec_endpoint::SANDBOX_STARTING`]), `attempt` counts failures so far (0 for the first),
+/// `waited` is the time already spent waiting. Backoff doubles from 1 s to a cap, and the last
+/// pause is cut so the total never passes [`STARTING_WAIT`].
+pub(crate) fn start_step(starting: bool, attempt: u32, waited: Duration) -> StartStep {
+    if !starting || waited >= STARTING_WAIT {
+        return StartStep::GiveUp;
+    }
+    let pause = Duration::from_secs(1)
+        .saturating_mul(1u32 << attempt.min(8))
+        .min(STARTING_BACKOFF_CAP);
+    StartStep::Retry(pause.min(STARTING_WAIT - waited))
+}
+
+/// Run `attempt` until it succeeds or [`start_step`] gives up, pausing with `pause`. The error is
+/// the last attempt's, with the wait it cost named when it was a starting sandbox.
+pub(crate) async fn start_waiting<T, F, Fut, P, PFut>(
+    mut attempt: F,
+    pause: P,
+) -> std::io::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<T>>,
+    P: Fn(Duration) -> PFut,
+    PFut: std::future::Future<Output = ()>,
+{
+    let mut waited = Duration::ZERO;
+    let mut n = 0;
+    loop {
+        let e = match attempt().await {
+            Ok(v) => return Ok(v),
+            Err(e) => e,
+        };
+        let starting = e
+            .to_string()
+            .starts_with(crate::exec_endpoint::SANDBOX_STARTING);
+        match start_step(starting, n, waited) {
+            StartStep::Retry(d) => {
+                pause(d).await;
+                waited += d;
+                n += 1;
+            }
+            StartStep::GiveUp if starting => {
+                return Err(std::io::Error::other(format!(
+                    "{e} (still starting after {}s)",
+                    waited.as_secs()
+                )));
+            }
+            StartStep::GiveUp => return Err(e),
+        }
+    }
+}
+
 /// The id of a connector's job: stable, so a connect can remove what an earlier one left.
 fn job_id(name: &str) -> std::io::Result<JobId> {
     let digest = sha2::Sha256::digest(name.as_bytes());
@@ -294,6 +363,129 @@ impl tokio::io::AsyncWrite for SandboxWriter {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    fn starting() -> std::io::Error {
+        std::io::Error::other(format!(
+            "{}: exec endpoint x returned 503",
+            crate::exec_endpoint::SANDBOX_STARTING
+        ))
+    }
+
+    #[test]
+    fn a_starting_sandbox_is_retried_with_capped_backoff_then_given_up_on() {
+        let mut waited = Duration::ZERO;
+        let mut pauses = vec![];
+        for n in 0.. {
+            match start_step(true, n, waited) {
+                StartStep::Retry(d) => {
+                    assert!(d <= STARTING_BACKOFF_CAP);
+                    pauses.push(d.as_secs());
+                    waited += d;
+                }
+                StartStep::GiveUp => break,
+            }
+        }
+        assert_eq!(&pauses[..4], &[1, 2, 4, 5]);
+        assert_eq!(waited, STARTING_WAIT);
+    }
+
+    #[test]
+    fn any_other_failure_is_not_retried() {
+        assert_eq!(start_step(false, 0, Duration::ZERO), StartStep::GiveUp);
+    }
+
+    #[tokio::test]
+    async fn a_connect_that_finds_the_sandbox_starting_succeeds_once_it_is_up() {
+        let calls = std::cell::Cell::new(0);
+        let r = start_waiting(
+            || {
+                calls.set(calls.get() + 1);
+                let up = calls.get() > 3;
+                async move { if up { Ok(7) } else { Err(starting()) } }
+            },
+            |_| async {},
+        )
+        .await;
+        assert_eq!(r.unwrap(), 7);
+        assert_eq!(calls.get(), 4);
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_that_never_starts_fails_with_the_wait_named_and_a_real_refusal_at_once() {
+        let e = start_waiting(|| async { Err::<(), _>(starting()) }, |_| async {})
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("still starting after 60s"), "{e}");
+        let calls = std::cell::Cell::new(0);
+        let e = start_waiting(
+            || {
+                calls.set(calls.get() + 1);
+                async { Err::<(), _>(std::io::Error::other("the sandbox did not answer: x")) }
+            },
+            |_| async {},
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(calls.get(), 1);
+        assert!(e.to_string().contains("did not answer"));
+    }
+
+    fn front_503(code: &str) -> std::io::Error {
+        let body = format!(r#"{{"code":"{code}","message":"words"}}"#);
+        std::io::Error::other(crate::exec_endpoint::EndpointStatus::new(
+            503,
+            body.clone(),
+            format!("exec endpoint x returned 503: {body}"),
+        ))
+    }
+
+    #[tokio::test]
+    async fn only_the_starting_code_is_waited_on_an_at_limit_503_fails_at_once() {
+        // Through the probe's own classification: what the front's body says, not its sentence.
+        let calls = std::cell::Cell::new(0);
+        let e = start_waiting(
+            || {
+                calls.set(calls.get() + 1);
+                let err = crate::exec_endpoint::probe_error(&front_503("sandbox_limit_reached"));
+                async move { Err::<(), _>(std::io::Error::other(err)) }
+            },
+            |_| async {},
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(calls.get(), 1);
+        assert!(e.to_string().contains("sandbox_limit_reached"), "{e}");
+
+        let calls = std::cell::Cell::new(0);
+        let r = start_waiting(
+            || {
+                calls.set(calls.get() + 1);
+                let up = calls.get() > 2;
+                let err = crate::exec_endpoint::probe_error(&front_503("sandbox_starting"));
+                async move {
+                    if up {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::other(err))
+                    }
+                }
+            },
+            |_| async {},
+        )
+        .await;
+        assert!(r.is_ok());
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn a_bare_503_without_the_starting_code_is_not_starting() {
+        let bare = std::io::Error::other(crate::exec_endpoint::EndpointStatus::new(
+            503,
+            "the sandbox is starting",
+            "x",
+        ));
+        assert!(crate::exec_endpoint::probe_error(&bare).starts_with("the sandbox did not answer"));
+    }
 
     #[test]
     fn a_connectors_job_id_is_stable_and_a_valid_id() {

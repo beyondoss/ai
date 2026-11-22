@@ -3612,15 +3612,27 @@ async fn connect_sandbox_stdio(
     servers: &SandboxServers,
     command: &crate::grant::SandboxCommand,
 ) -> Result<McpClient, String> {
-    let (read, write) = crate::tools::mcp_sandbox_stdio::connect(
-        servers.runner.clone(),
-        servers.scope.clone(),
-        &config.name,
-        command,
-        &servers.cwd,
+    // A cold sandbox is still being made when the front's wake budget runs out and it answers 503:
+    // wait it out (bounded) rather than leaving the server out of the session for good.
+    let (read, write) = crate::tools::mcp_sandbox_stdio::start_waiting(
+        || {
+            crate::tools::mcp_sandbox_stdio::connect(
+                servers.runner.clone(),
+                servers.scope.clone(),
+                &config.name,
+                command,
+                &servers.cwd,
+            )
+        },
+        tokio::time::sleep,
     )
     .await
-    .map_err(|e| format!("could not start the server in the sandbox: {e}"))?;
+    .map_err(|e| {
+        format!(
+            "could not start the server `{}` in the sandbox: {e}",
+            config.name
+        )
+    })?;
     let transport = crate::tools::mcp_handshake::Guard::new(
         crate::tools::mcp_stdio::client_transport(read, write),
     );
