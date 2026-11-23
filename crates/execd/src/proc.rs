@@ -37,6 +37,7 @@ use nix::unistd::Pid;
 use tokio::sync::{oneshot, watch};
 
 use crate::job_kernel;
+use crate::wire_kernel as wire;
 
 /// The children execd spawned and has not yet collected, each with the channel its exit status
 /// goes down.
@@ -379,11 +380,14 @@ fn members(pgid: i32, mark: &str, strays_only: bool) -> Vec<u32> {
         }
         if let Some((state, _, pg)) = stat(pid)
             && is_live(state)
-            && if strays_only {
-                pg != pgid && has_mark(pid, mark)
-            } else {
-                (pgid > 1 && pg == pgid) || has_mark(pid, mark)
-            }
+            // Membership is the kernel's (W3). The mark is read from `/proc` only for a process the
+            // group does not already reach: for one it reaches the answer does not depend on it.
+            && wire::is_member(
+                pgid,
+                pg,
+                !wire::group_reaches(pgid, pg) && has_mark(pid, mark),
+                strays_only,
+            )
         {
             out.push(pid);
         }

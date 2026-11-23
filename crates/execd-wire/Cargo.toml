@@ -1,0 +1,32 @@
+[package]
+name = "beyond-execd-wire"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "execd's wire timing and kill-scope decisions as pure functions, proven in Verus: the heartbeat, when a one-shot answer is committed, which processes a job's signal reaches"
+
+[lib]
+name = "execd_wire"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+# Its one dependency is `vstd`, for the `verus!` macro: a normal build erases every proof and spec, and
+# only `cargo verus` (`mise run verify:kernels`) checks them. execd's `exec.rs` and `proc.rs` call these
+# functions for every one of these decisions. The version is the one the pinned release ships
+# (`.github/scripts/verus.env`).
+[dependencies]
+vstd = "=0.0.0-2026-11-01-0251"
+
+[package.metadata.verus]
+verify = true
+
+[features]
+# Mutations of the kernel's decisions, each removing one guard. `execd` forwards them: its tests
+# (named in the README) and the proof (`mise run verify:kernels -- --features <mut>`) both go red.
+mut_beat_late = [] # the heartbeat waits a whole interval more than it should: a stream goes silent for two
+mut_beat_never = [] # a quiet stream is never due a heartbeat
+mut_oneshot_never_commits = [] # a one-shot still running at the first silence is not committed: its headers wait for the end
+mut_stray_not_signalled = [] # a job's signal reaches its group and not the marked processes that left it

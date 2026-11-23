@@ -23,6 +23,7 @@ variables alone ([Configuration](#configuration)).
 | `src/ring.rs`       | the job output ring's I/O: chunk files, the tail, the bits' storage; every decision is `crates/execd-ring`        |
 | `crates/execd-ring` | the ring's offset, retention and stderr-label decisions, pure and proven in Verus (R1 to R6, `execd::ring`)       |
 | `crates/execd-jobs` | the job table's decisions, pure and proven in Verus (`execd::job_kernel`); `tests/job_model.rs` model-checks them |
+| `crates/execd-wire` | the heartbeat wait (W1), the one-shot's first answer (W2) and which processes a job's signal reaches (W3), pure and proven in Verus (`execd::wire_kernel`); `exec.rs` and `proc.rs` call them |
 | `src/notify.rs`     | notify: the sender that drives the `exec-notify` kernel                                                           |
 | `src/proc.rs`       | spawning, the reaper that collects every child, process groups by syscall, the subreaper                          |
 | `src/spool.rs`      | the jobs directory: where a kept job's retained output lives as chunk files, and stale-directory cleanup          |

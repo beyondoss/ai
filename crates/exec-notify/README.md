@@ -84,6 +84,7 @@ them. What it proves, in `src/lib.rs`:
 | Retries are bounded: at most `MAX_ATTEMPTS` per count; each wait is `d(n)·(1 − u/2)`, between `d(n)/2` and `d(n)` ms                                    | `wf`, `post_answer`, `wait_ms`                 |
 | Nothing after removal                                                                                                                                   | `post_removed`                                 |
 | Liveness: under F1 (attempts end), F2 (time advances, wakes arrive), F3 (the job quiesces) a job that owes settles in at most `rank_bound()` fair steps | `lemma_progress`, `lemma_rank_bounded`, `rank` |
+| The reporter's window: a count of 12 attempts, each at most 30 s, and the 11 waits between them (at most `d(n)`) lasts at most 723 s; a retry past the 12th is given up (settled, the end left for the next contact); a refusal is final | `count_ms`, `lemma_retry_window`, `lemma_a_count_is_bounded`, `lemma_a_stop_is_final`, `lemma_4xx_table` (red under `mut_wait_doubled`, `mut_retry_unbounded`, `mut_stop_is_retried`; test `a_count_of_failed_attempts_ends_723_seconds_after_it_began`) |
 
 `step` requires a job that `step` or `Default` made, `owed < u64::MAX` and `now`
 within a minute of `u64::MAX`; a millisecond clock and a count of events reach

@@ -37,6 +37,7 @@ mut_stop_is_retried = []
 mut_change_not_owed = []
 mut_keep_early = []
 mut_keep_never = []
+mut_wait_doubled = [] # a retry waits twice d(n): the count outlasts its 723 s window
 
 [dev-dependencies]
 serde_json.workspace = true

@@ -121,7 +121,7 @@ fn resolve_shell() -> &'static str {
 /// so far. The command is not stopped: it keeps running as a numbered job that `bash_job` waits on or
 /// kills. Silence is grounds to ask the model, never to kill: a clean release build of this repo goes
 /// 204 s without output. See "`bash` and hung commands" in `ARCHITECTURE.md` for the eval behind 60 s.
-pub const IDLE_YIELD: Duration = Duration::from_secs(60);
+pub const IDLE_YIELD: Duration = Duration::from_millis(bash_gate::IDLE_YIELD_MS);
 
 /// How long the call that starts a command may stream the output of one that never goes quiet (a
 /// server logging requests, a watcher) before it returns with the output so far and leaves the
@@ -703,25 +703,37 @@ impl Bash {
     /// Why this attach should return now, if it should. The model's own `timeout_ms` is named first
     /// when it is due: it is the reason the model can act on.
     fn yield_reason(&self, job: &Job, attached: Instant, hold: Hold) -> Option<Yield> {
+        let ns = |d: Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
         let waited = attached.elapsed();
-        let (ceiling, timeout_ms) = match hold {
-            Hold::Settle(settle) => return (waited >= settle).then_some(Yield::Settled),
+        // Whether to return, and why, is the kernel's (B2, `crates/bash-gate`, proven in Verus); the
+        // numbers a reason carries are read here.
+        let (kernel_hold, quiet) = match hold {
+            Hold::Settle(settle) => (bash_gate::Hold::Settle(ns(settle)), Duration::ZERO),
             Hold::Foreground {
                 ceiling,
                 timeout_ms,
-            } => (ceiling, timeout_ms),
+            } => (
+                bash_gate::Hold::Foreground {
+                    ceiling: ns(ceiling),
+                    timeout_ms,
+                },
+                job.shared.out().last_output.max(attached).elapsed(),
+            ),
         };
-        let window = self.idle_yield?;
-        if let Some(ms) = timeout_ms
-            && waited >= Duration::from_millis(ms)
-        {
-            return Some(Yield::Timeout(ms));
-        }
-        let quiet = job.shared.out().last_output.max(attached).elapsed();
-        if quiet >= window {
-            return Some(Yield::Quiet(quiet));
-        }
-        (waited >= ceiling).then_some(Yield::Ceiling(waited))
+        let why =
+            bash_gate::yield_reason(kernel_hold, ns(waited), ns(quiet), self.idle_yield.map(ns))?;
+        Some(match why {
+            bash_gate::Why::Settled => Yield::Settled,
+            bash_gate::Why::Timeout => Yield::Timeout(match hold {
+                Hold::Foreground {
+                    timeout_ms: Some(ms),
+                    ..
+                } => ms,
+                _ => 0,
+            }),
+            bash_gate::Why::Quiet => Yield::Quiet(quiet),
+            bash_gate::Why::Ceiling => Yield::Ceiling(waited),
+        })
     }
 
     /// Park `job` in the table and tell the model what it has so far, why the call returned, and

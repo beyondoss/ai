@@ -26,6 +26,8 @@ beyond-agent-core = { path = "../agent-core" }
 # The exec protocol v1.4 notification kernel (`exec_endpoint::notify_kernel`): zero dependencies,
 # shared with every endpoint that calls back, the reference mock included.
 beyond-exec-notify = { path = "../exec-notify" }
+# The bash tool's running-command limit and hand-back decisions, written inside `verus!` and proven there.
+beyond-bash-gate = { path = "../bash-gate" }
 # The exec client, FsBackend and ShellFs, shared with every other way to use a sandbox.
 beyond-sandbox = { path = "../sandbox" }
 # `serve`'s `OutFrame::Raw` payload: a serialized event line shared — by refcount bump, not deep copy —
@@ -276,6 +278,9 @@ mut_change_not_owed = ["beyond-exec-notify/mut_change_not_owed"]
 mut_keep_early = ["beyond-exec-notify/mut_keep_early"]
 mut_keep_never = ["beyond-exec-notify/mut_keep_never"]
 mut_cancel_skips_kill = []
+# Mutations of the bash kernel (`crates/bash-gate`): the bash limit and idle-yield tests go red under them.
+mut_gate_ignores_limit = ["beyond-bash-gate/mut_gate_ignores_limit"]
+mut_quiet_never_hands_back = ["beyond-bash-gate/mut_quiet_never_hands_back"]
 # Mutations of the job-table kernel (`crates/execd-jobs`), under which the notify model goes red where the table and the notifier meet.
 mut_remove_keeps_entry = ["beyond-execd-jobs/mut_remove_keeps_entry"]
 mut_remove_live = ["beyond-execd-jobs/mut_remove_live"]

@@ -35,7 +35,15 @@ use tokio::time::{Instant, Sleep};
 use crate::frame::{self, READ_BUF};
 use crate::http::{self, Line, Request, Resp};
 use crate::proc::{self, Proc, locked};
+use crate::wire_kernel as wire;
 use crate::{Ctx, StreamEnd, StreamStart};
+
+/// How long a sender whose last byte went `since` ago waits before its heartbeat: the kernel's decision
+/// (W1), in nanoseconds on tokio's clock.
+fn beat_wait(since: Duration, beat: Duration) -> Duration {
+    let ns = |d: Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+    Duration::from_nanos(wire::quiet_wait(ns(since), ns(beat)))
+}
 
 /// How long, after a command's process exits, to keep reading pipes a descendant may be holding
 /// open: the client's own grace (streaming "Ordering").
@@ -295,8 +303,14 @@ fn answer(code: i32, stdout: &[u8], stderr: &[u8]) -> Value {
 pub(crate) async fn envelope(ctx: &Arc<Ctx>, req: Request) -> Resp {
     let beat = ctx.opts.heartbeat;
     let mut run = Box::pin(run_oneshot(ctx.clone(), req));
-    if let Ok(resp) = tokio::time::timeout(beat, &mut run).await {
+    // The first beat of silence: the wait is the kernel's (W1), and what it ends in its mode (W2).
+    let first = beat_wait(Duration::ZERO, beat);
+    let done = tokio::time::timeout(first, &mut run).await;
+    if let Ok(resp) = done {
         return resp;
+    }
+    if wire::oneshot_mode(false) == wire::Mode::Direct {
+        return run.await;
     }
     let (resp, out) = http::json_stream_response();
     tokio::spawn(async move {
@@ -305,7 +319,7 @@ pub(crate) async fn envelope(ctx: &Arc<Ctx>, req: Request) -> Resp {
                 resp = &mut run => break resp,
                 // The client left: dropping `run` ends the command with its group slot.
                 () = out.closed() => return,
-                () = tokio::time::sleep(beat) => {}
+                () = tokio::time::sleep(beat_wait(Duration::ZERO, beat)) => {}
             }
             if out.send(Bytes::from_static(b" ")).await.is_err() {
                 return;
@@ -505,14 +519,15 @@ impl Sink {
         }
     }
 
-    /// Resolves with `Ok` when a heartbeat is due, or `Err` when the stream is cut.
+    /// Resolves with `Ok` when a heartbeat is due, or `Err` when the stream is cut. When it is due is
+    /// the kernel's (W1): the beat less the time since the last frame.
     pub async fn quiet(&mut self) -> Result<(), Cut> {
-        let due = self.last + self.heartbeat;
+        let wait = beat_wait(self.last.elapsed(), self.heartbeat);
         tokio::select! {
             biased;
             () = &mut self.timer => Err(Cut::TimedOut),
             () = self.out.closed() => Err(Cut::Gone),
-            () = tokio::time::sleep_until(due) => Ok(()),
+            () = tokio::time::sleep(wait) => Ok(()),
         }
     }
 }

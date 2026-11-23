@@ -401,3 +401,69 @@ fn step_checked_never_wraps() {
     );
     assert_eq!((below.owed, actions.len()), (u64::MAX - 2, 1));
 }
+
+/// The worst count, driven through [`step`] as an endpoint drives it: every attempt takes its whole 30 s
+/// and fails, every wait is the longest (draw 0). The count gives up after 12 attempts, 723 s after
+/// it began, with nothing sent after and nothing left waiting: the end is left for the next contact.
+/// Red under `mut_wait_doubled` (a longer window) and `mut_retry_unbounded` (it never gives up).
+#[test]
+fn a_count_of_failed_attempts_ends_723_seconds_after_it_began() {
+    let (mut j, mut acts) = step(Job::default(), Event::Keep { notify: true }, 0);
+    let mut now = 0u64;
+    let mut begins = 1;
+    for _ in 0..100 {
+        match acts.last() {
+            Some(Action::Begin { .. }) => {
+                now += ATTEMPT_TIMEOUT_MS;
+                (j, acts) = step(
+                    j,
+                    Event::AttemptEnded {
+                        outcome: Outcome::Failed,
+                        draw: 0,
+                    },
+                    now,
+                );
+            }
+            Some(Action::WakeAt(at)) => {
+                now = *at;
+                (j, acts) = step(j, Event::Wake, now);
+                begins += 1;
+            }
+            _ => break,
+        }
+    }
+    assert_eq!(begins, MAX_ATTEMPTS, "attempts in a count");
+    assert!(
+        acts.is_empty(),
+        "nothing sent or waiting after the last: {acts:?}"
+    );
+    assert_eq!(j.settled, j.owed, "given up, not left owing");
+    assert_eq!(now, RETRY_WINDOW_MS, "the window");
+}
+
+/// A refusal (a `404`) settles at once: no retry, no wake. A `429` is retried. Red under
+/// `mut_stop_is_retried`.
+#[test]
+fn a_refusal_is_not_retried_and_a_429_is() {
+    let (j, _) = step(Job::default(), Event::Keep { notify: true }, 0);
+    let (j404, acts) = step(
+        j,
+        Event::AttemptEnded {
+            outcome: Outcome::Status(404),
+            draw: 0,
+        },
+        10,
+    );
+    assert!(acts.is_empty(), "{acts:?}");
+    assert_eq!(j404.settled, j404.owed);
+    let (j429, acts) = step(
+        j,
+        Event::AttemptEnded {
+            outcome: Outcome::Status(429),
+            draw: 0,
+        },
+        10,
+    );
+    assert!(matches!(acts.as_slice(), [Action::WakeAt(_)]), "{acts:?}");
+    assert!(j429.settled < j429.owed);
+}

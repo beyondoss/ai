@@ -397,7 +397,7 @@ pub fn wait_ms(n: u32, draw: u32) -> (r: u64)
         assert(q < a / 2) by (nonlinear_arith)
             requires q * 8589934592 <= t, t <= a * 4294967295, a % 2 == 0, 0 < a;
     }
-    a - q - carry
+    if cfg!(feature = "mut_wait_doubled") { 2 * a } else { a - q - carry }
 }
 
 /// An attempt begins: the job's next state and the action. Only called with something owed.
@@ -668,6 +668,85 @@ pub proof fn lemma_rank_bounded(j: Job)
     ensures
         0 <= rank(j) <= rank_bound(),
         rank(j) == 0 <==> !pending(j),
+{
+}
+
+// ---------------------------------------------------------------------------------------------
+// The retry window: how long the sandbox's reporter tries, and when it stops.
+// ---------------------------------------------------------------------------------------------
+
+/// The longest one count of callbacks lasts, in milliseconds: 12 attempts of at most 30 s each and
+/// the 11 waits between them, 1 + 2 + 4 + 8 + 16 + 32 + 5 * 60 = 363 s. The "about 723 s" a sandbox's
+/// reporter retries for (N16, N18).
+pub const RETRY_WINDOW_MS: u64 = 723_000;
+
+/// The longest time from the start of attempt `k` of a count to its end: the attempt's own bound,
+/// and (while the count has attempts left) the longest wait after it and the rest.
+pub open spec fn count_ms(k: u32) -> int
+    decreases (MAX_ATTEMPTS as int) - (k as int),
+{
+    if k >= MAX_ATTEMPTS {
+        ATTEMPT_TIMEOUT_MS as int
+    } else {
+        ATTEMPT_TIMEOUT_MS as int + backoff_ms(k) + count_ms((k + 1) as u32)
+    }
+}
+
+/// **The window is 723 s.** A count that starts with attempt 1 ends within [`RETRY_WINDOW_MS`].
+pub proof fn lemma_retry_window()
+    ensures
+        count_ms(1) == RETRY_WINDOW_MS as int,
+{
+    reveal_with_fuel(count_ms, 14);
+}
+
+/// **A retry waits at most `d(n)` and the count then ends.** An answer that says retry, for the
+/// attempt that carries everything owed, schedules the next attempt no later than `d(n)` after it
+/// (so the count is within [`count_ms`]) while the count has attempts left, and gives up (settled,
+/// no wake: the end is left for the next contact) once it has none. This is the step's own promise
+/// (`post_answer`) read at the retry, which `wait_ms` bounds by `d(n)`.
+pub proof fn lemma_a_count_is_bounded(job: Job, event: Event, now: u64, j2: Job, out: Seq<Action>)
+    requires
+        wf(job),
+        step_post(job, event, now, j2, out),
+        event is AttemptEnded,
+        job.in_flight is Some,
+        job.in_flight->Some_0 == job.owed,
+        verdict_spec(event->AttemptEnded_outcome) is Retry,
+        !job.removed,
+    ensures
+        job.attempts < MAX_ATTEMPTS ==> (has_wake(out) && out[0]->WakeAt_0 <= now + backoff_ms(job.attempts)),
+        job.attempts >= MAX_ATTEMPTS ==> (!has_wake(out) && !has_begin(out) && j2.settled == j2.owed),
+{
+}
+
+/// **A refusal is final.** An answer that says stop (a `401`, `403`, `404`, `410`, or any other status
+/// the table does not retry) settles what its attempt carried and schedules nothing: no wake, and no
+/// attempt of this count.
+pub proof fn lemma_a_stop_is_final(job: Job, event: Event, now: u64, j2: Job, out: Seq<Action>)
+    requires
+        wf(job),
+        step_post(job, event, now, j2, out),
+        event is AttemptEnded,
+        job.in_flight is Some,
+        job.in_flight->Some_0 == job.owed,
+        verdict_spec(event->AttemptEnded_outcome) is Stop,
+        !job.removed,
+    ensures
+        !has_wake(out),
+        !has_begin(out),
+        j2.settled == j2.owed,
+{
+}
+
+/// The table's `4xx` rows, as the code has them: a client error is final except `407`, `408`, `425`
+/// and `429`, which are retried. (The row text "stops on a 4xx" is the first half of this.)
+pub proof fn lemma_4xx_table(s: u16)
+    requires
+        400 <= s <= 499,
+    ensures
+        verdict_spec(Outcome::Status(s)) is Stop <==> !(s == 407 || s == 408 || s == 425 || s == 429),
+        verdict_spec(Outcome::Status(s)) is Retry <==> (s == 407 || s == 408 || s == 425 || s == 429),
 {
 }
 

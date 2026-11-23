@@ -1,0 +1,29 @@
+[package]
+name = "beyond-bash-gate"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The agent's bash decisions as pure functions, proven in Verus: the running-command limit gates a start and stops nothing; when a call hands back to the model"
+
+[lib]
+name = "bash_gate"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+# Its one dependency is `vstd`, for the `verus!` macro: a normal build erases every proof and spec, and
+# only `cargo verus` (`mise run verify:kernels`) checks them. The agent's `tools/bash_jobs.rs` and
+# `tools/bash.rs` call these functions. The version is the one the pinned release ships.
+[dependencies]
+vstd = "=0.0.0-2026-11-01-0251"
+
+[package.metadata.verus]
+verify = true
+
+[features]
+# Mutations of the kernel's decisions. `beyond-agent` forwards them: its bash tests (named in the
+# README) and the proof (`mise run verify:kernels -- --features <mut>`) both go red.
+mut_gate_ignores_limit = [] # a start is admitted at any count of running commands
+mut_quiet_never_hands_back = [] # a silent command is never handed back to the model
