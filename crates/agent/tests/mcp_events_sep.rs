@@ -1,4 +1,4 @@
-//! MCP Events against the rules of SEP-3415 (Final), end to end: a real stdio `serve`, the events
+//! MCP Events against the rules of SEP-3415 (extension stage Beta), end to end: a real stdio `serve`, the events
 //! fixture (which validates what the spec requires of a *server*), a mock model.
 //!
 //! One file per concern would be many tiny harnesses; these share one: the capability gate, the
