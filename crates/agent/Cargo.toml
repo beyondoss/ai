@@ -23,11 +23,11 @@ workspace = true
 # The harness core. Depended on by package name; imported as `agent_core` (its lib name).
 async-trait.workspace = true
 beyond-agent-core = { path = "../agent-core" }
+# The bash tool's running-command limit and hand-back decisions, written inside `verus!` and proven there.
+beyond-bash-gate = { path = "../bash-gate" }
 # The exec protocol v1.4 notification kernel (`exec_endpoint::notify_kernel`): zero dependencies,
 # shared with every endpoint that calls back, the reference mock included.
 beyond-exec-notify = { path = "../exec-notify" }
-# The bash tool's running-command limit and hand-back decisions, written inside `verus!` and proven there.
-beyond-bash-gate = { path = "../bash-gate" }
 # The exec client, FsBackend and ShellFs, shared with every other way to use a sandbox.
 beyond-sandbox = { path = "../sandbox" }
 # `serve`'s `OutFrame::Raw` payload: a serialized event line shared — by refcount bump, not deep copy —

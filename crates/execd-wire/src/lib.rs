@@ -145,9 +145,7 @@ pub fn oneshot_mode(ended_within_beat: bool) -> (m: Mode)
         ended_within_beat <==> m is Direct,
         !ended_within_beat <==> m is Committed,
 {
-    if cfg!(feature = "mut_oneshot_never_commits") {
-        Mode::Direct
-    } else if ended_within_beat {
+    if ended_within_beat || cfg!(feature = "mut_oneshot_never_commits") {
         Mode::Direct
     } else {
         Mode::Committed
