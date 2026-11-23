@@ -130,7 +130,7 @@ impl Front {
         let rest = upstream.trim_start_matches("http://");
         let (target, path) = rest.split_once('/').map_or((rest, ""), |(h, p)| (h, p));
         let (target, path) = (target.to_string(), path.to_string());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = beyond_test_support::ports::tokio_listener().await;
         let url = format!("http://{}/{path}", listener.local_addr().unwrap());
         let conns: Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>> = Arc::default();
         let keeps = Arc::new(std::sync::atomic::AtomicUsize::new(0));
