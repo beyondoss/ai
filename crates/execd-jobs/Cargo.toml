@@ -41,3 +41,7 @@ mut_take_by_key = [] # a take removes whatever job holds the key now, not the jo
 mut_follow_waits_after_end = [] # a stream never sends its final frame (L2)
 mut_signal_after_reap = [] # a signal by number is sent to a group the reaper has freed (J11)
 mut_held_forgets = [] # a spawn's group is not held, so a live group is never signalled (J11 liveness)
+mut_recover_drops_live = [] # a restart forgets a job whose group is alive (R2)
+mut_recover_adopts_gone = [] # a restart adopts a job whose group is gone, so it never ends (R3)
+mut_recover_reends_ended = [] # a restart drops an ended job whose group number is gone (R1)
+mut_recover_forgets_shell_status = [] # a restart ends a job whose shell had exited with the lost-status code, not the saved one (R3)

@@ -43,7 +43,8 @@
     clippy::if_same_then_else,
     clippy::implicit_saturating_sub,
     clippy::single_match,
-    clippy::collapsible_if
+    clippy::collapsible_if,
+    non_shorthand_field_patterns
 )]
 
 use vstd::prelude::*;
@@ -603,6 +604,157 @@ pub proof fn lemma_end_progress(old: State, ev: Ev, s: State, act: Act)
         end_rank(s.phase) < end_rank(old.phase),
         end_rank(old.phase) <= 2,
         end_rank(s.phase) == 0 <==> s.phase is Ended,
+{
+}
+
+// ---------------------------------------------------------------------------------------------
+// A restart of execd: what each job in the saved table becomes.
+// ---------------------------------------------------------------------------------------------
+
+/// What a restarted execd does with one saved job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Recovery {
+    /// The job is not in the table: it never had a group, or it was removed.
+    Drop,
+    /// The job is in the table with its group still running; a supervisor watches the group.
+    Adopt,
+    /// The job is in the table as it ended, with the status the kernel returned.
+    Restore,
+}
+
+/// The exit code of a job whose shell's status no one saw: the shell was reparented when execd
+/// died, and a process that is not our child gives no status. The same `-1` a lost status is
+/// everywhere else in execd (`Proc::wait`).
+pub const LOST_CODE: i32 = -1;
+
+/// R1-R5: what a saved job (`s`, as [`step`] left it and the ledger wrote it) becomes when execd
+/// starts again. `alive` is what the OS says: some process of the job's group, or carrying its
+/// mark, is still running. `now` is the shell's epoch seconds.
+///
+/// - R1: an ended job comes back as it ended: its code, signal and time are exactly what was saved,
+///   whatever the OS says now (the group number of an ended job may belong to another process).
+/// - R2: a job whose group is alive is adopted as saved: its phase and its shell's saved status stay.
+/// - R3: a job whose group is gone ends at once, with its shell's saved status, else [`LOST_CODE`]:
+///   never a status no one saw.
+/// - R4: a job that never had a group, or was removed, is not in the table.
+/// - R5 ([`lemma_recover_idempotent`]): recovering what recovery returned changes nothing (a
+///   restart during a restart).
+pub fn recover(s: State, alive: bool, now: u64) -> (r: (State, Recovery))
+    ensures
+        s.phase is Ended ==> (r.1 is Restore && r.0 == s),
+        (!s.removed && (s.phase is Running || s.phase is Exited) && alive) ==> (r.1 is Adopt && r.0 == s),
+        (!s.removed && s.phase is Running && !alive) ==> (r.1 is Restore && r.0 == State {
+            phase: Phase::Ended { pgid: pgid_s(s), code: -1i32, signal: None, at: now, shell_told: false },
+            ..s
+        }),
+        (!s.removed && s.phase is Exited && !alive) ==> (r.1 is Restore && r.0 == State {
+            phase: Phase::Ended {
+                pgid: pgid_s(s),
+                code: s.phase->Exited_code,
+                signal: s.phase->Exited_signal,
+                at: now,
+                shell_told: true,
+            },
+            ..s
+        }),
+        (s.phase is Spawning || (s.removed && !(s.phase is Ended))) ==> r.1 is Drop,
+        r.1 is Drop || r.0.claim == s.claim,
+        r.1 is Drop || r.0.seen == s.seen,
+        r.1 is Drop || r.0.started == s.started,
+        r.1 is Drop || pgid_s(r.0) == pgid_s(s),
+        r.1 is Adopt ==> (r.0.phase is Running || r.0.phase is Exited),
+        r.1 is Restore ==> r.0.phase is Ended,
+{
+    let State { phase, claim, seen, removed, started } = s;
+    match phase {
+        Phase::Spawning => (State { phase: Phase::Spawning, claim, seen, removed, started }, Recovery::Drop),
+        Phase::Ended { pgid, code, signal, at, shell_told } => (
+            State { phase: Phase::Ended { pgid, code, signal, at, shell_told }, claim, seen, removed, started },
+            if cfg!(feature = "mut_recover_reends_ended") && !alive {
+                Recovery::Drop
+            } else {
+                Recovery::Restore
+            },
+        ),
+        Phase::Running { pgid } => {
+            if removed {
+                (State { phase: Phase::Running { pgid }, claim, seen, removed, started }, Recovery::Drop)
+            } else if (alive && !cfg!(feature = "mut_recover_drops_live")) || cfg!(feature = "mut_recover_adopts_gone") {
+                (State { phase: Phase::Running { pgid }, claim, seen, removed, started }, Recovery::Adopt)
+            } else {
+                (
+                    State {
+                        phase: Phase::Ended { pgid, code: -1i32, signal: None, at: now, shell_told: false },
+                        claim,
+                        seen,
+                        removed,
+                        started,
+                    },
+                    Recovery::Restore,
+                )
+            }
+        },
+        Phase::Exited { pgid, code, signal } => {
+            if removed {
+                (State { phase: Phase::Exited { pgid, code, signal }, claim, seen, removed, started }, Recovery::Drop)
+            } else if (alive && !cfg!(feature = "mut_recover_drops_live")) || cfg!(feature = "mut_recover_adopts_gone") {
+                (State { phase: Phase::Exited { pgid, code, signal }, claim, seen, removed, started }, Recovery::Adopt)
+            } else {
+                let kept = !cfg!(feature = "mut_recover_forgets_shell_status");
+                (
+                    State {
+                        phase: Phase::Ended {
+                            pgid,
+                            code: if kept { code } else { -1 },
+                            signal: if kept { signal } else { None },
+                            at: now,
+                            shell_told: true,
+                        },
+                        claim,
+                        seen,
+                        removed,
+                        started,
+                    },
+                    Recovery::Restore,
+                )
+            }
+        },
+    }
+}
+
+/// [`recover`]'s answer as a spec, for [`lemma_recover_idempotent`].
+pub open spec fn recover_spec(s: State, alive: bool, now: u64) -> (State, Recovery) {
+    match s.phase {
+        Phase::Spawning => (s, Recovery::Drop),
+        Phase::Ended { .. } => (s, Recovery::Restore),
+        Phase::Running { pgid } => {
+            if s.removed {
+                (s, Recovery::Drop)
+            } else if alive {
+                (s, Recovery::Adopt)
+            } else {
+                (State { phase: Phase::Ended { pgid, code: -1i32, signal: None, at: now, shell_told: false }, ..s }, Recovery::Restore)
+            }
+        },
+        Phase::Exited { pgid, code, signal } => {
+            if s.removed {
+                (s, Recovery::Drop)
+            } else if alive {
+                (s, Recovery::Adopt)
+            } else {
+                (State { phase: Phase::Ended { pgid, code, signal, at: now, shell_told: true }, ..s }, Recovery::Restore)
+            }
+        },
+    }
+}
+
+/// R5: what [`recover`] put in the table as ended recovers to itself, whatever the OS says the second
+/// time and whenever it is asked: a restart during a restart changes nothing.
+pub proof fn lemma_recover_idempotent(s: State, alive: bool, now: u64, alive2: bool, now2: u64)
+    requires
+        recover_spec(s, alive, now).1 is Restore,
+    ensures
+        recover_spec(recover_spec(s, alive, now).0, alive2, now2) == recover_spec(s, alive, now),
 {
 }
 

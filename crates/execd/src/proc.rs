@@ -224,6 +224,16 @@ pub(crate) fn spawn(cmd: &mut std::process::Command) -> io::Result<Proc> {
     }
 }
 
+/// Take hold of a group a previous execd started (a restart's adoption), as a spawn of this one's:
+/// a signal by number reaches it while it is held, and the reaper lets it go once it is gone (J11).
+pub(crate) fn adopt_group(pgid: i32) -> Pg {
+    let sp = SPAWNS.fetch_add(1, Ordering::Relaxed);
+    if let Some(h) = held_groups().as_mut() {
+        h.insert(pgid, sp);
+    }
+    Pg { id: pgid, sp }
+}
+
 /// SIGKILL every member of group `pgid`. A group that is already gone is not an error.
 pub(crate) fn kill_group(pg: Pg) {
     let _no_reaping = no_reaping();

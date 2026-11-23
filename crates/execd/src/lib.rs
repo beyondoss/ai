@@ -39,6 +39,7 @@ pub use execd_jobs as job_kernel;
 #[doc(hidden)]
 pub use execd_wire as wire_kernel;
 mod jobs;
+mod ledger;
 pub mod log;
 mod notify;
 mod proc;
@@ -160,6 +161,15 @@ pub struct Options {
     /// execd's own (mode 0700); `None` is `$TMPDIR`, else `/tmp`. Use a disk-backed directory:
     /// on tmpfs the output is RAM.
     pub jobs_dir: Option<PathBuf>,
+    /// Where the jobs ledger is kept (a directory of execd's own, mode 0700), so a restart of execd
+    /// (a crash, a kill, a new binary) finds the jobs it started: the ones whose process groups run
+    /// on are adopted into the table (listable, signalled, removed, and counted by
+    /// [`Handle::activity`]); the ones that ended keep the status they ended with; one whose group
+    /// is gone ends with its shell's saved status, else `-1`. A job's retained output is not kept
+    /// (see `ledger.rs`), and a job that writes to its stdout after the restart loses its pipe.
+    /// `None`: nothing is kept, as before. Use a directory that dies with the machine the jobs run
+    /// on (tmpfs): a ledger that outlives its processes only names groups that are gone.
+    pub state_dir: Option<PathBuf>,
     /// The most output a one-shot answer carries; see [`MAX_RESPONSE_BYTES`].
     pub max_response_bytes: usize,
     /// The most a request may carry; see [`MAX_REQUEST_BYTES`].
@@ -206,6 +216,7 @@ impl Options {
             run_as: None,
             job_output_retention: JOB_OUTPUT_RETENTION,
             jobs_dir: None,
+            state_dir: None,
             max_response_bytes: MAX_RESPONSE_BYTES,
             max_request_bytes: MAX_REQUEST_BYTES,
             observer: None,
@@ -229,6 +240,7 @@ impl std::fmt::Debug for Options {
             .field("run_as", &self.run_as)
             .field("job_output_retention", &self.job_output_retention)
             .field("jobs_dir", &self.jobs_dir)
+            .field("state_dir", &self.state_dir)
             .field("max_response_bytes", &self.max_response_bytes)
             .field("max_request_bytes", &self.max_request_bytes)
             .field("observer", &self.observer.is_some())
@@ -368,6 +380,7 @@ impl Handle {
         self.stop.cancel();
         let _ = self.accept.await;
         let killed = self.ctx.groups.kill_all();
+        self.ctx.jobs.forget();
         self.ctx.spool.clean();
         self.reaper.cancel();
         killed
@@ -406,10 +419,14 @@ pub fn serve(listener: tokio::net::TcpListener, opts: Options) -> std::io::Resul
         .filter(|k| k.as_encoded_bytes().starts_with(b"EXECD_"))
         .collect();
     let activity = Arc::new(tokio::sync::watch::Sender::new(0));
+    let ledger = opts
+        .state_dir
+        .as_deref()
+        .map_or_else(ledger::Ledger::disabled, ledger::Ledger::at);
     let ctx = Arc::new(Ctx {
         opts,
         scrub,
-        jobs: jobs::Jobs::new(activity.clone()),
+        jobs: jobs::Jobs::new(activity.clone(), ledger),
         spool,
         groups: proc::Groups::default(),
         client: tokio::sync::OnceCell::new(),
@@ -421,6 +438,8 @@ pub fn serve(listener: tokio::net::TcpListener, opts: Options) -> std::io::Resul
     // The reaper collects every command's exit (see `proc`); it runs before the first can start.
     let reaper = CancellationToken::new();
     proc::start_reaper(reaper.clone())?;
+    // The jobs a previous execd started, before the first request can name one.
+    jobs::recover(&ctx);
     let stop = CancellationToken::new();
     let accept = tokio::spawn(http::accept_loop(listener, ctx.clone(), stop.clone()));
     Ok(Handle {

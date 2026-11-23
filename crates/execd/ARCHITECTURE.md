@@ -33,7 +33,7 @@ variables alone ([Configuration](#configuration)).
 
 execd has no command-line flags. It is configured by `EXECD_*` environment variables, each read once at startup in
 `src/config.rs` and nowhere else: `EXECD_LISTEN`, `EXECD_ROOT`, `EXECD_HOME`, `EXECD_BEARER_FILE`, `EXECD_BEARER`,
-`EXECD_INSECURE_NO_AUTH`, `EXECD_RUN_AS`, `EXECD_MAX_RESPONSE_BYTES`, `EXECD_JOBS_DIR`,
+`EXECD_INSECURE_NO_AUTH`, `EXECD_RUN_AS`, `EXECD_MAX_RESPONSE_BYTES`, `EXECD_JOBS_DIR`, `EXECD_STATE_DIR`,
 `EXECD_LOG`, `EXECD_WORKER_THREADS` and `EXECD_IDLE_TIMEOUT_MS` (the table is in the README). A value that does not parse is an error
 naming the variable and the value, with exit status 2; a boolean is `1`, `true`, `0` or `false`; an empty variable is unset.
 Any argument other than the internal `--execd-run-as-helper` re-exec marker (handled before anything else) prints the variable
@@ -259,6 +259,42 @@ where init reaps orphans outside the exclusion; and the supervisor's end of a jo
 ```sh
 cargo test -p beyond-execd --test os_model                              # J11, J11-live
 cargo test -p beyond-execd --features mut_signal_after_reap --test os_model the_mutation
+```
+
+### A restart of execd: the jobs ledger (R1-R5)
+
+A job's processes outlive execd when it is killed or crashes; what died is the table that knew them. With
+`EXECD_STATE_DIR` (`Options::state_dir`) set, execd keeps one typed value across its own restart: `execd-jobs.json`
+(`src/ledger.rs`), the table's jobs that have a group and are not removed, each as the job kernel's `State` plus its
+address, label and mark. It is replaced whole (written aside, renamed) at each change of a job's life (spawn, the shell's
+exit, the end, `keep`, removal), never as marker files; a file that does not parse is read as empty. A new execd reads it
+before it serves (`jobs::recover`) and asks the pure `job_kernel::recover(state, alive, now)` what each job becomes, where
+`alive` is whether any process of the group or carrying the mark runs:
+
+| saved | group | becomes |
+|---|---|---|
+| ended | any | in the table exactly as it ended: code, signal and time (R1) |
+| running or exited | alive | adopted as saved, its group held for signals and watched until it empties (R2) |
+| running | gone | ended, code `-1` (`LOST_CODE`): the shell's status was seen by no one (R3) |
+| exited | gone | ended with the shell's saved code and signal (R3) |
+| no group yet, or removed | | not in the table (R4) |
+
+R5: recovering what recovery returned changes nothing, so a restart during a restart is safe. Proven in Verus
+(`execd-jobs`, `recover` and `lemma_recover_idempotent`), run by production, and driven through the real binary by
+`tests/restart.rs`; four mutations (`mut_recover_drops_live`, `mut_recover_adopts_gone`, `mut_recover_reends_ended`,
+`mut_recover_forgets_shell_status`) are red in both. A held start no one kept dies with its client, whose connection went
+with the old process: recovery sends it the same `Disconnect` any client leaving does.
+
+What does not survive: a job's retained output (the old process's spool dies with it, so a recovered job reads back
+empty), a `notify` target, and a job's open stdin. A job that writes to its stdout or stderr after the restart loses
+its pipe and gets `SIGPIPE`, so a job that must run through a restart redirects its own output. `SIGTERM`
+is a shutdown, not a crash: it kills every group and empties the ledger. The directory should die with the machine the jobs
+run on (tmpfs); a ledger that outlives its processes only names groups that are gone, which recovery ends as above.
+
+```sh
+cargo test -p beyond-execd --test restart
+cargo test -p beyond-execd --features mut_recover_drops_live --test restart   # red
+mise run verify:kernels -- --features mut_recover_drops_live                    # red
 ```
 
 ## Security
