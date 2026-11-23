@@ -38,6 +38,8 @@ pub(crate) struct Ring {
     /// stderr byte, so a job that never writes stderr pays nothing; may be shorter than `tail`
     /// (a missing bit is stdout). A full chunk's bits go to `<chunk>.e` when any is set.
     tail_e: Option<Vec<u8>>,
+    /// The directory is not this ring's to delete: its owner (a job's spool) removes it.
+    keep: bool,
 }
 
 impl Ring {
@@ -50,7 +52,97 @@ impl Ring {
             base: 0,
             retain,
             tail_e: None,
+            keep: false,
         }
+    }
+
+    /// The ring's directory outlives this value (a job's spool directory, which a restarted execd
+    /// reads again, and which its owner removes with the job).
+    pub fn kept(mut self) -> Self {
+        self.keep = true;
+        self
+    }
+
+    /// A ring over the chunk files a previous execd left in `dir`: the longest run of whole chunks
+    /// that ends at the highest one. Anything else there (a chunk the crash cut short, one cut off
+    /// from the run by a refused write) is deleted. Its unfinished tail is not here: the journal
+    /// has it.
+    pub fn recover(retain: usize, dir: PathBuf, floor: u64) -> Self {
+        let mut have = std::collections::BTreeSet::new();
+        let mut junk = Vec::new();
+        for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let name = e.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let stem = name.strip_suffix(".e").unwrap_or(name);
+            let Ok(idx) = u64::from_str_radix(stem, 16) else {
+                junk.push(e.path());
+                continue;
+            };
+            let whole = e
+                .metadata()
+                .is_ok_and(|m| m.is_file() && (stem != name || m.len() == FRAME_MAX as u64));
+            if stem == name {
+                if whole {
+                    have.insert(idx);
+                } else {
+                    junk.push(e.path());
+                }
+            }
+        }
+        let mut ring = Self::new(retain, dir.clone()).kept();
+        if let Some(&top) = have.last() {
+            let mut low = top;
+            while low > 0 && have.contains(&(low - 1)) {
+                low -= 1;
+            }
+            ring.base = low * FRAME_MAX as u64;
+            ring.files = (top - low + 1) as usize;
+            ring.made = true;
+            junk.extend(have.iter().filter(|&&i| i < low).flat_map(|&i| {
+                [
+                    dir.join(format!("{i:010x}")),
+                    dir.join(format!("{i:010x}.e")),
+                ]
+            }));
+        }
+        // The chunks end before the journal's first byte: a chunk the disk refused, so the offsets
+        // between are a gap, as they were before the crash. The ring starts at the journal.
+        if ring.end() < floor && floor.is_multiple_of(FRAME_MAX as u64) {
+            junk.extend((0..ring.files).flat_map(|i| {
+                let at = ring.base / FRAME_MAX as u64 + i as u64;
+                [
+                    dir.join(format!("{at:010x}")),
+                    dir.join(format!("{at:010x}.e")),
+                ]
+            }));
+            ring.base = floor;
+            ring.files = 0;
+        }
+        for j in junk {
+            let _ = std::fs::remove_file(j);
+        }
+        // Sidecars of chunks that are not in the run.
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                let name = e.file_name();
+                let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(".e")) else {
+                    continue;
+                };
+                let held = u64::from_str_radix(stem, 16).is_ok_and(|i| {
+                    i * FRAME_MAX as u64 >= ring.base
+                        && i * (FRAME_MAX as u64) < ring.base + (ring.files * FRAME_MAX) as u64
+                });
+                if !held {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
+        ring
+    }
+
+    /// The bytes of the unfinished chunk.
+    pub fn tail_len(&self) -> usize {
+        self.tail.len()
     }
 
     fn held(&self) -> usize {
@@ -173,7 +265,7 @@ impl Ring {
 
 impl Drop for Ring {
     fn drop(&mut self) {
-        if self.made {
+        if self.made && !self.keep {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
     }

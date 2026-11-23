@@ -9,9 +9,9 @@
 //!
 //! Only what a restart cannot learn from the OS is kept: the job's address, its label, its mark (how
 //! its processes are found again, wherever they went), the kernel's [`State`] (phase, claim, what
-//! the model has seen) and, once it has them, the shell's status and the end's. Output is not kept:
-//! a job's retained output is the previous process's spool, which dies with it, so a recovered job
-//! reads back empty.
+//! the model has seen) and, once it has them, the shell's status and the end's. Its output is not in it: the entry names the job's spool directory
+//! (`Entry::spool`, see `tail.rs`), where the job's files, the journal and the ring's chunks are,
+//! and a restarted execd rebuilds the ring from there.
 //!
 //! The file is `0600` in a `0700` directory. A file that does not parse, or names a version this
 //! execd does not know, is set aside (read as empty) and never trusted.
@@ -48,6 +48,11 @@ pub(crate) struct Entry {
     pub kept: Option<Kept>,
     pub seen: u64,
     pub started: u64,
+    /// The directory of the job's output (`tail.rs`): its two files, its journal and its ring's
+    /// chunks. A restarted execd, and whoever clears stale directories at its start, keep what
+    /// this names. `None` for a job with no spool.
+    #[serde(default)]
+    pub spool: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,7 +80,14 @@ struct File {
 
 impl Entry {
     /// What to save of a job, or `None` for one not worth saving: no group yet, or removed.
-    pub fn of(scope: &str, id: &str, label: &str, mark: &str, k: &State) -> Option<Self> {
+    pub fn of(
+        scope: &str,
+        id: &str,
+        label: &str,
+        mark: &str,
+        k: &State,
+        spool: Option<&Path>,
+    ) -> Option<Self> {
         if k.removed {
             return None;
         }
@@ -121,6 +133,7 @@ impl Entry {
             kept,
             seen: k.seen,
             started: k.started,
+            spool: spool.map(|p| p.to_string_lossy().into_owned()),
         })
     }
 

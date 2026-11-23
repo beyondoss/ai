@@ -8,9 +8,9 @@
 //! - *Output*: the last [`crate::Options::job_output_retention`] bytes per job (8 MiB, the spec's
 //!   floor), as whole chunk files of 64 KiB under execd's jobs directory (see [`crate::spool`]),
 //!   so a job holds between that and that plus one chunk on disk, and in memory only its
-//!   unfinished chunk. Older bytes are dropped and read back as a gap. A job's two pumps write into it
+//!   unfinished chunk. Older bytes are dropped and read back as a gap. A job's tail writes into it
 //!   directly; there is no channel to fill, and a slow `attach` never slows the job (it reads a gap
-//!   instead).
+//!   instead). Between the job and the ring is the job's spool file, not a pipe: it outlives execd.
 //! - *The table*: one entry per job the agent has started and not removed. The agent keeps at most
 //!   `MAX_YIELDED_JOBS` (4) + `MAX_INTENDED_JOBS` (8) running and `MAX_ENDED_JOBS` (8) ended jobs
 //!   per session, and removes them (`remove`, `kill` with `remove`, `wipe`) when the session lets
@@ -21,9 +21,10 @@
 //! - *A read*: answers at most the output held, so `max` cannot ask for more than the retention.
 //! - *Streams* (`attach`, a held `start`): the same bounded channel as streaming, one task each, freed
 //!   when the stream ends or its client leaves.
-//! - *Pumps*: two per job, freed when their pipes close, when the job is removed, or when the
-//!   supervisor lets go of a pipe a descendant holds open after the grace.
+//! - *The tail*: one task per job reads its two spool files into the ring (`tail.rs`); it ends with
+//!   the job (the group is empty and the files are read to their ends) or when the job is removed.
 
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -36,14 +37,17 @@ use serde_json::{Value, json};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-use crate::exec::{self, AfterExit, Cut, PIPE_GRACE, Sink};
+use crate::exec::{self, Cut, Sink};
 use crate::frame::{self, FRAME_MAX};
 use crate::http::{self, Line, Request, Resp};
-use crate::job_kernel::{self as kernel, Act, Admit, Alive, Ev, Follow, Pick, Recovery};
+use crate::job_kernel::{
+    self as kernel, Act, Admit, Alive, Ev, Follow, Kind, Pick, Recovery, Sink as Dest,
+};
 use crate::ledger::{Entry, Ledger};
 use crate::notify::{self, Notifier, NotifyTarget};
 use crate::proc::{self, locked};
 use crate::ring::Ring;
+use crate::tail::{Journal, Spool, Start, Tail};
 use crate::{Ctx, StreamEnd, StreamStart};
 
 /// `(scope, id)`: a job's address.
@@ -61,6 +65,8 @@ pub(crate) struct Job {
     sp: u64,
     label: String,
     out: Ring,
+    /// Where its output goes while it runs ([`Spool`]), until it is removed.
+    spool: Option<Spool>,
     k: kernel::State,
     /// The latest `keep`'s `notify` (notify), if it carried one.
     pub notify: Option<NotifyTarget>,
@@ -122,7 +128,14 @@ impl Jobs {
                 .into_iter()
                 .filter_map(|((scope, id), cell)| {
                     let j = locked(&cell);
-                    Entry::of(&scope, &id, &j.label, &j.mark, &j.k)
+                    Entry::of(
+                        &scope,
+                        &id,
+                        &j.label,
+                        &j.mark,
+                        &j.k,
+                        j.spool.as_ref().map(Spool::dir),
+                    )
                 })
                 .collect()
         });
@@ -190,6 +203,9 @@ impl Jobs {
                 j.notifier = Notifier::removed();
                 if let Some(s) = &j.stdin {
                     s.close();
+                }
+                if let Some(sp) = j.spool.take() {
+                    sp.remove();
                 }
             }
         }
@@ -774,6 +790,7 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
             sp: 0,
             label: job.label.clone(),
             out: Ring::new(ctx.opts.job_output_retention, ctx.spool.new_job()),
+            spool: None,
             k: kernel::State::new(epoch(), job.hold),
             notify: None,
             notifier: Notifier::default(),
@@ -782,7 +799,7 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
         map.insert(key.clone(), cell.clone());
         cell
     };
-    let mut cmd = exec::command_for(ctx, req);
+    let mut cmd = exec::command_for(ctx, req, Kind::Job);
     cmd.stdin(if job.stdin_open {
         Stdio::piped()
     } else {
@@ -790,6 +807,39 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
     });
     let mark = locked(&cell).mark.clone();
     cmd.env(proc::JOB_MARK_ENV, &mark);
+    // The job's output goes where the kernel says (S1): its spool files, which the job inherits
+    // and which outlive execd, read by a tail that wakes on each write.
+    let mut tail = None;
+    if kernel::output_sink(Kind::Job) == Dest::Spool {
+        let made = Spool::create(&spool_base(ctx), &mark).and_then(|(sp, w)| {
+            let made = Journal::create(sp.dir(), [0, 0], Vec::new(), 0)
+                .and_then(|j| Tail::open(&ctx.tails, &sp, Start::Zero).map(|t| (t, j)));
+            match made {
+                Ok((t, j)) => Ok((sp, w, t, j)),
+                Err(e) => {
+                    sp.remove();
+                    Err(e)
+                }
+            }
+        });
+        match made {
+            Ok((sp, w, t, journal)) => {
+                cmd.stdout(Stdio::from(w.out)).stderr(Stdio::from(w.err));
+                {
+                    let mut j = locked(&cell);
+                    // The ring's chunks live in the spool, which a restart reads again.
+                    j.out = Ring::new(ctx.opts.job_output_retention, sp.ring_dir()).kept();
+                    j.spool = Some(sp);
+                }
+                tail = Some((t, journal));
+            }
+            Err(e) => {
+                ctx.jobs.remove(&[(key, cell.clone())]);
+                crate::log_warn!("cannot make a job's spool: {e}");
+                return http::error_response(500, "cannot make the job's output spool");
+            }
+        }
+    }
     let mut proc = match proc::spawn(&mut cmd) {
         Ok(p) => p,
         Err(e) => {
@@ -798,6 +848,8 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
             return http::error_response(500, why.trim_end());
         }
     };
+    // The child has its own copies of the write ends; execd holds none.
+    drop(cmd);
     let pgid = proc.pgid;
     let stdin = proc.stdin.take().map(JobStdin::new);
     {
@@ -806,51 +858,17 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
         j.sp = proc.sp;
         j.stdin = stdin;
     }
-    ctx.groups.insert(proc.pg());
+    ctx.groups.insert(proc.pg(), Kind::Job);
     ctx.jobs.bump_activity();
     ctx.jobs.save();
 
-    // Both pipes into one ring, in arrival order. `progress` counts what the pumps have read, so
-    // the supervisor can tell when they have gone quiet.
-    let progress = Arc::new(AtomicUsize::new(0));
-    let (exited, _) = tokio::sync::watch::channel(false);
-    let mut pipes = Vec::new();
-    let mut cap = 0;
-    if let Some(p) = proc.stdout.take() {
-        let n = proc::pipe_capacity(&p);
-        cap += n;
-        let after = AfterExit::new(&exited);
-        pipes.push(pump(
-            ctx.clone(),
-            cell.clone(),
-            false,
-            p,
-            progress.clone(),
-            after,
-        ));
-    }
-    if let Some(p) = proc.stderr.take() {
-        let n = proc::pipe_capacity(&p);
-        cap += n;
-        let after = AfterExit::new(&exited);
-        pipes.push(pump(
-            ctx.clone(),
-            cell.clone(),
-            true,
-            p,
-            progress.clone(),
-            after,
-        ));
-    }
+    let tail = tail.map(|(t, journal)| Tailing::start(ctx, &cell, t, journal));
     tokio::spawn(supervise(
         ctx.clone(),
         cell.clone(),
         key.clone(),
         proc,
-        pipes,
-        progress,
-        cap,
-        exited,
+        tail,
     ));
 
     let opened = job.stdin_open;
@@ -883,74 +901,88 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
     }
 }
 
-/// Read `pipe` into the job's ring until it closes or the job is removed.
-fn pump<R: tokio::io::AsyncRead + std::os::fd::AsFd + Unpin + Send + 'static>(
-    ctx: Arc<Ctx>,
-    cell: JobCell,
-    stderr: bool,
-    mut pipe: R,
-    progress: Arc<AtomicUsize>,
-    mut after: AfterExit,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut buf = vec![0u8; frame::READ_BUF];
-        while let Some(n) = after.read(&mut pipe, &mut buf).await {
-            {
-                let mut j = locked(&cell);
-                if kernel::step(&mut j.k, Ev::Push) == Act::Discard {
-                    return;
-                }
-                j.out.push(&buf[..n], stderr);
-            }
-            progress.fetch_add(n, Ordering::Relaxed);
-            ctx.jobs.bump();
-        }
-    })
+/// Where a job's spool files live: under the ledger's directory when there is one (they outlive
+/// this execd and a restart finds them by the job's mark), else under the jobs directory.
+fn spool_base(ctx: &Ctx) -> std::path::PathBuf {
+    match (&ctx.opts.state_dir, ctx.jobs.ledger.enabled()) {
+        (Some(d), true) => d.join("spool"),
+        _ => ctx.spool.path().to_path_buf(),
+    }
 }
 
-/// Wait for the pumps to read what the pipes hold: until they close, go quiet for [`PIPE_GRACE`],
-/// or `budget` more bytes have gone by (all a command can have written and not been read is the
-/// pipes' capacity; a descendant holding a pipe open and chatty is let go).
-async fn drain_pumps(
-    pipes: &mut [tokio::task::JoinHandle<()>],
-    progress: &AtomicUsize,
-    budget: usize,
-) {
-    let start = progress.load(Ordering::Relaxed);
-    let mut seen = start;
-    loop {
-        let all = async {
-            for p in pipes.iter_mut() {
-                // A pump that finished was awaited by an earlier call (one is made before and one
-                // after the group empties); a join handle must not be polled again.
-                if !p.is_finished() {
-                    let _ = p.await;
+/// A job's tail: its two spool files read into its ring, by a task that wakes when they are
+/// written ([`crate::tail`]).
+struct Tailing {
+    ctx: Arc<Ctx>,
+    cell: JobCell,
+    tail: tokio::sync::Mutex<Tail>,
+    /// The unfinished chunk, on disk beside the ring ([`Journal`]).
+    journal: Mutex<Journal>,
+    done: tokio_util::sync::CancellationToken,
+}
+
+impl Tailing {
+    fn start(
+        ctx: &Arc<Ctx>,
+        cell: &JobCell,
+        tail: Tail,
+        journal: Journal,
+    ) -> (Arc<Self>, tokio::task::JoinHandle<()>) {
+        let wake = tail.wake.clone();
+        let t = Arc::new(Self {
+            ctx: ctx.clone(),
+            cell: cell.clone(),
+            tail: tokio::sync::Mutex::new(tail),
+            journal: Mutex::new(journal),
+            done: tokio_util::sync::CancellationToken::new(),
+        });
+        let task = t.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                if !task.flush().await {
+                    return;
+                }
+                tokio::select! {
+                    () = wake.notified() => {}
+                    () = task.done.cancelled() => {
+                        // The last read, after the group emptied: nothing is written after it.
+                        task.flush().await;
+                        return;
+                    }
                 }
             }
-        };
-        if tokio::time::timeout(PIPE_GRACE, all).await.is_ok() {
-            return;
-        }
-        let now = progress.load(Ordering::Relaxed);
-        if now == seen || now.saturating_sub(start) >= budget {
-            return;
-        }
-        seen = now;
+        });
+        (t, handle)
+    }
+
+    /// Read what the files hold into the ring. `false`: the job was removed, so nothing is kept.
+    async fn flush(&self) -> bool {
+        let mut tail = self.tail.lock().await;
+        tail.drain(|data, stderr| {
+            {
+                let mut j = locked(&self.cell);
+                if kernel::step(&mut j.k, Ev::Push) == Act::Discard {
+                    return false;
+                }
+                j.out.push(data, stderr);
+                // Before the spool's bytes are returned (the drain punches after this returns).
+                locked(&self.journal).record(stderr, data, j.out.tail_len());
+            }
+            self.ctx.jobs.bump();
+            true
+        })
+        .await
     }
 }
 
 /// The job's life: wait for the shell, report `shell_exit` if its group lives on, wait for the
 /// group to empty, record the end. Each is a state change notify calls back about.
-#[allow(clippy::too_many_arguments)] // the job's parts, each used once
 async fn supervise(
     ctx: Arc<Ctx>,
     cell: JobCell,
     key: Key,
     mut proc: proc::Proc,
-    mut pipes: Vec<tokio::task::JoinHandle<()>>,
-    progress: Arc<AtomicUsize>,
-    cap: usize,
-    exited: tokio::sync::watch::Sender<bool>,
+    tail: Option<(Arc<Tailing>, tokio::task::JoinHandle<()>)>,
 ) {
     let pgid = proc.pgid;
     let mark = locked(&cell).mark.clone();
@@ -967,8 +999,11 @@ async fn supervise(
     });
     let mut exits = proc::ChildEvents::new();
     if !proc::job_gone(pgid, &mark, false).await {
-        // What the shell printed goes before `shell_exit`; the pumps read on, the group lives.
-        drain_pumps(&mut pipes, &progress, cap).await;
+        // What the shell printed goes before `shell_exit`: it is in the files already, so read to
+        // their ends. The tail goes on, the group lives.
+        if let Some((t, _)) = &tail {
+            t.flush().await;
+        }
         // The moment a held stream would send `shell_exit`: notify calls back.
         {
             let mut j = locked(&cell);
@@ -985,14 +1020,10 @@ async fn supervise(
             }
         }
     }
-    // The group is empty: the pumps take what the pipes still hold and end when a pipe closes or
-    // goes quiet (`AfterExit`), so nothing is aborted with output unread.
-    exited.send_replace(true);
-    for p in &mut pipes {
-        // One that finished was awaited by `drain_pumps`; a join handle must not be polled again.
-        if !p.is_finished() {
-            let _ = p.await;
-        }
+    // The group is empty, so nothing writes the files any more: the tail reads them to their ends.
+    if let Some((t, task)) = tail {
+        t.done.cancel();
+        let _ = task.await;
     }
     // The end is observable from here on: notify calls back.
     {
@@ -1026,6 +1057,8 @@ async fn supervise(
 /// killed as any disconnect kills it; the rest come back as they ended or not at all. The output
 /// of a recovered job is empty. Idempotent: it writes the ledger back as the table now is.
 pub(crate) fn recover(ctx: &Arc<Ctx>) {
+    let base = spool_base(ctx);
+    let mut adopted: Vec<std::path::PathBuf> = Vec::new();
     for e in ctx.jobs.ledger.load() {
         let alive = !proc::job_members(saved_pgid(&e), &e.mark).is_empty();
         let (mut state, how) = kernel::recover(e.state(), alive, epoch());
@@ -1044,11 +1077,28 @@ pub(crate) fn recover(ctx: &Arc<Ctx>) {
         } else {
             None
         };
+        // The job's spool, which the old execd made and the ledger names, and which the job still
+        // writes: the ring is rebuilt from it and its files are read from where execd stopped.
+        let spool = pg.and_then(|_| e.spool.as_deref().and_then(|d| Spool::at(Path::new(d))));
+        let rebuilt = spool
+            .as_ref()
+            .and_then(|sp| rebuild(ctx, sp).or_else(|| restart_cold(ctx, sp)));
+        let (out, tail) = match rebuilt {
+            Some((ring, tail, journal)) => (ring, Some((tail, journal))),
+            None => (
+                Ring::new(ctx.opts.job_output_retention, ctx.spool.new_job()),
+                None,
+            ),
+        };
+        if let Some(sp) = &spool {
+            adopted.push(sp.dir().to_path_buf());
+        }
         let cell: JobCell = Arc::new(Mutex::new(Job {
             mark: e.mark.clone(),
             sp: pg.map_or(0, |p| p.sp),
             label: e.label.clone(),
-            out: Ring::new(ctx.opts.job_output_retention, ctx.spool.new_job()),
+            out,
+            spool,
             k: state,
             notify: None,
             notifier: Notifier::default(),
@@ -1062,12 +1112,89 @@ pub(crate) fn recover(ctx: &Arc<Ctx>) {
             map.insert(key.clone(), cell.clone());
         }
         if let Some(pg) = pg {
-            ctx.groups.insert(pg);
-            tokio::spawn(supervise_adopted(ctx.clone(), cell, key, pg));
+            ctx.groups.insert(pg, Kind::Job);
+            let tail = tail.map(|(t, j)| Tailing::start(ctx, &cell, t, j));
+            tokio::spawn(supervise_adopted(ctx.clone(), cell, key, pg, tail));
         }
+    }
+    // A spool no job in the table owns (its job ended, or was removed, before the restart).
+    if ctx.jobs.ledger.enabled() {
+        let keep: Vec<&Path> = adopted.iter().map(std::path::PathBuf::as_path).collect();
+        Spool::retain(&base, &keep);
     }
     ctx.jobs.bump_activity();
     ctx.jobs.save();
+}
+
+/// A recovered job's ring and tail, from the spool the ledger names: the chunk files, then the
+/// journal's unfinished chunk, then the files from where execd stopped reading them. `execd_jobs::resume`
+/// decides where (X1, X2: after the last byte consumed, the ring ending at the bytes consumed) and
+/// `replay_skip` what of the journal the chunks already hold (X3): a client's offset names the same
+/// byte before and after, and no byte is served twice. `None` (no journal, or one that does not
+/// agree with the chunks): the job's output is read from what the files still hold and the ring
+/// starts after a gap.
+fn rebuild(ctx: &Arc<Ctx>, sp: &Spool) -> Option<(Ring, Tail, Journal)> {
+    let retain = ctx.opts.job_output_retention;
+    let (start, pieces) = Journal::load(sp.dir())?;
+    let from = start[0].checked_add(start[1])?;
+    let total: u64 = pieces.iter().map(|p| p.1.len() as u64).sum();
+    let (jo, je) = pieces.iter().fold((0u64, 0u64), |(o, e), (err, d)| {
+        if *err {
+            (o, e + d.len() as u64)
+        } else {
+            (o + d.len() as u64, e)
+        }
+    });
+    // The arithmetic below needs the sums to fit (`execd_jobs::OFFSET_MAX`).
+    if from.checked_add(total)? > kernel::OFFSET_MAX || from % FRAME_MAX as u64 != 0 {
+        return None;
+    }
+    let mut ring = Ring::recover(retain, sp.ring_dir(), from);
+    let chunk_end = ring.end();
+    if chunk_end > from + total {
+        // Chunks the journal never covered: not one this journal can continue.
+        return None;
+    }
+    let (mut at, mut skipped, mut kept) = (from, [0u64; 2], Vec::new());
+    for (err, data) in pieces {
+        let len = data.len() as u64;
+        let skip = kernel::replay_skip(chunk_end, at, len);
+        skipped[usize::from(err)] += skip;
+        let skip = usize::try_from(skip).ok()?;
+        if skip < data.len() {
+            ring.push(&data[skip..], err);
+            kept.push((err, data[skip..].to_vec()));
+        }
+        at += len;
+    }
+    let r = kernel::resume(start[0], start[1], jo, je);
+    // X2: the ring ends at the bytes consumed.
+    if ring.end() != r.end {
+        return None;
+    }
+    let journal = Journal::create(
+        sp.dir(),
+        [start[0] + skipped[0], start[1] + skipped[1]],
+        kept,
+        ring.tail_len(),
+    )
+    .ok()?;
+    let tail = Tail::open(&ctx.tails, sp, Start::At([r.out, r.err])).ok()?;
+    Some((ring, tail, journal))
+}
+
+/// [`rebuild`]'s way out: the ring starts empty, and the job's files are read from what they still
+/// hold (a gap, and bytes may repeat, but none is lost). Logged: this is the offsets moving.
+fn restart_cold(ctx: &Arc<Ctx>, sp: &Spool) -> Option<(Ring, Tail, Journal)> {
+    crate::log_warn!(
+        "a job's journal is missing or does not agree with its chunks; its output restarts with a gap dir={}",
+        sp.dir().display()
+    );
+    let _ = std::fs::remove_dir_all(sp.ring_dir());
+    let tail = Tail::open(&ctx.tails, sp, Start::Data).ok()?;
+    let journal = Journal::create(sp.dir(), tail.offsets(), Vec::new(), 0).ok()?;
+    let ring = Ring::new(ctx.opts.job_output_retention, sp.ring_dir()).kept();
+    Some((ring, tail, journal))
 }
 
 fn saved_pgid(e: &Entry) -> i32 {
@@ -1077,7 +1204,13 @@ fn saved_pgid(e: &Entry) -> i32 {
 /// [`supervise`] for a job a previous execd started: not our child, so no status arrives. Wait for
 /// its group to empty and end it with what the kernel was given: the shell's saved status, else
 /// the lost one.
-async fn supervise_adopted(ctx: Arc<Ctx>, cell: JobCell, key: Key, pg: proc::Pg) {
+async fn supervise_adopted(
+    ctx: Arc<Ctx>,
+    cell: JobCell,
+    key: Key,
+    pg: proc::Pg,
+    tail: Option<(Arc<Tailing>, tokio::task::JoinHandle<()>)>,
+) {
     let mark = locked(&cell).mark.clone();
     let mut exits = proc::ChildEvents::new();
     while !proc::job_gone(pg.id, &mark, false).await {
@@ -1085,6 +1218,10 @@ async fn supervise_adopted(ctx: Arc<Ctx>, cell: JobCell, key: Key, pg: proc::Pg)
         if proc::job_gone(pg.id, &mark, wake == proc::Wake::Tick).await {
             break;
         }
+    }
+    if let Some((t, task)) = tail {
+        t.done.cancel();
+        let _ = task.await;
     }
     {
         let mut j = locked(&cell);
@@ -1138,8 +1275,15 @@ async fn stream_job(
     if let Ok(end) = follow(&ctx, &key, &attached, offset, started, &mut sink).await {
         return end;
     }
-    // The connection is gone before the job's end: a held job nobody kept dies with it.
-    if hold && let Some(cell) = bound(&ctx, &key, &attached) {
+    // The connection is gone before the job's end: a held job nobody kept dies with it. Not when it
+    // went because execd is stopping and the kernel leaves this job's group alone (S3): the next
+    // execd finds the unkept held start in the ledger and ends it as any disconnect does.
+    let stopping =
+        ctx.stopping.load(Ordering::Acquire) && !ctx.groups.at_shutdown(Kind::Job).signal;
+    if hold
+        && !stopping
+        && let Some(cell) = bound(&ctx, &key, &attached)
+    {
         let job = {
             let mut j = locked(&cell);
             match kernel::step(&mut j.k, Ev::Disconnect { hold }) {

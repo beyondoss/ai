@@ -115,10 +115,14 @@ impl AfterExit {
 }
 
 /// The command a request describes, ready to spawn: its `cwd` (default: the root), `HOME`, and
-/// piped output. Nothing of execd's own secrets reaches it: every `EXECD_*` variable is removed
+/// its output's sink. Nothing of execd's own secrets reaches it: every `EXECD_*` variable is removed
 /// (the bearer must not be in a command's environment). Under `EXECD_RUN_AS` the switch helper becomes
 /// the command, as the target user.
-pub(crate) fn command_for(ctx: &Ctx, req: &Request) -> std::process::Command {
+pub(crate) fn command_for(
+    ctx: &Ctx,
+    req: &Request,
+    kind: crate::job_kernel::Kind,
+) -> std::process::Command {
     let cwd = req
         .cwd
         .as_deref()
@@ -133,7 +137,14 @@ pub(crate) fn command_for(ctx: &Ctx, req: &Request) -> std::process::Command {
             cmd
         }
     };
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // Where its output goes is the kernel's (S1, S2): a pipe execd reads for a command; for a job a
+    // spool file, which the job's start sets (`jobs.rs`).
+    if matches!(
+        crate::job_kernel::output_sink(kind),
+        crate::job_kernel::Sink::Pipe
+    ) {
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    }
     for name in &ctx.scrub {
         cmd.env_remove(name);
     }
@@ -215,7 +226,7 @@ pub(crate) struct GroupSlot {
 
 impl GroupSlot {
     pub fn new(ctx: &Arc<Ctx>, pg: proc::Pg) -> Self {
-        ctx.groups.insert(pg);
+        ctx.groups.insert(pg, crate::job_kernel::Kind::Command);
         Self {
             ctx: ctx.clone(),
             pg,
@@ -346,7 +357,7 @@ async fn run_oneshot(ctx: Arc<Ctx>, req: Request) -> Resp {
             }
         },
     };
-    let mut cmd = command_for(ctx, &req);
+    let mut cmd = command_for(ctx, &req, crate::job_kernel::Kind::Command);
     cmd.stdin(if stdin.is_some() {
         Stdio::piped()
     } else {
@@ -595,7 +606,7 @@ async fn run_stream(ctx: Arc<Ctx>, req: Request, out: mpsc::Sender<Bytes>) {
         ctx.opts.heartbeat,
         req.timeout_ms.map(Duration::from_millis),
     );
-    let mut cmd = command_for(&ctx, &req);
+    let mut cmd = command_for(&ctx, &req, crate::job_kernel::Kind::Command);
     cmd.stdin(Stdio::null());
     let mut proc = match proc::spawn(&mut cmd) {
         Ok(p) => p,
