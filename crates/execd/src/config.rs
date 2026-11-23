@@ -21,6 +21,7 @@ pub struct Config {
     pub run_as: Option<String>,
     pub max_response_bytes: usize,
     pub jobs_dir: Option<PathBuf>,
+    pub state_dir: Option<PathBuf>,
     pub log_level: Level,
     pub worker_threads: usize,
     pub idle_timeout: Option<Duration>,
@@ -39,6 +40,7 @@ execd takes no arguments; it is configured by environment variables:
   EXECD_RUN_AS                    run every command as user, uid, user:group or uid:gid; execd must be root
   EXECD_MAX_RESPONSE_BYTES        the most output one answer carries (default 16777216)
   EXECD_JOBS_DIR                  where a kept job's last 8 MiB of output is spooled (default $TMPDIR, else /tmp)
+  EXECD_STATE_DIR                 where the jobs ledger is kept, so a restart of execd finds its jobs (default none; use a tmpfs directory)
   EXECD_LOG                       off, error, warn, info, debug or trace (default info)
   EXECD_WORKER_THREADS            1 (default) one thread, 0 a worker per CPU, N workers
   EXECD_IDLE_TIMEOUT_MS           close a connection with no request in flight for this long; 0 (default) never
@@ -74,6 +76,7 @@ pub fn parse<E: Fn(&str) -> Option<String>>(env: E) -> Result<Config, String> {
         max_response_bytes: number("EXECD_MAX_RESPONSE_BYTES", get("EXECD_MAX_RESPONSE_BYTES"))?
             .unwrap_or(execd::MAX_RESPONSE_BYTES),
         jobs_dir: get("EXECD_JOBS_DIR").map(PathBuf::from),
+        state_dir: get("EXECD_STATE_DIR").map(PathBuf::from),
         log_level: match get("EXECD_LOG") {
             None => Level::Info,
             Some(s) => Level::parse(&s).ok_or_else(|| {

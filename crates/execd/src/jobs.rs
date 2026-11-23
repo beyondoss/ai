@@ -39,7 +39,8 @@ use tokio_util::sync::CancellationToken;
 use crate::exec::{self, AfterExit, Cut, PIPE_GRACE, Sink};
 use crate::frame::{self, FRAME_MAX};
 use crate::http::{self, Line, Request, Resp};
-use crate::job_kernel::{self as kernel, Act, Admit, Alive, Ev, Follow, Pick};
+use crate::job_kernel::{self as kernel, Act, Admit, Alive, Ev, Follow, Pick, Recovery};
+use crate::ledger::{Entry, Ledger};
 use crate::notify::{self, Notifier, NotifyTarget};
 use crate::proc::{self, locked};
 use crate::ring::Ring;
@@ -94,15 +95,42 @@ pub(crate) struct Jobs {
     changed: watch::Sender<u64>,
     /// [`crate::Handle::activity_changed`]'s counter.
     activity: Arc<watch::Sender<u64>>,
+    /// The table's jobs, kept across a restart of execd ([`crate::ledger`]).
+    ledger: Ledger,
 }
 
 impl Jobs {
-    pub fn new(activity: Arc<watch::Sender<u64>>) -> Self {
+    pub fn new(activity: Arc<watch::Sender<u64>>, ledger: Ledger) -> Self {
         Self {
             map: Mutex::default(),
             changed: watch::Sender::new(0),
             activity,
+            ledger,
         }
+    }
+
+    /// Write the table's jobs to the ledger: every job that has a group and is not removed. Called
+    /// with no job's lock held, at each change of a job's life (spawn, shell exit, end, keep,
+    /// removal); a no-op without [`crate::Options::state_dir`].
+    pub fn save(&self) {
+        if !self.ledger.enabled() {
+            return;
+        }
+        self.ledger.save(|| {
+            let cells = locked(&self.map).all();
+            cells
+                .into_iter()
+                .filter_map(|((scope, id), cell)| {
+                    let j = locked(&cell);
+                    Entry::of(&scope, &id, &j.label, &j.mark, &j.k)
+                })
+                .collect()
+        });
+    }
+
+    /// The server is shutting down and kills every group: nothing is left to recover.
+    pub fn forget(&self) {
+        self.ledger.save(Vec::new);
     }
 
     fn bump(&self) {
@@ -166,6 +194,7 @@ impl Jobs {
             }
         }
         self.bump();
+        self.save();
     }
 }
 
@@ -724,6 +753,7 @@ fn keep_or_seen(ctx: &Arc<Ctx>, job: &JobReq) -> Resp {
     drop(j);
     if keep {
         ctx.jobs.bump_activity();
+        ctx.jobs.save();
     }
     http::json_response(200, &json!({}))
 }
@@ -778,6 +808,7 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
     }
     ctx.groups.insert(proc.pg());
     ctx.jobs.bump_activity();
+    ctx.jobs.save();
 
     // Both pipes into one ring, in arrival order. `progress` counts what the pumps have read, so
     // the supervisor can tell when they have gone quiet.
@@ -946,6 +977,7 @@ async fn supervise(
             }
         }
         ctx.jobs.bump();
+        ctx.jobs.save();
         loop {
             let wake = exits.next().await;
             if proc::job_gone(pgid, &mark, wake == proc::Wake::Tick).await {
@@ -984,6 +1016,102 @@ async fn supervise(
     }
     ctx.groups.remove(proc.pg());
     ctx.jobs.bump();
+    ctx.jobs.save();
+}
+
+/// Start of a server: the jobs a previous execd saved ([`crate::ledger`]) come back as
+/// [`kernel::recover`] decides, each in the table under its address. A job whose group lives is
+/// adopted (watched until the group empties, then ended with the shell's saved status, else
+/// [`kernel::LOST_CODE`]) and a held start no one kept, whose client left with the old process, is
+/// killed as any disconnect kills it; the rest come back as they ended or not at all. The output
+/// of a recovered job is empty. Idempotent: it writes the ledger back as the table now is.
+pub(crate) fn recover(ctx: &Arc<Ctx>) {
+    for e in ctx.jobs.ledger.load() {
+        let alive = !proc::job_members(saved_pgid(&e), &e.mark).is_empty();
+        let (mut state, how) = kernel::recover(e.state(), alive, epoch());
+        if how == Recovery::Drop {
+            continue;
+        }
+        let key = (e.scope.clone(), e.id.clone());
+        let pgid = state.pgid();
+        let pg = if how == Recovery::Adopt {
+            let pg = proc::adopt_group(pgid);
+            // A held start's client was the old process's connection, which is gone.
+            if let Act::Kill { .. } = kernel::step(&mut state, Ev::Disconnect { hold: true }) {
+                proc::kill_group(pg);
+            }
+            Some(pg)
+        } else {
+            None
+        };
+        let cell: JobCell = Arc::new(Mutex::new(Job {
+            mark: e.mark.clone(),
+            sp: pg.map_or(0, |p| p.sp),
+            label: e.label.clone(),
+            out: Ring::new(ctx.opts.job_output_retention, ctx.spool.new_job()),
+            k: state,
+            notify: None,
+            notifier: Notifier::default(),
+            stdin: None,
+        }));
+        {
+            let mut map = locked(&ctx.jobs.map);
+            if map.admit(&key) == Admit::Exists {
+                continue;
+            }
+            map.insert(key.clone(), cell.clone());
+        }
+        if let Some(pg) = pg {
+            ctx.groups.insert(pg);
+            tokio::spawn(supervise_adopted(ctx.clone(), cell, key, pg));
+        }
+    }
+    ctx.jobs.bump_activity();
+    ctx.jobs.save();
+}
+
+fn saved_pgid(e: &Entry) -> i32 {
+    e.state().pgid()
+}
+
+/// [`supervise`] for a job a previous execd started: not our child, so no status arrives. Wait for
+/// its group to empty and end it with what the kernel was given: the shell's saved status, else
+/// the lost one.
+async fn supervise_adopted(ctx: Arc<Ctx>, cell: JobCell, key: Key, pg: proc::Pg) {
+    let mark = locked(&cell).mark.clone();
+    let mut exits = proc::ChildEvents::new();
+    while !proc::job_gone(pg.id, &mark, false).await {
+        let wake = exits.next().await;
+        if proc::job_gone(pg.id, &mark, wake == proc::Wake::Tick).await {
+            break;
+        }
+    }
+    {
+        let mut j = locked(&cell);
+        let (code, signal) = match j.k.phase {
+            kernel::Phase::Exited { code, signal, .. } => (code, signal),
+            _ => (kernel::LOST_CODE, None),
+        };
+        let act = kernel::step(
+            &mut j.k,
+            Ev::GroupEmpty {
+                code,
+                signal,
+                now: epoch(),
+            },
+        );
+        if let Act::Ended { notify } = act {
+            if let Some(s) = &j.stdin {
+                s.close();
+            }
+            if notify {
+                notify::change(&ctx, &cell, &key, &mut j);
+            }
+        }
+    }
+    ctx.groups.remove(pg);
+    ctx.jobs.bump();
+    ctx.jobs.save();
 }
 
 /// The job a stream attached to, while the table still holds that very job under `key`: a removed

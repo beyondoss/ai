@@ -96,6 +96,7 @@ error that names the variable and the value (exit 2), and so is any argument: ex
 | `EXECD_RUN_AS`             | unset                                              | run every command as `user`, `uid`, `user:group` or `uid:gid` with the user's groups; execd must be root                   |
 | `EXECD_MAX_RESPONSE_BYTES` | 16 MiB                                             | most output one one-shot answer carries; match the agent's `--exec-max-response-bytes`                                     |
 | `EXECD_JOBS_DIR`           | `$TMPDIR`, else `/tmp`                             | where a kept job's last 8 MiB of output is spooled; use a disk-backed directory                                            |
+| `EXECD_STATE_DIR`          | none                                               | where the jobs ledger is kept, so a restart of execd finds its jobs; use a tmpfs directory                                 |
 | `EXECD_LOG`                | `info`                                             | `off`, `error`, `warn`, `info`, `debug` or `trace`                                                                         |
 | `EXECD_WORKER_THREADS`     | `1`                                                | `1` one thread; `0` a worker per CPU; `N` workers                                                                          |
 | `EXECD_IDLE_TIMEOUT_MS`    | `0` (off)                                          | close a connection with no request in flight for this long (a stream in flight is never cut)                               |

@@ -62,6 +62,18 @@ mut_signal_after_reap = [
 mut_held_forgets = [
   "beyond-execd-jobs/mut_held_forgets",
 ] # a spawn's group is never held, so a live group is refused every signal (J11 liveness)
+mut_recover_drops_live = [
+  "beyond-execd-jobs/mut_recover_drops_live",
+] # a restart forgets a job whose group is alive (R2; `tests/restart.rs`)
+mut_recover_adopts_gone = [
+  "beyond-execd-jobs/mut_recover_adopts_gone",
+] # a restart adopts a job whose group is gone, so it never ends (R3)
+mut_recover_reends_ended = [
+  "beyond-execd-jobs/mut_recover_reends_ended",
+] # a restart drops an ended job whose group number is gone (R1)
+mut_recover_forgets_shell_status = [
+  "beyond-execd-jobs/mut_recover_forgets_shell_status",
+] # a restart ends a job whose shell had exited with the lost-status code (R3)
 # Mutations of `ring` (the crate `execd-ring`, which Verus proves), used only by `src/ring.rs`'s differential
 # test's red runs: each removes one guard.
 mut_window_before_base = [
