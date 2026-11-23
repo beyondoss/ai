@@ -36,6 +36,14 @@ pub(crate) struct Entry {
     pub label: String,
     pub mark: String,
     pub phase: Saved,
+    pub pgid: i32,
+    /// The shell's exit code, once it has one (`exited`, `ended`).
+    pub code: Option<i32>,
+    pub signal: Option<i32>,
+    /// When it ended (`ended`).
+    pub at: Option<u64>,
+    /// The shell's exit was reported before the end (`ended`).
+    pub told: Option<bool>,
     /// `None`: a held start nobody kept.
     pub kept: Option<Kept>,
     pub seen: u64,
@@ -48,25 +56,15 @@ pub(crate) struct Kept {
     pub kind: Option<String>,
 }
 
-/// The kernel's [`Phase`] the job had, past its spawn (a job with no group is never saved).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "phase", rename_all = "snake_case")]
+/// How far the job's life had gone: the kernel's [`Phase`] past its spawn (a job with no group is never saved). The fields a
+/// phase carries are flat on the entry, present as far as the phase has them: this is a record of the kernel's value, not a
+/// second state machine; every decision about it is `job_kernel`'s.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum Saved {
-    Running {
-        pgid: i32,
-    },
-    Exited {
-        pgid: i32,
-        code: i32,
-        signal: Option<i32>,
-    },
-    Ended {
-        pgid: i32,
-        code: i32,
-        signal: Option<i32>,
-        at: u64,
-        shell_told: bool,
-    },
+    Running,
+    Exited,
+    Ended,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -81,23 +79,26 @@ impl Entry {
         if k.removed {
             return None;
         }
-        let phase = match k.phase {
+        let (phase, pgid, code, signal, at, told) = match k.phase {
             Phase::Spawning => return None,
-            Phase::Running { pgid } => Saved::Running { pgid },
-            Phase::Exited { pgid, code, signal } => Saved::Exited { pgid, code, signal },
+            Phase::Running { pgid } => (Saved::Running, pgid, None, None, None, None),
+            Phase::Exited { pgid, code, signal } => {
+                (Saved::Exited, pgid, Some(code), signal, None, None)
+            }
             Phase::Ended {
                 pgid,
                 code,
                 signal,
                 at,
                 shell_told,
-            } => Saved::Ended {
+            } => (
+                Saved::Ended,
                 pgid,
-                code,
+                Some(code),
                 signal,
-                at,
-                shell_told,
-            },
+                Some(at),
+                Some(shell_told),
+            ),
         };
         let kept = match &k.claim {
             Claim::Held => None,
@@ -112,6 +113,11 @@ impl Entry {
             label: label.to_string(),
             mark: mark.to_string(),
             phase,
+            pgid,
+            code,
+            signal,
+            at,
+            told,
             kept,
             seen: k.seen,
             started: k.started,
@@ -120,21 +126,16 @@ impl Entry {
 
     /// The kernel state this entry saved.
     pub fn state(&self) -> State {
+        let (pgid, code, signal) = (self.pgid, self.code.unwrap_or(0), self.signal);
         let phase = match self.phase {
-            Saved::Running { pgid } => Phase::Running { pgid },
-            Saved::Exited { pgid, code, signal } => Phase::Exited { pgid, code, signal },
-            Saved::Ended {
+            Saved::Running => Phase::Running { pgid },
+            Saved::Exited => Phase::Exited { pgid, code, signal },
+            Saved::Ended => Phase::Ended {
                 pgid,
                 code,
                 signal,
-                at,
-                shell_told,
-            } => Phase::Ended {
-                pgid,
-                code,
-                signal,
-                at,
-                shell_told,
+                at: self.at.unwrap_or(0),
+                shell_told: self.told.unwrap_or(false),
             },
         };
         let claim = match &self.kept {

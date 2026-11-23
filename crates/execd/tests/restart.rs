@@ -109,10 +109,11 @@ async fn a_group_that_ended_while_execd_was_down_ends_with_the_status_saved_or_t
     // Find and kill both groups while no execd runs.
     crash(&mut first);
     for pgid in [p1, p2] {
-        std::process::Command::new("kill")
-            .args(["-KILL", &format!("-{pgid}")])
+        let status = std::process::Command::new("sh")
+            .args(["-c", &format!("kill -s KILL -- -{pgid}")])
             .status()
             .unwrap();
+        assert!(status.success(), "could not kill group {pgid}: {status:?}");
     }
     std::thread::sleep(Duration::from_millis(300));
     let second = Execd::start(&settings, &[]);
