@@ -254,7 +254,7 @@
 //! - **Held.** A job started with `hold: true` lives as long as its stream unless it is **kept**: if
 //!   the connection closes before the job's final frame and no `keep` arrived, the endpoint MUST kill
 //!   its whole group, exactly as "Disconnect kills". `keep` hands it to the endpoint for good
-//!   (recording `num`, `kind` and `seen` for `list`); after it a closed stream kills nothing. A job
+//!   (recording `num`, `kind` and `seen` for `list`; `num` may be absent: a job kept only so that it outlives its stream is nobody's numbered job); after it a closed stream kills nothing. A job
 //!   started with `hold: false` is kept from the start. Closing an `attach` never kills.
 //! - **A job stream** is a stream (`application/x-ndjson`, heartbeats, frame size, flushing,
 //!   unknown fields) with two more frames: `{"started": pgid}` first on a held start, and

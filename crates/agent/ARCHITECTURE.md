@@ -2517,6 +2517,21 @@ Any replica follows a job it did not start by `attach` from an offset. **Kill** 
 group, up to 300 ms (the local `TERM_GRACE`), `SIGKILL`, then a wait for the groups to empty; what is
 still alive (a process the sandbox user may not signal) is reported per job.
 
+**A long foreground command outlives its front.** A held command is owned by its stream, and the
+exec front in the stream's path restarts in a rolling deploy: a draining replica closes the streams
+it holds after its drain wait (Beyond's execfront, 90 s). So a held command still running
+`exec_notify::keep_gate::KEEP_AFTER_MS` (30 s) after it started is **kept** with no job number
+(`keep_foreground`, in `run`): from then on a broken stream costs only the live copy, and `run`
+follows the job again from the offset its output reached (`resumes`: after each break it reads the job's state, and
+follows again unless it is `Lost` or `Gone`, up to 120 breaks at one offset), so every output byte
+arrives once, in order, through any number of front restarts. The decision is the kernel's
+`keep_due` (Verus-proven: never before 30 s, never twice, always at or after it), so a command
+under 30 s costs no extra request. A kept foreground command has no number and is nobody's job to
+list: it ends by its own exit, by an explicit kill (cancelling the call drops the `Job`, whose
+`kill_hook` sends `kill`), or with its session (`wipe`, or the sandbox's end). A reopen that finds
+one kills it (`Reattached::stale`). `crates/agent/tests/bash_sandbox_jobs.rs` cuts a front under a
+40 s command twice and reads every line once.
+
 **Operations.** The module doc's "Sandbox jobs" specifies it —
 every operation is a request plus a `"job"` object (`start` held or kept, `attach` from an offset,
 `read`, `keep`, `seen`, `kill`, `list`, `remove`, `wipe`), and a job stream is a stream plus `started`

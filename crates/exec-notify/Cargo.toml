@@ -35,6 +35,8 @@ mut_retry_unbounded = []
 mut_wake_early = []
 mut_stop_is_retried = []
 mut_change_not_owed = []
+mut_keep_early = []
+mut_keep_never = []
 
 [dev-dependencies]
 serde_json.workspace = true

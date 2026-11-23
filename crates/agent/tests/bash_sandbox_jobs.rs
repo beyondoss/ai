@@ -34,6 +34,16 @@ struct Sandbox {
 
 impl Sandbox {
     async fn new() -> Self {
+        Self::build(false).await.0
+    }
+
+    /// A sandbox reached through a [`Front`] that can be restarted under a running command.
+    async fn behind_a_front() -> (Self, Front) {
+        let (sb, front) = Self::build(true).await;
+        (sb, front.unwrap())
+    }
+
+    async fn build(proxied: bool) -> (Self, Option<Front>) {
         let dir = tempfile::tempdir().unwrap();
         let mock = ExecMock::start_with(
             dir.path(),
@@ -43,14 +53,23 @@ impl Sandbox {
             },
         )
         .await;
-        let runner: Arc<dyn CommandRunner> = Arc::new(HttpExecRunner::new(&mock.url).unwrap());
+        let front = if proxied {
+            Some(Front::start(&mock.url).await)
+        } else {
+            None
+        };
+        let url = front.as_ref().map_or(mock.url.clone(), |f| f.url.clone());
+        let runner: Arc<dyn CommandRunner> = Arc::new(HttpExecRunner::new(&url).unwrap());
         let scope = JobScope::under(dir.path().join("jobs").to_str().unwrap(), "session");
-        Self {
-            runner,
-            scope,
-            _dir: dir,
-            _mock: mock,
-        }
+        (
+            Self {
+                runner,
+                scope,
+                _dir: dir,
+                _mock: mock,
+            },
+            front,
+        )
     }
 
     /// A replica serving the session: a job table over the session's scope, and its tools.
@@ -92,6 +111,77 @@ impl Sandbox {
             .unwrap()
             .wipe(&self.scope)
             .await;
+    }
+}
+
+/// What a rolling restart of the exec front does to a stream: a TCP relay to the sandbox whose
+/// connections [`Front::restart`] cuts (the replica dies, a peer takes the next connection at the
+/// same address), and that counts the `keep` requests that pass.
+struct Front {
+    url: String,
+    conns: Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>,
+    keeps: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Front {
+    async fn start(upstream: &str) -> Self {
+        use std::sync::atomic::Ordering::Relaxed;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let rest = upstream.trim_start_matches("http://");
+        let (target, path) = rest.split_once('/').map_or((rest, ""), |(h, p)| (h, p));
+        let (target, path) = (target.to_string(), path.to_string());
+        let listener = beyond_test_support::ports::tokio_listener().await;
+        let url = format!("http://{}/{path}", listener.local_addr().unwrap());
+        let conns: Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>> = Arc::default();
+        let keeps = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (c, k) = (conns.clone(), keeps.clone());
+        tokio::spawn(async move {
+            loop {
+                let Ok((down, _)) = listener.accept().await else {
+                    return;
+                };
+                let Ok(up) = tokio::net::TcpStream::connect(&target).await else {
+                    continue;
+                };
+                let (mut dr, mut dw) = down.into_split();
+                let (mut ur, mut uw) = up.into_split();
+                let k = k.clone();
+                let a = tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16 * 1024];
+                    while let Ok(n) = dr.read(&mut buf).await {
+                        if n == 0 || uw.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                        if buf[..n].windows(11).any(|w| w == b"\"op\":\"keep\"") {
+                            k.fetch_add(1, Relaxed);
+                        }
+                    }
+                });
+                let b = tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16 * 1024];
+                    while let Ok(n) = ur.read(&mut buf).await {
+                        if n == 0 || dw.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                c.lock()
+                    .unwrap()
+                    .extend([a.abort_handle(), b.abort_handle()]);
+            }
+        });
+        Self { url, conns, keeps }
+    }
+
+    /// The replica serving the streams goes away; the next connection reaches the sandbox again.
+    fn restart(&self) {
+        for h in self.conns.lock().unwrap().drain(..) {
+            h.abort();
+        }
+    }
+
+    fn keeps(&self) -> usize {
+        self.keeps.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -470,4 +560,87 @@ async fn the_reopen_note_says_a_job_the_sandbox_kept_is_still_running() {
     assert!(!note.contains("(not running)"), "{note}");
     assert!(note.contains("New jobs are numbered from 2."), "{note}");
     sb.wipe().await;
+}
+
+/// 40 numbered lines, one a second: a chatty foreground command, so `bash` never yields it.
+const COUNTING: &str =
+    "echo \"pid $$\"; i=1; while [ $i -le 40 ]; do echo line $i; i=$((i+1)); sleep 1; done";
+
+/// The numbered lines of `out`, in the order they arrived.
+fn lines_of(out: &str) -> Vec<u32> {
+    out.lines()
+        .filter_map(|l| l.strip_prefix("line ")?.trim().parse().ok())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_long_foreground_command_outlives_two_restarts_of_its_front_and_its_output_arrives_once_in_order()
+ {
+    let (sb, front) = Sandbox::behind_a_front().await;
+    let a = sb.replica(EndPolicy::KeepRunning);
+    let call = tokio::spawn({
+        let bash = a.bash.clone();
+        async move { call(bash.as_ref(), json!({ "command": COUNTING })).await }
+    });
+    // Past KEEP_AFTER_MS (30 s), the front is restarted twice, as a rolling deploy does.
+    tokio::time::sleep(Duration::from_secs(33)).await;
+    front.restart();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    front.restart();
+    let out = call.await.unwrap().unwrap();
+    assert_eq!(
+        lines_of(&out),
+        (1..=40).collect::<Vec<_>>(),
+        "every line once, in order, across two cuts: {out}"
+    );
+    assert_eq!(front.keeps(), 1, "kept once, when it passed 30 s");
+    sb.wipe().await;
+}
+
+#[tokio::test]
+async fn a_short_command_is_never_kept() {
+    let (sb, front) = Sandbox::behind_a_front().await;
+    let a = sb.replica(EndPolicy::KeepRunning);
+    let out = call(
+        a.bash.as_ref(),
+        json!({ "command": "echo hi; sleep 2; echo done" }),
+    )
+    .await
+    .unwrap();
+    assert!(out.contains("done"), "{out}");
+    assert_eq!(front.keeps(), 0, "a command under 30 s costs no keep");
+    sb.wipe().await;
+}
+
+#[tokio::test]
+async fn cancelling_a_kept_foreground_command_kills_it() {
+    let (sb, front) = Sandbox::behind_a_front().await;
+    let a = sb.replica(EndPolicy::KeepRunning);
+    let call = tokio::spawn({
+        let bash = a.bash.clone();
+        async move {
+            call(
+                bash.as_ref(),
+                json!({ "command": "echo \"pid $$\"; while :; do echo x; sleep 1; done" }),
+            )
+            .await
+        }
+    });
+    // The pid is in the output the call has not returned yet: read it from the sandbox's job.
+    tokio::time::sleep(Duration::from_secs(33)).await;
+    assert_eq!(front.keeps(), 1, "kept at 30 s");
+    let store = sb.runner.clone().sandbox_jobs().unwrap();
+    let listed = store.list(&sb.scope).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    let read = store.read(&sb.scope, &listed[0].id, 0, 4096).await.unwrap();
+    let pid = printed_pid(&String::from_utf8_lossy(&read.data));
+    // The call is cancelled (its turn is aborted): dropping it kills the command explicitly.
+    call.abort();
+    let _ = call.await;
+    assert!(wait_dead(pid).await, "a cancel left a kept command running");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while sb.jobs_left().await != 0 {
+        assert!(Instant::now() < deadline, "its record outlived the cancel");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }

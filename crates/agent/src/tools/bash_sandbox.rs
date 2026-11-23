@@ -152,11 +152,32 @@ pub(crate) async fn run(
 ) -> Result<ExecResult, String> {
     let mut ctl = Steer::install(shared);
     let events = |e: JobEvent<'_>| on_event(shared, link, e);
-    let held = link.store.run_held(&link.scope, &link.id, spec, &events);
-    let outcome = tokio::select! {
-        r = held => Some(r),
-        () = ctl.until(|c| matches!(c, Ctl::Close)) => None,
+    let mut held = Box::pin(link.store.run_held(&link.scope, &link.id, spec, &events));
+    let began = Instant::now();
+    // A keep that failed is not tried again for this command: it would fail the same way.
+    let mut tried = false;
+    let outcome = loop {
+        let age_ms = u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let done = link.kept() || tried;
+        if exec_notify::keep_gate::keep_due(age_ms, done, false) {
+            tried = true;
+            keep_foreground(shared, link).await;
+            continue;
+        }
+        // Nothing to wait for once kept: only the stream and the release row remain.
+        let wait = if done {
+            Duration::from_secs(u64::from(u32::MAX))
+        } else {
+            Duration::from_millis(exec_notify::keep_gate::keep_wait_ms(age_ms))
+        };
+        tokio::select! {
+            r = &mut held => break Some(r),
+            () = ctl.until(|c| matches!(c, Ctl::Close)) => break None,
+            () = tokio::time::sleep(wait) => {}
+        }
     };
+    // The stream is let go of here, before any follow and as the release row says: never held across `steered`.
+    drop(held);
     if outcome.is_some() {
         stream_ended(shared, link);
     }
@@ -169,6 +190,30 @@ pub(crate) async fn run(
         None => return steered(shared, link, &mut ctl, Phase::Released).await,
     }
     steered(shared, link, &mut ctl, Phase::Follow(FollowKind::Holding)).await
+}
+
+/// A held foreground command has run for [`exec_notify::keep_gate::KEEP_AFTER_MS`]: hand it to the
+/// sandbox so that it outlives its stream (a replica that is reaped or redeployed closes every
+/// stream it holds, and a held, unkept job dies with its stream). It has no number: it is nobody's
+/// job, so it ends by its own exit, by an explicit kill (its call being cancelled drops the
+/// job, which runs [`kill_hook`]), or with its session (`wipe`, or the sandbox's own end); a
+/// reopen that finds it kills it ([`Reattached::stale`]). If the keep fails the command stays
+/// held, as it was.
+async fn keep_foreground(shared: &JobShared, link: &SandboxLink) {
+    match link
+        .store
+        .keep(&link.scope, &link.id, None, "yielded", shared.offset())
+        .await
+    {
+        Ok(()) => link.kept.store(true, Ordering::Relaxed),
+        Err(e) => {
+            eprintln!("KEEPFAIL {e}");
+            tracing::warn!(
+                job = %link.id, error = %e,
+                "could not keep a long foreground command; it stays held by its stream"
+            );
+        }
+    }
 }
 
 /// The steering channel of one job's task, installed on the job for the task's life.
@@ -238,6 +283,8 @@ async fn steered(
     ctl: &mut Steer<'_>,
     mut phase: Phase,
 ) -> Result<ExecResult, String> {
+    // Breaks of the followed stream in a row that delivered nothing new: see [`resumes`].
+    let mut breaks = Breaks::default();
     loop {
         phase = match phase {
             Phase::Released => {
@@ -279,6 +326,12 @@ async fn steered(
                             None => Err(format!("{LOST_END} ({e})")),
                         });
                     }
+                    (Some(Err(e)), FollowKind::Holding)
+                        if resumes(shared, link, &mut breaks).await =>
+                    {
+                        tracing::info!(job = %link.id, error = %e, "a followed job's stream broke; following it again");
+                        Phase::Follow(kind)
+                    }
                     (Some(r), FollowKind::Holding) => {
                         stream_ended(shared, link);
                         return r;
@@ -291,6 +344,40 @@ async fn steered(
         };
     }
 }
+
+/// A kept job's followed stream breaks without the job having ended (the front serving it was
+/// restarted, as a rolling deploy does, and the next connection reaches the sandbox through a
+/// peer). Whether to follow again, from the offset reached: the job is still the sandbox's
+/// (running, or ended and not yet read to its end), and the breaks since the stream last delivered
+/// anything number fewer than [`MAX_BREAKS`]. Waits a moment first, so a front that is down is
+/// not spun on. `Lost` and `Gone` are the job's end, which the error reports.
+async fn resumes(shared: &JobShared, link: &SandboxLink, breaks: &mut Breaks) -> bool {
+    let at = shared.offset();
+    if breaks.at != Some(at) {
+        *breaks = Breaks { at: Some(at), n: 0 };
+    }
+    breaks.n += 1;
+    if breaks.n > MAX_BREAKS {
+        return false;
+    }
+    tokio::time::sleep(BREAK_PAUSE).await;
+    match link.store.read(&link.scope, &link.id, at, 0).await {
+        Ok(chunk) => !matches!(chunk.status, JobStatus::Lost | JobStatus::Gone),
+        // The sandbox cannot be reached this moment (a front with no replica yet): try again.
+        Err(_) => true,
+    }
+}
+
+/// The offset a followed stream last broke at, and how many times in a row.
+#[derive(Default)]
+struct Breaks {
+    at: Option<u64>,
+    n: u32,
+}
+
+/// Breaks at one offset after which a kept job is no longer followed (about a minute).
+const MAX_BREAKS: u32 = 120;
+const BREAK_PAUSE: Duration = Duration::from_millis(500);
 
 /// The stream holding a job (or the follow standing for it) delivered its final frame or broke:
 /// a proving or closing job is held as today from here (the release table's `proving, held` row).
@@ -397,7 +484,13 @@ pub(crate) async fn keep(
         }
         None => link
             .store
-            .keep(&link.scope, &link.id, num, kind_name(kind), shared.offset())
+            .keep(
+                &link.scope,
+                &link.id,
+                Some(num),
+                kind_name(kind),
+                shared.offset(),
+            )
             .await
             .map_err(|e| e.to_string())?,
     }
@@ -455,7 +548,7 @@ async fn keep_through(
             Action::SendKeep { notify: false, .. } => {
                 result = link
                     .store
-                    .keep(&link.scope, &link.id, num, kind, seen)
+                    .keep(&link.scope, &link.id, Some(num), kind, seen)
                     .await
                     .map_err(|e| e.to_string());
             }

@@ -828,7 +828,7 @@ impl Run<'_> {
                 return Err("no proof arrived".to_string());
             }
             self.jobs()
-                .keep(&scope, &id, 1, "background", 0)
+                .keep(&scope, &id, Some(1), "background", 0)
                 .await
                 .map_err(|e| format!("keep: {e}"))?;
             let after = Instant::now();
