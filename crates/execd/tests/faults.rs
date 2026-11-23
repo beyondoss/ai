@@ -154,6 +154,13 @@ async fn assert_spawn_fails_cleanly(e: &Execd, why: &str) {
 }
 
 async fn assert_spawns_work(e: &Execd, why: &str) {
+    assert_spawns_work_with(e, why, true).await;
+}
+
+/// `jobs_start`: a job can be started too. A job's output is a file in the jobs directory, so on a
+/// full disk it cannot be: the start is refused (a non-2xx answer, as the spec has it), not hung,
+/// and leaves nothing in the table.
+async fn assert_spawns_work_with(e: &Execd, why: &str, jobs_start: bool) {
     let a = call(e, sh("printf ok")).await;
     assert_eq!(
         a.json()["exit_code"],
@@ -171,12 +178,17 @@ async fn assert_spawns_work(e: &Execd, why: &str) {
     );
     let id = format!("after-{}", why.replace(' ', "-"));
     let a = start_job(e, &id, "printf ok").await;
-    assert_eq!(
-        a.status,
-        200,
-        "job start ({why}): {}",
-        String::from_utf8_lossy(&a.body)
-    );
+    if jobs_start {
+        assert_eq!(
+            a.status,
+            200,
+            "job start ({why}): {}",
+            String::from_utf8_lossy(&a.body)
+        );
+    } else {
+        assert_eq!(a.status, 500, "job start ({why})");
+        assert_eq!(read(e, &id, 0).await.state, "gone", "job start ({why})");
+    }
 }
 
 async fn livez(e: &Execd) -> u16 {
@@ -295,14 +307,17 @@ impl SmallDisk {
         let _ = std::fs::remove_file(self.path().join("fill"));
     }
 
-    /// Every file execd keeps under the mount, the filler excluded.
+    /// Every file execd keeps under the mount, the filler and each job's two spool files excluded.
     fn job_files(&self) -> usize {
         fn walk(p: &Path, n: &mut usize) {
             for e in std::fs::read_dir(p).into_iter().flatten().flatten() {
                 let path: PathBuf = e.path();
                 if path.is_dir() {
                     walk(&path, n);
-                } else if path.file_name().is_some_and(|f| f != "fill") {
+                } else if path
+                    .file_name()
+                    .is_some_and(|f| f != "fill" && f != "out" && f != "err" && f != "journal")
+                {
                     *n += 1;
                 }
             }
@@ -340,7 +355,7 @@ fn assert_parity(from: u64, data: &[u8]) {
 
 #[tokio::test]
 async fn a_full_jobs_disk_costs_the_output_and_nothing_else() {
-    let Some(mut disk) = SmallDisk::mount(512) else {
+    let Some(mut disk) = SmallDisk::mount(1024) else {
         return;
     };
     let jobs_dir = disk.path().to_string_lossy().into_owned();
@@ -361,12 +376,13 @@ async fn a_full_jobs_disk_costs_the_output_and_nothing_else() {
     assert_eq!(r.data.len() as u64, r.end, "healthy output is whole");
     assert_parity(0, &r.data);
 
-    // The disk fills (and stays full). The writer keeps running, and what it wrote reads back
-    // honestly: a gap at the front, offsets that never move backwards, bytes that are the bytes.
+    // The disk fills (and stays full). A job's output is a file on that disk, so its own writes
+    // fail as any write to a full disk does (`ENOSPC`); the job itself runs on, and what execd
+    // already holds reads back honestly: offsets never move backwards, bytes are the bytes.
     disk.fill();
     let last = std::cell::Cell::new((r.from, r.end));
-    let started = r.end;
-    until("600 KiB written while full", || async {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
         let (last_from, last_end) = last.get();
         let r = read(&e, "w", 0).await;
         assert_eq!(r.state, "running", "the writer must outlive a full disk");
@@ -379,16 +395,11 @@ async fn a_full_jobs_disk_costs_the_output_and_nothing_else() {
         assert!(r.end >= r.from + r.data.len() as u64);
         assert_parity(r.from, &r.data);
         last.set((r.from, r.end));
-        r.end >= started + (600 << 10)
-    })
-    .await;
-    assert!(
-        last.get().0 > 0,
-        "a full disk must read back as a gap, not as the old bytes"
-    );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     // Asking for the lost bytes is answered from what is held, never with an error.
     let r = read(&e, "w", 0).await;
-    assert!(r.from > 0 && r.from <= r.end);
+    assert!(r.from <= r.end);
 
     // Everything else still works: another job, one-shot, streaming, a new job, /livez.
     let calm = read(&e, "calm", 0).await;
@@ -396,15 +407,8 @@ async fn a_full_jobs_disk_costs_the_output_and_nothing_else() {
         (calm.state.as_str(), calm.data.as_slice()),
         ("running", &b"calm\n"[..])
     );
-    assert_spawns_work(&e, "full disk").await;
+    assert_spawns_work_with(&e, "full disk", false).await;
     assert_eq!(livez(&e).await, 200);
-    let a = start_job(&e, "small", "printf small").await;
-    assert_eq!(a.status, 200);
-    until("a small job to end", || async {
-        read(&e, "small", 0).await.state == "ended"
-    })
-    .await;
-    assert_eq!(read(&e, "small", 0).await.data, b"small");
 
     // A refused chunk leaves nothing on the disk behind it.
     assert!(
@@ -415,6 +419,16 @@ async fn a_full_jobs_disk_costs_the_output_and_nothing_else() {
 
     // Space comes back: new output is retained again, from the first byte written after.
     disk.free();
+    assert_eq!(
+        start_job(&e, "later", "printf later").await.status,
+        200,
+        "a job starts again once there is room"
+    );
+    until("a job started after the disk freed to end", || async {
+        read(&e, "later", 0).await.state == "ended"
+    })
+    .await;
+    assert_eq!(read(&e, "later", 0).await.data, b"later");
     tokio::time::sleep(Duration::from_millis(300)).await;
     let e0 = read(&e, "w", 0).await.end;
     until("192 KiB written after the disk freed", || async {

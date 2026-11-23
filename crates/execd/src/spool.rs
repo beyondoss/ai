@@ -60,6 +60,11 @@ impl JobsDir {
             .join(self.next.fetch_add(1, Ordering::Relaxed).to_string())
     }
 
+    /// The directory itself, where a job's spool files go when there is no ledger.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Say what the directory is on, and warn where retained output would be RAM.
     #[allow(clippy::unnecessary_cast)] // `f_type` is signed on glibc and unsigned on musl
     fn log_filesystem(&self) {

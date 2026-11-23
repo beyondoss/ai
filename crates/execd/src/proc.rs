@@ -21,7 +21,7 @@
 //! plus the children themselves, which the OS bounds (`pids.max`, `RLIMIT_NPROC`). [`Groups`] is
 //! the same idea per server, for the shutdown sweep.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::os::fd::AsFd;
 use std::os::unix::process::ExitStatusExt as _;
@@ -484,47 +484,71 @@ pub(crate) fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// The process groups a server has running, so a shutdown can kill them all.
+/// The process groups a server has running, so a shutdown can decide what to do with each.
 ///
 /// Bounded by the number of running commands and jobs; each entry is freed when its command or
-/// job ends ([`GroupSlot`] drops, or the job's supervisor finishes). Once [`Self::kill_all`] has
-/// run the set is closed: a group registered after it (a spawn that raced the shutdown) is killed
-/// at once instead of surviving it.
-#[derive(Default)]
-pub(crate) struct Groups(Mutex<GroupSet>);
+/// job ends ([`GroupSlot`] drops, or the job's supervisor finishes). Once [`Self::shutdown`] has
+/// run the set is closed: a group registered after it (a spawn that raced the shutdown) gets the
+/// same decision at once instead of escaping it.
+pub(crate) struct Groups {
+    set: Mutex<GroupSet>,
+    /// Whether a ledger keeps the jobs across this server ([`crate::Options::state_dir`]): the
+    /// kernel's `recorded`.
+    recorded: bool,
+}
 
 #[derive(Default)]
 struct GroupSet {
-    live: BTreeSet<Pg>,
+    live: BTreeMap<Pg, job_kernel::Kind>,
     closed: bool,
 }
 
 impl Groups {
-    pub fn insert(&self, pg: Pg) {
-        let mut g = locked(&self.0);
+    pub fn new(recorded: bool) -> Self {
+        Self {
+            set: Mutex::default(),
+            recorded,
+        }
+    }
+
+    /// What a shutdown does to a group of this kind (S3 to S5).
+    pub fn at_shutdown(&self, kind: job_kernel::Kind) -> job_kernel::Shutdown {
+        job_kernel::shutdown_of(kind, self.recorded)
+    }
+
+    pub fn insert(&self, pg: Pg, kind: job_kernel::Kind) {
+        let mut g = locked(&self.set);
         if g.closed {
             drop(g);
-            kill_group(pg);
+            if self.at_shutdown(kind).signal {
+                kill_group(pg);
+            }
         } else {
-            g.live.insert(pg);
+            g.live.insert(pg, kind);
         }
     }
 
     pub fn remove(&self, pg: Pg) {
-        locked(&self.0).live.remove(&pg);
+        locked(&self.set).live.remove(&pg);
     }
 
-    /// SIGKILL every registered group, forget them, and close the set. How many it killed.
-    pub fn kill_all(&self) -> usize {
+    /// Decide each registered group's fate ([`job_kernel::shutdown_of`]): SIGKILL the ones it says
+    /// to, leave the rest running (a recorded job: the next execd adopts it), forget them all, and
+    /// close the set. How many it killed.
+    pub fn shutdown(&self) -> usize {
         let all = {
-            let mut g = locked(&self.0);
+            let mut g = locked(&self.set);
             g.closed = true;
             std::mem::take(&mut g.live)
         };
-        for &g in &all {
-            kill_group(g);
+        let mut killed = 0;
+        for (&pg, &kind) in &all {
+            if self.at_shutdown(kind).signal {
+                kill_group(pg);
+                killed += 1;
+            }
         }
-        all.len()
+        killed
     }
 }
 

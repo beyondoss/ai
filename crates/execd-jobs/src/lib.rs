@@ -759,6 +759,143 @@ pub proof fn lemma_recover_idempotent(s: State, alive: bool, now: u64, alive2: b
 }
 
 // ---------------------------------------------------------------------------------------------
+// Where output goes, and what a shutdown does to each group.
+// ---------------------------------------------------------------------------------------------
+
+/// What a process group belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Kind {
+    /// A one-shot or streamed command: its client's connection is its life.
+    Command,
+    /// A job: it outlives the request that started it, and a restart of execd.
+    Job,
+}
+
+/// Where a process's standard output and error go.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sink {
+    /// A pipe execd reads: it dies with execd's end of it, and a write after that is `SIGPIPE`.
+    Pipe,
+    /// An `O_APPEND` file execd opened and the process inherits: it outlives execd, and execd
+    /// reads it from an offset.
+    Spool,
+}
+
+/// S1, S2: where a group's output goes. A job's is the spool file, never a pipe (a pipe's reader is
+/// execd, and a job that writes after execd restarted would die of `SIGPIPE`); a command's is a
+/// pipe, which ends with its client.
+pub fn output_sink(kind: Kind) -> (s: Sink)
+    ensures
+        kind is Job ==> s is Spool,
+        kind is Command ==> s is Pipe,
+{
+    match kind {
+        Kind::Job => if cfg!(feature = "mut_job_output_pipe") { Sink::Pipe } else { Sink::Spool },
+        Kind::Command => if cfg!(feature = "mut_command_output_spool") { Sink::Spool } else { Sink::Pipe },
+    }
+}
+
+/// What execd's shutdown (a `SIGTERM`, a restart) does with one group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Shutdown {
+    /// Signal the group. Only an explicit `kill` or `wipe` signals a job that a restart can find.
+    pub signal: bool,
+    /// Keep the group's record in the ledger, so the next execd finds it.
+    pub record: bool,
+}
+
+/// S3, S4, S5: what a shutdown of execd does to a group. `recorded` is whether execd keeps a
+/// ledger (`EXECD_STATE_DIR`), so a next execd can find a job's group.
+///
+/// - S3: a recorded job's group is never signalled: its processes run on, and the next execd adopts
+///   them ([`recover`]). An unrecorded job's group is signalled (S3b): nothing could ever find or
+///   stop it again.
+/// - S4: a recorded job's record is kept, and only a recorded job's.
+/// - S5: a command's group is signalled, since its client's connection ends with execd; it has no
+///   record.
+pub fn shutdown_of(kind: Kind, recorded: bool) -> (r: Shutdown)
+    ensures
+        (kind is Job && recorded) ==> !r.signal,
+        (kind is Job && !recorded) ==> r.signal,
+        (kind is Job && recorded) ==> r.record,
+        !(kind is Job && recorded) ==> !r.record,
+        kind is Command ==> r.signal,
+{
+    match kind {
+        Kind::Job => Shutdown {
+            signal: if recorded { cfg!(feature = "mut_shutdown_signals_jobs") } else { !cfg!(feature = "mut_shutdown_orphans_unrecorded") },
+            record: recorded && !cfg!(feature = "mut_shutdown_forgets_jobs"),
+        },
+        Kind::Command => Shutdown { signal: !cfg!(feature = "mut_shutdown_spares_commands"), record: false },
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Resuming a job's output after a restart of execd.
+// ---------------------------------------------------------------------------------------------
+
+/// Largest offset the resume arithmetic accepts: the sum of the two streams' offsets and a
+/// journal's bytes must fit in a `u64` (16 EiB of output).
+pub const OFFSET_MAX: u64 = 0x7fff_ffff_ffff_ffff;
+
+/// Where a restarted execd reads a job's two spool files from, and where its ring ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Resume {
+    /// The next byte of `out` to read.
+    pub out: u64,
+    /// The next byte of `err` to read.
+    pub err: u64,
+    /// The ring offset of the next byte: how many bytes execd had consumed.
+    pub end: u64,
+}
+
+/// X1, X2, X3: where a restarted execd resumes. The ledger names the job's spool, and in it the
+/// journal: the cursors (`out`, `err`) at the journal's start, and `jo` and `je` bytes of each
+/// stream that execd had consumed and journalled after them, in the order it ring-ed them.
+///
+/// - X1: each stream resumes exactly after the last byte consumed: its cursor plus its journalled
+///   bytes. A byte consumed before the crash is not read again, one not yet consumed is.
+/// - X2: the ring's end is the bytes consumed, so a client's offset means the same byte before and
+///   after: `end == out + err`.
+/// - X3 ([`replay_skip`]): a journalled byte already in a chunk file is not put in the ring twice.
+pub fn resume(out: u64, err: u64, jo: u64, je: u64) -> (r: Resume)
+    requires
+        out as int + err as int + jo as int + je as int <= OFFSET_MAX as int,
+    ensures
+        r.out == out + jo,
+        r.err == err + je,
+        r.end as int == r.out as int + r.err as int,
+{
+    let o = if cfg!(feature = "mut_resume_cursor_lags") { out } else { out + jo };
+    let e = err + je;
+    let end = if cfg!(feature = "mut_resume_end_drops_journal") { out + err } else { o + e };
+    Resume { out: o, err: e, end }
+}
+
+/// X3: of a journal record of `len` bytes at ring offset `at`, how many leading bytes are already in
+/// the chunk files, which hold the ring below `chunk_end`. Those are skipped; the rest are replayed
+/// into the ring, so every offset below `chunk_end` is served by a chunk and every offset at or
+/// above it by the journal, each once.
+pub fn replay_skip(chunk_end: u64, at: u64, len: u64) -> (skip: u64)
+    requires
+        at as int + len as int <= u64::MAX as int,
+    ensures
+        skip <= len,
+        chunk_end > at ==> skip as int == (if chunk_end - at < len { (chunk_end - at) as int } else { len as int }),
+        chunk_end <= at ==> skip == 0,
+{
+    if cfg!(feature = "mut_resume_replays_chunked") {
+        0
+    } else if chunk_end <= at {
+        0
+    } else if chunk_end - at < len {
+        chunk_end - at
+    } else {
+        len
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Output offsets.
 // ---------------------------------------------------------------------------------------------
 

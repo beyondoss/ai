@@ -74,6 +74,33 @@ mut_recover_reends_ended = [
 mut_recover_forgets_shell_status = [
   "beyond-execd-jobs/mut_recover_forgets_shell_status",
 ] # a restart ends a job whose shell had exited with the lost-status code (R3)
+mut_job_output_pipe = [
+  "beyond-execd-jobs/mut_job_output_pipe",
+] # a job's output goes to a pipe, so a write after a restart is SIGPIPE (S1; `tests/restart.rs`)
+mut_command_output_spool = [
+  "beyond-execd-jobs/mut_command_output_spool",
+] # a command's output goes to a spool file, not its client's pipe (S2)
+mut_shutdown_signals_jobs = [
+  "beyond-execd-jobs/mut_shutdown_signals_jobs",
+] # execd's shutdown signals every recorded job's group (S3; `tests/restart.rs`)
+mut_shutdown_orphans_unrecorded = [
+  "beyond-execd-jobs/mut_shutdown_orphans_unrecorded",
+] # execd's shutdown leaves a job running that no ledger can find (S3b)
+mut_shutdown_forgets_jobs = [
+  "beyond-execd-jobs/mut_shutdown_forgets_jobs",
+] # execd's shutdown empties the ledger of its jobs (S4; `tests/restart.rs`)
+mut_shutdown_spares_commands = [
+  "beyond-execd-jobs/mut_shutdown_spares_commands",
+] # execd's shutdown leaves a command's group running (S5)
+mut_resume_cursor_lags = [
+  "beyond-execd-jobs/mut_resume_cursor_lags",
+] # a restart reads a stream again from its cursor, journalled bytes included (X1; `tests/restart.rs`)
+mut_resume_end_drops_journal = [
+  "beyond-execd-jobs/mut_resume_end_drops_journal",
+] # a restart's ring ends before the journalled bytes, so offsets move (X2)
+mut_resume_replays_chunked = [
+  "beyond-execd-jobs/mut_resume_replays_chunked",
+] # a journalled byte already in a chunk file is put in the ring again (X3)
 # Mutations of `ring` (the crate `execd-ring`, which Verus proves), used only by `src/ring.rs`'s differential
 # test's red runs: each removes one guard.
 mut_window_before_base = [
@@ -130,7 +157,7 @@ hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
 # Process groups, subreaper, the pipe-size query and the socket's user timeout, as safe wrappers:
 # the workspace forbids `unsafe_code`.
 mimalloc = { version = "0.1.52", default-features = false, optional = true }
-nix = { version = "0.31", default-features = false, features = ["fs", "net", "process", "signal", "socket", "user"] }
+nix = { version = "0.31", default-features = false, features = ["fs", "inotify", "net", "process", "signal", "socket", "user"] }
 # Where the OS trust store lives (honours SSL_CERT_FILE and SSL_CERT_DIR), to say when it is empty.
 openssl-probe = "0.1"
 # Job-end callbacks over HTTPS that verify the server and never follow a redirect: rustls with

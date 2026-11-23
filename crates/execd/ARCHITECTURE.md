@@ -27,6 +27,7 @@ variables alone ([Configuration](#configuration)).
 | `src/notify.rs`     | notify: the sender that drives the `exec-notify` kernel                                                                                                                                       |
 | `src/proc.rs`       | spawning, the reaper that collects every child, process groups by syscall, the subreaper                                                                                                      |
 | `src/spool.rs`      | the jobs directory: where a kept job's retained output lives as chunk files, and stale-directory cleanup                                                                                      |
+| `src/tail.rs`       | a job's output spool: the two `O_APPEND` files its stdout and stderr go to, execd's tail of them (woken by one `inotify`), and the spool's directory                                          |
 | `src/ledger.rs`     | the jobs ledger: the one typed value kept across a restart of execd, written whole and read at start                                                                                          |
 | `src/frame.rs`      | streaming frame encoding                                                                                                                                                                      |
 
@@ -144,7 +145,7 @@ chunk that holds any stderr. A job that never writes stderr allocates and writes
 its chunk; a sidecar that cannot be written turns its chunk into a gap, so bytes are never read back mislabelled. `read` answers
 `stderr_ranges` (absolute `[from, len]`, ascending, disjoint, at most `RANGES_MAX` = 1024: the window is cut before the range that
 would exceed it, so an alternating writer cannot grow an answer), and a job stream's frames are keyed `stdout` or `stderr` and
-never span a change of stream. Arrival order between the two pipes is the order the pumps took the job lock, as before.
+never span a change of stream. Arrival order between the two files is the order the job's tail read them: a buffer from each in turn (see "A job's output is a file").
 
 **Stdin.** `start` with `stdin_open` spawns with a piped stdin (default `/dev/null`: a job that reads to EOF must not hang) and
 the answer echoes `stdin: true`. The job holds a `JobStdin`: the pipe behind an async (FIFO) mutex, `written` (a `watch`), a
@@ -286,16 +287,86 @@ R5: recovering what recovery returned changes nothing, so a restart during a res
 `mut_recover_forgets_shell_status`) are red in both. A held start no one kept dies with its client, whose connection went
 with the old process: recovery sends it the same `Disconnect` any client leaving does.
 
-What does not survive: a job's retained output (the old process's spool dies with it, so a recovered job reads back
-empty), a `notify` target, and a job's open stdin. A job that writes to its stdout or stderr after the restart loses
-its pipe and gets `SIGPIPE`, so a job that must run through a restart redirects its own output. `SIGTERM`
-is a shutdown, not a crash: it kills every group and empties the ledger. The directory should die with the machine the jobs
-run on (tmpfs); a ledger that outlives its processes only names groups that are gone, which recovery ends as above.
+What does not survive: a `notify` target and a job's open stdin (a pipe: a job that reads stdin sees EOF). A job's output does
+(below): its ledger entry names its spool directory.
+
+### A job's output is a file; a shutdown leaves its groups (S1-S5)
+
+**Output.** A job's stdout and stderr are two files, `out` and `err`, that execd opens with `O_APPEND` and the job inherits
+(`src/tail.rs`); there is no pipe. A pipe's reader is execd, so a write after execd died was `SIGPIPE`: a job could not run
+through a restart. A file has no reader to lose. `job_kernel::output_sink` decides it (S1: a job's is `Spool`, never a
+pipe; S2: a command's is a pipe, which ends with its client), and `exec::command_for` and `start_job` call it.
+
+With `EXECD_STATE_DIR` the files are in `<state>/spool/<mark>/` (`0700`, files `0600`, `O_EXCL`, `O_NOFOLLOW`), which survives
+the process; without it they are under the jobs directory and die with execd, as the jobs' ledger would not have kept them
+anyway. The directory goes when the job is removed, and at a restart for every spool no recovered job names.
+
+**The tail.** One task per job reads each file from its own offset into the job's ring (offsets, stderr labels and retention
+are still `crates/execd-ring`'s, R1-R6), a buffer from each file in turn, and yields to the runtime after each round. A file gives
+no readiness, so one `inotify` instance per server (`tail::Hub`) wakes the job's tail on `IN_MODIFY`: a write reaches the ring
+as soon as it reached it through a pipe, with no polling. The task always reads to the end before it waits, so a lost or doubled
+wake costs nothing, and a queue overflow wakes every tail. Bytes read are returned to the filesystem in 64 KiB steps
+(`FALLOC_FL_PUNCH_HOLE`), so a spool holds what execd has not read plus under 64 KiB per stream.
+The settle of a pipe (read until it closes, go quiet 100 ms, or one pipe's worth of late bytes) is gone for jobs: when the shell
+exits or the group empties, everything written is already in the files, so execd reads to their ends and is done; a descendant
+that holds the output open past its job's end costs nothing. A restarted execd opens a recovered job's files and reads from the
+exact byte it stopped at (X1-X3, below), so what the job wrote while execd was down, on each stream and labelled, is read back.
+
+**Resuming at an offset (X1-X3).** Each ledger entry names its job's spool directory (`spool`), and in it, beside the two files,
+are the ring's chunk files (`ring/`) and `journal`: the cursors of `out` and `err` at its start, then every piece execd consumed
+and has not yet written to a chunk, in the order it ring-ed it, with its stream. It is appended before the bytes read are returned
+to the filesystem and replaced (written aside, renamed) whenever the ring flushes a chunk, so it never holds more than the
+unfinished chunk and a byte is always in a spool file or the journal. A restarted execd takes the chunks, then replays the
+journal, then reads each file from `execd_jobs::resume`: each stream resumes at its cursor plus its journalled bytes (X1), and the
+ring ends at the bytes consumed, `out + err` (X2), so a client's offset names the same byte before and after the restart, with
+the same stderr labels, and `read` at that offset answers the next byte with no gap. A journalled byte a chunk already holds is
+skipped (`replay_skip`, X3), so none is served twice; a crash between a chunk's write and the journal's replacement is that case.
+With no journal, or one that disagrees with the chunks, the ring starts empty and the files are read from what they still hold: a
+gap, logged. Proven in Verus (`resume`, `replay_skip`; `mut_resume_cursor_lags`, `mut_resume_end_drops_journal`,
+`mut_resume_replays_chunked` are red); `tests/restart.rs` drives a crash mid-write and compares the answer before and after.
+
+A job's ring chunks therefore live in its spool (`<state>/spool/<mark>/ring/`), not the jobs directory, and the disk under it is a
+dependency: a job needs room to start (`500`: its spool cannot be made), and a job writing to a full disk sees `ENOSPC`, as any
+write to a file does.
+
+**Shutdown.** `SIGTERM` or `SIGINT` stops the accept loop and drops every open connection; the kernel decides each registered
+group (`job_kernel::shutdown_of(kind, recorded)`, `recorded` is whether there is a ledger):
+
+| group                        | signalled | record in the ledger                           |
+| ---------------------------- | --------- | ---------------------------------------------- |
+| a command (one-shot, stream) | yes (S5)  | none                                           |
+| a job, with a ledger         | no (S3)   | kept (S4): the next execd adopts it (R2)       |
+| a job, without a ledger      | yes (S3b) | none: nothing could ever find or stop it again |
+
+Only an explicit `kill` or `wipe` signals a job that a restart can find. A held `start` nobody kept dies with its client's
+connection (J6); a shutdown is not the client leaving, so that kill waits for the next execd, which ends it as any recovered
+disconnect (R2 above). Who restarts execd and keeps its process group out of the supervisor's kill is the supervisor's
+(`KillMode=process`, or its own).
+
+Proven in Verus (`execd-jobs`, `output_sink` and `shutdown_of`): five `mut_*` features each turn one clause red
+(`mut_job_output_pipe`, `mut_command_output_spool`, `mut_shutdown_signals_jobs`, `mut_shutdown_orphans_unrecorded`,
+`mut_shutdown_forgets_jobs`, `mut_shutdown_spares_commands`), and `tests/restart.rs` drives the binary through S1, S3 and S4.
+
+**Measured** (`benches/jobs_first_byte.py`, n=40 per run, three runs each, release builds, this 2-CPU ext4/tmpfs host), before
+the pipe and after the file:
+
+|                                                                             | before (pipe, pump)      | after (file, `inotify`, tail)                                 |
+| --------------------------------------------------------------------------- | ------------------------ | ------------------------------------------------------------- |
+| a running job's write to its arrival at an attached client, p50 / p95       | 0.18-0.20 / 0.22 ms      | 0.21-0.22 / 0.31-0.33 ms                                      |
+| first output frame of a held `start`, p50 / p95                             | 6.3-7.1 / 7.5-8.3 ms     | 5.8-6.0 / 6.9-7.2 ms (the same 6 ms of start work; unchanged) |
+| a streamed command's first byte (not a job; unchanged path), p50 / p95      | 0.45-0.64 / 0.91-0.94 ms | 0.46-0.79 / 0.89-0.99 ms                                      |
+| `true` while 16 jobs write 1 GiB flat out (`benches/jobs_io.py`), p50 / p99 | 1.0 / 94 ms              | 3.5 / 5.9 ms                                                  |
+| `read` of 8 MiB from the oldest offset / `attach` from it, MB/s             | 167 / 1,100              | 166 / 1,080                                                   |
+
+The hop through the file and the journal's append costs about 0.03 ms at the median (0.1 ms at p95) on the write-to-client path. Under 16 flat-out writers the median is higher
+(a writer is no longer slowed by a full pipe, so the tails have more to read) and the tail is far lower: the pump held the
+one thread for a pipe's worth of data per wake, and the tail reads 64 KiB per file per turn and yields.
 
 ```sh
 cargo test -p beyond-execd --test restart
-cargo test -p beyond-execd --features mut_recover_drops_live --test restart   # red
-mise run verify:kernels -- --features mut_recover_drops_live                    # red
+cargo test -p beyond-execd --features mut_job_output_pipe --test restart      # red
+cargo test -p beyond-execd --features mut_shutdown_signals_jobs --test restart # red
+mise run verify:kernels -- --features mut_shutdown_signals_jobs               # red
 ```
 
 ## Security
@@ -442,8 +513,9 @@ each and a job's `trap` running on each.
   still needed (a host can embed `execd::serve` in a multi-thread runtime, as the test mock does) and cost two uncontended
   atomics per spawn.
 - **Shutdown.** `SIGTERM` or `SIGINT` stops the accept loop, drops every open connection (which drops every in-flight handler, and
-  with it the guard that kills that handler's group), then kills every group still registered, commands and jobs alike, and
-  exits.
+  with it the guard that kills that handler's group), then decides every group still registered by `job_kernel::shutdown_of`:
+  commands are killed; jobs are left running and kept in the ledger when there is one, killed when there is not (see "A job's
+  output is a file; a shutdown leaves its groups"); and exits.
 - **Embedding.** The library never sets a subreaper. `serve` starts its own reaper (it listens for `SIGCHLD`); a host that
   wants the PID 1 duties calls `become_subreaper` first, as the binary does.
 
@@ -465,7 +537,7 @@ cold callers. No limit here is invented: each is the spec's, the agent's own, or
 | Job output                    | the last 8 MiB per job (`JOB_OUTPUT_RETENTION`), in whole chunks of 64 KiB **on disk** (`EXECD_JOBS_DIR`), so between 8 MiB and 8 MiB plus one chunk; in memory, one unfinished chunk                                | The spec: the endpoint keeps at least the last 8 MiB.                                                                                                                                                                                                                                                                                                                                                                                                                                                           | a chunk's eviction; the job's `remove`, `kill` with `remove`, or `wipe`; shutdown | N jobs hold N times 8 MiB of files                                                                                                                                                                |
 | Job table                     | one entry per job started and not removed                                                                                                                                                                            | The agent keeps at most `MAX_YIELDED_JOBS` (4) + `MAX_INTENDED_JOBS` (8) running and `MAX_ENDED_JOBS` (8) ended per session and removes them with the session, so a session holds at most 20 entries. execd adds no second limit; an ended job whose client never removes it stays until execd exits.                                                                                                                                                                                                           | `remove`, `wipe`, `kill` with `remove`                                            | N sessions hold N times 20 entries, 160 MiB of files at the floor                                                                                                                                 |
 | Job `read`                    | at most the output held                                                                                                                                                                                              | A read cannot ask for more than the ring has.                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | the answer being sent                                                             | N answers of at most 8 MiB plus a chunk, base64 encoded                                                                                                                                           |
-| Job pumps                     | two tasks per job                                                                                                                                                                                                    | One per pipe. They end when their pipes close, when the job is removed, or when the supervisor lets go of a pipe a descendant holds open after the settle.                                                                                                                                                                                                                                                                                                                                                      | as stated                                                                         | 2N tasks for N running jobs                                                                                                                                                                       |
+| Job tail                      | one task per job                                                                                                                                                                                                     | It reads the job's two spool files into the ring and ends with the job: the group is empty and the files are read to their ends. Its spool holds the unread bytes plus under 64 KiB per stream.                                                                                                                                                                                                                                                                                                                 | as stated                                                                         | 2N tasks for N running jobs                                                                                                                                                                       |
 | Job supervisor                | one task per job                                                                                                                                                                                                     | Ends when the shell has exited, its group is empty and the end is recorded.                                                                                                                                                                                                                                                                                                                                                                                                                                     | the end                                                                           | N tasks for N running jobs                                                                                                                                                                        |
 | Callback attempts             | one in flight per job, 30 s each, 12 per count                                                                                                                                                                       | N16, N18: a count is over within 723 s however the receiver behaves.                                                                                                                                                                                                                                                                                                                                                                                                                                            | the verdict, the 12th failure, a new `keep`, or the job's removal                 | N attempts at once, one request each, none pooled                                                                                                                                                 |
 | Callback client               | one `reqwest` client, built on the first attempt, with no idle connection kept                                                                                                                                       | A deployment that never keeps a job with `notify` never builds it. A token never sits on a pooled socket.                                                                                                                                                                                                                                                                                                                                                                                                       | process exit                                                                      | built once                                                                                                                                                                                        |

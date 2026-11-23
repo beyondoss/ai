@@ -46,6 +46,7 @@ mod proc;
 mod ring;
 mod runas;
 mod spool;
+mod tail;
 
 pub use notify::{
     ATTEMPT_TIMEOUT, CallbackAttempt, CallbackKind, NOTIFY_VERSION, NotifyTarget, parse_notify,
@@ -165,8 +166,10 @@ pub struct Options {
     /// (a crash, a kill, a new binary) finds the jobs it started: the ones whose process groups run
     /// on are adopted into the table (listable, signalled, removed, and counted by
     /// [`Handle::activity`]); the ones that ended keep the status they ended with; one whose group
-    /// is gone ends with its shell's saved status, else `-1`. A job's retained output is not kept
-    /// (see `ledger.rs`), and a job that writes to its stdout after the restart loses its pipe.
+    /// is gone ends with its shell's saved status, else `-1`. Each entry names the job's spool
+    /// directory (`ledger.rs`): its output is files it inherits (`tail.rs`), so it writes through the
+    /// restart, and the new execd rebuilds its ring and answers `read` at the same offsets. A
+    /// shutdown of this server leaves a job's group running when this is set, and kills it when not.
     /// `None`: nothing is kept, as before. Use a directory that dies with the machine the jobs run
     /// on (tmpfs): a ledger that outlives its processes only names groups that are gone.
     pub state_dir: Option<PathBuf>,
@@ -324,6 +327,10 @@ pub(crate) struct Ctx {
     pub jobs: jobs::Jobs,
     /// Where kept jobs' output is held.
     pub spool: spool::JobsDir,
+    /// Wakes a job's tail when its spool file is written (`tail.rs`).
+    pub tails: Arc<tail::Hub>,
+    /// Set when a shutdown begins: a held job's client leaving with it is not a client leaving.
+    pub stopping: std::sync::atomic::AtomicBool,
     pub groups: proc::Groups,
     /// The callback client, built on the first attempt: a deployment that never keeps a job with
     /// `notify` never pays for it.
@@ -374,13 +381,20 @@ impl Handle {
         self.ctx.activity.subscribe()
     }
 
-    /// Stop accepting, drop every open connection, kill every process group still running (the
-    /// commands and the jobs), and return how many groups that was.
+    /// Stop accepting, drop every open connection, and decide each process group still running
+    /// ([`job_kernel::shutdown_of`]): a command's is killed; a job's is left running and kept in
+    /// the ledger when there is one (`Options::state_dir`), for the next execd to adopt, and killed
+    /// when there is not. Returns how many groups it killed.
     pub async fn shutdown(self) -> usize {
+        self.ctx.stopping.store(true, Ordering::Release);
         self.stop.cancel();
         let _ = self.accept.await;
-        let killed = self.ctx.groups.kill_all();
-        self.ctx.jobs.forget();
+        let killed = self.ctx.groups.shutdown();
+        if self.ctx.groups.at_shutdown(job_kernel::Kind::Job).record {
+            self.ctx.jobs.save();
+        } else {
+            self.ctx.jobs.forget();
+        }
         self.ctx.spool.clean();
         self.reaper.cancel();
         killed
@@ -423,12 +437,15 @@ pub fn serve(listener: tokio::net::TcpListener, opts: Options) -> std::io::Resul
         .state_dir
         .as_deref()
         .map_or_else(ledger::Ledger::disabled, ledger::Ledger::at);
+    let ledger_on = ledger.enabled();
     let ctx = Arc::new(Ctx {
         opts,
         scrub,
         jobs: jobs::Jobs::new(activity.clone(), ledger),
         spool,
-        groups: proc::Groups::default(),
+        tails: tail::Hub::new()?,
+        stopping: std::sync::atomic::AtomicBool::new(false),
+        groups: proc::Groups::new(ledger_on),
         client: tokio::sync::OnceCell::new(),
         epoch: Instant::now(),
         next_seq: AtomicU64::new(0),
