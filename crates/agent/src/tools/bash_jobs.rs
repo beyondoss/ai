@@ -36,7 +36,7 @@ use crate::exec_endpoint::jobs::JobScope;
 /// Most jobs running at once, of any kind. One shared limit, set from execd's bound on a session's
 /// entries (20: `crates/execd/ARCHITECTURE.md`, "Job table"). At it a new command is refused before it
 /// starts, with the list of what is running; nothing running is ever stopped to make room.
-pub const MAX_RUNNING_JOBS: usize = 20;
+pub const MAX_RUNNING_JOBS: usize = bash_gate::MAX_RUNNING_JOBS;
 /// Most ended jobs whose output is kept for `bash_job` after their notice; the oldest goes first.
 pub const MAX_ENDED_JOBS: usize = 8;
 /// Lines of new output a finish notice quotes.
@@ -766,7 +766,8 @@ impl BashJobs {
     /// new command would be refused.
     pub(crate) fn at_limit(&self) -> Option<String> {
         let running = running_jobs(&lock(&self.table));
-        (running.len() >= MAX_RUNNING_JOBS).then(|| running.join(", "))
+        (bash_gate::admit_start(running.len()) == bash_gate::Admit::Refuse)
+            .then(|| running.join(", "))
     }
 
     /// Park a job whose call returned while it runs (any kind: an intended job a `bash_job` wait
@@ -787,7 +788,7 @@ impl BashJobs {
     pub(crate) fn park_intended(&self, mut job: Job) -> Result<u64, (Job, String)> {
         let mut table = lock(&self.table);
         let running = running_jobs(&table);
-        if running.len() >= MAX_RUNNING_JOBS {
+        if bash_gate::admit_start(running.len()) == bash_gate::Admit::Refuse {
             return Err((job, running.join(", ")));
         }
         let id = self.assign_id(&mut job);

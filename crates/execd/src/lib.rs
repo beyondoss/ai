@@ -34,6 +34,10 @@ mod http;
 /// production calls.
 #[doc(hidden)]
 pub use execd_jobs as job_kernel;
+/// The heartbeat, the one-shot's first answer and a job's signal scope, proven in Verus
+/// (`crates/execd-wire`); `exec.rs` and `proc.rs` call it for each.
+#[doc(hidden)]
+pub use execd_wire as wire_kernel;
 mod jobs;
 pub mod log;
 mod notify;
@@ -66,7 +70,7 @@ pub use runas::{HELPER_FLAG, Resolved, RunAs, helper_main};
 pub use spool::remove_stale_jobs_dirs;
 
 /// The spec's heartbeat: a stream silent for this long gets `{}` (streaming).
-pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(execd_wire::HEARTBEAT_MS);
 
 /// How much of a job's output is kept: the spec's floor (jobs), 8 MiB. Older bytes read back as a
 /// gap.

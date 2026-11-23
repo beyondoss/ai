@@ -3058,7 +3058,10 @@ separate host `bash` instance (`build_tools` with `bash_waits_for_exit`) over th
   output stops (or, through `| tail`/`> log`, never starts) and the command never exits. The eval's
   legitimate full suites finish in under 17 s with gaps of at most 4 s between outputs, but a clean
   release build of this repo goes **204 s without output**. So silence is grounds to _ask_ the model,
-  never to kill.
+  never to kill. Whether a call returns, and why (settle, the model's `timeout_ms`, the idle window, the
+  ceiling), and whether a start is admitted at `MAX_RUNNING_JOBS` are pure functions in `crates/bash-gate`
+  (`yield_reason`, `admit_start`), proven in Verus: a hand-back kills nothing, a call always returns by its
+  ceiling, and no decision there stops a running job. `bash.rs` and `bash_jobs.rs` call them.
   - Every call runs as a `Job` on its own task (`exec_detachable`); `attach` waits on the job's
     shared state (output, its shell leaving processes behind, its end — one `Notify` for all three),
     its yield deadline and the call's own cancellation. New output gets its live update even when the

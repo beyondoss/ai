@@ -10,23 +10,24 @@ variables alone ([Configuration](#configuration)).
 
 ## Modules
 
-| file                | role                                                                                                              |
-| ------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| `src/lib.rs`        | `Options`, the `Observer` trait, `serve` and `Handle`, and the derived limits                                     |
-| `src/main.rs`       | the binary: bearer sources and the environment scrub, fail-closed start, subreaper, signals                       |
-| `src/config.rs`     | the binary's settings: every `EXECD_*` variable, parsed once at startup, and the usage text                       |
-| `src/log.rs`        | the logger: one text line per event to stderr, level via `EXECD_LOG` / `log::set_level`, no subscriber            |
-| `src/runas.rs`      | `EXECD_RUN_AS`: resolving the user, proving execd can switch, the switch helper                                   |
-| `src/http.rs`       | hyper (HTTP/1.1 and h2c), routing, `/livez`, the bearer check, the request limit, the log line                    |
-| `src/exec.rs`       | one-shot envelope and streams: pumps, the sink, heartbeat, leftovers, timeout, disconnect                         |
-| `src/jobs.rs`       | jobs: the table, the supervisor, job streams                                                                      |
-| `src/ring.rs`       | the job output ring's I/O: chunk files, the tail, the bits' storage; every decision is `crates/execd-ring`        |
-| `crates/execd-ring` | the ring's offset, retention and stderr-label decisions, pure and proven in Verus (R1 to R6, `execd::ring`)       |
-| `crates/execd-jobs` | the job table's decisions, pure and proven in Verus (`execd::job_kernel`); `tests/job_model.rs` model-checks them |
-| `src/notify.rs`     | notify: the sender that drives the `exec-notify` kernel                                                           |
-| `src/proc.rs`       | spawning, the reaper that collects every child, process groups by syscall, the subreaper                          |
-| `src/spool.rs`      | the jobs directory: where a kept job's retained output lives as chunk files, and stale-directory cleanup          |
-| `src/frame.rs`      | streaming frame encoding                                                                                          |
+| file                | role                                                                                                                                                                                          |
+| ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `src/lib.rs`        | `Options`, the `Observer` trait, `serve` and `Handle`, and the derived limits                                                                                                                 |
+| `src/main.rs`       | the binary: bearer sources and the environment scrub, fail-closed start, subreaper, signals                                                                                                   |
+| `src/config.rs`     | the binary's settings: every `EXECD_*` variable, parsed once at startup, and the usage text                                                                                                   |
+| `src/log.rs`        | the logger: one text line per event to stderr, level via `EXECD_LOG` / `log::set_level`, no subscriber                                                                                        |
+| `src/runas.rs`      | `EXECD_RUN_AS`: resolving the user, proving execd can switch, the switch helper                                                                                                               |
+| `src/http.rs`       | hyper (HTTP/1.1 and h2c), routing, `/livez`, the bearer check, the request limit, the log line                                                                                                |
+| `src/exec.rs`       | one-shot envelope and streams: pumps, the sink, heartbeat, leftovers, timeout, disconnect                                                                                                     |
+| `src/jobs.rs`       | jobs: the table, the supervisor, job streams                                                                                                                                                  |
+| `src/ring.rs`       | the job output ring's I/O: chunk files, the tail, the bits' storage; every decision is `crates/execd-ring`                                                                                    |
+| `crates/execd-ring` | the ring's offset, retention and stderr-label decisions, pure and proven in Verus (R1 to R6, `execd::ring`)                                                                                   |
+| `crates/execd-jobs` | the job table's decisions, pure and proven in Verus (`execd::job_kernel`); `tests/job_model.rs` model-checks them                                                                             |
+| `crates/execd-wire` | the heartbeat wait (W1), the one-shot's first answer (W2) and which processes a job's signal reaches (W3), pure and proven in Verus (`execd::wire_kernel`); `exec.rs` and `proc.rs` call them |
+| `src/notify.rs`     | notify: the sender that drives the `exec-notify` kernel                                                                                                                                       |
+| `src/proc.rs`       | spawning, the reaper that collects every child, process groups by syscall, the subreaper                                                                                                      |
+| `src/spool.rs`      | the jobs directory: where a kept job's retained output lives as chunk files, and stale-directory cleanup                                                                                      |
+| `src/frame.rs`      | streaming frame encoding                                                                                                                                                                      |
 
 ## Configuration
 

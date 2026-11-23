@@ -7,7 +7,7 @@ set -euo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 # shellcheck source=/dev/null
 . "$root/.github/scripts/verus.env"
-KERNELS=(crates/exec-notify crates/execd-jobs crates/execd-ring)
+KERNELS=(crates/exec-notify crates/execd-jobs crates/execd-ring crates/execd-wire crates/bash-gate)
 home=${VERUS_HOME:-$HOME/.cache/verus}
 dir=$home/verus-$VERUS_VERSION
 if [[ ! -x $dir/verus-x86-linux/cargo-verus ]]; then
