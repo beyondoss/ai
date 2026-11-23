@@ -7274,7 +7274,9 @@ for a server nobody has ever logged into.
 
 ## MCP Events (SEP-3415)
 
-> Implements **SEP-3415, the Events extension** (`io.modelcontextprotocol/events`, Final), pinned at
+> Implements **SEP-3415, the Events extension** (`io.modelcontextprotocol/events`; SEP Final, extension stage **Beta** on the
+> [extensions overview](https://modelcontextprotocol.io/extensions/overview), normative text now at `modelcontextprotocol/ext-events`
+> `specification/beta/events/events.mdx`), pinned at
 > [`bbc31f8ded5762eae4df115b93942f5e71c8b3a7`](https://github.com/modelcontextprotocol/modelcontextprotocol/blob/bbc31f8ded5762eae4df115b93942f5e71c8b3a7/seps/3415-events-extension.md)
 > of `modelcontextprotocol/modelcontextprotocol`, for protocol revision `2026-07-28` (per-request
 > `_meta`, `server/discover`, `subscriptions/listen`), with the Server Card of SEP-2127 for server

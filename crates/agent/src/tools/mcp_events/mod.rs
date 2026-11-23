@@ -1,4 +1,4 @@
-//! MCP **Events** — the client side of the Events extension, SEP-3415 (Final), pinned at
+//! MCP **Events** — the client side of the Events extension, SEP-3415 (extension stage Beta), pinned at
 //! [`SPEC_COMMIT`] of <https://github.com/modelcontextprotocol/modelcontextprotocol>
 //! (`seps/3415-events-extension.md`; protocol revision `2026-07-28`, whose per-request `_meta`,
 //! `server/discover` and `subscriptions/listen` it builds on). Everything here is behind

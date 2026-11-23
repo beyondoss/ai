@@ -1,4 +1,4 @@
-//! A hand-rolled MCP server implementing the **server** side of the MCP Events extension (SEP-3415, Final) — a
+//! A hand-rolled MCP server implementing the **server** side of the MCP Events extension (SEP-3415, extension stage Beta) — a
 //! test fixture, not a product. It exists so `crates/agent/tests/mcp_events_*.rs` can drive the real
 //! `tools::mcp_events` client inside a real `serve` against a real process speaking the real wire:
 //! `events/list`, `events/poll`, `events/stream` (push, with heartbeats), and webhook
