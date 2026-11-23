@@ -152,8 +152,7 @@ pub(crate) async fn run(
 ) -> Result<ExecResult, String> {
     let mut ctl = Steer::install(shared);
     let events = |e: JobEvent<'_>| on_event(shared, link, e);
-    let held = link.store.run_held(&link.scope, &link.id, spec, &events);
-    tokio::pin!(held);
+    let mut held = Box::pin(link.store.run_held(&link.scope, &link.id, spec, &events));
     let began = Instant::now();
     // A keep that failed is not tried again for this command: it would fail the same way.
     let mut tried = false;
@@ -177,6 +176,11 @@ pub(crate) async fn run(
             () = tokio::time::sleep(wait) => {}
         }
     };
+    // The stream is let go of here, before any follow and as the release row says: never held across `steered`.
+    drop(held);
+    if outcome.is_some() {
+        stream_ended(shared, link);
+    }
     match outcome {
         Some(Ok(end)) => return Ok(status_result(end.code())),
         Some(Err(e)) if !link.kept() => return Err(e.to_string()),

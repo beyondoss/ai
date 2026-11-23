@@ -501,7 +501,9 @@ async fn a_sandbox_job_lives_in_the_target_and_outlives_its_hold_once_kept() {
         () = until("kept output", || output.lock().unwrap().as_slice() == b"one\n") => {}
     }
     // Kept while the hold is up, then the hold goes.
-    jobs.keep(&scope, &kept, Some(1), "background", 4).await.unwrap();
+    jobs.keep(&scope, &kept, Some(1), "background", 4)
+        .await
+        .unwrap();
     drop(run);
     let pgid = started.lock().unwrap().unwrap();
     tokio::time::sleep(Duration::from_secs(2)).await;

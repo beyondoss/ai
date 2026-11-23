@@ -527,7 +527,10 @@ async fn callbacks_follow_the_latest_keep_and_stop_at_removal() {
         .unwrap();
     assert_eq!(b.wait_for(1, Duration::from_secs(2)).await.len(), 1);
     // A plain keep removes the notify: b's retries stop.
-    e.jobs().keep(&sc, &id, Some(1), "background", 0).await.unwrap();
+    e.jobs()
+        .keep(&sc, &id, Some(1), "background", 0)
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(2500)).await;
     assert_eq!(a.received().len(), 1, "the abandoned notification went on");
     assert_eq!(
@@ -670,5 +673,8 @@ async fn a_refused_notify_is_invalid_input_to_the_client() {
     let job = e.jobs().list(&sc).await.unwrap().remove(0);
     assert!(!job.kept);
     assert!(e.mock.callbacks().is_empty());
-    e.jobs().keep(&sc, &id, Some(1), "background", 0).await.unwrap();
+    e.jobs()
+        .keep(&sc, &id, Some(1), "background", 0)
+        .await
+        .unwrap();
 }

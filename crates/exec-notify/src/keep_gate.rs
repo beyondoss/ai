@@ -48,6 +48,7 @@ pub fn keep_due(age_ms: u64, kept: bool, ended: bool) -> (due: bool)
 
 /// How long to wait from age `age_ms` until the keep is due: the progress measure. It is zero
 /// exactly when the keep is due by age, and waiting that long makes it due.
+#[allow(clippy::implicit_saturating_sub)]
 pub fn keep_wait_ms(age_ms: u64) -> (wait: u64)
     ensures
         age_ms >= KEEP_AFTER_MS ==> wait == 0,
