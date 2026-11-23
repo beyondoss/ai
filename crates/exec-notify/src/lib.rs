@@ -19,6 +19,8 @@
 
 use vstd::prelude::*;
 
+pub mod keep_gate;
+
 verus! {
 
 /// The most attempts one count makes (N18).

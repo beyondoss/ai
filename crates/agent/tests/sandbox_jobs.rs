@@ -194,7 +194,7 @@ async fn a_kept_job_outlives_its_hold_and_is_read_back_from_an_offset() {
     }
     // Kept while the hold is still up — as `bash` keeps a job before it lets go of anything.
     sb.jobs
-        .keep(&sb.scope, &id, 7, "background", 4)
+        .keep(&sb.scope, &id, Some(7), "background", 4)
         .await
         .unwrap();
     drop(run);

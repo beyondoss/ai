@@ -330,12 +330,14 @@ pub trait SandboxJobs: Send + Sync {
         max: usize,
     ) -> std::io::Result<ReadChunk>;
 
-    /// Hand the job to the sandbox, recording its number, its kind and the output already shown.
+    /// Hand the job to the sandbox, recording its number (none for a foreground command kept only
+    /// so that it outlives its stream: it is nobody's numbered job, and a reopen kills it), its
+    /// kind and the output already shown.
     async fn keep(
         &self,
         scope: &JobScope,
         id: &JobId,
-        num: u64,
+        num: Option<u64>,
         kind: &str,
         seen: u64,
     ) -> std::io::Result<()>;

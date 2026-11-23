@@ -112,7 +112,8 @@ impl Drop for Job {
         self.handle.abort();
         // A job the sandbox owns outlives this process's interest in it: dropping it lets go of
         // its stream (the abort above), and nothing more.
-        if self.shared.released() {
+        // `mut_cancel_skips_kill`: the explicit kill on cancel removed; a kept command then outlives it.
+        if self.shared.released() || cfg!(feature = "mut_cancel_skips_kill") {
             return;
         }
         // `abort` only drops the runner's future when the runtime next polls the task, which a

@@ -1268,7 +1268,7 @@ impl Verifier {
                 return fail(JOBS_KEEP, "no `one` within 10 s");
             },
         }
-        if let Err(e) = jobs.keep(&scope, &id, 7, "background", 3).await {
+        if let Err(e) = jobs.keep(&scope, &id, Some(7), "background", 3).await {
             return fail(JOBS_KEEP, format!("keep: {e}"));
         }
         drop(run);

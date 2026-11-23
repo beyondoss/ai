@@ -95,6 +95,18 @@ for m in mut_keep_keeps_in_flight mut_change_begins_in_flight mut_answer_settles
 done
 '''
 
+[tasks."test:keep-gate-mutants"]
+description = "The foreground keep tests (crates/agent/tests/bash_sandbox_jobs.rs) under each mutation of the keep gate and of the cancel kill: every run must go red. mut_keep_early (a short command is kept), mut_keep_never (a long one dies with its front), mut_cancel_skips_kill (a cancel leaves a kept command running). Pairs with `verify:kernels -- --features <mut>`."
+run = '''
+set -u
+for m in mut_keep_early mut_keep_never mut_cancel_skips_kill; do
+  if cargo test -p beyond-agent --test it --locked --features "beyond-agent/$m" -- bash_sandbox_jobs::a_long bash_sandbox_jobs::a_short bash_sandbox_jobs::cancelling >/dev/null 2>&1; then
+    echo "tests stayed green under $m" >&2; exit 1
+  fi
+  echo "tests red under $m"
+done
+'''
+
 [tasks."test:notify-model-job-mutants"]
 description = "The notify model under the job-table kernel mutation that touches the seam (crates/execd-jobs): a removed job that stays in the table (J3) must turn the model red. The other table mutations (J7, J9) need a stream on a removed job or a live removal, which no agent flow reaches; the table's own model (crates/execd/tests/job_model.rs) covers them."
 run = '''

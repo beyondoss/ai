@@ -95,7 +95,7 @@ impl SandboxJobs for HttpJobs {
         &self,
         scope: &JobScope,
         id: &JobId,
-        num: u64,
+        num: Option<u64>,
         kind: &str,
         seen: u64,
     ) -> std::io::Result<()> {
@@ -375,7 +375,7 @@ impl SandboxJobs for NativeJobs<'_> {
         &self,
         scope: &JobScope,
         id: &JobId,
-        num: u64,
+        num: Option<u64>,
         kind: &str,
         seen: u64,
     ) -> std::io::Result<()> {
