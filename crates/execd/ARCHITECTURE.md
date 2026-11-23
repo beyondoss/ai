@@ -27,6 +27,7 @@ variables alone ([Configuration](#configuration)).
 | `src/notify.rs`     | notify: the sender that drives the `exec-notify` kernel                                                                                                                                       |
 | `src/proc.rs`       | spawning, the reaper that collects every child, process groups by syscall, the subreaper                                                                                                      |
 | `src/spool.rs`      | the jobs directory: where a kept job's retained output lives as chunk files, and stale-directory cleanup                                                                                      |
+| `src/ledger.rs`     | the jobs ledger: the one typed value kept across a restart of execd, written whole and read at start                                                                                          |
 | `src/frame.rs`      | streaming frame encoding                                                                                                                                                                      |
 
 ## Configuration
@@ -271,13 +272,13 @@ exit, the end, `keep`, removal), never as marker files; a file that does not par
 before it serves (`jobs::recover`) and asks the pure `job_kernel::recover(state, alive, now)` what each job becomes, where
 `alive` is whether any process of the group or carrying the mark runs:
 
-| saved | group | becomes |
-|---|---|---|
-| ended | any | in the table exactly as it ended: code, signal and time (R1) |
-| running or exited | alive | adopted as saved, its group held for signals and watched until it empties (R2) |
-| running | gone | ended, code `-1` (`LOST_CODE`): the shell's status was seen by no one (R3) |
-| exited | gone | ended with the shell's saved code and signal (R3) |
-| no group yet, or removed | | not in the table (R4) |
+| saved                    | group | becomes                                                                        |
+| ------------------------ | ----- | ------------------------------------------------------------------------------ |
+| ended                    | any   | in the table exactly as it ended: code, signal and time (R1)                   |
+| running or exited        | alive | adopted as saved, its group held for signals and watched until it empties (R2) |
+| running                  | gone  | ended, code `-1` (`LOST_CODE`): the shell's status was seen by no one (R3)     |
+| exited                   | gone  | ended with the shell's saved code and signal (R3)                              |
+| no group yet, or removed |       | not in the table (R4)                                                          |
 
 R5: recovering what recovery returned changes nothing, so a restart during a restart is safe. Proven in Verus
 (`execd-jobs`, `recover` and `lemma_recover_idempotent`), run by production, and driven through the real binary by
