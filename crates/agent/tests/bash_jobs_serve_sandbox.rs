@@ -233,3 +233,110 @@ async fn a_job_that_ended_while_no_process_served_the_session_is_noticed_once() 
         "an ended job is not reported stopped: {last}"
     );
 }
+
+/// A TCP relay to `upstream` that answers the sandbox's `remove` op with success and deletes
+/// nothing: the job's directory outlives the process that reported its end, as it does when that
+/// process dies between persisting the report and deleting it. Returns the relay's url.
+async fn front_that_keeps_removed_jobs(upstream: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let rest = upstream.trim_start_matches("http://");
+    let (target, path) = rest.split_once('/').map_or((rest, ""), |(h, p)| (h, p));
+    let (target, path) = (target.to_string(), path.to_string());
+    let listener = beyond_test_support::ports::tokio_listener().await;
+    let url = format!("http://{}/{path}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        loop {
+            let Ok((down, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(up) = tokio::net::TcpStream::connect(&target).await else {
+                continue;
+            };
+            let (mut dr, dw) = down.into_split();
+            let (mut ur, mut uw) = up.into_split();
+            let dw = std::sync::Arc::new(tokio::sync::Mutex::new(dw));
+            let back = dw.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 16 * 1024];
+                while let Ok(n) = ur.read(&mut buf).await {
+                    if n == 0 || back.lock().await.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 16 * 1024];
+                while let Ok(n) = dr.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    if buf[..n].windows(14).any(|w| w == b"\"op\":\"remove\"") {
+                        let ok = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}";
+                        if dw.lock().await.write_all(ok).await.is_err() {
+                            break;
+                        }
+                    } else if uw.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    url
+}
+
+/// The process that told a job's end persisted the report and died before the sandbox deleted the
+/// job's record. The next process to open the session finds the job ended, with its notice already
+/// in the transcript, and tells nothing: the end is in the conversation once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_job_end_the_transcript_already_holds_is_not_told_again_after_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let exec = ExecMock::start(dir.path()).await;
+    let url = front_that_keeps_removed_jobs(&exec.url).await;
+    let session_file = dir.path().join("s.jsonl").to_string_lossy().into_owned();
+    let run = |turns: Vec<String>, prompt: &'static str| {
+        let (session_file, url) = (session_file.clone(), url.clone());
+        async move {
+            tokio::task::spawn_blocking(move || serve_once(&session_file, &url, turns, prompt))
+                .await
+                .unwrap()
+        }
+    };
+    run(
+        vec![
+            tool(
+                "t1",
+                "bash",
+                json!({ "command": "sleep 3; echo built-while-away", "run_in_background": true }),
+            ),
+            turn_text("building"),
+            turn_text("ok"),
+            turn_text("spare"),
+        ],
+        "build it",
+    )
+    .await;
+    std::thread::sleep(Duration::from_secs(4));
+    let noted = vec![turn_text("noted"); 4];
+    // A tool call first: the notice (its end is read on its own task) joins the tool results.
+    let mut turns = vec![tool("t2", "bash", json!({ "command": "sleep 1" }))];
+    turns.extend(noted.clone());
+    let second = run(turns, "how did the build go?").await;
+    assert_eq!(
+        second
+            .last()
+            .unwrap()
+            .matches("[job 1 exited with code 0")
+            .count(),
+        1,
+        "told once by the process that reopened it: {second:?}"
+    );
+    // The record is still in the sandbox (the delete never happened); a third process reopens it.
+    let third = run(noted, "and now?").await;
+    let last = third.last().unwrap();
+    assert_eq!(
+        last.matches("[job 1 exited with code 0").count(),
+        1,
+        "the end is in the conversation once, not told again: {last}"
+    );
+}

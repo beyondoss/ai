@@ -2686,8 +2686,9 @@ reconcile (and again on a transcript switch) `BashJobs::set_told` reads the fini
 persisted transcript holds, and a reattached job in that set is never due (`bash_gate::end_due`,
 B3, proven in Verus; `Parked::told_persisted`); `read_back` queues its record for deletion without
 reporting it. A replica that died before persisting leaves no notice in the transcript, so the next
-one tells it. Test: `tests/bash_sandbox_jobs.rs`
-(`a_reopened_job_whose_end_the_transcript_holds_is_not_told_again`).
+one tells it. Test: `tests/bash_jobs_serve_sandbox.rs`
+(`a_job_end_the_transcript_already_holds_is_not_told_again_after_a_restart`: three `serve` processes, the
+sandbox keeping the record).
 
 Tests: `tests/sandbox_jobs.rs` runs every operation against the mock (held streaming, a hold dropped
 before and after `keep`, leftovers, a `SIGTERM`-ignoring kill, the cap's gap, `wipe` scoped to one

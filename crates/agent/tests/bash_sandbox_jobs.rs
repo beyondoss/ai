@@ -446,34 +446,6 @@ async fn a_replica_that_dies_before_persisting_a_notice_leaves_it_for_the_next()
     assert_eq!(sb.jobs_left().await, 0);
 }
 
-/// A replica that told the end, persisted the report and died before deleting the job's directory
-/// leaves the job behind, ended. The next one finds the notice in the transcript and tells nothing.
-#[tokio::test]
-async fn a_reopened_job_whose_end_the_transcript_holds_is_not_told_again() {
-    let sb = Sandbox::new().await;
-    let a = sb.replica(EndPolicy::KeepRunning);
-    call(
-        a.bash.as_ref(),
-        json!({ "command": "sleep 2.5; echo done", "run_in_background": true }),
-    )
-    .await
-    .unwrap();
-    let told = notice(&a.jobs).await;
-    assert!(told.starts_with("[job 1 exited with code 0"), "{told}");
-    // Persisted (the transcript holds the notice as the wake's prompt), then dies before collecting.
-    let transcript = vec![Message::user(told)];
-    a.vanish();
-
-    let b = sb.replica(EndPolicy::KeepRunning);
-    b.jobs.set_told(&transcript);
-    assert_eq!(reattach(&b.jobs, sb.runner.clone()).await.ended, vec![1]);
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(b.jobs.take_notices().is_none(), "told again");
-    assert!(!b.jobs.has_notice());
-    b.jobs.collect_garbage().await;
-    assert_eq!(sb.jobs_left().await, 0, "its directory goes unannounced");
-}
-
 #[tokio::test]
 async fn a_run_stops_what_an_earlier_run_of_its_session_left_in_the_sandbox() {
     let sb = Sandbox::new().await;
