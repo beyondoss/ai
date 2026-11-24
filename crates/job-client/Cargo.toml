@@ -1,0 +1,37 @@
+[package]
+name = "beyond-job-client"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+readme = "README.md"
+rust-version.workspace = true
+description = "The job client's kernel: the job cursor (one job incarnation at one output offset) as pure functions, proven in Verus"
+
+[lib]
+name = "job_client"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+# Its one dependency is `vstd`, for the `verus!` macro: a normal build erases every proof and spec, and
+# only `cargo verus` (`mise run verify:kernels`) checks them. The version is the one the pinned release
+# ships (`.github/scripts/verus.env`).
+[dependencies]
+vstd = "=0.0.0-2026-11-01-0251"
+
+[package.metadata.verus]
+verify = true
+
+[features]
+# Mutations of the cursor's decisions, each removing one guard. The proof
+# (`mise run verify:kernels -- --features <mut>`, which runs here) goes red under each.
+mut_offset_truncated = [] # encode writes only the low 32 bits of the offset (C2)
+mut_check_skipped = [] # decode accepts any check value (C1, C3a)
+mut_check_skips_a_byte = [] # the check leaves out the last body byte, so a change there goes unseen (C3a)
+mut_trailing_accepted = [] # decode drops one trailing newline, so a cursor with a byte glued on decodes (C3c)
+mut_prefix_accepted = [] # decode pads a missing last byte, so a cursor cut short decodes (C3b)
+mut_scope_unchecked = [] # decode takes any byte in a scope (C4)
+mut_mark_unchecked = [] # decode takes any byte in a mark (C4)
+mut_id_unchecked = [] # decode takes any byte in an id (C4)
+mut_rejects_max_offset = [] # decode refuses the offset u64::MAX, a valid cursor (C1, C2)
