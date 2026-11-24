@@ -270,7 +270,7 @@ async fn front_that_keeps_removed_jobs(upstream: &str) -> String {
                     if n == 0 {
                         break;
                     }
-                    if buf[..n].windows(14).any(|w| w == b"\"op\":\"remove\"") {
+                    if buf[..n].windows(13).any(|w| w == b"\"op\":\"remove\"") {
                         let ok = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}";
                         if dw.lock().await.write_all(ok).await.is_err() {
                             break;
