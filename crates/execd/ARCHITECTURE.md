@@ -305,9 +305,14 @@ What does not survive: a `notify` target and a job's open stdin (a pipe: a job t
 through a restart. A file has no reader to lose. `job_kernel::output_sink` decides it (S1: a job's is `Spool`, never a
 pipe; S2: a command's is a pipe, which ends with its client), and `exec::command_for` and `start_job` call it.
 
-With `EXECD_STATE_DIR` the files are in `<state>/spool/<mark>/` (`0700`, files `0600`, `O_EXCL`, `O_NOFOLLOW`), which survives
-the process; without it they are under the jobs directory and die with execd, as the jobs' ledger would not have kept them
-anyway. The directory goes when the job is removed, and at a restart for every spool no recovered job names.
+The files are always under the jobs directory (`EXECD_JOBS_DIR`, a disk), never the state directory (S7: `job_kernel::spool_root`,
+which `spool_base` calls). With `EXECD_STATE_DIR` they are in `<jobs>/execd-spool-<tag>/<mark>/` (`<tag>` hashes the state directory's path, so two ledgers in one jobs directory never clean up each other; `0700`, files `0600`, `O_EXCL`,
+`O_NOFOLLOW`), a directory no execd removes when it stops, which survives the process: the ledger names each job's spool by its
+path, so a restart finds it there. That name does not match `execd-jobs-<uid>-<pid>-<random>`, so the stale-directory cleanup at
+start never reads it. Without a state directory they are in this execd's own `execd-jobs-...` directory and die with it, as the
+jobs' ledger would not have kept them anyway. The state directory holds the ledger and nothing else: in a sandbox it is a tmpfs,
+where 8 MiB per job would be RAM and part of every memory snapshot. The spool's directory goes when the job is removed, and at a
+restart for every spool no recovered job names (`Spool::retain` over `<jobs>/execd-spool-<tag>`).
 
 **The tail.** One task per job reads each file from its own offset into the job's ring (offsets, stderr labels and retention
 are still `crates/execd-ring`'s, R1-R6), a buffer from each file in turn, and yields to the runtime after each round. A file gives
@@ -333,7 +338,7 @@ With no journal, or one that disagrees with the chunks, the ring starts empty an
 gap, logged. Proven in Verus (`resume`, `replay_skip`; `mut_resume_cursor_lags`, `mut_resume_end_drops_journal`,
 `mut_resume_replays_chunked` are red); `tests/restart.rs` drives a crash mid-write and compares the answer before and after.
 
-A job's ring chunks therefore live in its spool (`<state>/spool/<mark>/ring/`), not the jobs directory, and the disk under it is a
+A job's ring chunks therefore live in its spool (`<jobs>/execd-spool-<tag>/<mark>/ring/` with a ledger), and the disk under it is a
 dependency: a job needs room to start (`507` when the disk is full, `500` for any other reason its spool cannot be made), and a job writing to a full disk sees `ENOSPC`, as any
 write to a file does.
 
@@ -358,9 +363,9 @@ connection (J6); a shutdown is not the client leaving, so that kill waits for th
 disconnect (R2 above). Who restarts execd and keeps its process group out of the supervisor's kill is the supervisor's
 (`KillMode=process`, or its own).
 
-Proven in Verus (`execd-jobs`, `output_sink` and `shutdown_of`): five `mut_*` features each turn one clause red
-(`mut_job_output_pipe`, `mut_command_output_spool`, `mut_shutdown_signals_jobs`, `mut_shutdown_orphans_unrecorded`,
-`mut_shutdown_forgets_jobs`, `mut_shutdown_spares_commands`), and `tests/restart.rs` drives the binary through S1, S3 (a `SIGHUP`), S4 and S6 (a `SIGTERM`).
+Proven in Verus (`execd-jobs`, `output_sink`, `spool_root` and `shutdown_of`): each of these `mut_*` features each turn one clause red
+(`mut_job_output_pipe`, `mut_command_output_spool`, `mut_spool_under_state`, `mut_shutdown_signals_jobs`, `mut_shutdown_orphans_unrecorded`,
+`mut_shutdown_forgets_jobs`, `mut_shutdown_spares_commands`), and `tests/restart.rs` drives the binary through S1, S7 (`a_ledgers_spools_are_in_the_jobs_directory_and_survive_a_restart`), S3 (a `SIGHUP`), S4 and S6 (a `SIGTERM`).
 
 **Measured** (`benches/jobs_first_byte.py`, n=40 per run, three runs each, release builds, this 2-CPU ext4/tmpfs host), before
 the pipe and after the file:
@@ -380,6 +385,7 @@ one thread for a pipe's worth of data per wake, and the tail reads 64 KiB per fi
 ```sh
 cargo test -p beyond-execd --test restart
 cargo test -p beyond-execd --features mut_job_output_pipe --test restart      # red
+cargo test -p beyond-execd --features mut_spool_under_state --test restart     # red
 cargo test -p beyond-execd --features mut_shutdown_signals_jobs --test restart # red
 mise run verify:kernels -- --features mut_shutdown_signals_jobs               # red
 ```
