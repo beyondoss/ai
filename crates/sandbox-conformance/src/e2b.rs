@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -20,8 +21,13 @@ use tokio::process::Command;
 use crate::backends::Started;
 
 const API: &str = "https://api.e2b.dev";
-/// The VM's hard lifetime, set at create time: it dies by itself even if nothing kills it.
+/// The VM's hard lifetime: set at create time, and set again from now at the start of every cell (see
+/// [`Vm::lease`]), so it dies by itself even if nothing kills it, and no cell runs on a VM that expires
+/// before the cell's budget ([`CELL_SECS`]) is up.
 pub const LIFETIME_SECS: u64 = 1500;
+/// The most one cell may take: shorter than the lifetime, so a cell that outlives its lease fails with
+/// a message instead of failing on a dead VM.
+const CELL_SECS: u64 = LIFETIME_SECS - 60;
 /// The port `execd` listens on in the VM.
 const PORT: u16 = 8081;
 const HOME: &str = "/home/user";
@@ -120,6 +126,36 @@ fn delete(key: &str, id: &str) {
 }
 
 impl Vm {
+    /// Set the VM's remaining lifetime to [`LIFETIME_SECS`] from now; the budget the caller then has.
+    async fn lease(&self) -> Result<Duration, String> {
+        let body = curl(
+            &[
+                ("X-API-Key", &self.key),
+                ("Content-Type", "application/json"),
+            ],
+            &[
+                "-X",
+                "POST",
+                &format!("{API}/sandboxes/{}/timeout", self.id),
+                "-d",
+                &json!({"timeout": LIFETIME_SECS}).to_string(),
+            ],
+            None,
+        )
+        .await?;
+        // 204 with no body is the answer; anything else is an error document.
+        if !body.is_empty() {
+            return Err(format!(
+                "e2b: the sandbox lease was refused: {}",
+                String::from_utf8_lossy(&body)
+                    .chars()
+                    .take(300)
+                    .collect::<String>()
+            ));
+        }
+        Ok(Duration::from_secs(CELL_SECS))
+    }
+
     /// Run a script in the VM through envd's process API (Connect, server-streaming). Returns
     /// (exit code, stdout, stderr).
     async fn run(&self, script: &str, envs: Value) -> Result<(i64, String, String), String> {
@@ -217,11 +253,11 @@ pub async fn start(name: &str) -> Result<Started, String> {
     };
     // From here the VM costs money until it is deleted: the guard owns that.
     crate::reaper::watch_sandbox(id);
-    let vm = Vm {
+    let vm = Arc::new(Vm {
         id: id.into(),
         envd_token: tok.into(),
         key,
-    };
+    });
     eprintln!(
         "e2b: sandbox {} created ({} s lifetime)",
         vm.id, LIFETIME_SECS
@@ -363,6 +399,13 @@ pub async fn start(name: &str) -> Result<Started, String> {
             ("SPOOL_STATE".into(), STATE_DIR.into()),
             ("SPOOL_JOBS".into(), JOBS_DIR.into()),
         ]),
+        lease: Some(Arc::new({
+            let vm = vm.clone();
+            move || {
+                let vm = vm.clone();
+                Box::pin(async move { vm.lease().await })
+            }
+        })),
         _guard: Box::new(vm),
     })
 }

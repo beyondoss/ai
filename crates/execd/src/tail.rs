@@ -46,13 +46,14 @@ use crate::proc::locked;
 /// Bytes read at once, and the step in which read bytes are returned to the filesystem.
 const STEP: usize = 64 * 1024;
 
-/// One job's spool directory, held open: everything in it is made and opened through the
-/// descriptor, so no name swapped in above it (or inside, by anyone but us) is followed.
+/// One job's spool directory, named relative to its held base (`spool::Base`): its files are made
+/// through a descriptor of the directory itself, and every later open goes through the base's
+/// descriptor (`/proc/self/fd/<base>/<mark>`), so no name swapped in above the base is followed.
+/// One descriptor serves every job of a base: an ended job holds none.
 #[derive(Debug)]
 pub(crate) struct Spool {
     /// The name the ledger records.
     dir: PathBuf,
-    fd: Arc<std::os::fd::OwnedFd>,
     base: Base,
     mark: String,
 }
@@ -74,13 +75,12 @@ impl Spool {
         let fd = base.make_dir(mark)?;
         let spool = Self {
             dir: base.path().join(mark),
-            fd: Arc::new(fd),
             base: base.clone(),
             mark: mark.to_string(),
         };
         let open = |name: &str| {
             openat(
-                &spool.fd,
+                &fd,
                 name,
                 OFlag::O_WRONLY
                     | OFlag::O_APPEND
@@ -112,10 +112,10 @@ impl Spool {
             return None;
         }
         let mark = dir.file_name()?.to_str()?;
-        let fd = base.open_dir(mark).ok()?;
+        // A real directory, never a link.
+        drop(base.open_dir(mark).ok()?);
         Some(Self {
             dir: dir.to_path_buf(),
-            fd: Arc::new(fd),
             base: base.clone(),
             mark: mark.to_string(),
         })
@@ -126,16 +126,16 @@ impl Spool {
         &self.dir
     }
 
-    /// A path to the directory that is the held one whatever its name now names: what every open
-    /// of a file in the spool goes through.
+    /// A path to this job's directory through the base's descriptor: what every open of a file in
+    /// the spool goes through.
     pub fn access(&self) -> PathBuf {
-        PathBuf::from(format!("/proc/self/fd/{}", self.fd.as_raw_fd()))
+        self.base.access().join(&self.mark)
     }
 
-    /// The held directory, to be kept by everything that stores a path made by [`Self::access`]:
-    /// the descriptor number stays this directory's for as long as one of them is alive.
+    /// The base's descriptor, to be kept by everything that stores a path made by
+    /// [`Self::access`]: its number stays the base's for as long as one of them is alive.
     pub fn guard(&self) -> Arc<std::os::fd::OwnedFd> {
-        self.fd.clone()
+        self.base.guard()
     }
 
     /// Where this job's ring keeps its chunk files: with the spool, so a restart finds them.
@@ -584,26 +584,32 @@ mod hold_tests {
         v
     }
 
-    /// A job's ring and journal keep the job's directory descriptor open, so after the job is
-    /// removed its number is not another job's: a late flush writes into the removed directory
-    /// (and fails), never into a later job's spool. Red when the descriptor is not held.
+    /// A job's ring and journal keep the base's descriptor open, so after the server that made it is
+    /// gone its number is not another server's: a late flush fails in the removed directory, never
+    /// writes into a later server's spool of the same name. Red when the descriptor is not held.
     #[test]
-    fn a_stale_ring_and_journal_never_write_into_a_job_that_took_the_fd_number() {
-        let (_base, jobs) = stable();
-        let (a, _w) = Spool::create(jobs.stable(), "a").unwrap();
+    fn a_stale_ring_and_journal_never_write_into_a_later_servers_spool() {
+        let (_base1, jobs1) = stable();
+        let (a, _w) = Spool::create(jobs1.stable(), "a").unwrap();
         let mut journal = Journal::create(&a.access(), a.guard(), [0, 0], Vec::new(), 0).unwrap();
         let mut ring = Ring::new(1 << 20, a.ring_dir()).holding(a.guard()).kept();
         a.remove();
         drop(a);
-        // The next job: with the number free it would be given A's.
-        let (b, _wb) = Spool::create(jobs.stable(), "b").unwrap();
+        drop(jobs1);
+        // A later server: with the numbers free it is given the first one's.
+        let (_base2, jobs2) = stable();
+        let (b, _wb) = Spool::create(jobs2.stable(), "a").unwrap();
         let _b_journal = Journal::create(&b.access(), b.guard(), [0, 0], Vec::new(), 0).unwrap();
         let before = names(&b.access());
         let journal_before = fs::read(b.access().join("journal")).unwrap();
-        // A's flushes: a journal rewrite and a full chunk of the ring.
+        // The first one's flushes: a journal rewrite and a full chunk of the ring.
         journal.record(false, b"x", 0);
         ring.push(&vec![b'z'; 70_000], false);
-        assert_eq!(names(&b.access()), before, "a stale writer reached job b");
+        assert_eq!(
+            names(&b.access()),
+            before,
+            "a stale writer reached a later spool"
+        );
         assert_eq!(
             fs::read(b.access().join("journal")).unwrap(),
             journal_before
