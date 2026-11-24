@@ -9,6 +9,11 @@
 //!   or at the model's own `timeout_ms`. Returning is the whole effect: a hand-back kills nothing, and
 //!   a call that has waited past its ceiling always returns (progress).
 //!
+//! * **B3, a job's end is told once** ([`end_due`]): the session is told that a sandbox job ended
+//!   once, across a replica's death. What survives is the transcript: a notice it already holds is
+//!   told, whatever the sandbox's directory for the job still says. An ended job whose notice
+//!   nobody holds is always due (the retry after a restart tells it).
+//!
 //! Durations are in nanoseconds; this crate reads no clock.
 
 use vstd::prelude::*;
@@ -171,6 +176,21 @@ pub proof fn lemma_a_call_returns_by_its_ceiling(ceiling: u64, timeout_ms: Optio
 {
 }
 
+/// B3. Whether a job's end notice is due. `told_live` is this process having delivered it;
+/// `told_persisted` is the session's persisted transcript already holding it (a replica that died
+/// between persisting the report and deleting the job's directory left the job behind, ended). The
+/// iff is both halves: a held notice is never due again, and an ended job nobody holds always is.
+pub fn end_due(ended: bool, told_live: bool, told_persisted: bool) -> (r: bool)
+    ensures
+        r <==> (ended && !told_live && !told_persisted),
+{
+    if cfg!(feature = "mut_told_ignores_transcript") {
+        ended && !told_live
+    } else {
+        ended && !told_live && !told_persisted
+    }
+}
+
 } // verus!
 
 #[cfg(test)]
@@ -185,6 +205,16 @@ mod tests {
         assert_eq!(admit_start(MAX_RUNNING_JOBS - 1), Admit::Start);
         assert_eq!(admit_start(MAX_RUNNING_JOBS), Admit::Refuse);
         assert_eq!(admit_start(MAX_RUNNING_JOBS + 5), Admit::Refuse);
+    }
+
+    /// B3: a notice the transcript holds is not due again; an ended job it does not hold is. Red
+    /// under `mut_told_ignores_transcript`.
+    #[test]
+    fn a_persisted_end_is_not_told_again() {
+        assert!(!end_due(true, false, true));
+        assert!(end_due(true, false, false));
+        assert!(!end_due(true, true, false));
+        assert!(!end_due(false, false, false));
     }
 
     /// B2: 60 s of silence hands a foreground call back; 59 s does not. Red under
