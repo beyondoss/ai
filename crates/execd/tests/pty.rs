@@ -584,3 +584,84 @@ async fn terminals_leave_nothing_behind() {
     assert!(keepers(jobs.path()).is_empty(), "a keeper outlived its job");
     assert!(threads(e.child.id()) <= t0 + 1, "execd leaked threads");
 }
+
+/// T-503: with no pseudo-terminal free a start is `503`, nothing runs, and the refusal clears: once
+/// a terminal ends the same start is taken (the partner, retried once). The cap is the test-only
+/// `EXECD_TERMINALS_MAX`; the kernel's table is the real limit.
+#[tokio::test]
+async fn a_start_with_no_pseudo_terminal_free_is_503_and_a_retry_after_one_ends_opens() {
+    let (e, jobs) = start_execd(&[("EXECD_TERMINALS_MAX", "2")]);
+    let a = SocketAddr::V4(e.addr);
+    term(a, "a", "exec sleep 300", 80, 24).await;
+    term(a, "b", "exec sleep 300", 80, 24).await;
+    let body = json!({
+        "command": "true",
+        "job": { "op": "start", "scope": "s", "id": "c", "hold": false, "pty": { "cols": 80, "rows": 24 } },
+    });
+    for _ in 0..2 {
+        let r = post(a, &[], &body).await;
+        assert_eq!(r.status, 503, "{}", String::from_utf8_lossy(&r.body));
+        assert!(String::from_utf8_lossy(&r.body).contains("no pseudo-terminal is free"));
+    }
+    // Nothing was left of the refused start: no entry, no keeper.
+    let l = job(a, json!({"op":"list","scope":"s"})).await;
+    assert!(l["jobs"].as_array().unwrap().iter().all(|j| j["id"] != "c"));
+    assert_eq!(keepers(jobs.path()).len(), 2);
+    // A job with no terminal is not counted.
+    let plain = json!({"command":"true","job":{"op":"start","scope":"s","id":"p","hold":false}});
+    assert_eq!(post(a, &[], &plain).await.status, 200);
+    // One ends: the same start now opens.
+    job(
+        a,
+        json!({"op":"kill","scope":"s","ids":["a"],"grace_ms":100}),
+    )
+    .await;
+    ended(a, "a").await;
+    assert_eq!(post(a, &[], &body).await.status, 200);
+}
+
+/// `EXECD_RUN_AS`: the shell of a terminal runs as the target user, which owns its tty and has it as
+/// its controlling terminal; the keeper (root) is not the shell's uid. As E2B runs execd.
+#[tokio::test]
+async fn under_run_as_the_shell_is_the_target_and_owns_its_terminal() {
+    let jobs = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(
+        jobs.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    let e = Execd::start_as_root(
+        &[
+            ("EXECD_RUN_AS", "nobody"),
+            ("EXECD_HOME", "/tmp"),
+            ("EXECD_JOBS_DIR", jobs.path().to_str().unwrap()),
+        ],
+        &[],
+    )
+    .expect("this test needs root (or passwordless sudo)");
+    let a = SocketAddr::V4(e.addr);
+    term(
+        a,
+        "u",
+        "id -u; stat -c %U $(tty); exec 3</dev/tty && echo ctty; stty size",
+        90,
+        33,
+    )
+    .await;
+    let v = ended(a, "u").await;
+    assert_eq!(v["code"], json!(0), "{v}");
+    let (text, _) = read(a, "u").await;
+    assert!(text.starts_with("65534\r\nnobody\r\n"), "{text:?}");
+    assert!(text.contains("ctty\r\n33 90\r\n"), "{text:?}");
+    // The keeper runs as root, out of the user's reach: the user cannot signal it.
+    term(a, "k", "exec sleep 300", 80, 24).await;
+    let ks = keepers(jobs.path());
+    assert_eq!(ks.len(), 1);
+    let uid = std::fs::read_to_string(format!("/proc/{}/status", ks[0]))
+        .unwrap()
+        .lines()
+        .find(|l| l.starts_with("Uid:"))
+        .map(str::to_string)
+        .unwrap();
+    assert!(uid.split_whitespace().nth(1) == Some("0"), "{uid}");
+}

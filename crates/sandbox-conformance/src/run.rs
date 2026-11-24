@@ -39,7 +39,8 @@ pub trait Connector: Send + Sync {
 #[async_trait]
 pub trait Host: Send + Sync {
     /// The actions this host performs: `restart_execd` (the endpoint's process is killed and a new one
-    /// serves the same URL, root and job directory, so a kept job's keeper outlives it) and
+    /// serves the same URL, root and job directory, so a kept job's keeper outlives it), `crash_execd` (the
+    /// same with no shutdown at all: `SIGKILL`) and
     /// `kill_keepers` (every terminal keeper process under this endpoint's job directory is killed).
     fn actions(&self) -> &'static [&'static str];
 

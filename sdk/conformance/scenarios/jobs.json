@@ -5342,6 +5342,184 @@
       ]
     },
     {
+      "id": "jobs.pty.survives-execd-crash",
+      "description": "A terminal survives a crash of the endpoint's process (SIGKILL, no shutdown at all, then a new process on the same URL): the shell is the same one, offsets continue, a write at the old position lands once, and its real exit code is reported.",
+      "requires": {
+        "features": [
+          "job_pty"
+        ],
+        "host": [
+          "crash_execd"
+        ]
+      },
+      "steps": [
+        {
+          "id": "start",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "pt16",
+          "command": "sh",
+          "args": [],
+          "pty": {
+            "cols": 80,
+            "rows": 24
+          },
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              },
+              "pty": {
+                "cols": 80,
+                "rows": 24
+              }
+            }
+          }
+        },
+        {
+          "id": "w1",
+          "op": "job_write",
+          "scope": "${SCOPE}",
+          "job": "pt16",
+          "at": 0,
+          "data_b64": "ZWNobyBiZWZvcmUK",
+          "expect": {
+            "ok": {
+              "written": 12
+            }
+          }
+        },
+        {
+          "id": "before",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "pt16",
+          "offset": 0,
+          "expect": {
+            "ok": {
+              "data_utf8": {
+                "$contains": "echo before\r\nbefore\r\n"
+              }
+            }
+          },
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          },
+          "save": {
+            "end0": "end"
+          }
+        },
+        {
+          "id": "restart",
+          "host": "crash_execd"
+        },
+        {
+          "id": "still-there",
+          "op": "job_list",
+          "scope": "${SCOPE}",
+          "expect": {
+            "ok": {
+              "jobs": {
+                "$includes": [
+                  {
+                    "id": "pt16",
+                    "state": "running",
+                    "pty": {
+                      "cols": 80,
+                      "rows": 24,
+                      "open": true
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          }
+        },
+        {
+          "id": "offsets-continue",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "pt16",
+          "offset": "${end0}",
+          "expect": {
+            "ok": {
+              "offset": "${end0}"
+            }
+          },
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          }
+        },
+        {
+          "id": "w2",
+          "op": "job_write",
+          "scope": "${SCOPE}",
+          "job": "pt16",
+          "at": 12,
+          "data_b64": "c3R0eSBzaXplCg==",
+          "expect": {
+            "ok": {
+              "written": 22
+            }
+          }
+        },
+        {
+          "id": "size",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "pt16",
+          "offset": 0,
+          "expect": {
+            "ok": {
+              "data_utf8": {
+                "$contains": "24 80\r\n"
+              }
+            }
+          },
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          }
+        },
+        {
+          "id": "exit",
+          "op": "job_write",
+          "scope": "${SCOPE}",
+          "job": "pt16",
+          "at": 22,
+          "data_b64": "ZXhpdCAzCg==",
+          "expect": {
+            "ok": {
+              "written": 29
+            }
+          }
+        },
+        {
+          "id": "real-exit-code",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "pt16",
+          "offset": 0,
+          "expect": {
+            "ok": {
+              "state": "ended",
+              "code": 3
+            }
+          },
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          }
+        }
+      ]
+    },
+    {
       "id": "jobs.pty.keeper-killed-is-gone",
       "description": "A terminal whose keeper is killed is hung up, not lost: it reads closed, input and resize are conflict, `eof` is still the client's error, the job can still be killed, and a new terminal opens.",
       "requires": {

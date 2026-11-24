@@ -273,6 +273,29 @@ pub struct ExecMock {
     requests: Arc<Mutex<Vec<ExecRequest>>>,
     streams: Arc<Mutex<Vec<StreamRecord>>>,
     callbacks: Arc<Mutex<Vec<CallbackAttempt>>>,
+    /// What restarts the endpoint's execd ([`Self::restart_execd`]): only an endpoint that is execd itself.
+    ctl: Option<Arc<tokio::sync::Mutex<Ctl>>>,
+}
+
+/// The running execd of a mock, and how to make its successor: the same address, root, state and
+/// jobs directories, so a terminal's keeper (a process of its own) and the ledger outlive it.
+struct Ctl {
+    handle: Option<execd::Handle>,
+    addr: std::net::SocketAddr,
+    make: Box<dyn Fn() -> execd::Options + Send + Sync>,
+    /// The state and jobs directories, which last as long as the mock.
+    dirs: tempfile::TempDir,
+}
+
+/// The `execd` binary a terminal's keeper is started from: this process is a test binary and does not
+/// serve the helper modes. `EXECD_BIN`, else `execd` beside the test binary's `deps` directory.
+fn execd_bin() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("EXECD_BIN").filter(|p| !p.is_empty()) {
+        return Some(PathBuf::from(p));
+    }
+    let exe = std::env::current_exe().ok()?;
+    let p = exe.parent()?.parent()?.join("execd");
+    p.is_file().then_some(p)
 }
 
 #[derive(Clone)]
@@ -373,6 +396,7 @@ impl ExecMock {
             requests: shared.requests.clone(),
             streams: shared.streams.clone(),
             callbacks: shared.callbacks.clone(),
+            ctl: None,
         };
         if let Some(idle) = shared.opts.idle_kill {
             tokio::spawn(idle_killer(shared.clone(), idle));
@@ -393,25 +417,49 @@ impl ExecMock {
         url: String,
         opts: &MockOptions,
     ) -> Self {
+        let dirs = tempfile::tempdir().expect("a state directory");
+        let (state, jobs): (PathBuf, PathBuf) =
+            (dirs.path().join("state"), dirs.path().join("jobs"));
+        let requests: Arc<Mutex<Vec<ExecRequest>>> = Arc::default();
+        let streams: Arc<Mutex<Vec<StreamRecord>>> = Arc::default();
+        let callbacks: Arc<Mutex<Vec<CallbackAttempt>>> = Arc::default();
+        std::fs::create_dir_all(&jobs).expect("a jobs directory");
+        let (root, opts, helper) = (root.to_path_buf(), opts.clone(), execd_bin());
+        let make: Box<dyn Fn() -> execd::Options + Send + Sync> = {
+            let (requests, streams, callbacks) =
+                (requests.clone(), streams.clone(), callbacks.clone());
+            Box::new(move || {
+                let mut o = execd::Options::new(&root);
+                o.home = opts.home.clone();
+                o.bearer = opts.require_bearer.clone();
+                o.heartbeat = opts.heartbeat;
+                o.job_output_retention = opts.job_output_cap;
+                o.state_dir = Some(state.clone());
+                o.jobs_dir = Some(jobs.clone());
+                o.helper_exe = helper.clone();
+                o.observer = Some(Arc::new(Recorder {
+                    requests: requests.clone(),
+                    streams: streams.clone(),
+                    callbacks: callbacks.clone(),
+                    index: Mutex::default(),
+                }));
+                o
+            })
+        };
+        let addr = listener.local_addr().expect("addr");
+        let handle = execd::serve(listener, make()).expect("execd serves");
         let mock = Self {
             url,
-            requests: Arc::default(),
-            streams: Arc::default(),
-            callbacks: Arc::default(),
+            requests,
+            streams,
+            callbacks,
+            ctl: Some(Arc::new(tokio::sync::Mutex::new(Ctl {
+                handle: Some(handle),
+                addr,
+                make,
+                dirs,
+            }))),
         };
-        let mut o = execd::Options::new(root);
-        o.home = opts.home.clone();
-        o.bearer = opts.require_bearer.clone();
-        o.heartbeat = opts.heartbeat;
-        o.job_output_retention = opts.job_output_cap;
-        o.observer = Some(Arc::new(Recorder {
-            requests: mock.requests.clone(),
-            streams: mock.streams.clone(),
-            callbacks: mock.callbacks.clone(),
-            index: Mutex::default(),
-        }));
-        // The handle is dropped: the server runs until the test's runtime ends, as the mock always has.
-        execd::serve(listener, o).expect("execd serves");
         mock
     }
 
@@ -446,6 +494,61 @@ impl ExecMock {
             }
         });
         mock
+    }
+
+    /// Restart the endpoint as `SIGHUP` restarts execd: the old server stops and leaves its jobs
+    /// (and a terminal's keeper) running, and a new one serves the same address and finds them in
+    /// the ledger. `Err` for an endpoint that is not execd.
+    pub async fn restart_execd(&self) -> Result<(), String> {
+        let ctl = self.ctl.as_ref().ok_or("this endpoint is not execd")?;
+        let mut c = ctl.lock().await;
+        if let Some(h) = c.handle.take() {
+            h.restart().await;
+        }
+        let mut last = String::new();
+        for _ in 0..100 {
+            match tokio::net::TcpListener::bind(c.addr).await {
+                Ok(l) => {
+                    c.handle = Some(execd::serve(l, (c.make)()).map_err(|e| e.to_string())?);
+                    return Ok(());
+                }
+                Err(e) => last = e.to_string(),
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Err(format!("the address did not come back: {last}"))
+    }
+
+    /// Kill every terminal keeper of this endpoint (its jobs directory names them).
+    pub async fn kill_keepers(&self) -> Result<usize, String> {
+        let ctl = self.ctl.as_ref().ok_or("this endpoint is not execd")?;
+        let needle = ctl
+            .lock()
+            .await
+            .dirs
+            .path()
+            .join("jobs")
+            .to_string_lossy()
+            .into_owned();
+        let mut n = 0;
+        for e in std::fs::read_dir("/proc")
+            .map_err(|e| e.to_string())?
+            .flatten()
+        {
+            let Ok(raw) = std::fs::read(e.path().join("cmdline")) else {
+                continue;
+            };
+            let text = String::from_utf8_lossy(&raw).replace('\0', " ");
+            if text.contains("--execd-run-as-helper keep ") && text.contains(&needle) {
+                if let Ok(pid) = e.file_name().to_string_lossy().parse::<i32>() {
+                    let _ = std::process::Command::new("kill")
+                        .args(["-KILL", &pid.to_string()])
+                        .status();
+                    n += 1;
+                }
+            }
+        }
+        Ok(n)
     }
 
     pub fn requests(&self) -> Vec<ExecRequest> {

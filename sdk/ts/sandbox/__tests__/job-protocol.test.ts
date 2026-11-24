@@ -388,6 +388,7 @@ describe("job terminals", () => {
       });
     const e = await fail(t.jobs.writeStdin("s", "aa", 4, utf8("x"), false));
     expect(e).toBeInstanceOf(StdinClosedError);
+    expect(e.reason).toBe("hung_up");
     expect(e.written).toBe(4);
   });
 

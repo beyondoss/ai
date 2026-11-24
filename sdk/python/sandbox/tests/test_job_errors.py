@@ -231,6 +231,7 @@ def test_a_terminal_write_refuses_eof_and_a_hangup_is_stdin_closed_with_written(
     with pytest.raises(StdinClosedError) as e:
         sb.write_stdin("s", "aa", 4, b"x")
     assert e.value.written == 4
+    assert e.value.reason == "hung_up"
 
 
 def test_list_and_read_carry_pty_on_terminals_only() -> None:

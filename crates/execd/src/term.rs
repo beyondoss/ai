@@ -668,13 +668,14 @@ pub(crate) fn helper(mode: &OsString, rest: &[OsString]) -> Option<ExitCode> {
 /// The command a keeper is to run as the terminal's session: the program, arguments, directory and
 /// the whole environment, as the job's `command_for` built it.
 pub(crate) fn keeper_command(
+    exe: &Path,
     spool: &Path,
     size: Size,
     cmd: &Command,
     chown: Option<(u32, u32)>,
     env: &[(String, String)],
 ) -> Command {
-    let mut k = Command::new("/proc/self/exe");
+    let mut k = Command::new(exe);
     k.arg(crate::runas::HELPER_FLAG)
         .arg(KEEP)
         .arg(spool)

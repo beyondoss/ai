@@ -859,7 +859,7 @@ function jobFailure(
     if (status === 409) {
       return new StdinClosedError(
         `job stdin: ${detail}`,
-        "closed",
+        detail.includes("the terminal hung up") ? "hung_up" : "closed",
         writtenIn(detail),
         cause,
       );

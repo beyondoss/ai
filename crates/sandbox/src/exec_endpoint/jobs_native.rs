@@ -1175,5 +1175,16 @@ mod tests {
             .map(|j| j.code()),
             Some("stdin_closed")
         );
+        assert!(matches!(
+            c(
+                JobOp::Write,
+                409,
+                r#"{"error":"the terminal hung up","written":4}"#
+            ),
+            Some(JobError::StdinClosed {
+                reason: super::super::jobs::StdinClosedReason::HungUp,
+                ..
+            })
+        ));
     }
 }

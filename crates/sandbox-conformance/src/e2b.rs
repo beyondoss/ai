@@ -388,6 +388,11 @@ pub async fn start(name: &str) -> Result<Started, String> {
         eprintln!("e2b: {}", log.trim());
     }
     eprintln!("e2b: ready in {:.1}s", t0.elapsed().as_secs_f64());
+    let host = Arc::new(E2bHost {
+        vm: vm.clone(),
+        launch,
+        bearer: Arc::new(bearer.clone()),
+    });
     Ok(Started {
         name: name.into(),
         url,
@@ -406,7 +411,68 @@ pub async fn start(name: &str) -> Result<Started, String> {
                 Box::pin(async move { vm.lease().await })
             }
         })),
-        host: None,
+        host: Some(host),
         _guard: Box::new(vm),
     })
+}
+
+/// What a `host` step does inside the VM: the execd there is a root process (started by the install
+/// above), so it is signalled with `sudo`, and a new one is started with the very command that started
+/// the first (same port, root, state and jobs directories and bearer), so the URL holds and the
+/// ledger on the VM's tmpfs finds the jobs. Terminal keepers are execd's own binary in keeper mode.
+struct E2bHost {
+    vm: Arc<Vm>,
+    launch: String,
+    bearer: Arc<String>,
+}
+
+impl E2bHost {
+    /// The server's pid is the process whose command line is exactly the binary (a keeper has
+    /// arguments); its signal and a new launch, then wait for the port to answer in the VM.
+    async fn restart(&self, signal: &str) -> Result<Value, String> {
+        let script = format!(
+            "pid=$(pgrep -fx {HOME}/bin/execd | head -1)\n\
+             [ -n \"$pid\" ] || {{ echo 'no execd' >&2; exit 1; }}\n\
+             sudo kill {signal} \"$pid\"\n\
+             for i in $(seq 100); do kill -0 \"$pid\" 2>/dev/null || break; sleep 0.1; done\n\
+             if kill -0 \"$pid\" 2>/dev/null; then echo 'execd did not exit' >&2; exit 1; fi\n\
+             {launch}\n\
+             for i in $(seq 100); do curl -s -o /dev/null -m 1 -X POST http://127.0.0.1:{PORT}/exec -d '{{}}' && break; sleep 0.1; done",
+            launch = self.launch
+        );
+        let (c, o, e) = self
+            .vm
+            .run(&script, json!({"BEARER": &*self.bearer}))
+            .await?;
+        if c != 0 {
+            return Err(format!("e2b host: exited {c}: {o}{e}"));
+        }
+        Ok(json!({}))
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::run::Host for E2bHost {
+    fn actions(&self) -> &'static [&'static str] {
+        &["restart_execd", "crash_execd", "kill_keepers"]
+    }
+
+    async fn act(&self, action: &str) -> Result<Value, String> {
+        match action {
+            "restart_execd" => self.restart("-HUP").await,
+            "crash_execd" => self.restart("-KILL").await,
+            "kill_keepers" => {
+                let (_, out, _) = self
+                    .vm
+                    .run(
+                        "pids=$(pgrep -f -- '--execd-run-as-helper keep '); \
+                         for p in $pids; do sudo kill -KILL $p; done; echo $pids | wc -w",
+                        json!({}),
+                    )
+                    .await?;
+                Ok(json!({ "killed": out.trim().parse::<u64>().unwrap_or(0) }))
+            }
+            other => Err(format!("no host action {other:?}")),
+        }
+    }
 }

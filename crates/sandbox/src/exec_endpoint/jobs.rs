@@ -219,6 +219,8 @@ pub enum StdinClosedReason {
     NeverOpened,
     /// EOF was sent, the job ended or its reader left. Retrying cannot succeed.
     Closed,
+    /// A terminal's keeper is gone or its job ended: nothing can be typed into it any more.
+    HungUp,
 }
 
 /// A job condition the endpoint refuses with, told apart as the TypeScript and Python SDKs tell
@@ -264,6 +266,10 @@ impl JobError {
                 text,
             },
             (JobOp::Write, 409) if body.contains("\"gap\"") => Self::StdinGap { text },
+            (JobOp::Write, 409) if body.contains("the terminal hung up") => Self::StdinClosed {
+                reason: StdinClosedReason::HungUp,
+                text,
+            },
             (JobOp::Write, 409) => Self::StdinClosed {
                 reason: StdinClosedReason::Closed,
                 text,

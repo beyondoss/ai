@@ -1092,13 +1092,30 @@ async fn launch_term(
     out: std::fs::File,
     dir: &Path,
 ) -> Result<TermLead, (u16, &'static str)> {
+    // A cap on open terminals (a test's way to the 503 without filling the machine's ptys).
+    if let Some(max) = ctx.opts.terminals_max {
+        let open = locked(&ctx.jobs.map)
+            .all()
+            .into_iter()
+            .filter(|(_, c)| matches!(locked(c).k.term, Term::Open { .. }))
+            .count();
+        // The start itself is in the table already.
+        if open > max {
+            return Err((503, "no pseudo-terminal is free"));
+        }
+    }
     // The request's own TERM wins; a terminal otherwise gets the usual one.
     if !req.env_pairs.iter().any(|(k, _)| k == "TERM") {
         cmd.env("TERM", "xterm-256color");
     }
     let chown = ctx.opts.run_as.as_ref().map(|r| (r.uid, r.gid));
     let env = term::full_env(cmd);
-    let mut k = term::keeper_command(dir, size, cmd, chown, &env);
+    let exe = ctx
+        .opts
+        .helper_exe
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("/proc/self/exe"));
+    let mut k = term::keeper_command(&exe, dir, size, cmd, chown, &env);
     // The keeper's own errors go where execd's do (its log).
     k.stdin(Stdio::null())
         .stdout(Stdio::from(out))

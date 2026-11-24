@@ -91,6 +91,8 @@ def _stdin_failure(e: SandboxError, job: str) -> SandboxError:
         return StdinClosedError(detail, reason="never_opened", status=409)
     if e.status == 409 and '"gap"' in d:
         return StdinGapError(detail, written=_written_in(d), status=409)
+    if e.status == 409 and "the terminal hung up" in d:
+        return StdinClosedError(detail, reason="hung_up", written=_written_in(d), status=409)
     if e.status == 409:
         return StdinClosedError(detail, reason="closed", written=_written_in(d), status=409)
     if e.status == 429:

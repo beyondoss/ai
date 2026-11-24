@@ -195,6 +195,14 @@ pub struct Options {
     /// only for an unknown op, after authentication and request parsing, never for one execd handles.
     /// It is synchronous and runs on the server's own thread, so it must be quick and must not block.
     pub job_op_hook: Option<JobOpHook>,
+    /// The binary a terminal's keeper is started from: execd's own, run in keeper mode. Default
+    /// `/proc/self/exe`; a host that embeds execd in a process that does not call [`helper_main`]
+    /// first (a test binary) names the `execd` binary here.
+    pub helper_exe: Option<PathBuf>,
+    /// At most this many open terminals; a start beyond it is `503 no pseudo-terminal is free`, as
+    /// when the kernel's table is full. `None` (the default) is the kernel's own limit. Set only by
+    /// `EXECD_TERMINALS_MAX`, so a test can reach the refusal without filling the machine's ptys.
+    pub terminals_max: Option<usize>,
     /// Shown every request except the health paths, after [`Self::authorizer`] or [`Self::bearer`]
     /// has accepted it (a refused one is answered `401` and the hook never sees it) and before its
     /// body is read: [`Route::Claimed`] takes the request over, [`Route::Declined`] hands it back to
@@ -230,6 +238,8 @@ impl Options {
             observer: None,
             idle_timeout: None,
             job_op_hook: None,
+            helper_exe: None,
+            terminals_max: None,
             route_hook: None,
         }
     }

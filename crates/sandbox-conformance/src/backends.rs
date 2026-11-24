@@ -289,12 +289,17 @@ impl LocalHost {
 #[async_trait::async_trait]
 impl crate::run::Host for LocalHost {
     fn actions(&self) -> &'static [&'static str] {
-        &["restart_execd", "kill_keepers"]
+        &["restart_execd", "crash_execd", "kill_keepers"]
     }
 
     async fn act(&self, action: &str) -> Result<Value, String> {
         match action {
-            "restart_execd" => {
+            "restart_execd" | "crash_execd" => {
+                let signal = if action == "crash_execd" {
+                    "-KILL"
+                } else {
+                    "-HUP"
+                };
                 let mut p = self.proc.lock().await;
                 // SIGHUP is execd's restart: it exits and leaves its jobs running (a stop, SIGTERM,
                 // ends them). A keeper is in a group of its own, so it outlives execd, as it would an
@@ -302,16 +307,16 @@ impl crate::run::Host for LocalHost {
                 // group that now holds nothing).
                 let pid = p.0.id().ok_or("execd already exited")?;
                 let sent = Command::new("kill")
-                    .args(["-HUP", &pid.to_string()])
+                    .args([signal, &pid.to_string()])
                     .status()
                     .await
                     .map_err(|e| format!("kill -HUP: {e}"))?;
                 if !sent.success() {
-                    return Err(format!("kill -HUP {pid} failed"));
+                    return Err(format!("kill {signal} {pid} failed"));
                 }
                 tokio::time::timeout(READY_WITHIN, p.0.wait())
                     .await
-                    .map_err(|_| "execd did not exit on SIGHUP".to_string())?
+                    .map_err(|_| format!("execd did not exit on {signal}"))?
                     .map_err(|e| format!("wait for execd: {e}"))?;
                 drop(p.1.take());
                 let (child, leader, addr) = Self::spawn(
