@@ -406,6 +406,7 @@ pub async fn start(name: &str) -> Result<Started, String> {
                 Box::pin(async move { vm.lease().await })
             }
         })),
+        host: None,
         _guard: Box::new(vm),
     })
 }

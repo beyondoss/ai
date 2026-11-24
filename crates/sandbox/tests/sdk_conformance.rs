@@ -167,7 +167,7 @@ fn scenario_files_are_well_formed() {
                     .unwrap_or_else(|| panic!("{id}: step without id"));
                 assert!(step_ids.insert(sid), "{id}: duplicate step id {sid}");
                 assert!(
-                    s["op"].is_string() || s.get("edge").is_some(),
+                    s["op"].is_string() || s.get("edge").is_some() || s.get("host").is_some(),
                     "{id}/{sid}: no op"
                 );
             }
@@ -184,6 +184,10 @@ async fn reference_agent_passes_every_scenario() {
     let files = load();
     let mut grand = Tally::default();
     let mut grand_failures: Vec<String> = Vec::new();
+    // Checks the in-process endpoint cannot run: a `host` step restarts or kills the endpoint's own
+    // process, which this test does not own (the `local-*` matrix backends do). They are unsupported
+    // here by name, never passed.
+    let mut host_unsupported = 0;
     for profile in profiles() {
         let dir = tempfile::tempdir().unwrap();
         let work = dir.path().canonicalize().unwrap();
@@ -220,6 +224,10 @@ async fn reference_agent_passes_every_scenario() {
             for sc in file["scenarios"].as_array().unwrap() {
                 let checks = run_scenario(sc, &be).await;
                 for c in &checks {
+                    if c.status == Status::Unsupported && c.detail.contains("cannot do host action")
+                    {
+                        host_unsupported += 1;
+                    }
                     match c.status {
                         Status::Fail => grand_failures
                             .push(format!("[{}] {}: {}", profile.name, c.id, c.detail)),
@@ -265,7 +273,10 @@ async fn reference_agent_passes_every_scenario() {
         grand_failures.join("\n")
     );
     assert!(grand.passed > 0);
-    assert_eq!(grand.unsupported, 0, "the reference driver has every op");
+    assert_eq!(
+        grand.unsupported, host_unsupported,
+        "the reference driver has every op"
+    );
 }
 
 /// The wire shape FILES-OVER-EXEC.md states as exact: a write is one command with the content on stdin.

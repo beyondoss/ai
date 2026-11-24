@@ -35,6 +35,7 @@ class LocalTransport implements Transport {
     remove: refuse("jobs"),
     wipe: refuse("jobs"),
     writeStdin: refuse("jobs"),
+    resize: refuse("jobs"),
     signal: refuse("jobs"),
   };
 

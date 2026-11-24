@@ -7,6 +7,7 @@ import type {
   JobInfo,
   JobSpec,
   KeepFields,
+  PtySize,
   ReqOptions,
   StdinWritten,
   Survivor,
@@ -62,6 +63,17 @@ function validId(id: string): void {
   }
 }
 
+/** A terminal's cols and rows are integers from 1 to 1024. */
+export function checkPtySize(p: PtySize): void {
+  for (const n of [p.cols, p.rows]) {
+    if (!Number.isInteger(n) || n < 1 || n > 1024) {
+      throw new InvalidRequestError(
+        "pty: cols and rows are integers from 1 to 1024",
+      );
+    }
+  }
+}
+
 function count(name: string, v: number | undefined, dflt: number): number {
   if (v === undefined) return dflt;
   if (!Number.isInteger(v) || v < 0) {
@@ -94,6 +106,7 @@ export class Jobs {
   ): Promise<number> {
     validScope(scope);
     validId(id);
+    if (spec.pty !== undefined) checkPtySize(spec.pty);
     return this.transport.jobs.start(scope, id, spec, req);
   }
 
@@ -110,6 +123,7 @@ export class Jobs {
   ): AsyncGenerator<JobFrame> {
     validScope(scope);
     validId(id);
+    if (spec.pty !== undefined) checkPtySize(spec.pty);
     yield* this.transport.jobs.startHeld(scope, id, spec, req);
   }
 
@@ -286,6 +300,25 @@ export class Jobs {
     validId(id);
     count("at", at, 0);
     return this.transport.jobs.writeStdin(scope, id, at, data, eof, req);
+  }
+
+  /**
+   * Set a terminal job's size (wire `resize`; `cols` and `rows` are integers from 1 to 1024, else
+   * {@link InvalidRequestError} and nothing is sent). Absolute: a retry changes nothing. No such job
+   * is {@link JobGoneError}; a job with no terminal, an ended one or one whose terminal hung up is
+   * {@link ConflictError}.
+   */
+  async resize(
+    scope: string,
+    id: string,
+    cols: number,
+    rows: number,
+    req: ReqOptions = {},
+  ): Promise<PtySize> {
+    validScope(scope);
+    validId(id);
+    checkPtySize({ cols, rows });
+    return this.transport.jobs.resize(scope, id, cols, rows, req);
   }
 
   /**
