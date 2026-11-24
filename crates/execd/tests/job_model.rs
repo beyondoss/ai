@@ -41,6 +41,15 @@
 //!   group number now names.
 //! - L2 (`k = 1`): a stream that has sent everything of an ended job sends its final frame next.
 //!   Fairness assumed: the supervisor and the stream task are always scheduled.
+//! - K1 a start with a key never runs a second job for a key and spec already in the table: the retry of a
+//!   start whose answer was lost (`StartKeyed` again with the same key and spec, at any later point, across
+//!   a `Restart` of execd too) answers the first job.
+//! - K2 a replay names the job that was started under that key and spec, and a key used for another spec
+//!   never starts.
+//! - K3 (`k = 1`, the liveness partner of K2's and J1's refusals): a retry of a keyed start whose job is in
+//!   the table is answered with that job, and a fresh key on a free id starts, whatever came before (a
+//!   restart, a removal, another key's record).
+//! - K4 a start with no key never replays.
 //!
 //! Not modelled: bytes (the ring is two counters: its content is the fuzz target `ring`'s), stdin (its decisions, `stdin_plan` and
 //! `admit_waiter`, are the kernel's and proven in Verus; this model only checks production calls them),
@@ -54,7 +63,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use execd::job_kernel::{self as kernel, Act, Admit, Alive, Ev, Follow, Key, Phase, Pick, State};
+use execd::job_kernel::{
+    self as kernel, Act, Admit, Alive, Begin, Ev, Follow, Key, Phase, Pick, Rec, Recovery, State,
+};
 use stateright::{Checker, Model, Property};
 
 const V_J1: u32 = 1;
@@ -66,6 +77,9 @@ const V_J7: u32 = 32;
 const V_J8: u32 = 64;
 const V_J9: u32 = 128;
 const V_J10: u32 = 256;
+const V_K1: u32 = 512;
+const V_K2: u32 = 1024;
+const V_K4: u32 = 2048;
 
 fn key(scope: u8, id: u8) -> Key {
     (format!("S{scope}"), format!("i{id}"))
@@ -107,6 +121,8 @@ struct Sim {
     /// What the job's end was when the supervisor recorded it: `(code, signal, end offset)`.
     snap: Option<(i32, Option<i32>, u8)>,
     was_kept: bool,
+    /// The start's key and spec (the model's own record of what the client sent), `None` for an unkeyed start.
+    idem: Option<(u8, u8)>,
 }
 
 impl Sim {
@@ -152,6 +168,14 @@ impl std::hash::Hash for St {
         let mut all = self.table.all();
         all.sort();
         all.hash(h);
+        let mut recs: Vec<_> = self
+            .table
+            .records()
+            .into_iter()
+            .map(|r| (r.scope, r.key, r.id, r.digest))
+            .collect();
+        recs.sort();
+        recs.hash(h);
         (&self.sims, &self.clients, &self.pending, self.bad).hash(h);
     }
 }
@@ -163,6 +187,15 @@ enum A {
         id: u8,
         client: Option<usize>,
     },
+    /// A keyed start: the first send, or the retry of one whose answer was lost.
+    StartKeyed {
+        scope: u8,
+        id: u8,
+        key: u8,
+        spec: u8,
+    },
+    /// execd restarts: its table is gone and the ledger's jobs come back as `recover` decides.
+    Restart,
     SpawnOk(usize),
     SpawnFail(usize),
     ShellDies(usize),
@@ -214,6 +247,11 @@ struct Jobs {
     max_end: u8,
     /// `remove` and `wipe` may decide and take as two steps (the shell awaits the group between).
     slow: bool,
+    /// Start keys in use (`0`: no keyed start), and the specs a key may be sent with.
+    keys: u8,
+    specs: u8,
+    /// execd may restart.
+    restart: bool,
 }
 
 /// One scope, one id, two jobs: a key is reused after a removal.
@@ -224,6 +262,9 @@ const REUSE: Jobs = Jobs {
     clients: 1,
     max_end: 1,
     slow: false,
+    keys: 0,
+    specs: 0,
+    restart: false,
 };
 /// One scope, one id, two jobs, no streams: a `remove`/`wipe` decides, other clients remove and
 /// restart the id, then it takes (J10).
@@ -234,6 +275,9 @@ const SLOW: Jobs = Jobs {
     clients: 0,
     max_end: 0,
     slow: true,
+    keys: 0,
+    specs: 0,
+    restart: false,
 };
 /// Two scopes that both use one id (no ring: the ring is REUSE's and STREAMS').
 const SCOPES: Jobs = Jobs {
@@ -243,6 +287,9 @@ const SCOPES: Jobs = Jobs {
     clients: 1,
     max_end: 0,
     slow: false,
+    keys: 0,
+    specs: 0,
+    restart: false,
 };
 /// One scope, two ids: `kill` of one id leaves the other (no streams, no ring).
 const IDS: Jobs = Jobs {
@@ -252,6 +299,9 @@ const IDS: Jobs = Jobs {
     clients: 0,
     max_end: 0,
     slow: false,
+    keys: 0,
+    specs: 0,
+    restart: false,
 };
 /// One job, two clients, two bytes: streams and the ring (a gap, an eviction under a reader).
 const STREAMS: Jobs = Jobs {
@@ -261,7 +311,32 @@ const STREAMS: Jobs = Jobs {
     clients: 2,
     max_end: 2,
     slow: false,
+    keys: 0,
+    specs: 0,
+    restart: false,
 };
+
+/// Keys and specs: two keys, two specs, two ids, two jobs: a keyed start retried after a lost answer, after a
+/// restart, after a removal, with another spec, and with another key's record beside it.
+const KEYED: Jobs = Jobs {
+    scopes: 1,
+    ids: 2,
+    max_jobs: 2,
+    clients: 0,
+    max_end: 0,
+    slow: false,
+    keys: 2,
+    specs: 2,
+    restart: true,
+};
+
+fn key_name(key: u8) -> String {
+    format!("k{key}")
+}
+
+fn digest(spec: u8) -> String {
+    format!("d{spec}")
+}
 
 impl St {
     /// The job a lookup in `scope` resolved to, judged against the facts: J2 and J3.
@@ -433,6 +508,23 @@ impl Model for Jobs {
                 }
             }
         }
+        for scope in 0..self.scopes {
+            for id in 0..self.ids {
+                for key in 0..self.keys {
+                    for spec in 0..self.specs {
+                        out.push(A::StartKeyed {
+                            scope,
+                            id,
+                            key,
+                            spec,
+                        });
+                    }
+                }
+            }
+        }
+        if self.restart && !s.table.all().is_empty() {
+            out.push(A::Restart);
+        }
         for (i, sim) in s.sims.iter().enumerate() {
             // A failed spawn took the entry: nothing spawns after it.
             if sim.k.phase == Phase::Spawning && !sim.k.removed {
@@ -505,8 +597,14 @@ impl Model for Jobs {
         match a {
             A::Start { scope, id, client } => {
                 let k = key(scope, id);
-                if s.table.admit(&k) == Admit::Exists {
-                    return None;
+                // `start_job`'s decision, with no key (K4, K5).
+                match s.table.begin(&scope_name(scope), &format!("i{id}"), None, "") {
+                    Begin::Refuse(_) => return None,
+                    Begin::Replay(_) => {
+                        s.bad |= V_K4;
+                        return Some(s);
+                    }
+                    Begin::Start => {}
                 }
                 // J1: the entry is the claim; a start never replaces a job still in the table.
                 if let Some(old) = s.table.get(&k)
@@ -527,6 +625,7 @@ impl Model for Jobs {
                     end: 0,
                     snap: None,
                     was_kept: client.is_none(),
+                    idem: None,
                 });
                 s.table.insert(k, h);
                 if let Some(c) = client {
@@ -539,6 +638,127 @@ impl Model for Jobs {
                         sent: 0,
                         told: false,
                     };
+                }
+            }
+            A::StartKeyed {
+                scope,
+                id,
+                key: kk,
+                spec,
+            } => {
+                let (sc, idn, kn, dg) = (scope_name(scope), format!("i{id}"), key_name(kk), digest(spec));
+                let in_table = |s: &St, f: &dyn Fn(&Sim) -> bool| {
+                    s.table
+                        .all()
+                        .iter()
+                        .any(|((sco, _), h)| *sco == sc && f(&s.sims[*h]))
+                };
+                match s.table.begin(&sc, &idn, Some(&kn), &dg) {
+                    Begin::Refuse(_) => {}
+                    Begin::Replay(rid) => {
+                        // K2: the job it names was started under this key and spec.
+                        match s.table.get(&(sc.clone(), rid)) {
+                            Some(h) if s.sims[h].idem == Some((kk, spec)) && s.sims[h].scope == scope => {
+                                s.resolved(scope, h);
+                            }
+                            _ => s.bad |= V_K2,
+                        }
+                    }
+                    Begin::Start => {
+                        // K1: no job of this key and spec is in the table. K2: no job of this key and
+                        // another spec is either (the key was used for another command).
+                        if in_table(&s, &|x| x.idem == Some((kk, spec))) {
+                            s.bad |= V_K1;
+                        }
+                        if in_table(&s, &|x| x.idem.is_some_and(|(k2, s2)| k2 == kk && s2 != spec)) {
+                            s.bad |= V_K2;
+                        }
+                        if s.sims.len() >= self.max_jobs {
+                            return if s.bad == last.bad { None } else { Some(s) };
+                        }
+                        let h = s.sims.len();
+                        s.sims.push(Sim {
+                            scope,
+                            id,
+                            k: State::new(0, false),
+                            shell: false,
+                            desc: false,
+                            pumps: false,
+                            sup: Sup::Idle,
+                            base: 0,
+                            end: 0,
+                            snap: None,
+                            was_kept: true,
+                            idem: Some((kk, spec)),
+                        });
+                        if let Some(old) = s.table.get(&key(scope, id))
+                            && !s.sims[old].k.removed
+                        {
+                            s.bad |= V_J1;
+                        }
+                        s.table.insert(key(scope, id), h);
+                        s.table.record(Rec {
+                            scope: sc,
+                            key: kn,
+                            id: idn,
+                            digest: dg,
+                        });
+                    }
+                }
+            }
+            A::Restart => {
+                // execd's table is gone; every job the ledger saved comes back as `recover` decides
+                // (`jobs::recover`): the table is rebuilt, with each job's key record when the kernel keeps it.
+                let old = s.table.all();
+                s.table = kernel::Table::default();
+                s.pending.clear();
+                for cl in &mut s.clients {
+                    cl.st = Cl::Done;
+                }
+                for ((sc, idn), h) in old {
+                    let sim = &mut s.sims[h];
+                    let (mut state, how) = kernel::recover(sim.k.clone(), sim.alive(), 0);
+                    if how == Recovery::Drop {
+                        // Never saved (it was spawning): the spawn died with the process.
+                        kernel::step(&mut sim.k, Ev::Taken);
+                        continue;
+                    }
+                    if how == Recovery::Adopt {
+                        sim.sup = if sim.shell {
+                            Sup::Wait
+                        } else if sim.desc {
+                            Sup::Reported
+                        } else {
+                            Sup::Reaping
+                        };
+                        if let Act::Kill { .. } =
+                            kernel::step(&mut state, Ev::Disconnect { hold: true })
+                        {
+                            sim.shell = false;
+                            sim.desc = false;
+                        }
+                    } else {
+                        sim.pumps = false;
+                        sim.sup = Sup::Done;
+                        if let Phase::Ended { code, signal, .. } = state.phase
+                            && sim.snap.is_none()
+                        {
+                            sim.snap = Some((code, signal, sim.end));
+                        }
+                    }
+                    sim.k = state;
+                    let idem = sim.idem;
+                    s.table.insert((sc.clone(), idn.clone()), h);
+                    if let Some((kk, spec)) = idem
+                        && kernel::keeps_record(how)
+                    {
+                        s.table.record(Rec {
+                            scope: sc,
+                            key: key_name(kk),
+                            id: idn,
+                            digest: digest(spec),
+                        });
+                    }
                 }
             }
             A::SpawnOk(i) => {
@@ -845,6 +1065,36 @@ impl Model for Jobs {
                 },
             ),
             Property::always(
+                "K1: a keyed start never runs a second job for its key and spec",
+                |_, s: &St| s.bad & V_K1 == 0,
+            ),
+            Property::always(
+                "K2: a replay names the job started under its key and spec; another spec never starts",
+                |_, s: &St| s.bad & V_K2 == 0,
+            ),
+            Property::always(
+                "K3: a retry of a keyed start whose job is in the table answers it, and a fresh key on a free id starts",
+                |m, s: &St| {
+                    let retry = s.table.all().iter().all(|((sc, idn), h)| {
+                        s.sims[*h].idem.is_none_or(|(kk, spec)| {
+                            s.table.begin(sc, idn, Some(&key_name(kk)), &digest(spec))
+                                == Begin::Replay(idn.clone())
+                        })
+                    });
+                    let fresh = (0..m.scopes).all(|scope| {
+                        (0..m.ids).all(|id| {
+                            s.table.get(&key(scope, id)).is_some()
+                                || s.table.begin(&scope_name(scope), &format!("i{id}"), Some("fresh"), "d")
+                                    == Begin::Start
+                        })
+                    });
+                    retry && fresh
+                },
+            ),
+            Property::always("K4: a start with no key never replays", |_, s: &St| {
+                s.bad & V_K4 == 0
+            }),
+            Property::always(
                 "alive: a job counts as alive only with a group",
                 |_, s: &St| {
                     s.sims
@@ -892,6 +1142,13 @@ fn faithful_scopes() {
 #[test]
 fn faithful_ids() {
     check(IDS);
+}
+
+/// ... and with start keys: retried after a lost answer, a restart and a removal, with another spec, and
+/// beside another key's record.
+#[test]
+fn faithful_keyed() {
+    check(KEYED);
 }
 
 /// ... and with two clients.
@@ -1015,7 +1272,14 @@ fn ended_is_final() {
     feature = "mut_signal_ended",
     feature = "mut_ended_not_removable",
     feature = "mut_take_by_key",
-    feature = "mut_follow_waits_after_end"
+    feature = "mut_follow_waits_after_end",
+    feature = "mut_key_replay_starts",
+    feature = "mut_key_digest_ignored",
+    feature = "mut_key_fresh_refused",
+    feature = "mut_unkeyed_replays",
+    feature = "mut_key_forgotten_on_restart",
+    feature = "mut_key_record_clears",
+    feature = "mut_key_take_forgets_none"
 ))]
 #[test]
 fn the_mutation_turns_its_property_red() {
@@ -1043,11 +1307,25 @@ fn the_mutation_turns_its_property_red() {
         "J10: "
     } else if cfg!(feature = "mut_ended_not_removable") {
         "L1: "
-    } else {
+    } else if cfg!(feature = "mut_key_replay_starts") {
+        "K1: "
+    } else if cfg!(feature = "mut_key_digest_ignored") || cfg!(feature = "mut_key_take_forgets_none")
+    {
+        "K2: "
+    } else if cfg!(feature = "mut_key_fresh_refused")
+        || cfg!(feature = "mut_key_forgotten_on_restart")
+        || cfg!(feature = "mut_key_record_clears")
+    {
+        "K3: "
+    } else if cfg!(feature = "mut_unkeyed_replays") {
+        "K4: "
+    } else if cfg!(feature = "mut_follow_waits_after_end") {
         "L2: "
+    } else {
+        unreachable!("a mutation with no property")
     };
     let mut red: Vec<&str> = Vec::new();
-    for m in [SLOW, REUSE, SCOPES, IDS, STREAMS] {
+    for m in [SLOW, REUSE, SCOPES, IDS, STREAMS, KEYED] {
         // A red run stops when the named property fails: the counterexample is the evidence.
         let named: std::collections::BTreeSet<&'static str> = m
             .properties()
@@ -1092,6 +1370,9 @@ fn production_calls_the_kernel() {
     );
     for needle in [
         "admit(&key)",
+        ".begin(",
+        ".record(Rec {",
+        "kernel::keeps_record(",
         "kernel::State::new(",
         "Ev::Spawned {",
         "Ev::ShellExit {",
@@ -1151,10 +1432,8 @@ fn production_calls_the_kernel() {
     // The only insert is the kernel table's, after `admit` said fresh, under the same lock.
     let at = prod.find("map.insert(").expect("the table insert");
     assert!(
-        prod[..at]
-            .rfind("admit(&key)")
-            .is_some_and(|a| at - a < 1500),
-        "the insert is no longer behind `admit`"
+        prod[..at].rfind(".begin(").is_some_and(|a| at - a < 1500),
+        "the insert is no longer behind `begin` (admit, with the key's replay)"
     );
 }
 

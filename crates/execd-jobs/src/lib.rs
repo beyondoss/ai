@@ -87,6 +87,88 @@ pub fn visible(same_scope: bool, named: bool) -> (r: bool)
     (same_scope || cfg!(feature = "mut_scope_ignored")) && named
 }
 
+/// Why a start is refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// The id is a job in the table, and the start's key is not the one that job was started under (or the start has
+    /// no key): the id is the claim (J1). `409`, "the job exists".
+    IdExists,
+    /// The key was used for a different command: it names a job whose spec digest is not this start's. `409`,
+    /// "the key was used for a different command".
+    KeyReused,
+}
+
+/// What a start does.
+#[verifier::allow(autoderive_clone_without_spec)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Begin {
+    /// Run the job: take the id (and the key, if the start has one).
+    Start,
+    /// The key was already used for this very command: answer that job (its id), run nothing.
+    Replay(String),
+    Refuse(Refusal),
+}
+
+/// K1-K5: what a start does. `id_held` is whether the table has a job under the start's `(scope, id)`; `by_key` is
+/// the ledger's record for the start's key in its scope, when the start has a key and the record names a job still in
+/// the table: that job's id, and whether its stored spec digest is this start's. A start with no key, or whose key
+/// the ledger has not seen, has `None`. [`Table::begin`] feeds both from the table and the ledger.
+///
+/// - K1: a key already used for this command is a replay of that job; it never starts a second one.
+/// - K2: a key already used for another command is refused (`KeyReused`); it neither replays nor starts.
+/// - K3 (the completeness half of K2's refusal and of J1's): a key the ledger has not seen, with a free id, always
+///   starts; a key already used for this command always replays. A refusal clears: the same start with a fresh
+///   key (or after the id's job is removed) is admitted.
+/// - K4: a start with no key never replays and never answers `KeyReused`.
+/// - K5: an id in the table with no key that names it is `IdExists`: a start under another key never takes a
+///   running job's id.
+pub fn start_decision(id_held: bool, by_key: Option<(String, bool)>) -> (r: Begin)
+    ensures
+        (by_key is Some && by_key->Some_0.1) ==> (r is Replay && r->Replay_0@ == by_key->Some_0.0@),
+        (by_key is Some && !by_key->Some_0.1) ==> r == Begin::Refuse(Refusal::KeyReused),
+        (by_key is None && id_held) ==> r == Begin::Refuse(Refusal::IdExists),
+        (by_key is None && !id_held) ==> r is Start,
+{
+    match by_key {
+        Some((id, same)) => {
+            if same {
+                if cfg!(feature = "mut_key_replay_starts") {
+                    Begin::Start
+                } else {
+                    Begin::Replay(id)
+                }
+            } else if cfg!(feature = "mut_key_digest_ignored") {
+                Begin::Replay(id)
+            } else {
+                Begin::Refuse(Refusal::KeyReused)
+            }
+        },
+        None => {
+            if id_held {
+                Begin::Refuse(Refusal::IdExists)
+            } else if cfg!(feature = "mut_key_fresh_refused") {
+                Begin::Refuse(Refusal::IdExists)
+            } else {
+                Begin::Start
+            }
+        },
+    }
+}
+
+/// K6: a restarted execd keeps the start key's record of every job it brings back (running, or as it ended): a
+/// retry of a start whose answer was lost across the restart replays, never starts a second job. A job `recover`
+/// drops (it never had a group, or was removed) is not in the table, so its record goes with it.
+pub fn keeps_record(how: Recovery) -> (r: bool)
+    ensures
+        r == !(how is Drop),
+{
+    match how {
+        Recovery::Drop => false,
+        Recovery::Adopt => true,
+        Recovery::Restore => !cfg!(feature = "mut_key_forgotten_on_restart"),
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // One job's state.
 // ---------------------------------------------------------------------------------------------
@@ -1475,6 +1557,24 @@ pub open spec fn key_eq(a: Key, b: Key) -> bool {
     a.0@ == b.0@ && a.1@ == b.1@
 }
 
+/// Two records say the same (by what they hold).
+pub open spec fn same(a: Rec, b: Rec) -> bool {
+    a.scope@ == b.scope@ && a.key@ == b.key@ && a.id@ == b.id@ && a.digest@ == b.digest@
+}
+
+/// One start key's record in the ledger: a keyed start's key, in its scope, names the job it started and the digest
+/// of the spec it started with (a hash of command, args, cwd, env, pty, stdin_open and hold: the digest alone, never
+/// the spec, because the env can hold secrets). The record is as old as its job: it is written with the job's entry,
+/// saved with the job's ledger entry, restored with it, and dropped only when the job is taken (K5-K8).
+#[verifier::allow(autoderive_clone_without_spec)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Rec {
+    pub scope: String,
+    pub key: String,
+    pub id: String,
+    pub digest: String,
+}
+
 /// Which ids of a scope an operation names.
 #[derive(Clone, Copy, Debug)]
 pub enum Pick<'a> {
@@ -1531,17 +1631,42 @@ impl<'a> Pick<'a> {
 /// invariant), so a key names at most one job.
 pub struct Table<C> {
     entries: Vec<(Key, C)>,
+    /// The start keys of the jobs in `entries`: the ledger's records (`Rec`).
+    recs: Vec<Rec>,
 }
 
 impl<C> Table<C> {
     /// The keys are distinct. `new` makes a table that satisfies it and every method that changes
     /// the table keeps it; the field is private, so no other table exists.
     pub closed spec fn wf(self) -> bool {
-        forall|i: int, j: int|
+        &&& forall|i: int, j: int|
             0 <= i < j < self.entries@.len() ==> !key_eq(
                 (#[trigger] self.entries@[i]).0,
                 (#[trigger] self.entries@[j]).0,
             )
+        &&& forall|i: int, j: int|
+            0 <= i < j < self.recs@.len() ==> !(
+                (#[trigger] self.recs@[i]).scope@ == (#[trigger] self.recs@[j]).scope@
+                    && self.recs@[i].key@ == self.recs@[j].key@)
+    }
+
+    /// The ledger's records, in order.
+    pub closed spec fn recs(self) -> Seq<Rec> {
+        self.recs@
+    }
+
+    /// Some job is under `(scope, id)`.
+    pub closed spec fn holds_at(self, scope: Seq<char>, id: Seq<char>) -> bool {
+        exists|i: int|
+            0 <= i < self.entries@.len() && (#[trigger] self.entries@[i]).0.0@ == scope
+                && self.entries@[i].0.1@ == id
+    }
+
+    /// The ledger has a record: `key` of `scope` names job `id`, started with `digest`.
+    pub closed spec fn recorded(self, scope: Seq<char>, key: Seq<char>, id: Seq<char>, digest: Seq<char>) -> bool {
+        exists|i: int|
+            0 <= i < self.recs@.len() && (#[trigger] self.recs@[i]).scope@ == scope
+                && self.recs@[i].key@ == key && self.recs@[i].id@ == id && self.recs@[i].digest@ == digest
     }
 
     /// Some job is under `k`.
@@ -1566,7 +1691,7 @@ impl<C> Table<C> {
             r.wf(),
             forall|k: Key| !r.holds(k),
     {
-        Table { entries: Vec::new() }
+        Table { entries: Vec::new(), recs: Vec::new() }
     }
 
     /// Where `key` is: the first (and only) entry whose scope and id both equal. (`scope_matters`
@@ -1622,6 +1747,369 @@ impl<C> Table<C> {
             !self.holds(*key) ==> r is Fresh,
     {
         admit(self.is_held(key))
+    }
+
+    fn has_id(&self, scope: &str, id: &str) -> (r: bool)
+        ensures
+            r == self.holds_at(scope@, id@),
+    {
+        let mut n = 0;
+        while n < self.entries.len()
+            invariant
+                n <= self.entries@.len(),
+                forall|i: int|
+                    0 <= i < n ==> !((#[trigger] self.entries@[i]).0.0@ == scope@ && self.entries@[i].0.1@ == id@),
+            decreases self.entries@.len() - n,
+        {
+            let e = &self.entries[n];
+            if e.0.0.as_str() == scope && e.0.1.as_str() == id {
+                return true;
+            }
+            n += 1;
+        }
+        false
+    }
+
+    /// The ledger's record of start key `k` in `scope`, when the job it names is still in the table: that job's id, and
+    /// whether its stored digest is `digest`.
+    fn lookup(&self, scope: &str, k: &str, digest: &str) -> (r: Option<(String, bool)>)
+        requires
+            self.wf(),
+        ensures
+            forall|j: int|
+                0 <= j < self.recs@.len() && (#[trigger] self.recs@[j]).scope@ == scope@ && self.recs@[j].key@ == k@
+                    && self.holds_at(scope@, self.recs@[j].id@) ==> (r is Some && r->Some_0.0@ == self.recs@[j].id@
+                    && r->Some_0.1 == (self.recs@[j].digest@ == digest@)),
+            r is Some ==> exists|j: int|
+                0 <= j < self.recs@.len() && (#[trigger] self.recs@[j]).scope@ == scope@ && self.recs@[j].key@ == k@
+                    && self.holds_at(scope@, self.recs@[j].id@),
+    {
+        let mut n = 0;
+        while n < self.recs.len()
+            invariant
+                n <= self.recs@.len(),
+                self.wf(),
+                forall|i: int|
+                    0 <= i < n ==> !((#[trigger] self.recs@[i]).scope@ == scope@ && self.recs@[i].key@ == k@),
+            decreases self.recs@.len() - n,
+        {
+            let r = &self.recs[n];
+            if r.scope.as_str() == scope && r.key.as_str() == k {
+                proof {
+                    assert forall|j: int|
+                        0 <= j < self.recs@.len() && (#[trigger] self.recs@[j]).scope@ == scope@
+                            && self.recs@[j].key@ == k@ implies j == n as int by {
+                        if j < n as int {
+                        } else if j > n as int {
+                            assert(!(self.recs@[n as int].scope@ == self.recs@[j].scope@
+                                && self.recs@[n as int].key@ == self.recs@[j].key@));
+                        }
+                    }
+                }
+                if self.has_id(scope, r.id.as_str()) {
+                    return Some((r.id.clone(), r.digest.as_str() == digest));
+                }
+                return None;
+            }
+            n += 1;
+        }
+        None
+    }
+
+    /// K1-K5: what a start of `(scope, id)` does, with the start key `key` (`None`: no key) and the spec digest
+    /// `digest`. The ledger's record for the key counts only while its job is still in the table. The decision is
+    /// [`start_decision`], over what the table and the ledger hold.
+    pub fn begin(&self, scope: &str, id: &str, key: Option<&str>, digest: &str) -> (r: Begin)
+        requires
+            self.wf(),
+        ensures
+            // K1: a key already used for this command, by a job still in the table, replays that job.
+            forall|j: int|
+                0 <= j < self.recs().len() && key is Some && (#[trigger] self.recs()[j]).scope@ == scope@
+                    && self.recs()[j].key@ == key->Some_0@ && self.holds_at(scope@, self.recs()[j].id@)
+                    && self.recs()[j].digest@ == digest@ ==> (r is Replay && r->Replay_0@ == self.recs()[j].id@
+                    && self.holds_at(scope@, r->Replay_0@)),
+            // K2: a key already used for another command is refused, as that.
+            forall|j: int|
+                0 <= j < self.recs().len() && key is Some && (#[trigger] self.recs()[j]).scope@ == scope@
+                    && self.recs()[j].key@ == key->Some_0@ && self.holds_at(scope@, self.recs()[j].id@)
+                    && self.recs()[j].digest@ != digest@ ==> r == Begin::Refuse(Refusal::KeyReused),
+            // K3, K5: with no such record, a free id starts and a held one is refused.
+            (key is None || !(exists|j: int|
+                0 <= j < self.recs().len() && (#[trigger] self.recs()[j]).scope@ == scope@
+                    && self.recs()[j].key@ == key->Some_0@ && self.holds_at(scope@, self.recs()[j].id@)))
+                ==> (r == (if self.holds_at(scope@, id@) { Begin::Refuse(Refusal::IdExists) } else { Begin::Start })),
+            // K4: a start with no key never replays and is never `KeyReused`.
+            key is None ==> (!(r is Replay) && r != Begin::Refuse(Refusal::KeyReused)),
+    {
+        // J1: the id is the claim; `admit` is where that decision is made.
+        let id_held = match admit(self.has_id(scope, id)) {
+            Admit::Exists => true,
+            Admit::Fresh => false,
+        };
+        let by_key = match key {
+            Some(k) => self.lookup(scope, k, digest),
+            None => {
+                if cfg!(feature = "mut_unkeyed_replays") && id_held {
+                    Some((id.to_string(), true))
+                } else {
+                    None
+                }
+            },
+        };
+        start_decision(id_held, by_key)
+    }
+
+    /// K7: write a start key's record. A key's record is one: a second record of the same key in the same scope
+    /// replaces the first (a record whose job is gone); every other key's record stays.
+    pub fn record(&mut self, rec: Rec)
+        requires
+            old(self).wf(),
+        ensures
+            final(self).wf(),
+            final(self).rows() == old(self).rows(),
+            final(self).recorded(rec.scope@, rec.key@, rec.id@, rec.digest@),
+            forall|s: Seq<char>, k: Seq<char>, j: Seq<char>, d: Seq<char>|
+                !(s == rec.scope@ && k == rec.key@) ==> (final(self).recorded(s, k, j, d)
+                    == old(self).recorded(s, k, j, d)),
+    {
+        let ghost before = self.recs@;
+        let mut kept: Vec<Rec> = Vec::new();
+        let mut n = 0;
+        while n < self.recs.len()
+            invariant
+                n <= self.recs@.len(),
+                self.recs@ == before,
+                self.wf(),
+                forall|i: int| 0 <= i < kept@.len() ==> {
+                    &&& !((#[trigger] kept@[i]).scope@ == rec.scope@ && kept@[i].key@ == rec.key@)
+                    &&& exists|m: int| 0 <= m < n && same(before[m], kept@[i])
+                },
+                forall|m: int|
+                    0 <= m < n && !((#[trigger] before[m]).scope@ == rec.scope@ && before[m].key@ == rec.key@)
+                        ==> exists|i: int| 0 <= i < kept@.len() && same(kept@[i], before[m]),
+                forall|a: int, b: int|
+                    0 <= a < b < kept@.len() ==> !(
+                        (#[trigger] kept@[a]).scope@ == (#[trigger] kept@[b]).scope@ && kept@[a].key@ == kept@[b].key@),
+            decreases self.recs@.len() - n,
+        {
+            let r = &self.recs[n];
+            let ghost old_kept = kept@;
+            if !(r.scope.as_str() == rec.scope.as_str() && r.key.as_str() == rec.key.as_str()) && !cfg!(feature = "mut_key_record_clears") {
+                kept.push(Rec { scope: r.scope.clone(), key: r.key.clone(), id: r.id.clone(), digest: r.digest.clone() });
+                proof {
+                    let k = old_kept.len() as int;
+                    assert(kept@.len() == k + 1);
+                    assert(forall|i: int| 0 <= i < k ==> kept@[i] == old_kept[i]);
+                    assert(same(kept@[k], before[n as int]));
+                    assert forall|i: int| 0 <= i < kept@.len() implies {
+                        &&& !((#[trigger] kept@[i]).scope@ == rec.scope@ && kept@[i].key@ == rec.key@)
+                        &&& exists|m: int| 0 <= m < n + 1 && same(before[m], kept@[i])
+                    } by {
+                        if i < k {
+                            assert(kept@[i] == old_kept[i]);
+                            let m = choose|m: int| 0 <= m < n && same(before[m], old_kept[i]);
+                            assert(same(before[m], kept@[i]));
+                        } else {
+                            assert(same(before[n as int], kept@[i]));
+                        }
+                    }
+                    assert forall|m: int|
+                        0 <= m < n + 1 && !((#[trigger] before[m]).scope@ == rec.scope@ && before[m].key@ == rec.key@)
+                            implies exists|i: int| 0 <= i < kept@.len() && same(kept@[i], before[m]) by {
+                        if m == n as int {
+                            assert(same(kept@[k], before[m]));
+                        } else {
+                            let i = choose|i: int| 0 <= i < k && same(old_kept[i], before[m]);
+                            assert(kept@[i] == old_kept[i]);
+                        }
+                    }
+                    assert forall|a: int, b: int| 0 <= a < b < kept@.len() implies !(
+                        (#[trigger] kept@[a]).scope@ == (#[trigger] kept@[b]).scope@
+                            && kept@[a].key@ == kept@[b].key@) by {
+                        if b == k {
+                            let m = choose|m: int| 0 <= m < n && same(before[m], old_kept[a]);
+                            assert(kept@[a] == old_kept[a]);
+                            assert(self.recs@[m] == before[m]);
+                            assert(self.recs@[n as int] == before[n as int]);
+                        } else {
+                            assert(kept@[a] == old_kept[a]);
+                            assert(kept@[b] == old_kept[b]);
+                        }
+                    }
+                }
+            } else {
+                proof {
+                    assert forall|m: int|
+                        0 <= m < n + 1 && !((#[trigger] before[m]).scope@ == rec.scope@ && before[m].key@ == rec.key@)
+                            implies exists|i: int| 0 <= i < kept@.len() && same(kept@[i], before[m]) by {
+                        assert(m < n as int);
+                    }
+                    assert forall|i: int| 0 <= i < kept@.len() implies
+                        ((#[trigger] kept@[i]) == kept@[i]
+                            && exists|m: int| 0 <= m < n + 1 && same(before[m], kept@[i])) by {
+                        let m = choose|m: int| 0 <= m < n && same(before[m], kept@[i]);
+                        assert(same(before[m], kept@[i]));
+                    }
+                }
+            }
+            n += 1;
+        }
+        let ghost kept_before_push = kept@;
+        let ghost scope = rec.scope@;
+        let ghost key = rec.key@;
+        let ghost id = rec.id@;
+        let ghost digest = rec.digest@;
+        kept.push(rec);
+        self.recs = kept;
+        proof {
+            let last = kept_before_push.len() as int;
+            assert(self.recs@.len() == last + 1);
+            assert(forall|i: int| 0 <= i < last ==> self.recs@[i] == kept_before_push[i]);
+            assert(self.recs@[last].scope@ == scope && self.recs@[last].key@ == key);
+            assert(self.recs@[last].id@ == id && self.recs@[last].digest@ == digest);
+            assert(self.recorded(scope, key, id, digest));
+            assert forall|a: int, b: int| 0 <= a < b < self.recs@.len() implies !(
+                (#[trigger] self.recs@[a]).scope@ == (#[trigger] self.recs@[b]).scope@
+                    && self.recs@[a].key@ == self.recs@[b].key@) by {
+                assert(self.recs@[a] == kept_before_push[a]);
+                if b != last {
+                    assert(self.recs@[b] == kept_before_push[b]);
+                }
+            }
+            assert forall|s: Seq<char>, k: Seq<char>, j: Seq<char>, d: Seq<char>|
+                !(s == scope && k == key) implies (self.recorded(s, k, j, d)
+                    == old(self).recorded(s, k, j, d)) by {
+                if self.recorded(s, k, j, d) {
+                    let i = choose|i: int| 0 <= i < self.recs@.len() && self.recs@[i].scope@ == s
+                        && self.recs@[i].key@ == k && self.recs@[i].id@ == j && self.recs@[i].digest@ == d;
+                    assert(i != last);
+                    assert(self.recs@[i] == kept_before_push[i]);
+                    let m = choose|m: int| 0 <= m < before.len() && same(before[m], kept_before_push[i]);
+                    assert(old(self).recs@[m].scope@ == s && old(self).recs@[m].key@ == k);
+                }
+                if old(self).recorded(s, k, j, d) {
+                    let m = choose|m: int| 0 <= m < before.len() && before[m].scope@ == s
+                        && before[m].key@ == k && before[m].id@ == j && before[m].digest@ == d;
+                    let i = choose|i: int| 0 <= i < kept_before_push.len() && same(kept_before_push[i], before[m]);
+                    assert(self.recs@[i] == kept_before_push[i]);
+                }
+            }
+        }
+    }
+
+    /// K8: drop the records of the job under `(scope, id)` and no other record.
+    fn forget(&mut self, scope: &str, id: &str)
+        requires
+            old(self).wf(),
+        ensures
+            final(self).wf(),
+            final(self).rows() == old(self).rows(),
+            forall|s: Seq<char>, k: Seq<char>, j: Seq<char>, d: Seq<char>|
+                final(self).recorded(s, k, j, d) ==> (old(self).recorded(s, k, j, d)
+                    && !(s == scope@ && j == id@)),
+            forall|s: Seq<char>, k: Seq<char>, j: Seq<char>, d: Seq<char>|
+                old(self).recorded(s, k, j, d) && !(s == scope@ && j == id@) ==> final(self).recorded(s, k, j, d),
+    {
+        let ghost before = self.recs@;
+        let mut kept: Vec<Rec> = Vec::new();
+        let mut n = 0;
+        while n < self.recs.len()
+            invariant
+                n <= self.recs@.len(),
+                self.recs@ == before,
+                self.wf(),
+                forall|i: int| 0 <= i < kept@.len() ==> {
+                    &&& !((#[trigger] kept@[i]).scope@ == scope@ && kept@[i].id@ == id@)
+                    &&& exists|m: int| 0 <= m < n && same(before[m], kept@[i])
+                },
+                forall|m: int|
+                    0 <= m < n && !((#[trigger] before[m]).scope@ == scope@ && before[m].id@ == id@)
+                        ==> exists|i: int| 0 <= i < kept@.len() && same(kept@[i], before[m]),
+                forall|a: int, b: int|
+                    0 <= a < b < kept@.len() ==> !(
+                        (#[trigger] kept@[a]).scope@ == (#[trigger] kept@[b]).scope@ && kept@[a].key@ == kept@[b].key@),
+            decreases self.recs@.len() - n,
+        {
+            let r = &self.recs[n];
+            let ghost old_kept = kept@;
+            if !(r.scope.as_str() == scope && r.id.as_str() == id) || cfg!(feature = "mut_key_take_forgets_none") {
+                kept.push(Rec { scope: r.scope.clone(), key: r.key.clone(), id: r.id.clone(), digest: r.digest.clone() });
+                proof {
+                    let k = old_kept.len() as int;
+                    assert(kept@.len() == k + 1);
+                    assert(forall|i: int| 0 <= i < k ==> kept@[i] == old_kept[i]);
+                    assert(same(kept@[k], before[n as int]));
+                    assert forall|i: int| 0 <= i < kept@.len() implies {
+                        &&& !((#[trigger] kept@[i]).scope@ == scope@ && kept@[i].id@ == id@)
+                        &&& exists|m: int| 0 <= m < n + 1 && same(before[m], kept@[i])
+                    } by {
+                        if i < k {
+                            assert(kept@[i] == old_kept[i]);
+                            let m = choose|m: int| 0 <= m < n && same(before[m], old_kept[i]);
+                            assert(same(before[m], kept@[i]));
+                        } else {
+                            assert(same(before[n as int], kept@[i]));
+                        }
+                    }
+                    assert forall|m: int|
+                        0 <= m < n + 1 && !((#[trigger] before[m]).scope@ == scope@ && before[m].id@ == id@)
+                            implies exists|i: int| 0 <= i < kept@.len() && same(kept@[i], before[m]) by {
+                        if m == n as int {
+                            assert(same(kept@[k], before[m]));
+                        } else {
+                            let i = choose|i: int| 0 <= i < k && same(old_kept[i], before[m]);
+                            assert(kept@[i] == old_kept[i]);
+                        }
+                    }
+                    assert forall|a: int, b: int| 0 <= a < b < kept@.len() implies !(
+                        (#[trigger] kept@[a]).scope@ == (#[trigger] kept@[b]).scope@
+                            && kept@[a].key@ == kept@[b].key@) by {
+                        if b == k {
+                            let m = choose|m: int| 0 <= m < n && same(before[m], old_kept[a]);
+                            assert(kept@[a] == old_kept[a]);
+                            assert(self.recs@[m] == before[m]);
+                            assert(self.recs@[n as int] == before[n as int]);
+                        } else {
+                            assert(kept@[a] == old_kept[a]);
+                            assert(kept@[b] == old_kept[b]);
+                        }
+                    }
+                }
+            } else {
+                proof {
+                    assert forall|m: int|
+                        0 <= m < n + 1 && !((#[trigger] before[m]).scope@ == scope@ && before[m].id@ == id@)
+                            implies exists|i: int| 0 <= i < kept@.len() && same(kept@[i], before[m]) by {
+                        assert(m < n as int);
+                    }
+                    assert forall|i: int| 0 <= i < kept@.len() implies
+                        ((#[trigger] kept@[i]) == kept@[i]
+                            && exists|m: int| 0 <= m < n + 1 && same(before[m], kept@[i])) by {
+                        let m = choose|m: int| 0 <= m < n && same(before[m], kept@[i]);
+                        assert(same(before[m], kept@[i]));
+                    }
+                }
+            }
+            n += 1;
+        }
+        self.recs = kept;
+        proof {
+            assert forall|s: Seq<char>, k: Seq<char>, j: Seq<char>, d: Seq<char>|
+                self.recorded(s, k, j, d) implies (old(self).recorded(s, k, j, d) && !(s == scope@ && j == id@)) by {
+                let i = choose|i: int| 0 <= i < self.recs@.len() && self.recs@[i].scope@ == s
+                    && self.recs@[i].key@ == k && self.recs@[i].id@ == j && self.recs@[i].digest@ == d;
+                let m = choose|m: int| 0 <= m < before.len() && same(before[m], self.recs@[i]);
+                assert(old(self).recs@[m].scope@ == s);
+            }
+            assert forall|s: Seq<char>, k: Seq<char>, j: Seq<char>, d: Seq<char>|
+                old(self).recorded(s, k, j, d) && !(s == scope@ && j == id@) implies self.recorded(s, k, j, d) by {
+                let m = choose|m: int| 0 <= m < before.len() && before[m].scope@ == s
+                    && before[m].key@ == k && before[m].id@ == j && before[m].digest@ == d;
+                let i = choose|i: int| 0 <= i < self.recs@.len() && same(self.recs@[i], before[m]);
+                assert(self.recs@[i].scope@ == s);
+            }
+        }
     }
 
     /// Put a job in its key: only after [`Table::admit`] said `Fresh`, under the same lock. An
@@ -1859,6 +2347,7 @@ impl<C> Table<C> {
                     } else {
                         let (key, job) = self.entries.remove(i);
                         taken.push((key, job));
+                        self.forget(k.0.as_str(), k.1.as_str());
                     }
                 }
             }
@@ -1911,6 +2400,13 @@ impl State {
     }
 }
 
+impl<C> Table<C> {
+    /// The ledger's records (the model's state hashes them).
+    pub fn records(&self) -> Vec<Rec> {
+        self.recs.clone()
+    }
+}
+
 impl<C> Default for Table<C> {
     fn default() -> Self {
         Self::new()
@@ -1921,6 +2417,7 @@ impl<C: Clone> Clone for Table<C> {
     fn clone(&self) -> Self {
         Self {
             entries: self.entries.clone(),
+            recs: self.recs.clone(),
         }
     }
 }
@@ -1937,6 +2434,8 @@ impl<C: std::fmt::Debug> std::fmt::Debug for Table<C> {
 impl<C: PartialEq> PartialEq for Table<C> {
     fn eq(&self, other: &Self) -> bool {
         self.entries.len() == other.entries.len()
+            && self.recs.len() == other.recs.len()
+            && self.recs.iter().all(|r| other.recs.contains(r))
             && self
                 .entries
                 .iter()

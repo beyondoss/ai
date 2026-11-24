@@ -89,6 +89,7 @@ Job failures are typed, each a subclass of the kind it was before (`except NotFo
 
 - `Jobs.attach` / `AsyncJobs.attach` are renamed `collect` (follow to the end, collected); `follow` is unchanged.
 - `Jobs.read` of a removed or unknown job raises `JobGoneError` (a `NotFoundError`) instead of returning state `gone`.
+- Every `jobs.start` and `jobs.start_held` carries an idempotency key: `idempotency_key` when you pass one (1 to 128 characters of `[0-9A-Za-z._:-]`), else one generated for the call. A start sent again with the same key and command answers the job the first send started and runs nothing, even across an execd restart; the key of another command is a `JobExistsError` (409). Pass your own so a re-run of a whole program returns its job.
 - A start of an existing id is `JobExistsError`, a full disk `DiskFullError`, and a stdin write's 409 and 429 are `StdinClosedError`, `StdinGapError` and `StdinBusyError` (all still `ConflictError`s).
 - A custom `job_call` / `job_stream` is passed `heartbeat_seconds`, `env`, `command`, `args` and `cwd` only when set.
 

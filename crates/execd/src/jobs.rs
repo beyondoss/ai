@@ -41,9 +41,10 @@ use crate::exec::{self, Cut, Sink};
 use crate::frame::{self, FRAME_MAX};
 use crate::http::{self, Line, Request, Resp};
 use crate::job_kernel::{
-    self as kernel, Act, Admit, Alive, Ev, Follow, Kind, Pick, Recovery, Sink as Dest,
+    self as kernel, Act, Admit, Alive, Begin, Ev, Follow, Kind, Pick, Recovery, Refusal, Rec,
+    Sink as Dest,
 };
-use crate::ledger::{Entry, Ledger};
+use crate::ledger::{Entry, Idem, Ledger};
 use crate::notify::{self, Notifier, NotifyTarget};
 use crate::proc::{self, locked};
 use crate::ring::Ring;
@@ -74,6 +75,9 @@ pub(crate) struct Job {
     pub notifier: Notifier,
     /// The job's open stdin, when it was started with `stdin_open`.
     stdin: Option<Arc<JobStdin>>,
+    /// The start's idempotency key and spec digest, for the ledger (the table's own record of the key is
+    /// [`kernel::Rec`]); `None` for an unkeyed start. Written once, at the start or the restart.
+    idem: Option<Idem>,
 }
 
 impl Job {
@@ -135,6 +139,7 @@ impl Jobs {
                         &j.mark,
                         &j.k,
                         j.spool.as_ref().map(Spool::dir),
+                        j.idem.as_ref(),
                     )
                 })
                 .collect()
@@ -324,6 +329,9 @@ struct JobReq {
     notify: Option<Value>,
     /// `start`: keep the job's stdin open for `write` (default: `/dev/null`).
     stdin_open: bool,
+    /// `start`: the idempotency key. A start that carries the key of an earlier start of the same spec
+    /// answers that job and runs nothing; the same key with another spec is `409`.
+    idempotency_key: Option<String>,
     /// `signal`: the signal's name.
     signal: Option<String>,
     /// `write`: the stream position of the data's first byte and whether to close
@@ -816,26 +824,80 @@ fn keep_or_seen(ctx: &Arc<Ctx>, job: &JobReq) -> Resp {
 /// the group is empty.
 async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
     let key = (job.scope.clone(), job.id.clone());
-    let cell: JobCell = {
+    let idem = match job.idempotency_key.as_deref() {
+        None => None,
+        Some(k) if valid_key(k) => Some(Idem {
+            key: k.to_string(),
+            digest: spec_digest(req, job),
+        }),
+        Some(_) => return http::error_response(400, "bad idempotency key"),
+    };
+    /// What the table's decision leaves to do once its lock is dropped.
+    enum Gate {
+        Run(JobCell),
+        Answer(Resp),
+        Replay(Key, Option<JobCell>),
+    }
+    let gate = {
         let mut map = locked(&ctx.jobs.map);
-        if map.admit(&key) == Admit::Exists {
-            return http::error_response(409, "the job exists");
+        // The kernel's decision (K1-K5): a key already used for this command replays its job, a key used
+        // for another command is refused, and an id in the table is the claim.
+        let begin = map.begin(
+            &key.0,
+            &key.1,
+            idem.as_ref().map(|i| i.key.as_str()),
+            idem.as_ref().map_or("", |i| i.digest.as_str()),
+        );
+        match begin {
+            Begin::Refuse(Refusal::IdExists) => {
+                Gate::Answer(http::error_response(409, "the job exists"))
+            }
+            Begin::Refuse(Refusal::KeyReused) => Gate::Answer(http::error_response(
+                409,
+                "the key was used for a different command",
+            )),
+            Begin::Replay(id) => {
+                let replayed = (job.scope.clone(), id);
+                let cell = map.get(&replayed);
+                Gate::Replay(replayed, cell)
+            }
+            Begin::Start => {
+                // Placeholder until the spawn gives the group: the entry is the claim on the id, so two
+                // starts of one id cannot both run.
+                let cell = Arc::new(Mutex::new(Job {
+                    mark: proc::new_job_mark(ctx.next_seq.fetch_add(1, Ordering::Relaxed)),
+                    sp: 0,
+                    label: job.label.clone(),
+                    out: Ring::new(ctx.opts.job_output_retention, ctx.spool.new_job()),
+                    spool: None,
+                    k: kernel::State::new(epoch(), job.hold),
+                    notify: None,
+                    notifier: Notifier::default(),
+                    stdin: None,
+                    idem: idem.clone(),
+                }));
+                map.insert(key.clone(), cell.clone());
+                // The key's record goes in with the entry, under the same lock: no other start sees the id
+                // without it.
+                if let Some(i) = &idem {
+                    map.record(Rec {
+                        scope: key.0.clone(),
+                        key: i.key.clone(),
+                        id: key.1.clone(),
+                        digest: i.digest.clone(),
+                    });
+                }
+                Gate::Run(cell)
+            }
         }
-        // Placeholder until the spawn gives the group: the entry is the claim on the id, so two
-        // starts of one id cannot both run.
-        let cell = Arc::new(Mutex::new(Job {
-            mark: proc::new_job_mark(ctx.next_seq.fetch_add(1, Ordering::Relaxed)),
-            sp: 0,
-            label: job.label.clone(),
-            out: Ring::new(ctx.opts.job_output_retention, ctx.spool.new_job()),
-            spool: None,
-            k: kernel::State::new(epoch(), job.hold),
-            notify: None,
-            notifier: Notifier::default(),
-            stdin: None,
-        }));
-        map.insert(key.clone(), cell.clone());
-        cell
+    };
+    let cell = match gate {
+        Gate::Run(cell) => cell,
+        Gate::Answer(resp) => return resp,
+        Gate::Replay(replayed, Some(cell)) => {
+            return replay_job(ctx, req, job, replayed, cell).await;
+        }
+        Gate::Replay(_, None) => return http::error_response(500, "the job did not start"),
     };
     let mut cmd = exec::command_for(ctx, req, Kind::Job);
     cmd.stdin(if job.stdin_open {
@@ -942,12 +1004,103 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
         });
         resp
     } else {
-        let mut body = json!({ "started": pgid });
-        if opened {
-            body["stdin"] = json!(true);
-        }
-        http::json_response(200, &body)
+        started_body(pgid, opened)
     }
+}
+
+/// A key is 1 to 128 characters of `[0-9A-Za-z._:-]`: a UUID, or a name such as `deploy-2026-11-24`.
+fn valid_key(k: &str) -> bool {
+    (1..=128).contains(&k.len())
+        && k.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
+}
+
+/// The digest of what a start runs: command, args, cwd, env, stdin_open and hold, length-prefixed so no two
+/// specs share a byte string, hashed with SHA-256. This is all execd keeps of a keyed start's spec: the env can
+/// hold secrets, so the spec itself is never stored. The label is not in it (a name, not a command). Every field
+/// that decides what runs is here: a field added to `start` that changes the command belongs in this list.
+fn spec_digest(req: &Request, job: &JobReq) -> String {
+    use sha2::{Digest as _, Sha256};
+    let mut h = Sha256::new();
+    let mut field = |tag: u8, bytes: &[u8]| {
+        h.update([tag]);
+        h.update((bytes.len() as u64).to_le_bytes());
+        h.update(bytes);
+    };
+    field(b'c', req.command.as_bytes());
+    for a in &req.args {
+        field(b'a', a.as_bytes());
+    }
+    match &req.cwd {
+        Some(c) => field(b'd', c.as_bytes()),
+        None => field(b'D', b""),
+    }
+    // The environment is a set: the order a client wrote it in is not part of the spec.
+    let mut env: Vec<&(String, String)> = req.env_pairs.iter().collect();
+    env.sort();
+    for (k, v) in env {
+        field(b'k', k.as_bytes());
+        field(b'v', v.as_bytes());
+    }
+    field(b'i', &[u8::from(job.stdin_open)]);
+    field(b'h', &[u8::from(job.hold)]);
+    let out = h.finalize();
+    out.iter().fold(String::with_capacity(64), |mut s, b| {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
+/// The answer to a start the key ledger already has: the original job's, as its start answered (its group; `stdin`
+/// when it was opened), or, for a held start, its stream from the first byte. Nothing is spawned. A replay that
+/// arrives while the original is still spawning waits for its group, so it never answers a job with no process.
+async fn replay_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq, key: Key, cell: JobCell) -> Resp {
+    let mut waited = 0;
+    let pgid = loop {
+        let (pgid, removed) = {
+            let j = locked(&cell);
+            (j.k.pgid(), j.k.removed)
+        };
+        if pgid != 0 {
+            break pgid;
+        }
+        if removed || waited >= 1000 {
+            return http::error_response(500, "the job did not start");
+        }
+        waited += 1;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    let opened = job.stdin_open;
+    if job.hold {
+        let (resp, out) = http::stream_response();
+        let ctx2 = ctx.clone();
+        let beat = req.beat;
+        tokio::spawn(async move {
+            stream_job(
+                ctx2,
+                key,
+                cell,
+                0,
+                true,
+                Some((pgid, opened)),
+                Sink::new(out, beat, None),
+            )
+            .await;
+        });
+        resp
+    } else {
+        started_body(pgid, opened)
+    }
+}
+
+/// What a start answers: the job's process group, and `stdin` when its stdin was opened.
+fn started_body(pgid: i32, opened: bool) -> Resp {
+    let mut body = json!({ "started": pgid });
+    if opened {
+        body["stdin"] = json!(true);
+    }
+    http::json_response(200, &body)
 }
 
 /// What a start answers when its output spool cannot be made: `507` with a plain reason when the
@@ -1171,6 +1324,7 @@ pub(crate) fn recover(ctx: &Arc<Ctx>) {
             notify: None,
             notifier: Notifier::default(),
             stdin: None,
+            idem: e.idem.clone(),
         }));
         {
             let mut map = locked(&ctx.jobs.map);
@@ -1178,6 +1332,17 @@ pub(crate) fn recover(ctx: &Arc<Ctx>) {
                 continue;
             }
             map.insert(key.clone(), cell.clone());
+            // K6: the job came back, so does its key's record.
+            if let Some(i) = &e.idem
+                && kernel::keeps_record(how)
+            {
+                map.record(Rec {
+                    scope: key.0.clone(),
+                    key: i.key.clone(),
+                    id: key.1.clone(),
+                    digest: i.digest.clone(),
+                });
+            }
         }
         if let Some(pg) = pg {
             ctx.groups.insert(pg, Kind::Job);

@@ -146,6 +146,13 @@ pub struct JobSpec {
     /// Keep the job's stdin open for [`SandboxJobs::write_stdin`] (default: empty, so a job that
     /// reads its stdin sees EOF at once).
     pub stdin_open: bool,
+    /// The start's idempotency key (wire `idempotency_key`): 1 to 128 characters of `[0-9A-Za-z._:-]`. A start
+    /// that repeats an earlier one's key with the same command, arguments, directory, environment, stdin and
+    /// hold answers that job and runs nothing; the same key with another command is a conflict
+    /// ([`JobError::Exists`]). `None`: a fresh key is generated for each start call, before its first send, so a
+    /// start whose answer was lost can be sent again without running twice. Set your own to make a re-run of a
+    /// whole program return its job.
+    pub idempotency_key: Option<String>,
 }
 
 /// The output stream a piece of a job's output came from.

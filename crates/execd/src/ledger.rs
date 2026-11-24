@@ -53,6 +53,17 @@ pub(crate) struct Entry {
     /// this names. `None` for a job with no spool.
     #[serde(default)]
     pub spool: Option<String>,
+    /// The start's idempotency key and the digest of the spec it started with (`jobs::spec_digest`): the
+    /// job's record in the key ledger. Never the spec itself, which can hold secrets in its env. A restarted
+    /// execd puts it back (K6), so a start retried across the restart replays the job. `None`: an unkeyed start.
+    #[serde(default)]
+    pub idem: Option<Idem>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Idem {
+    pub key: String,
+    pub digest: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,6 +98,7 @@ impl Entry {
         mark: &str,
         k: &State,
         spool: Option<&Path>,
+        idem: Option<&Idem>,
     ) -> Option<Self> {
         if k.removed {
             return None;
@@ -134,6 +146,7 @@ impl Entry {
             seen: k.seen,
             started: k.started,
             spool: spool.map(|p| p.to_string_lossy().into_owned()),
+            idem: idem.cloned(),
         })
     }
 

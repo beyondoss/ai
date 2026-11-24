@@ -112,6 +112,14 @@ export interface JobSpec {
   env?: Record<string, string>;
   /** Keep the job's stdin open for `writeStdin`; default: empty (EOF at once). */
   stdinOpen?: boolean;
+  /**
+   * The start's idempotency key (wire `idempotency_key`): 1 to 128 characters of `[0-9A-Za-z._:-]`. A start that
+   * carries the key of an earlier start of the same command, arguments, directory, environment, stdin and hold
+   * answers that job and runs nothing; the same key with another command is `409`. Omitted, `Jobs.start` and
+   * `Jobs.startHeld` generate one per call, so a start whose answer was lost can be sent again without running
+   * twice; pass your own to make a re-run of a whole program return its job. Level 3 sends exactly what is given.
+   */
+  idempotencyKey?: string;
 }
 
 /** The most bytes one `writeStdin` carries. */

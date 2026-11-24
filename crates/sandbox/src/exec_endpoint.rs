@@ -221,7 +221,7 @@
 //!
 //! | op | `job` fields | answer |
 //! |---|---|---|
-//! | `start` | `id`, `hold`, `label`, `stdin_open` — the command is the request's `command`/`args`/`cwd`/`env` | `hold: true` (with `"stream": true`): a job stream; `hold: false`: `{"started": pgid}`; both say `"stdin": true` when `stdin_open` was honoured |
+//! | `start` | `id`, `hold`, `label`, `stdin_open`, `idempotency_key` — the command is the request's `command`/`args`/`cwd`/`env` | `hold: true` (with `"stream": true`): a job stream; `hold: false`: `{"started": pgid}`; both say `"stdin": true` when `stdin_open` was honoured. A start whose key (1 to 128 characters of `[0-9A-Za-z._:-]`) an earlier start of the same command, args, cwd, env, `stdin_open` and `hold` used answers that job as the first answer did and runs nothing; the key of another command is `409`; a key an endpoint does not know is ignored |
 //! | `attach` | `id`, `offset` (with `"stream": true`) | a job stream from `offset` |
 //! | `read` | `id`, `offset`, `max` | `{"state", "code", "signal"?, "offset", "end", "data", "stderr_ranges"?}` |
 //! | `keep` | `id`, `num`, `kind`, `seen` | `{}` |

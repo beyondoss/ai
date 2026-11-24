@@ -69,13 +69,29 @@ class Jobs:
         env: dict[str, str] | None = None,
         stdin_open: bool = False,
         heartbeat_seconds: int | None = None,
+        idempotency_key: str | None = None,
     ) -> int:
         """Start a job the sandbox keeps from the start; returns its process group. ``env`` is the
         command's own environment; ``stdin_open`` keeps its stdin open for :meth:`write_stdin`
         (an endpoint that predates it is a ``NotOfferedError`` and the job is stopped). An id that
         exists is :class:`~beyond_sandbox.JobExistsError`; a full disk is
-        :class:`~beyond_sandbox.DiskFullError`."""
-        op = _jobs.start(scope, job, command, args, cwd, label, env, stdin_open, heartbeat_seconds)
+        :class:`~beyond_sandbox.DiskFullError`. The start carries an idempotency key
+        (``idempotency_key``, 1 to 128 characters of ``[0-9A-Za-z._:-]``; omitted, one is generated for this
+        call): sent again, it answers the same job and runs nothing, and the key of another command is
+        :class:`~beyond_sandbox.JobExistsError` too (``409``). Pass your own to make a re-run of a whole
+        program return its job."""
+        op = _jobs.start(
+            scope,
+            job,
+            command,
+            args,
+            cwd,
+            label,
+            env,
+            stdin_open,
+            heartbeat_seconds,
+            idempotency_key,
+        )
         return drive(op, self._t)
 
     def start_held(
@@ -90,12 +106,22 @@ class Jobs:
         env: dict[str, str] | None = None,
         stdin_open: bool = False,
         heartbeat_seconds: int | None = None,
+        idempotency_key: str | None = None,
     ) -> Generator[JobFrame, None, None]:
         """Start a job held by the returned stream (wire ``hold: true``): events, the first a
         :class:`JobStarted`, ending with a :class:`JobEnd`. If you stop before the end and did not
         :meth:`keep` the job, the sandbox kills its group."""
         op = _jobs.start_held(
-            scope, job, command, args, cwd, label, env, stdin_open, heartbeat_seconds
+            scope,
+            job,
+            command,
+            args,
+            cwd,
+            label,
+            env,
+            stdin_open,
+            heartbeat_seconds,
+            idempotency_key,
         )
         items = drive_iter(op, self._t)
         try:
@@ -209,8 +235,20 @@ class AsyncJobs:
         env: dict[str, str] | None = None,
         stdin_open: bool = False,
         heartbeat_seconds: int | None = None,
+        idempotency_key: str | None = None,
     ) -> int:
-        op = _jobs.start(scope, job, command, args, cwd, label, env, stdin_open, heartbeat_seconds)
+        op = _jobs.start(
+            scope,
+            job,
+            command,
+            args,
+            cwd,
+            label,
+            env,
+            stdin_open,
+            heartbeat_seconds,
+            idempotency_key,
+        )
         return await adrive(op, self._t)
 
     async def start_held(
@@ -225,10 +263,20 @@ class AsyncJobs:
         env: dict[str, str] | None = None,
         stdin_open: bool = False,
         heartbeat_seconds: int | None = None,
+        idempotency_key: str | None = None,
     ) -> AsyncGenerator[JobFrame, None]:
         """As :meth:`Jobs.start_held`."""
         op = _jobs.start_held(
-            scope, job, command, args, cwd, label, env, stdin_open, heartbeat_seconds
+            scope,
+            job,
+            command,
+            args,
+            cwd,
+            label,
+            env,
+            stdin_open,
+            heartbeat_seconds,
+            idempotency_key,
         )
         events = aiter_events(op, self._t)
         try:

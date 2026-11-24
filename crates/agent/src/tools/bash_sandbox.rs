@@ -944,6 +944,7 @@ mod notify_tests {
             label: "sleep 1".into(),
             env: Vec::new(),
             stdin_open: false,
+            idempotency_key: None,
         };
         let job = link.id.as_str().to_string();
         let task = {

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import re
+import uuid
 from typing import Any, Sequence
 
 from . import _wire
@@ -44,6 +45,21 @@ def check_id(job: str) -> str:
     if not _JOB_ID.fullmatch(job):
         raise InvalidRequestError(f"bad job id {job!r}: 1 to 32 characters of [0-9a-z]")
     return job
+
+
+_KEY = re.compile(r"[0-9A-Za-z._:-]{1,128}")
+
+
+def start_key(key: str | None) -> str:
+    """The start's idempotency key: the caller's, checked, else a fresh one. Taken once per call, before the first
+    send, so a start sent again for a lost answer carries the key of the first send."""
+    if key is None:
+        return uuid.uuid4().hex
+    if not _KEY.fullmatch(key):
+        raise InvalidRequestError(
+            f"bad idempotency key {key!r}: 1 to 128 characters of [0-9A-Za-z._:-]"
+        )
+    return key
 
 
 def check_scope(scope: str) -> str:
@@ -105,12 +121,22 @@ def start(
     env: dict[str, str] | None = None,
     stdin_open: bool = False,
     heartbeat_seconds: int | None = None,
+    idempotency_key: str | None = None,
 ) -> Op[int]:
     check_scope(scope)
     check_id(job)
+    key = start_key(idempotency_key)
     try:
         v = yield Call(
-            _wire.job_op("start", scope, id=job, hold=False, label=label, stdin_open=stdin_open),
+            _wire.job_op(
+                "start",
+                scope,
+                id=job,
+                hold=False,
+                label=label,
+                stdin_open=stdin_open,
+                idempotency_key=key,
+            ),
             command,
             args,
             cwd,
@@ -140,15 +166,25 @@ def start_held(
     env: dict[str, str] | None = None,
     stdin_open: bool = False,
     heartbeat_seconds: int | None = None,
+    idempotency_key: str | None = None,
 ) -> Op[JobEnd]:
     """Start a job held by this stream (wire ``hold: true``). Emits the job's events, the first a
     :class:`~beyond_sandbox.JobStarted`; returns how it ended. If the stream stops before the end and
     the job was not kept (:func:`keep`), the sandbox kills its group."""
     check_scope(scope)
     check_id(job)
+    key = start_key(idempotency_key)
     try:
         end: JobEnd = yield Follow(
-            _wire.job_op("start", scope, id=job, hold=True, label=label, stdin_open=stdin_open),
+            _wire.job_op(
+                "start",
+                scope,
+                id=job,
+                hold=True,
+                label=label,
+                stdin_open=stdin_open,
+                idempotency_key=key,
+            ),
             command,
             args,
             cwd,

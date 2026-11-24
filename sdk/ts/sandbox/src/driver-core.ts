@@ -228,6 +228,7 @@ export class Driver {
               "job_signal_op",
               "job_errors",
               "job_options",
+              "job_start_key",
             ],
           },
         };
@@ -308,6 +309,9 @@ export class Driver {
           ...(label !== undefined ? { label } : {}),
           ...(env !== undefined ? { env } : {}),
           ...(flag(req, "stdin_open") ? { stdinOpen: true } : {}),
+          ...(optStr(req, "idempotency_key") !== undefined
+            ? { idempotencyKey: optStr(req, "idempotency_key") as string }
+            : {}),
         });
         return { pgid };
       }

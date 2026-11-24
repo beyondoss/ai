@@ -545,6 +545,7 @@ impl Driver {
             label: opt_str(req, "label")?.unwrap_or("").to_string(),
             env: env_arg(req)?,
             stdin_open: flag(req, "stdin_open")?,
+            idempotency_key: opt_str(req, "idempotency_key")?.map(str::to_string),
         };
         let pgid = self
             .jobs()?
@@ -566,6 +567,7 @@ impl Driver {
             label: opt_str(req, "label")?.unwrap_or("").to_string(),
             env: env_arg(req)?,
             stdin_open: flag(req, "stdin_open")?,
+            idempotency_key: None,
         };
         let keep = flag(req, "keep")?;
         let beat = self.beat(req)?;

@@ -94,6 +94,7 @@ fn sh(cmd: &str) -> JobSpec {
         label: cmd.into(),
         env: Vec::new(),
         stdin_open: false,
+        idempotency_key: None,
     }
 }
 

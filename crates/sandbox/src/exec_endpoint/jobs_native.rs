@@ -284,6 +284,27 @@ impl<'a> NativeJobs<'a> {
     }
 }
 
+/// The start's idempotency key: the caller's, checked, else a fresh one (128 random bits). Taken once per start
+/// call, before the first send.
+fn start_key(spec: &JobSpec) -> std::io::Result<String> {
+    if let Some(k) = &spec.idempotency_key {
+        let ok = (1..=128).contains(&k.len())
+            && k.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'));
+        return if ok {
+            Ok(k.clone())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("bad idempotency key {k:?}: 1 to 128 characters of [0-9A-Za-z._:-]"),
+            ))
+        };
+    }
+    let mut b = [0u8; 16];
+    getrandom::fill(&mut b).map_err(|e| std::io::Error::other(format!("no randomness for the start key: {e}")))?;
+    Ok(hex::encode(b))
+}
+
 impl NativeJobs<'_> {
     /// [`SandboxJobs::run_held`] with a heartbeat of the request's choosing (whole seconds, 1 to
     /// 240: the `Keepalive-Ping-Interval` header). The stream is presumed dead after two beats and
@@ -302,6 +323,7 @@ impl NativeJobs<'_> {
             json!({
                 "id": id.as_str(), "hold": true, "label": spec.label,
                 "stdin_open": spec.stdin_open,
+                "idempotency_key": start_key(spec)?,
             }),
         );
         self.stream(
@@ -425,6 +447,7 @@ impl SandboxJobs for NativeJobs<'_> {
             json!({
                 "id": id.as_str(), "hold": false, "label": spec.label,
                 "stdin_open": spec.stdin_open,
+                "idempotency_key": start_key(spec)?,
             }),
         );
         let resp = self

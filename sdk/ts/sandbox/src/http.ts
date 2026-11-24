@@ -893,6 +893,9 @@ class HttpJobs implements JobOps {
         hold,
         label: spec.label ?? "",
         stdin_open: spec.stdinOpen === true,
+        ...(spec.idempotencyKey !== undefined
+          ? { idempotency_key: spec.idempotencyKey }
+          : {}),
       }),
       env: spec.env,
       heartbeatSeconds: req.heartbeatSeconds,

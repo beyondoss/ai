@@ -62,6 +62,27 @@ function validId(id: string): void {
   }
 }
 
+function validKey(key: string): void {
+  if (typeof key !== "string" || !/^[0-9A-Za-z._:-]{1,128}$/.test(key)) {
+    throw new InvalidRequestError(
+      `bad idempotency key ${JSON.stringify(key)}: 1 to 128 characters of [0-9A-Za-z._:-]`,
+    );
+  }
+}
+
+/** The spec with its idempotency key: the caller's, checked, else a fresh one (one per call, before the first send). */
+async function keyed(spec: JobSpec): Promise<JobSpec> {
+  if (spec.idempotencyKey !== undefined) {
+    validKey(spec.idempotencyKey);
+    return spec;
+  }
+  const c = (globalThis as { crypto?: Crypto }).crypto;
+  const key = c?.randomUUID
+    ? c.randomUUID()
+    : (await import("node:crypto")).randomUUID();
+  return { ...spec, idempotencyKey: key };
+}
+
 function count(name: string, v: number | undefined, dflt: number): number {
   if (v === undefined) return dflt;
   if (!Number.isInteger(v) || v < 0) {
@@ -84,7 +105,9 @@ export class Jobs {
 
   /**
    * Start a job the sandbox keeps from the start; returns its process group. An id that exists is
-   * {@link JobExistsError}; a full disk is {@link DiskFullError}.
+   * {@link JobExistsError}; a full disk is {@link DiskFullError}. The start carries an idempotency key
+   * (`spec.idempotencyKey`, or one generated for this call): sent again, it answers the same job and runs
+   * nothing, and the key of another command is {@link JobExistsError} too (`409`).
    */
   async start(
     scope: string,
@@ -94,7 +117,7 @@ export class Jobs {
   ): Promise<number> {
     validScope(scope);
     validId(id);
-    return this.transport.jobs.start(scope, id, spec, req);
+    return this.transport.jobs.start(scope, id, await keyed(spec), req);
   }
 
   /**
@@ -110,7 +133,7 @@ export class Jobs {
   ): AsyncGenerator<JobFrame> {
     validScope(scope);
     validId(id);
-    yield* this.transport.jobs.startHeld(scope, id, spec, req);
+    yield* this.transport.jobs.startHeld(scope, id, await keyed(spec), req);
   }
 
   /** Every job in the scope. */

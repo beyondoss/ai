@@ -101,7 +101,7 @@ naming one session's jobs; the harness sends a scope unique to the scenario.
 
 | op               | request                                                                                                           | result                                                                                                                                                                                               |
 | ---------------- | ----------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `job_start`      | `scope`, `job`, `command`, `args`, `cwd?`, `env?`, `stdin_open?`, `label?`                                        | `{pgid}`: the job is kept by the sandbox from the start                                                                                                                                              |
+| `job_start`      | `scope`, `job`, `command`, `args`, `cwd?`, `env?`, `stdin_open?`, `label?`, `idempotency_key?` | `{pgid}`: the job is kept by the sandbox from the start. `idempotency_key` (1 to 128 characters of `[0-9A-Za-z._:-]`): a start that repeats an earlier one's key and command answers that job's `pgid` and runs nothing; the key of another command is `conflict` (`job_exists`) |
 | `job_list`       | `scope`                                                                                                           | `{jobs: [{id, state, code, signal?, kept, num, kind, seen, started, ended, label}]}`                                                                                                                 |
 | `job_read`       | `scope`, `job`, `offset` (0), `max` (131072)                                                                      | `{state, code, signal?, offset, end, data_b64, stderr_ranges?}`                                                                                                                                      |
 | `job_attach`     | `scope`, `job`, `offset` (0)                                                                                      | `{exit_code \| signal, output_b64, stderr_b64?, gap}`: follows to the job's end, ending as `exec_stream` does (`signal` in place of `exit_code` for a shell a signal killed); `gap` is bytes dropped |
@@ -357,6 +357,7 @@ scenario whose point is something a driver's transport cannot show, however the 
 | `job_signal_op`    | `job_signal`                                                                                                             |
 | `job_errors`       | `error.code`: the typed job errors above                                                                                 |
 | `job_options`      | `job_start_held`, `job_keep`, `job_seen`, `grace_ms` on `job_kill` and `job_wipe`, `heartbeat_seconds`                   |
+| `job_start_key`    | `job_start`'s `idempotency_key`                                                                                          |
 
 A backend may define directories beyond `${ROOT}` and `${WORK}`, as variables:
 `${RO}` (a read-only mount holding one file, `existing`, with content `old`),

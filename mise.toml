@@ -94,6 +94,17 @@ for m in mut_offset_truncated mut_check_skipped mut_check_skips_a_byte mut_trail
 done
 '''
 
+[tasks."verify:start-key-mutants"]
+description = "crates/execd-jobs under each of the start key's seven mut_* features (K1-K8): every proof must go red (a Verus verification failure, not a build error). The execd tests (crates/execd/tests/startkey.rs) go red under the same features. Pairs with `verify:kernels`, which must be green without a feature."
+run = '''
+set -u
+for m in mut_key_replay_starts mut_key_digest_ignored mut_key_fresh_refused mut_unkeyed_replays mut_key_forgotten_on_restart mut_key_record_clears mut_key_take_forgets_none; do
+  out=$(KERNEL_CRATES=crates/execd-jobs .github/scripts/verify-kernels.sh --features "$m" 2>&1) && { echo "proof stayed green under $m" >&2; exit 1; }
+  line=$(grep -E "verification results:: .* [1-9][0-9]* errors" <<<"$out") || { echo "$m: failed without a Verus verification result (build error?)" >&2; exit 1; }
+  echo "red under $m: $line"
+done
+'''
+
 [tasks."test:notify-model-mutants"]
 description = "The notify model (crates/agent/tests/notify_model.rs) under each exec-notify kernel mutation: every run must go red, one property each: S7 (keep_keeps_in_flight, change_begins_in_flight), S9 (retry_unbounded), S10 (wake_early), S12 (stop_is_retried), S13 (answer_settles_all), S14 (change_not_owed). Pairs with `verify:kernels -- --features <mut>`."
 run = '''

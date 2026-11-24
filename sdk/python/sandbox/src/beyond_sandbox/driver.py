@@ -56,7 +56,7 @@ class _Unsupported(SandboxError):
 # raw stream, so it has all of them.
 FEATURES = [
     "frames", "unbounded_stream", "exit_signal", "exec_env", "job_streams", "job_stdin",
-    "job_signal_op", "job_errors", "job_options",
+    "job_signal_op", "job_errors", "job_options", "job_start_key",
 ]  # fmt: skip
 
 OPS = [
@@ -343,9 +343,18 @@ def _job_plan(op: str, req: dict[str, Any]) -> Plan:
         command, args = _str(req, "command"), _strings(req, "args")
         cwd, label = _opt_str(req, "cwd"), _opt_str(req, "label") or ""
         env, stdin_open = _env(req), _flag(req, "stdin_open")
+        key = _opt_str(req, "idempotency_key")
         return (
             lambda sb: sb.jobs.start(
-                scope, job, command, args, cwd=cwd, label=label, env=env, stdin_open=stdin_open
+                scope,
+                job,
+                command,
+                args,
+                cwd=cwd,
+                label=label,
+                env=env,
+                stdin_open=stdin_open,
+                idempotency_key=key,
             ),
             lambda pgid: {"pgid": pgid},
         )

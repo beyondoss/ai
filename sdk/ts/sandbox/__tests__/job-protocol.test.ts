@@ -115,6 +115,29 @@ describe("job ops over HTTP", () => {
     });
   });
 
+  it("sends an idempotency key: one per start call, the caller's when given, checked", async () => {
+    const { t, seen } = await jobs(() => [200, { started: 5 }]);
+    const jobsApi = new Jobs(t);
+    await jobsApi.start("s", "aa", { command: "true" });
+    await jobsApi.start("s", "ab", { command: "true" });
+    const [first, second] = seen.map((b) => b.job.idempotency_key);
+    expect(first).not.toEqual(second);
+    for (const k of [first, second]) {
+      expect(k).toMatch(/^[0-9A-Za-z._:-]{1,128}$/);
+    }
+    await jobsApi.start("s", "ac", {
+      command: "true",
+      idempotencyKey: "deploy-2026-11-24",
+    });
+    expect(seen[2].job.idempotency_key).toBe("deploy-2026-11-24");
+    for (const bad of ["", "a b", "k/1", "k".repeat(129)]) {
+      await expect(
+        jobsApi.start("s", "ad", { command: "true", idempotencyKey: bad }),
+      ).rejects.toMatchObject({ kind: "invalid_request" });
+    }
+    expect(seen).toHaveLength(3);
+  });
+
   it("kills a job whose stdin_open was ignored", async () => {
     const { t, seen } = await jobs((b) =>
       b.job.op === "start" ? [200, { started: 5 }] : [200, { survivors: [] }]

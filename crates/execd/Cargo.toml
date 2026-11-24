@@ -50,6 +50,27 @@ mut_ended_not_removable = [
 mut_stream_follows_key = [
   "beyond-execd-jobs/mut_stream_follows_key",
 ] # a stream goes on with whatever job holds its key now (J9)
+mut_key_replay_starts = [
+  "beyond-execd-jobs/mut_key_replay_starts",
+] # a start whose key already ran this command starts a second job (K1)
+mut_key_digest_ignored = [
+  "beyond-execd-jobs/mut_key_digest_ignored",
+] # a key used for another command is replayed, not refused (K2)
+mut_key_fresh_refused = [
+  "beyond-execd-jobs/mut_key_fresh_refused",
+] # a fresh key on a free id is refused (K3)
+mut_unkeyed_replays = [
+  "beyond-execd-jobs/mut_unkeyed_replays",
+] # a start with no key can replay a job (K4)
+mut_key_forgotten_on_restart = [
+  "beyond-execd-jobs/mut_key_forgotten_on_restart",
+] # a restart drops the key's record of a job it brings back (K6)
+mut_key_record_clears = [
+  "beyond-execd-jobs/mut_key_record_clears",
+] # writing one key's record drops every other record (K7)
+mut_key_take_forgets_none = [
+  "beyond-execd-jobs/mut_key_take_forgets_none",
+] # taking a job leaves its key's record behind (K8)
 mut_take_by_key = [
   "beyond-execd-jobs/mut_take_by_key",
 ]
@@ -214,6 +235,8 @@ rustix = { version = "1", default-features = false, features = ["std"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde.workspace = true
 serde_json.workspace = true
+# The digest of a keyed start's spec (`jobs::spec_digest`).
+sha2 = "0.10"
 # Not `workspace = true`: the workspace holds tokio below 1.54 for pingora (the gateway), a cap an
 # embedder of this crate should not inherit. 1.53.3 is the advisory floor (#506); caret, no ceiling.
 tokio = { version = "1.53.3", features = ["io-util", "macros", "net", "process", "rt", "rt-multi-thread", "signal", "sync", "time"] }

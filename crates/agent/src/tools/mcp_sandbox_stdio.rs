@@ -197,6 +197,7 @@ pub(crate) async fn connect(
         label: format!("mcp {name}"),
         env: Vec::new(),
         stdin_open: false,
+        idempotency_key: None,
     };
     store.start_kept(&scope, &id, &spec).await?;
 

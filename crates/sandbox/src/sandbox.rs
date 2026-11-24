@@ -64,6 +64,7 @@ impl Jobs {
                 label: String::new(),
                 env: Vec::new(),
                 stdin_open: false,
+                idempotency_key: None,
             },
         }
     }
@@ -95,6 +96,12 @@ impl StartJob<'_> {
     /// One-line label; newlines are replaced before it is written.
     pub fn label(mut self, label: impl Into<String>) -> Self {
         self.spec.label = label.into();
+        self
+    }
+
+    /// The start's idempotency key (see [`JobSpec::idempotency_key`]); omitted, one is generated for each `run`.
+    pub fn idempotency_key(mut self, key: impl Into<String>) -> Self {
+        self.spec.idempotency_key = Some(key.into());
         self
     }
 
