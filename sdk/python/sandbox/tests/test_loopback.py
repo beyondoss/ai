@@ -10,7 +10,19 @@ import asyncio
 import time
 from pathlib import Path
 
-from beyond_sandbox import AsyncSandbox, Exit, Sandbox, Signal, Stderr, Stdout
+import pytest
+
+from beyond_sandbox import (
+    AsyncSandbox,
+    Exit,
+    JobAttached,
+    JobGoneError,
+    JobRemoved,
+    Sandbox,
+    Signal,
+    Stderr,
+    Stdout,
+)
 
 
 def test_connect_probes(execd_url: str) -> None:
@@ -90,6 +102,35 @@ def test_jobs(execd_url: str) -> None:
     finally:
         sb.jobs.wipe(scope)
     assert sb.jobs.list(scope) == []
+
+
+def test_job_marks(execd_url: str) -> None:
+    sb = Sandbox.connect(execd_url)
+    scope = f"pytest{time.monotonic_ns()}"
+    try:
+        first = sb.jobs.start(scope, "m-1_a", "sh", ["-c", "printf hello"])
+        a = sb.jobs.collect(scope, "m-1_a", 3, mark=first.mark)
+        assert (a.attached, a.output) == (JobAttached(first.mark, 3), b"lo")
+        [j] = sb.jobs.list(scope)
+        assert (j.mark, j.command, j.args, j.output_end) == (
+            first.mark,
+            "sh",
+            ("-c", "printf hello"),
+            5,
+        )
+        assert sb.jobs.remove(scope, ["m-1_a"], marks={"m-1_a": first.mark}) == JobRemoved((), ())
+        second = sb.jobs.start(scope, "m-1_a", "sleep", ["30"])
+        assert second.mark != first.mark
+        with pytest.raises(JobGoneError):
+            sb.jobs.collect(scope, "m-1_a", mark=first.mark)
+        got = sb.jobs.remove(scope, ["m-1_a"], marks={"m-1_a": first.mark})
+        assert got == JobRemoved((), ("m-1_a",))
+        assert sb.jobs.remove(scope, ["m-1_a"]).running == ("m-1_a",)
+        quiet = sb.jobs.start(scope, "q1", "sh", ["-c", "printf hi; sleep 0.3; printf later"])
+        s = sb.jobs.collect(scope, "q1", mark=quiet.mark, output=False)
+        assert (s.output, s.attached is not None and s.attached.from_offset >= 0) == (b"", True)
+    finally:
+        sb.jobs.wipe(scope)
 
 
 def test_async_sandbox(execd_url: str, tmp_path: Path) -> None:

@@ -64,6 +64,13 @@ const IDS: [&str; 9] = [
     "LONG",
 ];
 
+/// The ids a start accepts: 1 to 64 characters of `[0-9a-z_-]`; any other is a 400 that starts nothing.
+fn id_ok(s: &str) -> bool {
+    (1..=64).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase() || b == b'-' || b == b'_')
+}
+
 fn id(i: usize) -> String {
     if IDS[i] == "LONG" {
         "x".repeat(4096)
@@ -726,7 +733,7 @@ impl World {
                 self.scopes.insert(*s);
                 let a = self.op(*s, json!({ "op": "remove", "ids": ids.iter().map(|i| id(*i)).collect::<Vec<_>>() })).await;
                 ensure!(
-                    a.status == 200 && a.json() == json!({}),
+                    a.status == 200 && a.json()["mismatch"] == json!([]),
                     "remove: {} {}",
                     a.status,
                     a.json()
@@ -800,6 +807,18 @@ impl World {
         let held = hold != Hold::No;
         let mut body = json!({ "command": "sh", "args": ["-c", script], "cwd": self.dir(),
             "job": { "op": "start", "scope": SCOPES[s], "id": id(i), "hold": held, "label": label } });
+        if !id_ok(&id(i)) {
+            let a = self.post_raw(&body).await;
+            ensure!(
+                a.status == 400,
+                "a start of a bad id answered {} {}",
+                a.status,
+                a.json()
+            );
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            ensure!(!pids.exists(), "a start of a bad id ran its command");
+            return Ok(());
+        }
         let mut stream = None;
         if held {
             body["stream"] = json!(true);
@@ -1061,7 +1080,12 @@ impl World {
                 f.get("error").is_none(),
                 "an attach of a live job reported an error: {f}"
             );
-            if let Some(b) = f["stdout"].as_str() {
+            if let Some(a) = f.get("attached") {
+                ensure!(
+                    a["from"] == off && a["mark"].as_str().is_some_and(|m| !m.is_empty()),
+                    "attached {a} for offset {off}"
+                );
+            } else if let Some(b) = f["stdout"].as_str() {
                 out.extend(base64::engine::general_purpose::STANDARD.decode(b).unwrap());
             } else if f.get("exit_code").is_some() || f.get("signal").is_some() {
                 finals.push(f);
@@ -1184,6 +1208,14 @@ impl World {
                 "cwd": self.dir(),
                 "job": { "op": "start", "scope": SCOPES[s], "id": id(i), "hold": false, "label": label } });
             tries.push((label, pids, gate, body));
+        }
+        if !id_ok(&id(i)) {
+            for (_, pids, _, body) in &tries {
+                let a = self.post_raw(body).await;
+                ensure!(a.status == 400, "a start of a bad id answered {}", a.status);
+                ensure!(!pids.exists(), "a start of a bad id ran its command");
+            }
+            return Ok(());
         }
         let mut set = tokio::task::JoinSet::new();
         for (k, (_, _, _, body)) in tries.iter().enumerate() {

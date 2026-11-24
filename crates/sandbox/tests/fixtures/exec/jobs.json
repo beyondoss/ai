@@ -9,7 +9,7 @@
     {
       "name": "a held start: started, output, end",
       "lines": [
-        "{\"started\":4242}",
+        "{\"started\":4242,\"mark\":\"m1\"}",
         "{\"stdout\":\"aGVsbG8K\"}",
         "{}",
         "{\"stderr\":\"b29wcwo=\"}",
@@ -20,7 +20,8 @@
         "output_base64": "aGVsbG8Kb29wcwo=",
         "gap": 0,
         "shell_exits": [],
-        "end": 3
+        "end": 3,
+        "mark": "m1"
       }
     },
     {
@@ -103,6 +104,23 @@
         "end": 0,
         "stdin": true,
         "streams": "oeo"
+      }
+    },
+    {
+      "name": "an attach: attached first, then output and the end",
+      "lines": [
+        "{\"attached\":{\"mark\":\"m1\",\"from\":5}}",
+        "{\"stdout\":\"aGVsbG8K\"}",
+        "{\"exit_code\":0}"
+      ],
+      "expect": {
+        "started": null,
+        "mark": "m1",
+        "from": 5,
+        "output_base64": "aGVsbG8K",
+        "gap": 0,
+        "shell_exits": [],
+        "end": 0
       }
     }
   ],
@@ -191,7 +209,15 @@
             "signal": 9,
             "kept": true,
             "ended": 5,
-            "label": "killed"
+            "label": "killed",
+            "mark": "m0",
+            "command": "sh",
+            "args": [
+              "-c",
+              "true"
+            ],
+            "outputStart": 0,
+            "outputEnd": 10
           },
           {
             "id": "bb",
@@ -199,7 +225,15 @@
             "code": 137,
             "kept": true,
             "ended": 6,
-            "label": "exited"
+            "label": "exited",
+            "mark": "m1",
+            "command": "sh",
+            "args": [
+              "-c",
+              "true"
+            ],
+            "outputStart": 1,
+            "outputEnd": 11
           },
           {
             "id": "cc",
@@ -208,7 +242,15 @@
             "signal": 9,
             "kept": true,
             "ended": 0,
-            "label": "running"
+            "label": "running",
+            "mark": "m2",
+            "command": "sh",
+            "args": [
+              "-c",
+              "true"
+            ],
+            "outputStart": 2,
+            "outputEnd": 12
           }
         ]
       },
@@ -224,7 +266,15 @@
             "kind": null,
             "seen": 0,
             "ended": 5,
-            "label": "killed"
+            "label": "killed",
+            "mark": "m0",
+            "command": "sh",
+            "args": [
+              "-c",
+              "true"
+            ],
+            "output_start": 0,
+            "output_end": 10
           },
           {
             "id": "bb",
@@ -236,7 +286,15 @@
             "kind": null,
             "seen": 0,
             "ended": 6,
-            "label": "exited"
+            "label": "exited",
+            "mark": "m1",
+            "command": "sh",
+            "args": [
+              "-c",
+              "true"
+            ],
+            "output_start": 1,
+            "output_end": 11
           },
           {
             "id": "cc",
@@ -248,7 +306,15 @@
             "kind": null,
             "seen": 0,
             "ended": 0,
-            "label": "running"
+            "label": "running",
+            "mark": "m2",
+            "command": "sh",
+            "args": [
+              "-c",
+              "true"
+            ],
+            "output_start": 2,
+            "output_end": 12
           }
         ]
       }
@@ -283,7 +349,15 @@
             "seen": 17,
             "started": 1700000000,
             "ended": 0,
-            "label": "npm run dev"
+            "label": "npm run dev",
+            "mark": "m0",
+            "command": "sh",
+            "args": [
+              "-c",
+              "true"
+            ],
+            "outputStart": 0,
+            "outputEnd": 10
           },
           {
             "id": "00ff",
@@ -295,13 +369,29 @@
             "seen": 0,
             "started": 1700000000,
             "ended": 1700000009,
-            "label": "make"
+            "label": "make",
+            "mark": "m1",
+            "command": "sh",
+            "args": [
+              "-c",
+              "true"
+            ],
+            "outputStart": 1,
+            "outputEnd": 11
           },
           {
             "id": "../escape",
             "state": "running",
             "kept": true,
-            "label": "never followed"
+            "label": "never followed",
+            "mark": "m2",
+            "command": "sh",
+            "args": [
+              "-c",
+              "true"
+            ],
+            "outputStart": 2,
+            "outputEnd": 12
           }
         ]
       },
@@ -316,7 +406,15 @@
             "kind": "background",
             "seen": 17,
             "ended": 0,
-            "label": "npm run dev"
+            "label": "npm run dev",
+            "mark": "m0",
+            "command": "sh",
+            "args": [
+              "-c",
+              "true"
+            ],
+            "output_start": 0,
+            "output_end": 10
           },
           {
             "id": "00ff",
@@ -327,7 +425,15 @@
             "kind": null,
             "seen": 0,
             "ended": 1700000009,
-            "label": "make"
+            "label": "make",
+            "mark": "m1",
+            "command": "sh",
+            "args": [
+              "-c",
+              "true"
+            ],
+            "output_start": 1,
+            "output_end": 11
           }
         ]
       }

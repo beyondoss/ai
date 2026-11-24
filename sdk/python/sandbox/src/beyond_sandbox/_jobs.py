@@ -25,7 +25,7 @@ from .errors import (
     StdinClosedError,
     StdinGapError,
 )
-from .models import JobEnd, JobInfo, JobRead, StdinWritten, Survivor
+from .models import JobEnd, JobInfo, JobRead, JobRemoved, JobStart, StdinWritten, Survivor
 
 #: The most one ``read`` returns by default: its base64 fits the smallest answer a runner keeps whole.
 READ_MAX = 128 * 1024
@@ -42,7 +42,7 @@ _SCOPE = re.compile(r"[0-9a-z-]{1,64}")
 
 def check_id(job: str) -> str:
     if not _JOB_ID.fullmatch(job):
-        raise InvalidRequestError(f"bad job id {job!r}: 1 to 32 characters of [0-9a-z]")
+        raise InvalidRequestError(f"bad job id {job!r}: 1 to 64 characters of [0-9a-z_-]")
     return job
 
 
@@ -105,7 +105,7 @@ def start(
     env: dict[str, str] | None = None,
     stdin_open: bool = False,
     heartbeat_seconds: int | None = None,
-) -> Op[int]:
+) -> Op[JobStart]:
     check_scope(scope)
     check_id(job)
     try:
@@ -127,7 +127,10 @@ def start(
         with contextlib.suppress(SandboxError):
             yield Call(_wire.job_op("kill", scope, ids=[job], remove=True, grace_ms=KILL_GRACE_MS))
         raise NotOfferedError("the endpoint predates job stdin: it ran the job without it")
-    return pgid
+    mark = v.get("mark")
+    if not isinstance(mark, str) or not mark:
+        raise NotOfferedError("the endpoint predates the job mark: its start did not name one")
+    return JobStart(pgid, mark)
 
 
 def start_held(
@@ -173,20 +176,37 @@ def read(scope: str, job: str, offset: int = 0, max_bytes: int = READ_MAX) -> Op
 
 
 def follow(
-    scope: str, job: str, offset: int = 0, heartbeat_seconds: int | None = None
+    scope: str,
+    job: str,
+    offset: int = 0,
+    heartbeat_seconds: int | None = None,
+    mark: str | None = None,
+    output: bool = True,
 ) -> Op[JobEnd]:
-    """Emits the job's events; returns how it ended. A job that does not exist is
-    :class:`~beyond_sandbox.JobGoneError`."""
+    """Emits the job's events, the first a :class:`~beyond_sandbox.JobAttached`; returns how it
+    ended. A job that does not exist, or whose mark is not ``mark``, is
+    :class:`~beyond_sandbox.JobGoneError`. ``output=False`` follows to the end without any output."""
     check_scope(scope)
     check_id(job)
     try:
         end: JobEnd = yield Follow(
-            _wire.job_op("attach", scope, id=job, offset=offset),
+            _wire.job_op("attach", scope, id=job, offset=offset, **_attach_fields(mark, output)),
             heartbeat_seconds=heartbeat_seconds,
         )
     except SandboxError as e:
         raise _gone_failure(e, job) from None
     return end
+
+
+def _attach_fields(mark: str | None, output: bool) -> dict[str, Any]:
+    fields: dict[str, Any] = {}
+    if mark is not None:
+        if not isinstance(mark, str) or not mark:
+            raise InvalidRequestError("`mark` must be a non-empty string")
+        fields["mark"] = mark
+    if not output:
+        fields["output"] = False
+    return fields
 
 
 def keep(
@@ -251,12 +271,22 @@ def kill(
     return [s for s in _wire.parse_survivors(v) if s.id is not None and _JOB_ID.fullmatch(s.id)]
 
 
-def remove(scope: str, ids: Sequence[str]) -> Op[None]:
+def remove(scope: str, ids: Sequence[str], marks: dict[str, str] | None = None) -> Op[JobRemoved]:
+    """Delete jobs whose group is empty. A running job is left and reported in ``running``; a job
+    whose mark is not the one ``marks`` names for its id is left and reported in ``mismatch``."""
     check_scope(scope)
     for i in ids:
         check_id(i)
-    if ids:
-        yield Call(_wire.job_op("remove", scope, ids=list(ids)))
+    fields: dict[str, Any] = {}
+    if marks:
+        for i, m in marks.items():
+            check_id(i)
+            if not isinstance(m, str) or not m:
+                raise InvalidRequestError("a mark must be a non-empty string")
+        fields["marks"] = dict(marks)
+    if not ids:
+        return JobRemoved((), ())
+    return _wire.parse_removed((yield Call(_wire.job_op("remove", scope, ids=list(ids), **fields))))
 
 
 def wipe(scope: str, grace_ms: int = KILL_GRACE_MS) -> Op[list[Survivor]]:

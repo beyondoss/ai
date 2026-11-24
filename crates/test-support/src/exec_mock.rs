@@ -1010,6 +1010,10 @@ async fn serve_stream(sock: tokio::net::TcpStream, req: Value, shared: Shared) {
 /// One job, as the endpoint keeps it.
 struct MockJob {
     pgid: u32,
+    /// Names this incarnation of the id.
+    mark: String,
+    command: String,
+    args: Vec<String>,
     label: String,
     started: u64,
     ended: u64,
@@ -1050,6 +1054,13 @@ impl Jobs {
     fn bump(&self) {
         self.changed.send_modify(|v| *v = v.wrapping_add(1));
     }
+}
+
+/// A mark no earlier incarnation of any id has had.
+fn fresh_mark(pgid: u32) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    format!("{pgid:x}-{:x}", N.fetch_add(1, Ordering::Relaxed))
 }
 
 fn epoch() -> u64 {
@@ -1160,8 +1171,22 @@ async fn serve_job(sock: tokio::net::TcpStream, req: Value, shared: Shared) {
             if !jobs.map.lock().unwrap().contains_key(&key(&id)) {
                 return respond_json(sock, 404, &json!({ "error": "no such job" })).await;
             }
-            let offset = job["offset"].as_u64().unwrap_or(0);
-            let _ = stream_job(sock, shared, key(&id), offset, false, None).await;
+            let quiet = job["output"].as_bool() == Some(false);
+            let (mark, end) = {
+                let map = jobs.map.lock().unwrap();
+                let j = &map[&key(&id)];
+                (j.mark.clone(), j.base + j.out.len() as u64)
+            };
+            if job["mark"].as_str().is_some_and(|m| m != mark) {
+                return respond_json(sock, 404, &json!({ "error": "no such job" })).await;
+            }
+            let from = if quiet {
+                end
+            } else {
+                job["offset"].as_u64().unwrap_or(0)
+            };
+            let head = json!({ "attached": { "mark": mark, "from": from } });
+            let _ = stream_job(sock, shared, key(&id), from, false, Some(head), quiet).await;
         }
         "read" => {
             let id = job["id"].as_str().unwrap_or("");
@@ -1300,13 +1325,33 @@ async fn serve_job(sock: tokio::net::TcpStream, req: Value, shared: Shared) {
             respond_json(sock, 200, &json!({ "survivors": survivors })).await;
         }
         "remove" => {
+            let marks = job["marks"].as_object();
+            let (mut running, mut mismatch) = (Vec::new(), Vec::new());
             jobs.map.lock().unwrap().retain(|(sc, id), j| {
-                !(*sc == scope
-                    && ids.contains(id)
-                    && (j.end.is_some() || members(j.pgid).is_empty()))
+                if *sc != scope || !ids.contains(id) {
+                    return true;
+                }
+                if marks
+                    .and_then(|m| m.get(id))
+                    .and_then(Value::as_str)
+                    .is_some_and(|m| m != j.mark)
+                {
+                    mismatch.push(id.clone());
+                    return true;
+                }
+                if j.end.is_some() || members(j.pgid).is_empty() {
+                    return false;
+                }
+                running.push(id.clone());
+                true
             });
             jobs.bump();
-            respond_json(sock, 200, &json!({})).await;
+            respond_json(
+                sock,
+                200,
+                &json!({ "running": running, "mismatch": mismatch }),
+            )
+            .await;
         }
         "list" => {
             let list: Vec<Value> = jobs
@@ -1319,6 +1364,11 @@ async fn serve_job(sock: tokio::net::TcpStream, req: Value, shared: Shared) {
                     let (state, code) = state_of(j);
                     let mut entry = json!({
                         "id": id,
+                        "mark": j.mark,
+                        "command": j.command,
+                        "args": j.args,
+                        "outputStart": j.base,
+                        "outputEnd": j.base + j.out.len() as u64,
                         "state": state,
                         "code": code,
                         "kept": j.kept,
@@ -1368,10 +1418,14 @@ async fn start_job(sock: tokio::net::TcpStream, req: Value, shared: Shared) {
         Err(e) => return respond_json(sock, 500, &json!({ "error": e.to_string() })).await,
     };
     let pgid = child.id().unwrap_or(0);
+    let mark = fresh_mark(pgid);
     shared.jobs.map.lock().unwrap().insert(
         key.clone(),
         MockJob {
             pgid,
+            mark: mark.clone(),
+            command: req["command"].as_str().unwrap_or("").to_string(),
+            args: args_of(&req),
             label: job["label"].as_str().unwrap_or("").to_string(),
             started: epoch(),
             ended: 0,
@@ -1472,10 +1526,11 @@ async fn start_job(sock: tokio::net::TcpStream, req: Value, shared: Shared) {
             });
             streams.len() - 1
         };
-        let end = stream_job(sock, shared.clone(), key, 0, true, Some(pgid)).await;
+        let head = json!({ "started": pgid, "mark": mark });
+        let end = stream_job(sock, shared.clone(), key, 0, true, Some(head), false).await;
         shared.streams.lock().unwrap()[index].end = Some((end, Instant::now()));
     } else {
-        respond_json(sock, 200, &json!({ "started": pgid })).await;
+        respond_json(sock, 200, &json!({ "started": pgid, "mark": mark })).await;
     }
 }
 
@@ -1487,16 +1542,14 @@ async fn stream_job(
     key: (String, String),
     offset: u64,
     hold: bool,
-    started: Option<u32>,
+    first: Option<Value>,
+    quiet: bool,
 ) -> StreamEnd {
     let (mut rd, mut wr) = sock.into_split();
     let head = "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nTransfer-Encoding: chunked\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n";
     let mut gone = wr.write_all(head.as_bytes()).await.is_err();
-    if let (false, Some(pgid)) = (gone, started) {
-        gone = wr
-            .write_all(&chunk(&json!({ "started": pgid })))
-            .await
-            .is_err();
+    if let (false, Some(first)) = (gone, first) {
+        gone = wr.write_all(&chunk(&first)).await.is_err();
     }
     let mut changed = shared.jobs.changed.subscribe();
     let mut sent = offset;
@@ -1516,6 +1569,9 @@ async fn stream_job(
                 None => Next::Missing,
                 Some(j) => {
                     let total = j.base + j.out.len() as u64;
+                    if quiet {
+                        sent = total;
+                    }
                     if sent < j.base {
                         let n = j.base - sent;
                         sent = j.base;

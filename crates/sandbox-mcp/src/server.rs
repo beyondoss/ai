@@ -274,7 +274,7 @@ pub struct JobStartArgs {
     cwd: Opt<String>,
     /// A short note shown in `job_list`.
     label: Opt<String>,
-    /// The job's id: 1 to 32 characters of [0-9a-z]. Default: a random one, returned.
+    /// The job's id: 1 to 64 characters of [0-9a-z_-]. Default: a random one, returned.
     id: Opt<String>,
     /// The group the job belongs to. Default: this server's.
     scope: Opt<String>,
@@ -1099,8 +1099,8 @@ impl SandboxMcp {
             stdin_open: a.stdin_open.unwrap_or(false),
         };
         let t = self.target().await?;
-        let pgid = t.sandbox.jobs()?.start_kept(&scope, &id, &spec).await?;
-        Ok(json!({ "id": id.as_str(), "scope": scope.name(), "pgid": pgid }))
+        let st = t.sandbox.jobs()?.start_kept(&scope, &id, &spec).await?;
+        Ok(json!({ "id": id.as_str(), "scope": scope.name(), "pgid": st.pgid, "mark": st.mark }))
     }
 
     async fn do_job_list(&self, a: JobListArgs) -> Out {
@@ -1112,7 +1112,8 @@ impl SandboxMcp {
             .map(|j| {
                 let (state, code) = state_of(j.status);
                 let mut entry = json!({
-                    "id": j.id.as_str(), "state": state, "code": code, "kept": j.kept,
+                    "id": j.id.as_str(), "mark": j.mark, "command": j.command, "args": j.args,
+                    "output_start": j.output_start, "output_end": j.output_end, "state": state, "code": code, "kept": j.kept,
                     "num": j.num, "kind": j.kind, "seen": j.seen,
                     "started": j.started, "ended": j.ended, "label": j.label,
                 });

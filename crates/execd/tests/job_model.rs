@@ -54,7 +54,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use execd::job_kernel::{self as kernel, Act, Admit, Alive, Ev, Follow, Key, Phase, Pick, State};
+use execd::job_kernel::{
+    self as kernel, Act, Admit, Alive, Attach, Ev, Follow, Key, Phase, Pick, Removal, State,
+};
 use stateright::{Checker, Model, Property};
 
 const V_J1: u32 = 1;
@@ -66,6 +68,9 @@ const V_J7: u32 = 32;
 const V_J8: u32 = 64;
 const V_J9: u32 = 128;
 const V_J10: u32 = 256;
+const V_M1: u32 = 512;
+const V_M3: u32 = 1024;
+const V_M7: u32 = 2048;
 
 fn key(scope: u8, id: u8) -> Key {
     (format!("S{scope}"), format!("i{id}"))
@@ -107,6 +112,8 @@ struct Sim {
     /// What the job's end was when the supervisor recorded it: `(code, signal, end offset)`.
     snap: Option<(i32, Option<i32>, u8)>,
     was_kept: bool,
+    /// The incarnation's mark: one per job, so two jobs of one id never share it.
+    mark: String,
 }
 
 impl Sim {
@@ -134,6 +141,8 @@ struct Client {
     hold: bool,
     sent: u8,
     told: bool,
+    /// The stream carries output (`false`: a status-only attach).
+    output: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -184,6 +193,8 @@ enum A {
         scope: u8,
     },
     Remove(u8, u8),
+    /// `remove` naming the mark of job `target` (an incarnation of the id, maybe an earlier one).
+    MarkedRemove(u8, u8, usize),
     /// `remove` that decides now and takes later (`TakePending`).
     SlowRemove(u8, u8),
     /// `wipe` that decides now and takes later.
@@ -196,6 +207,9 @@ enum A {
         client: usize,
         scope: u8,
         id: u8,
+        /// The incarnation the attach names, as a job's handle.
+        mark: Option<usize>,
+        output: bool,
     },
     Follow(usize),
     Disconnect(usize),
@@ -214,6 +228,8 @@ struct Jobs {
     max_end: u8,
     /// `remove` and `wipe` may decide and take as two steps (the shell awaits the group between).
     slow: bool,
+    /// Attach and remove may name a mark, and an attach may be status-only.
+    marks: bool,
 }
 
 /// One scope, one id, two jobs: a key is reused after a removal.
@@ -224,6 +240,7 @@ const REUSE: Jobs = Jobs {
     clients: 1,
     max_end: 1,
     slow: false,
+    marks: true,
 };
 /// One scope, one id, two jobs, no streams: a `remove`/`wipe` decides, other clients remove and
 /// restart the id, then it takes (J10).
@@ -234,6 +251,7 @@ const SLOW: Jobs = Jobs {
     clients: 0,
     max_end: 0,
     slow: true,
+    marks: false,
 };
 /// Two scopes that both use one id (no ring: the ring is REUSE's and STREAMS').
 const SCOPES: Jobs = Jobs {
@@ -243,6 +261,7 @@ const SCOPES: Jobs = Jobs {
     clients: 1,
     max_end: 0,
     slow: false,
+    marks: false,
 };
 /// One scope, two ids: `kill` of one id leaves the other (no streams, no ring).
 const IDS: Jobs = Jobs {
@@ -252,6 +271,7 @@ const IDS: Jobs = Jobs {
     clients: 0,
     max_end: 0,
     slow: false,
+    marks: false,
 };
 /// One job, two clients, two bytes: streams and the ring (a gap, an eviction under a reader).
 const STREAMS: Jobs = Jobs {
@@ -261,6 +281,7 @@ const STREAMS: Jobs = Jobs {
     clients: 2,
     max_end: 2,
     slow: false,
+    marks: true,
 };
 
 impl St {
@@ -370,9 +391,11 @@ impl St {
             None => Some((None, Follow::Wait)),
             Some(h) => {
                 let sim = &self.sims[h];
+                // A status-only stream is never behind the ring's end (M7).
+                let sent = kernel::quiet_from(cl.output, u64::from(cl.sent), u64::from(sim.end));
                 let f = kernel::follow(
                     &sim.k,
-                    u64::from(cl.sent),
+                    sent,
                     u64::from(sim.base),
                     u64::from(sim.end),
                     cl.told,
@@ -405,6 +428,7 @@ impl Model for Jobs {
                     hold: false,
                     sent: 0,
                     told: false,
+                    output: true,
                 };
                 self.clients
             ],
@@ -471,9 +495,33 @@ impl Model for Jobs {
                 for remove in [false, true] {
                     out.push(A::Kill { scope, id, remove });
                 }
+                if self.marks {
+                    for target in 0..self.max_jobs {
+                        out.push(A::MarkedRemove(scope, id, target));
+                    }
+                }
                 for client in 0..self.clients {
                     if s.clients[client].st == Cl::Idle {
-                        out.push(A::Attach { client, scope, id });
+                        let marks: Vec<Option<usize>> = if self.marks {
+                            std::iter::once(None)
+                                .chain((0..self.max_jobs).map(Some))
+                                .collect()
+                        } else {
+                            vec![None]
+                        };
+                        for mark in marks {
+                            for output in [true, false] {
+                                if output || self.marks {
+                                    out.push(A::Attach {
+                                        client,
+                                        scope,
+                                        id,
+                                        mark,
+                                        output,
+                                    });
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -527,6 +575,7 @@ impl Model for Jobs {
                     end: 0,
                     snap: None,
                     was_kept: client.is_none(),
+                    mark: format!("m{h}"),
                 });
                 s.table.insert(k, h);
                 if let Some(c) = client {
@@ -538,6 +587,7 @@ impl Model for Jobs {
                         hold: true,
                         sent: 0,
                         told: false,
+                        output: true,
                     };
                 }
             }
@@ -673,17 +723,72 @@ impl Model for Jobs {
                 }
                 s.finish(gone, slow);
             }
-            A::Attach { client, scope, id } => {
+            A::MarkedRemove(scope, id, target) => {
+                let ids = [format!("i{id}")];
+                let named = s.table.in_scope(&scope_name(scope), Pick::Ids(&ids));
+                let want = Some(s.sims.get(target)?.mark.clone());
+                let mut gone = Vec::new();
+                for (k, h) in named {
+                    s.resolved(scope, h);
+                    let ok = kernel::mark_ok(&want, &s.sims[h].mark);
+                    let take = s.removable(h, true);
+                    match kernel::removal(ok, take) {
+                        Removal::Take => {
+                            // M1: a remove naming a mark takes only that incarnation.
+                            if h != target {
+                                s.bad |= V_M1;
+                            }
+                            gone.push((k, h));
+                        }
+                        // M3: the job named has not ended (running, or spawning): a remove cannot take it yet.
+                        Removal::Running => {
+                            if h != target || s.sims[h].k.ended() {
+                                s.bad |= V_M3;
+                            }
+                        }
+                        // M3: a mismatch is reported only for another incarnation.
+                        Removal::Mismatch => {
+                            if h == target {
+                                s.bad |= V_M3;
+                            }
+                        }
+                    }
+                }
+                s.finish(gone, false);
+            }
+            A::Attach {
+                client,
+                scope,
+                id,
+                mark,
+                output,
+            } => {
                 let h = s.table.get(&key(scope, id))?;
                 s.resolved(scope, h);
+                let want = match mark {
+                    Some(t) => Some(s.sims.get(t)?.mark.clone()),
+                    None => None,
+                };
+                let ok = kernel::mark_ok(&want, &s.sims[h].mark);
+                // A refused attach is the shell's 404: no stream.
+                let Attach::Stream { from } =
+                    kernel::attach_plan(ok, output, 0, u64::from(s.sims[h].end))
+                else {
+                    return None;
+                };
+                // M1: an attach naming a mark streams only that incarnation.
+                if mark.is_some_and(|t| t != h) {
+                    s.bad |= V_M1;
+                }
                 s.clients[client] = Client {
                     st: Cl::Following,
                     scope,
                     id,
                     job: h,
                     hold: false,
-                    sent: 0,
+                    sent: u8::try_from(from).unwrap_or(u8::MAX),
                     told: false,
+                    output,
                 };
             }
             A::Follow(c) => {
@@ -703,6 +808,17 @@ impl Model for Jobs {
                 }
                 let (base, end) = (s.sims[h].base, s.sims[h].end);
                 let cl = &mut s.clients[c];
+                // The stream's position after the kernel's `quiet_from`, as the shell sets it.
+                cl.sent = u8::try_from(kernel::quiet_from(
+                    cl.output,
+                    u64::from(cl.sent),
+                    u64::from(end),
+                ))
+                .unwrap_or(u8::MAX);
+                // M7: a status-only stream sends no bytes and no gap.
+                if !cl.output && matches!(f, Follow::Data | Follow::Gap(_)) {
+                    s.bad |= V_M7;
+                }
                 match f {
                     Follow::Gap(n) => {
                         // A gap is exactly the bytes dropped before the ring's start.
@@ -806,6 +922,18 @@ impl Model for Jobs {
             Property::always("J8: no signal reaches an ended job", |_, s: &St| {
                 s.bad & V_J8 == 0
             }),
+            Property::always(
+                "M1: a request naming a mark never reaches another incarnation",
+                |_, s: &St| s.bad & V_M1 == 0,
+            ),
+            Property::always(
+                "M3: remove reports a running job as running and a mismatch as one",
+                |_, s: &St| s.bad & V_M3 == 0,
+            ),
+            Property::always(
+                "M7: a status-only stream sends no bytes and no gap",
+                |_, s: &St| s.bad & V_M7 == 0,
+            ),
             Property::always("L1: an ended job can always be removed", |_, s: &St| {
                 s.table.all().iter().all(|(_, h)| {
                     let mut k = s.sims[*h].k.clone();
@@ -830,13 +958,15 @@ impl Model for Jobs {
                             return true;
                         };
                         let sim = &s.sims[h];
+                        let sent =
+                            kernel::quiet_from(cl.output, u64::from(cl.sent), u64::from(sim.end));
                         // Everything sent, the shell's exit told (or never owed): the end is next.
                         !(sim.k.ended()
-                            && cl.sent >= sim.end
+                            && sent >= u64::from(sim.end)
                             && (cl.told || sim.k.shell_code().is_none())
                             && kernel::follow(
                                 &sim.k,
-                                u64::from(cl.sent),
+                                sent,
                                 u64::from(sim.base),
                                 u64::from(sim.end),
                                 cl.told,
@@ -1015,7 +1145,12 @@ fn ended_is_final() {
     feature = "mut_signal_ended",
     feature = "mut_ended_not_removable",
     feature = "mut_take_by_key",
-    feature = "mut_follow_waits_after_end"
+    feature = "mut_follow_waits_after_end",
+    feature = "mut_mark_ignored",
+    feature = "mut_remove_ignores_mark",
+    feature = "mut_attach_ignores_mark",
+    feature = "mut_running_unreported",
+    feature = "mut_status_only_streams"
 ))]
 #[test]
 fn the_mutation_turns_its_property_red() {
@@ -1043,6 +1178,16 @@ fn the_mutation_turns_its_property_red() {
         "J10: "
     } else if cfg!(feature = "mut_ended_not_removable") {
         "L1: "
+    } else if cfg!(any(
+        feature = "mut_mark_ignored",
+        feature = "mut_remove_ignores_mark",
+        feature = "mut_attach_ignores_mark"
+    )) {
+        "M1: "
+    } else if cfg!(feature = "mut_running_unreported") {
+        "M3: "
+    } else if cfg!(feature = "mut_status_only_streams") {
+        "M7: "
     } else {
         "L2: "
     };
@@ -1108,6 +1253,11 @@ fn production_calls_the_kernel() {
         "kernel::spool_root(",
         "kernel::bound(",
         "kernel::follow(",
+        "kernel::mark_ok(",
+        "kernel::removal(",
+        "kernel::attach_plan(",
+        "kernel::quiet_from(",
+        "kernel::id_ok(",
         "kernel::stdin_plan(",
         "kernel::admit_waiter(",
         "kernel::advance(",
