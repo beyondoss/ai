@@ -125,6 +125,18 @@ mut_stdin_waiter_stuck = [
 mut_stdin_waits_at_written = [
   "beyond-execd-jobs/mut_stdin_waits_at_written",
 ] # a write exactly at `written` waits for bytes that never come (W5-live, progress)
+mut_stdin_wait_sticks = [
+  "beyond-execd-jobs/mut_stdin_wait_sticks",
+] # a write keeps waiting after the gap filled (W5-live, progress lemma)
+mut_stdin_written_shrinks = [
+  "beyond-execd-jobs/mut_stdin_written_shrinks",
+] # `written` is set to the last write's size, so it can fall (W2b)
+mut_stdin_apply_off_start = [
+  "beyond-execd-jobs/mut_stdin_apply_off_start",
+] # an apply skips one byte more than was applied, so it starts past `written` (W2c)
+mut_stdin_closes_early = [
+  "beyond-execd-jobs/mut_stdin_closes_early",
+] # EOF closes the stdin before every byte of the write landed (W4)
 # Mutations of `ring` (the crate `execd-ring`, which Verus proves), used only by `src/ring.rs`'s differential
 # test's red runs: each removes one guard.
 mut_window_before_base = [

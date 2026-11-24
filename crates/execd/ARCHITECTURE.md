@@ -159,7 +159,7 @@ never span a change of stream. Arrival order between the two files is the order 
 the answer echoes `stdin: true`. The job holds a `JobStdin`: the pipe behind an async (FIFO) mutex, `written` (a `watch`), a
 cancel token and a waiter count. `write` is positional (`at`): bytes below `written` are skipped, a write ahead waits on the
 `watch` without holding the pipe (so the write that fills the gap can run), then applies under the mutex, advancing `written`
-after every `write(2)`. So writes are ordered, idempotent and exact when cut off. Every decision of the write is the job kernel's (`execd_jobs::stdin_plan`: wait, refuse, already applied, or apply from `written`; `admit_waiter`; `advance`), proven in Verus: bytes below `written` are never applied again and an apply starts exactly at `written` (W2), nothing lands on an ended job (W3) or after EOF (W4), a write ahead waits rather than applies (W5), the 17th waiter is refused (W1), and a refused or waiting write is always answered within `stdin_rank` steps (W1-live, `lemma_stdin_progress`). The shell only does the pipe's I/O, the `watch` and the mutex. There is no queue and no polling: a full pipe
+after every `write(2)`. So writes are ordered, idempotent and exact when cut off. Every decision of the write is the job kernel's (`execd_jobs::stdin_plan`: wait, refuse, already applied, or apply from `written`; `admit_waiter`; `advance`), proven in Verus: bytes below `written` are never applied again (W2a), `written` only grows (W2b) and an apply starts exactly at `written` (W2c); EOF closes only after every byte landed (`remaining`, `closes`), nothing lands on an ended job (W3) or after EOF (W4), a write ahead waits rather than applies (W5), the 17th waiter is refused (W1), and a refused or waiting write is always answered within `stdin_rank` steps (W1-live, `lemma_stdin_progress`). The shell only does the pipe's I/O, the `watch` and the mutex. There is no queue and no polling: a full pipe
 parks the request on the reactor, `timeout_ms` bounds the wait (short write), a dropped connection cancels it. `WRITE_MAX`
 128 KiB, `WAITERS_MAX` 16 per job (429). The token cancels and the pipe is dropped when the job ends or is removed, so no fd
 outlives the job. The std `Mutex<Job>` is never held across an await.
@@ -251,6 +251,10 @@ cargo test -p beyond-execd --features <mut> --test job_model the_mutation   # ea
 | `mut_signal_after_reap`       | J11 (`os_model`, and Verus on `may_deliver`)       |
 | `mut_held_forgets`            | J11-live (`os_model`, and Verus on `Held::insert`) |
 | `mut_stdin_replays`           | W2 (Verus on `stdin_plan`)                         |
+| `mut_stdin_written_shrinks`   | W2b (Verus on `advance`)                           |
+| `mut_stdin_apply_off_start`   | W2c (Verus on `stdin_plan`)                        |
+| `mut_stdin_wait_sticks`       | W5-live (progress lemma)                           |
+| `mut_stdin_closes_early`      | W4 (Verus on `closes`)                             |
 | `mut_stdin_applies_ahead`     | W5 (Verus on `stdin_plan`)                         |
 | `mut_stdin_writes_ended`      | W3 (Verus on `stdin_plan`)                         |
 | `mut_stdin_writes_after_eof`  | W4 (Verus on `stdin_plan`)                         |

@@ -463,7 +463,7 @@ async fn write_stdin(ctx: &Arc<Ctx>, req: &Request, job: &JobReq, data: Vec<u8>)
         pipe.is_some(),
         stdin.dead.is_cancelled(),
     );
-    let (skip, close) = match plan {
+    let (skip, take, close) = match plan {
         // `Wait` cannot be asked here: the loop above left only with the bytes before `at`
         // applied or the job over.
         kernel::Plan::Wait | kernel::Plan::Refuse => return closed(&state(true)),
@@ -473,16 +473,17 @@ async fn write_stdin(ctx: &Arc<Ctx>, req: &Request, job: &JobReq, data: Vec<u8>)
             }
             return http::json_response(200, &state(pipe.is_none()));
         }
-        kernel::Plan::Apply { skip, close, .. } => {
-            (usize::try_from(skip).unwrap_or(usize::MAX), close)
+        kernel::Plan::Apply { skip, take, close } => {
+            (usize::try_from(skip).unwrap_or(usize::MAX), take, close)
         }
     };
-    let mut rest = &data[skip.min(data.len())..];
-    while !rest.is_empty() {
+    let body = &data[skip.min(data.len())..];
+    let mut landed = 0u64;
+    while kernel::remaining(take, landed) > 0 {
         let Some(p) = pipe.as_mut() else { break };
         let step = async {
             tokio::select! {
-                r = p.write(rest) => Some(r),
+                r = p.write(&body[landed as usize..]) => Some(r),
                 () = stdin.dead.cancelled() => None,
                 () = async {
                     match deadline {
@@ -494,7 +495,7 @@ async fn write_stdin(ctx: &Arc<Ctx>, req: &Request, job: &JobReq, data: Vec<u8>)
         };
         match step.await {
             Some(Ok(n)) if n > 0 => {
-                rest = &rest[n..];
+                landed += n as u64;
                 stdin
                     .written
                     .send_modify(|w| *w = kernel::advance(*w, n as u64));
@@ -515,7 +516,7 @@ async fn write_stdin(ctx: &Arc<Ctx>, req: &Request, job: &JobReq, data: Vec<u8>)
             }
         }
     }
-    if close {
+    if kernel::closes(close, kernel::remaining(take, landed)) {
         pipe.take();
     }
     http::json_response(200, &state(pipe.is_none()))

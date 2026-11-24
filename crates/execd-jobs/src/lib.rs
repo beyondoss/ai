@@ -982,6 +982,12 @@ pub open spec fn post_plan(written: u64, at: u64, len: u64, eof: bool, open: boo
 pub fn stdin_plan(written: u64, at: u64, len: u64, eof: bool, open: bool, ended: bool) -> (p: Plan)
     ensures
         post_plan(written, at, len, eof, open, ended, p),
+        // W2a: the bytes below `written` are skipped, never applied again.
+        p is Apply && at <= written ==> p->Apply_skip as int >= (if written - at < len { (written - at) as int } else { len as int }),
+        // W2c: an apply starts exactly at `written`: no byte is skipped that was not applied.
+        p is Apply ==> at as int + p->Apply_skip as int == written as int,
+        // W5-live: nothing missing, nothing waited for.
+        at <= written ==> !(p is Wait),
 {
     if at > written {
         if ended {
@@ -993,10 +999,14 @@ pub fn stdin_plan(written: u64, at: u64, len: u64, eof: bool, open: bool, ended:
         }
     } else if cfg!(feature = "mut_stdin_waits_at_written") && at == written && len > 0 && !ended {
         Plan::Wait
+    } else if cfg!(feature = "mut_stdin_wait_sticks") && at < written && len > 0 && !ended {
+        Plan::Wait
     } else {
         let below = written - at;
         let skip = if cfg!(feature = "mut_stdin_replays") {
             0
+        } else if cfg!(feature = "mut_stdin_apply_off_start") && below < len {
+            below + 1
         } else if below < len {
             below
         } else {
@@ -1019,12 +1029,32 @@ pub fn advance(written: u64, n: u64) -> (r: u64)
         r >= written,
         written as int + n as int <= u64::MAX as int ==> r as int == written as int + n as int,
 {
-    if written <= u64::MAX - n { written + n } else { u64::MAX }
+    if cfg!(feature = "mut_stdin_written_shrinks") {
+        n
+    } else if written <= u64::MAX - n { written + n } else { u64::MAX }
+}
+
+/// What of a plan's `take` bytes is still to land after `landed` did (the shell's `write(2)`s).
+pub fn remaining(take: u64, landed: u64) -> (r: u64)
+    ensures
+        r as int == (if landed < take { take as int - landed as int } else { 0int }),
+{
+    if landed < take { take - landed } else { 0 }
+}
+
+/// W4: the stdin closes at EOF only once every byte of the write landed, so EOF never cuts a write
+/// short (a short write answers its exact `written` and leaves the pipe open).
+pub fn closes(close: bool, remaining: u64) -> (r: bool)
+    ensures
+        r <==> (close && remaining == 0),
+{
+    if cfg!(feature = "mut_stdin_closes_early") { close } else { close && remaining == 0 }
 }
 
 /// W1-live, progress: an admitted write is never stuck. The rank is the bytes of the write still
 /// above `written`, plus one for the answer. Under fairness F1 (what a write waits for is filled,
-/// or the job ends), F2 (the pipe takes at least one byte of a write) and F3 (the task runs): a
+/// or the job ends), F2 (the pipe takes at least one byte of a write) and F3 (the task runs); these
+/// three are the property's axioms: a
 /// `Wait` is left by any growth of `written` or by the job's end, and each `Apply` lowers the rank,
 /// so the write is answered in at most `stdin_rank` steps. A write is `Wait` only while ahead and
 /// alive, `Refuse`d only when ended or closed, and answered `Done` at rank 1.
@@ -1041,19 +1071,24 @@ pub proof fn lemma_stdin_progress(
     ended: bool,
     p: Plan,
     written2: u64,
+    p2: Plan,
 )
     requires
         post_plan(written, at, len, eof, open, ended, p),
         written2 > written,
+        post_plan(written2, at, len, eof, open, ended, p2),
     ensures
         stdin_rank(written, at, len) >= 1,
         // a fair step (the gap fills, or bytes land) lowers the rank while the write is unanswered
         stdin_rank(written, at, len) > 1 ==> stdin_rank(written2, at, len) < stdin_rank(written, at, len),
-        // a write with nothing missing is never made to wait, and an open, living one is never refused
-        at <= written ==> !(p is Wait),
-        (at <= written && open && !ended) ==> !(p is Refuse),
+        // F1 (the gap fills): once `written` reaches `at`, a living write is not made to wait again
+        // (and is never refused while open), so it applies or is answered
+        (written2 >= at && !ended) ==> !(p2 is Wait),
+        (written2 >= at && !ended && open) ==> !(p2 is Refuse),
         // an apply that lands all its bytes leaves the write answered (rank 1)
         p is Apply && written2 as int == written as int + p->Apply_take as int ==> stdin_rank(written2, at, len) == 1,
+        // and then it is `Done`
+        p is Apply && written2 as int == written as int + p->Apply_take as int ==> p2 == (Plan::Done { close: eof }),
 {
 }
 

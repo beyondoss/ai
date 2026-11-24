@@ -1110,6 +1110,8 @@ fn production_calls_the_kernel() {
         "kernel::stdin_plan(",
         "kernel::admit_waiter(",
         "kernel::advance(",
+        "kernel::remaining(",
+        "kernel::closes(",
         "Pick::",
         ".take(checked, Arc::ptr_eq)",
         "map: Mutex<kernel::Table<JobCell>>",
