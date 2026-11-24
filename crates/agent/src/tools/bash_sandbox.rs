@@ -860,6 +860,11 @@ async fn read_back(
             Some("adopted") => JobKind::Adopted,
             _ => JobKind::Background,
         };
+        // Told already (a replica persisted the report and died before deleting the directory):
+        // nothing is owed, so the directory goes at the next collection.
+        if j.status.ended() && jobs.told_end(num) {
+            jobs.discard_later(&link);
+        }
         jobs.insert_reattached(
             num,
             Job {

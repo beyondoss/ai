@@ -98,9 +98,12 @@ mut_recover_forgets_shell_status = [
 mut_job_output_pipe = [
   "beyond-execd-jobs/mut_job_output_pipe",
 ] # a job's output goes to a pipe, so a write after a restart is SIGPIPE (S1; `tests/restart.rs`)
-mut_spool_under_state = [
-  "beyond-execd-jobs/mut_spool_under_state",
-] # a ledger puts the spools in the state directory, which may be RAM (S7; `tests/restart.rs`)
+mut_ledger_spool_per_server = [
+  "beyond-execd-jobs/mut_ledger_spool_per_server",
+] # a ledger's spools go in the server's own directory, which goes with it (S7; `tests/restart.rs`)
+mut_unledgered_spool_stable = [
+  "beyond-execd-jobs/mut_unledgered_spool_stable",
+] # a server with no ledger leaves its spools in the stable directory (S7)
 mut_command_output_spool = [
   "beyond-execd-jobs/mut_command_output_spool",
 ] # a command's output goes to a spool file, not its client's pipe (S2)

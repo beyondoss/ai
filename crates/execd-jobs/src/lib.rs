@@ -877,24 +877,32 @@ pub fn output_sink(kind: Kind) -> (s: Sink)
     }
 }
 
-/// Where a job's spool files live: the jobs directory (a disk, which the operator chose), or the
-/// ledger's directory (which may be a tmpfs, where 8 MiB per job would be RAM).
+/// Where a job's spool files live. Both places are under the jobs directory (a disk the operator
+/// chose); there is no variant for the ledger's state directory (tmpfs in a sandbox, where 8 MiB per
+/// job would be RAM), so a spool cannot be put there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Root {
-    /// Under the jobs directory.
-    Jobs,
-    /// Under the ledger's state directory.
-    State,
+    /// The directory that outlives this execd, which a ledger's spools need: a restart finds a spool
+    /// there by the path the ledger names.
+    Stable,
+    /// This execd's own directory, which goes with it.
+    PerServer,
 }
 
-/// S7: where a job's spool lives. Always under the jobs directory, with a ledger or without: the
-/// ledger only names the spool by its path, so a restart finds it there, and the state directory
-/// (tmpfs in a sandbox, by design) holds the ledger and nothing else.
+/// S7: where a job's spool lives. With a ledger, the stable directory (a restart finds the spool by
+/// its recorded path); without one, this server's own (nothing could find a spool later).
 pub fn spool_root(ledger: bool) -> (r: Root)
     ensures
-        r is Jobs,
+        ledger ==> r is Stable,
+        !ledger ==> r is PerServer,
 {
-    if cfg!(feature = "mut_spool_under_state") && ledger { Root::State } else { Root::Jobs }
+    if ledger {
+        if cfg!(feature = "mut_ledger_spool_per_server") { Root::PerServer } else { Root::Stable }
+    } else if cfg!(feature = "mut_unledgered_spool_stable") {
+        Root::Stable
+    } else {
+        Root::PerServer
+    }
 }
 
 /// Why execd is stopping: `SIGTERM` or `SIGINT` (a stop: the sandbox is stopping, so nothing may be left

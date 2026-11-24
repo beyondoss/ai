@@ -95,6 +95,7 @@ async fn setup_exec(
     keep_alive: &Arc<std::sync::atomic::AtomicBool>,
     timing: &mut crate::timing::StartupTiming,
     persistence: &Persistence,
+    history: &[agent_core::Message],
 ) -> Result<ExecSetup, SetupError> {
     // Assemble the system prompt from the base identity + this repo's project instructions + skills +
     // environment, so the agent behaves like it belongs in the working directory. Split into a static
@@ -348,6 +349,9 @@ async fn setup_exec(
         mode.tenant(),
         persistence.session_id(),
     )));
+    // The ends this session's transcript already holds are told: a replica that died after
+    // persisting a report and before deleting the job's directory must not have it told again.
+    bash_jobs.set_told(history);
     if exec_cell.pending() {
         crate::tools::bash_sandbox::reattach_later(&bash_jobs, exec_cell.runner());
     } else {
@@ -1334,6 +1338,7 @@ impl SessionLoop {
             &keep_alive,
             &mut timing,
             &persistence,
+            &session.messages,
         )
         .await?;
         let PromptSetup {
