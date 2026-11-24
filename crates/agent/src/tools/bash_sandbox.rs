@@ -104,7 +104,8 @@ pub(crate) const UNREACHED: &str = "the job's processes in the sandbox (the kill
 pub(crate) fn on_event(shared: &JobShared, link: &SandboxLink, event: JobEvent<'_>) {
     match event {
         // Started means the output is live from here: what `bash`'s idle window measures.
-        JobEvent::Started(_) => shared.track(kill_hook(link)),
+        JobEvent::Started(..) => shared.track(kill_hook(link)),
+        JobEvent::Attached { .. } => {}
         JobEvent::Output(bytes, _) => shared.append(bytes),
         JobEvent::Gap(n) => shared.append_gap(n),
         JobEvent::ShellExit(code) => shared.orphaned(
@@ -567,7 +568,7 @@ pub(crate) async fn remove_all(garbage: Vec<SandboxLink>) {
         }
     }
     for (link, ids) in groups {
-        if let Err(e) = link.store.remove(&link.scope, &ids).await {
+        if let Err(e) = link.store.remove(&link.scope, &ids, &[]).await {
             tracing::warn!(error = %e, "could not delete ended sandbox jobs");
         }
     }

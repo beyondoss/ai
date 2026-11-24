@@ -113,9 +113,9 @@ impl JobId {
     /// An id read back from a sandbox, if it is one.
     pub fn parse(s: &str) -> Option<Self> {
         (!s.is_empty()
-            && s.len() <= 32
+            && s.len() <= 64
             && s.bytes()
-                .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase()))
+                .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase() || b == b'-' || b == b'_'))
         .then(|| Self(s.to_string()))
     }
 
@@ -153,6 +153,21 @@ pub struct JobSpec {
 pub enum Stream {
     Stdout,
     Stderr,
+}
+
+/// What a `start` answered: the job's leading process group and the mark of its incarnation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Started {
+    pub pgid: u32,
+    pub mark: String,
+}
+
+/// What a `remove` left alone: the ids whose group is not empty (`running`) and the ids whose job's
+/// mark is not the one named (`mismatch`). An id with no job is in neither.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Removal {
+    pub running: Vec<JobId>,
+    pub mismatch: Vec<JobId>,
 }
 
 /// What one `write` to a job's stdin left: how many bytes of the stream the job's stdin has taken
@@ -358,6 +373,14 @@ impl JobStatus {
 #[derive(Clone, Debug)]
 pub struct JobInfo {
     pub id: JobId,
+    /// Which incarnation of the id this is (answered by `start`, echoed by `attach`).
+    pub mark: String,
+    /// What the job runs: the command and its arguments (never its environment).
+    pub command: String,
+    pub args: Vec<String>,
+    /// The offsets of the oldest byte of output the sandbox holds and of the next one.
+    pub output_start: u64,
+    pub output_end: u64,
     pub status: JobStatus,
     /// The signal that killed the shell, when `status` carries a code and a signal produced it
     /// (the code is then `128 + signal`); `None` for a shell that exited, whatever its code.
@@ -420,8 +443,10 @@ impl JobEnd {
 /// What a running job reports, as it happens.
 #[derive(Debug)]
 pub enum JobEvent<'a> {
-    /// It started, leading process group `pgid`.
-    Started(u32),
+    /// It started, leading process group `pgid`; `mark` names this incarnation of its id.
+    Started(u32, &'a str),
+    /// An attach answered: the job's `mark` and the offset the stream starts at.
+    Attached { mark: &'a str, from: u64 },
     /// Output, in order, and the stream it came from. Concatenated, the pieces are the job's
     /// combined output.
     Output(&'a [u8], Stream),
@@ -473,7 +498,7 @@ pub trait SandboxJobs: Send + Sync {
         scope: &JobScope,
         id: &JobId,
         spec: &JobSpec,
-    ) -> std::io::Result<u32>;
+    ) -> std::io::Result<Started>;
 
     /// Follow a job's output from `from` until it ends, returning how it ended.
     async fn follow(
@@ -557,8 +582,14 @@ pub trait SandboxJobs: Send + Sync {
         signal: &str,
     ) -> std::io::Result<Vec<JobId>>;
 
-    /// Delete jobs whose processes are gone (a running one is left alone).
-    async fn remove(&self, scope: &JobScope, ids: &[JobId]) -> std::io::Result<()>;
+    /// Delete jobs whose processes are gone (a running one is left alone). A job whose id is in `marks`
+    /// is deleted only if its mark is the one named. What was left alone is answered.
+    async fn remove(
+        &self,
+        scope: &JobScope,
+        ids: &[JobId],
+        marks: &[(JobId, String)],
+    ) -> std::io::Result<Removal>;
 
     /// Kill every job in the scope and delete it. What survived, described.
     async fn wipe(&self, scope: &JobScope) -> std::io::Result<Vec<String>>;

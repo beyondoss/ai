@@ -12,8 +12,8 @@ use serde_json::{Value, json};
 
 use super::HttpExecRunner;
 use super::jobs::{
-    EventSink, JOB_SIGNALS, JobEnd, JobError, JobId, JobInfo, JobNotify, JobOp, JobScope, JobSpec,
-    JobStatus, ReadChunk, SandboxJobs, StdinWritten, Stream, WRITE_MAX,
+    EventSink, JOB_SIGNALS, JobEnd, JobError, JobId, JobInfo, JobNotify, JobOp, JobScope,
+    JobSpec, JobStatus, ReadChunk, Removal, SandboxJobs, Started, StdinWritten, Stream, WRITE_MAX,
 };
 use job_client::step::{Mark, Mode, State};
 
@@ -88,7 +88,7 @@ impl SandboxJobs for HttpJobs {
         scope: &JobScope,
         id: &JobId,
         spec: &JobSpec,
-    ) -> std::io::Result<u32> {
+    ) -> std::io::Result<Started> {
         dispatch!(self, start_kept(scope, id, spec))
     }
 
@@ -172,8 +172,13 @@ impl SandboxJobs for HttpJobs {
         dispatch!(self, signal(scope, ids, signal))
     }
 
-    async fn remove(&self, scope: &JobScope, ids: &[JobId]) -> std::io::Result<()> {
-        dispatch!(self, remove(scope, ids))
+    async fn remove(
+        &self,
+        scope: &JobScope,
+        ids: &[JobId],
+        marks: &[(JobId, String)],
+    ) -> std::io::Result<Removal> {
+        dispatch!(self, remove(scope, ids, marks))
     }
 
     async fn wipe(&self, scope: &JobScope) -> std::io::Result<Vec<String>> {
@@ -241,6 +246,7 @@ impl NativeJobs<'_> {
             id,
             spec: Some(spec),
             beat,
+            output: true,
         };
         let state = State::for_start(1, Mode::Follow, false, beat.unwrap_or(0));
         handle::drive(&h, state, events).await
@@ -255,15 +261,46 @@ impl NativeJobs<'_> {
         beat: Option<u32>,
         events: EventSink<'_>,
     ) -> std::io::Result<JobEnd> {
+        self.follow_opts(scope, id, from, None, true, beat, events)
+            .await
+    }
+
+    /// [`SandboxJobs::follow`] naming the incarnation it means (`mark`: a job of another mark is
+    /// [`JobError::Gone`], and nothing is streamed) and whether to carry output (`false`: a status-only
+    /// attach, which starts at the job's current end). The first event is [`JobEvent::Attached`]; an
+    /// endpoint that does not say it predates marks.
+    #[allow(clippy::too_many_arguments)] // the request's parts, each used once
+    pub async fn follow_opts(
+        &self,
+        scope: &JobScope,
+        id: &JobId,
+        from: u64,
+        mark: Option<&str>,
+        output: bool,
+        beat: Option<u32>,
+        events: EventSink<'_>,
+    ) -> std::io::Result<JobEnd> {
         check_beat(beat)?;
+        let mark = match mark {
+            None => Mark::none(),
+            Some(m) => Mark::from_bytes(m.as_bytes()).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("a mark is 1 to 32 characters of [0-9a-f], got {m:?}"),
+                )
+            })?,
+        };
         let h = handle::Handle {
             runner: self.runner,
             scope,
             id,
             spec: None,
             beat,
+            output,
         };
-        let state = State::for_attach(Mark::none(), from, Mode::Follow, false, beat.unwrap_or(0));
+        // A status-only attach carries no output: the kernel counts it and delivers only the exit.
+        let mode = if output { Mode::Follow } else { Mode::Watch };
+        let state = State::for_attach(mark, from, mode, false, beat.unwrap_or(0));
         handle::drive(&h, state, events).await
     }
 
@@ -339,7 +376,7 @@ impl SandboxJobs for NativeJobs<'_> {
         scope: &JobScope,
         id: &JobId,
         spec: &JobSpec,
-    ) -> std::io::Result<u32> {
+    ) -> std::io::Result<Started> {
         let job = Self::op(
             "start",
             scope,
@@ -370,6 +407,10 @@ impl SandboxJobs for NativeJobs<'_> {
             let _ = self.kill(scope, std::slice::from_ref(id), true).await;
             return Err(predates("job stdin"));
         }
+        let mark = answer
+            .as_ref()
+            .and_then(|v| v.get("mark")?.as_str())
+            .map(str::to_string);
         let started = answer
             .and_then(|v| v.get("started")?.as_u64())
             .ok_or_else(|| {
@@ -378,11 +419,13 @@ impl SandboxJobs for NativeJobs<'_> {
                     String::from_utf8_lossy(&body[..body.len().min(200)])
                 ))
             })?;
-        u32::try_from(started).map_err(|_| {
+        let pgid = u32::try_from(started).map_err(|_| {
             std::io::Error::other(format!(
                 "unreadable job answer: the endpoint reported an out-of-range job start: {started}"
             ))
-        })
+        })?;
+        let mark = mark.ok_or_else(|| predates("job marks"))?;
+        Ok(Started { pgid, mark })
     }
 
     async fn follow(
@@ -548,14 +591,39 @@ impl SandboxJobs for NativeJobs<'_> {
             .collect())
     }
 
-    async fn remove(&self, scope: &JobScope, ids: &[JobId]) -> std::io::Result<()> {
+    async fn remove(
+        &self,
+        scope: &JobScope,
+        ids: &[JobId],
+        marks: &[(JobId, String)],
+    ) -> std::io::Result<Removal> {
         if ids.is_empty() {
-            return Ok(());
+            return Ok(Removal::default());
         }
-        let ids: Vec<&str> = ids.iter().map(JobId::as_str).collect();
-        self.call(Self::op("remove", scope, json!({ "ids": ids })))
-            .await
-            .map(drop)
+        let names: Vec<&str> = ids.iter().map(JobId::as_str).collect();
+        let marks: serde_json::Map<String, Value> = marks
+            .iter()
+            .map(|(i, m)| (i.as_str().to_string(), json!(m)))
+            .collect();
+        let v = self
+            .call(Self::op(
+                "remove",
+                scope,
+                json!({ "ids": names, "marks": marks }),
+            ))
+            .await?;
+        // An endpoint that predates marks answers `{}`: it removed on its own terms.
+        let list = |k: &str| -> std::io::Result<Vec<JobId>> {
+            let a = v
+                .get(k)
+                .and_then(Value::as_array)
+                .ok_or_else(|| predates("job marks"))?;
+            Ok(a.iter().filter_map(|i| JobId::parse(i.as_str()?)).collect())
+        };
+        Ok(Removal {
+            running: list("running")?,
+            mismatch: list("mismatch")?,
+        })
     }
 
     async fn wipe(&self, scope: &JobScope) -> std::io::Result<Vec<String>> {
@@ -777,7 +845,7 @@ fn predates(what: &str) -> std::io::Error {
     )
 }
 
-/// A `list` answer: `{"jobs": [{"id", "state", "code", "signal"?, "kept", "num", "kind", "seen", "started",
+/// A `list` answer: `{"jobs": [{"id", "mark", "command", "args", "outputStart", "outputEnd", "state", "code", "signal"?, "kept", "num", "kind", "seen", "started",
 /// "ended", "label"}]}`. A job whose id is not one is skipped, never followed.
 pub fn parse_list(v: &Value) -> std::io::Result<Vec<JobInfo>> {
     let jobs = v
@@ -799,8 +867,26 @@ pub fn parse_list(v: &Value) -> std::io::Result<Vec<JobInfo>> {
         };
         let signal = signal_field(j, status)?;
         let num = |k: &str| j.get(k).and_then(Value::as_u64);
+        let text = |k: &str| j.get(k).and_then(Value::as_str).map(str::to_string);
+        // An endpoint that predates marks says none: its list is not trusted.
+        let (Some(mark), Some(command), Some(args)) = (
+            text("mark"),
+            text("command"),
+            j.get("args").and_then(Value::as_array).map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+            }),
+        ) else {
+            return Err(predates("job marks"));
+        };
         out.push(JobInfo {
             id,
+            mark,
+            command,
+            args,
+            output_start: num("outputStart").unwrap_or(0),
+            output_end: num("outputEnd").unwrap_or(0),
             status,
             signal,
             kept: j.get("kept").and_then(Value::as_bool).unwrap_or(false),

@@ -27,6 +27,8 @@ pub(super) struct Handle<'a> {
     /// The command a `Start` action sends; `None` for a handle that only attaches.
     pub spec: Option<&'a JobSpec>,
     pub beat: Option<u32>,
+    /// Whether an attach carries the output (`false`: status only).
+    pub output: bool,
 }
 
 /// The shell's clock: milliseconds since the handle began. A test makes it run `divisor` times
@@ -116,14 +118,22 @@ pub(super) async fn drive(
         s = next_state;
         // The kernel took the first frame: the sink hears of the incarnation, and a stdin the
         // endpoint did not open is refused (an endpoint that predates job stdin says nothing).
-        if confirming
-            && matches!(s.phase, step::Phase::Streaming)
-            && let Ev::Frame(KFrame::Started { .. }) = ev
-        {
-            if h.spec.is_some_and(|sp| sp.stdin_open) && !payload.stdin {
-                return Err(predates("job stdin"));
+        if confirming && matches!(s.phase, step::Phase::Streaming) {
+            match ev {
+                Ev::Frame(KFrame::Started { mark }) => {
+                    if h.spec.is_some_and(|sp| sp.stdin_open) && !payload.stdin {
+                        return Err(predates("job stdin"));
+                    }
+                    events(JobEvent::Started(payload.pgid, mark_text(&mark)));
+                }
+                Ev::Frame(KFrame::Attached { mark, from }) => {
+                    events(JobEvent::Attached {
+                        mark: mark_text(&mark),
+                        from,
+                    });
+                }
+                _ => {}
             }
-            events(JobEvent::Started(payload.pgid));
         }
         // The event the last I/O action produced, if it did.
         let mut next: Option<Ev> = None;
@@ -247,7 +257,8 @@ async fn open(
                 .await
         }
         Opening::Attach { offset, mark } => {
-            let mut extra = json!({ "id": h.id.as_str(), "offset": offset });
+            let mut extra =
+                json!({ "id": h.id.as_str(), "offset": offset, "output": h.output });
             if mark.len > 0 {
                 extra["mark"] = Value::String(mark_text(&mark).to_string());
             }

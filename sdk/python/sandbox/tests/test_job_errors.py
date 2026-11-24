@@ -102,7 +102,7 @@ def test_keep_seen_and_grace_ms_go_out_under_their_wire_names() -> None:
 
 
 def held_stream(h: Any, b: Any) -> None:
-    body = b'{"started":42}\n{"exit_code":0}\n'
+    body = b'{"started":42,"mark":"ab12"}\n{"exit_code":0}\n'
     reply(h, 200, body, NDJSON)
 
 

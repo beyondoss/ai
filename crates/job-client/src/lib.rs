@@ -14,7 +14,7 @@
 //! |---|---|---|
 //! | `j1` | the cursor format's own version | this crate |
 //! | scope | 1 to 64 bytes of `[0-9a-z-]` | `JobScope::named` (`crates/sandbox/src/exec_endpoint/jobs.rs`), the TypeScript `Jobs` scope check (`sdk/ts/sandbox/src/jobs.ts`) |
-//! | id | 1 to 32 bytes of `[0-9a-z]` | `JobId::parse` (same file), the TypeScript id check (same) |
+//! | id | 1 to 64 bytes of `[0-9a-z_-]` | `JobId::parse` (same file), the TypeScript id check (same) |
 //! | mark | 1 to 32 bytes of `[0-9a-f]` | execd's `new_job_mark` (`crates/execd/src/proc.rs`): 16 hex of a hash, then the sequence in hex |
 //! | offset | 16 bytes of `[0-9a-f]`, the u64 | fixed width, so a truncated cursor can never decode to a smaller offset |
 //! | check | 4 bytes of `[0-9a-f]`: the sum of every byte before the `.` that precedes it | an additive check, not a MAC |
@@ -65,9 +65,9 @@ pub open spec fn scope_byte(b: u8) -> bool {
     is_digit(b) || (97 <= b && b <= 122) || b == 45
 }
 
-/// An id's bytes: `[0-9a-z]`.
+/// An id's bytes: `[0-9a-z_-]`.
 pub open spec fn id_byte(b: u8) -> bool {
-    is_digit(b) || (97 <= b && b <= 122)
+    is_digit(b) || (97 <= b && b <= 122) || b == 45 || b == 95
 }
 
 /// A mark's bytes: `[0-9a-f]`.
@@ -78,7 +78,7 @@ pub open spec fn mark_byte(b: u8) -> bool {
 /// The rules for the three variable fields.
 pub open spec fn fields_ok(scope: Seq<u8>, id: Seq<u8>, mark: Seq<u8>) -> bool {
     &&& 1 <= scope.len() <= 64
-    &&& 1 <= id.len() <= 32
+    &&& 1 <= id.len() <= 64
     &&& 1 <= mark.len() <= 32
     &&& forall|i: int| 0 <= i < scope.len() ==> scope_byte(#[trigger] scope[i])
     &&& forall|i: int| 0 <= i < id.len() ==> id_byte(#[trigger] id[i])
@@ -415,7 +415,7 @@ pub open spec fn enc_facts(scope: Seq<u8>, id: Seq<u8>, mark: Seq<u8>, offset: u
     let m = mark.len() as int;
     let n = s.len() as int;
     &&& n == a + b + m + 27
-    &&& 30 <= n <= 155
+    &&& 30 <= n <= 187
     &&& s[0] == 106 && s[1] == 49 && s[2] == 46
     &&& s.subrange(3, 3 + a) == scope
     &&& forall|j: int| 3 <= j < 3 + a ==> scope_byte(#[trigger] s[j])
@@ -465,12 +465,12 @@ pub proof fn lemma_enc_facts(scope: Seq<u8>, id: Seq<u8>, mark: Seq<u8>, offset:
     assert(s.subrange(4 + a, 4 + a + b) =~= id);
     assert(s.subrange(5 + a + b, 5 + a + b + m) =~= mark);
     assert(s.subrange(n - 21, n - 5) =~= h16);
-    // The check fits four digits: the body is at most 150 bytes of at most 255.
+    // The check fits four digits: the body is at most 182 bytes of at most 255.
     lemma_sum_bound(bd);
-    assert(sum(bd) <= 255 * 150) by (nonlinear_arith)
+    assert(sum(bd) <= 255 * 182) by (nonlinear_arith)
         requires
             sum(bd) <= 255 * bd.len(),
-            bd.len() <= 150,
+            bd.len() <= 182,
     ;
     lemma_body_dots(scope, id, mark, offset);
     assert forall|i: int| 0 <= i < hx.len() implies #[trigger] hx[i] != 46 by {
@@ -509,7 +509,7 @@ proof fn lemma_accepts_facts(s: Seq<u8>)
     requires
         accepts(s),
     ensures
-        30 <= s.len() <= 155,
+        30 <= s.len() <= 187,
         s[s.len() - 5] == 46,
         s.subrange(s.len() - 5, s.len() as int) == tail(sum(s.subrange(0, s.len() - 5))),
         sum(s.subrange(0, s.len() - 5)) < 65536,
@@ -721,7 +721,7 @@ impl Cursor {
         if scope.len() < 1 || scope.len() > 64 || !all_ok(scope, 0, scope.len(), 0) {
             return Err(CursorError::BadField(Field::Scope));
         }
-        if id.len() < 1 || id.len() > 32 || !all_ok(id, 0, id.len(), 1) {
+        if id.len() < 1 || id.len() > 64 || !all_ok(id, 0, id.len(), 1) {
             return Err(CursorError::BadField(Field::Id));
         }
         if mark.len() < 1 || mark.len() > 32 || !all_ok(mark, 0, mark.len(), 2) {
@@ -763,7 +763,7 @@ fn byte_ok(kind: u8, b: u8) -> (r: bool)
     if kind == 0 {
         digit || (97 <= b && b <= 122) || b == 45
     } else if kind == 1 {
-        digit || (97 <= b && b <= 122)
+        digit || (97 <= b && b <= 122) || b == 45 || b == 95
     } else {
         digit || (97 <= b && b <= 102)
     }
@@ -1063,7 +1063,7 @@ fn decode_core(input: &[u8]) -> (r: Result<Cursor, CursorError>)
         }
     }
     let n = s.len();
-    if n < 30 || n > 155 {
+    if n < 30 || n > 187 {
         return Err(CursorError::BadLength);
     }
     if s[0] != 106 || s[1] != 49 {
@@ -1082,7 +1082,7 @@ fn decode_core(input: &[u8]) -> (r: Result<Cursor, CursorError>)
     if p1 < 4 || p1 > 67 || (!cfg!(feature = "mut_scope_unchecked") && !all_ok(s, 3, p1, 0)) {
         return Err(CursorError::BadField(Field::Scope));
     }
-    if p2 < p1 + 2 || p2 > p1 + 33 || (!cfg!(feature = "mut_id_unchecked") && !all_ok(s, p1 + 1, p2, 1)) {
+    if p2 < p1 + 2 || p2 > p1 + 65 || (!cfg!(feature = "mut_id_unchecked") && !all_ok(s, p1 + 1, p2, 1)) {
         return Err(CursorError::BadField(Field::Id));
     }
     if end < p2 + 2 || end > p2 + 33 || (!cfg!(feature = "mut_mark_unchecked") && !all_ok(s, p2 + 1, end, 2)) {
@@ -1348,16 +1348,18 @@ mod tests {
     #[test]
     fn the_fields_obey_the_rules_of_the_job_endpoint() {
         let ok = |s: &str, i: &str, m: &str| Cursor::from_parts(s, i, m, 0);
-        assert!(ok(&"a".repeat(64), &"b".repeat(32), &"c".repeat(32)).is_ok());
+        assert!(ok(&"a".repeat(64), &"b".repeat(64), &"c".repeat(32)).is_ok());
         assert!(ok(&"a".repeat(65), "b", "c").is_err());
-        assert!(ok("a", &"b".repeat(33), "c").is_err());
+        assert!(ok("a", &"b".repeat(65), "c").is_err());
         assert!(ok("a", "b", &"c".repeat(33)).is_err());
         assert!(ok("", "b", "c").is_err());
         assert!(ok("a", "", "c").is_err());
         assert!(ok("a", "b", "").is_err());
         assert!(ok("A", "b", "c").is_err());
         assert!(ok("a.b", "b", "c").is_err());
-        assert!(ok("a", "b-c", "c").is_err(), "an id has no '-'");
+        assert!(ok("a", "b-c_d", "c").is_ok(), "an id has '-' and '_'");
+        assert!(ok("a", "b.c", "c").is_err(), "an id has no '.'");
+        assert!(ok("a", "B", "c").is_err(), "an id is lowercase");
         assert!(ok("a", "b", "g").is_err(), "a mark is hex");
         assert!(ok("a-b", "b", "c").is_ok(), "a scope has '-'");
     }

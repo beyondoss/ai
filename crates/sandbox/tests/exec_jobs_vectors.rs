@@ -32,13 +32,19 @@ fn state_name(s: JobStatus) -> (&'static str, Option<i64>) {
 fn job_streams_decode_as_the_vectors_say() {
     for case in vectors()["streams"].as_array().unwrap() {
         let name = case["name"].as_str().unwrap();
+        let (mut mark, mut from) = (None, None);
         let (mut started, mut output, mut gap, mut shell) = (None, Vec::new(), 0, Vec::new());
         let (mut end, mut error) = (None, None);
         let (mut stdin, mut streams) = (false, String::new());
         for line in case["lines"].as_array().unwrap() {
             match decode_job_frame(line.as_str().unwrap().as_bytes()).unwrap() {
-                JobFrame::Event(Event::Started(p, _, s)) => {
+                JobFrame::Event(Event::Attached(m, f)) => {
+                    mark = Some(m);
+                    from = Some(f);
+                }
+                JobFrame::Event(Event::Started(p, m, s)) => {
                     started = Some(p);
+                    mark = m;
                     stdin = s;
                 }
                 JobFrame::Event(Event::Output(b, s)) => {
@@ -55,6 +61,8 @@ fn job_streams_decode_as_the_vectors_say() {
         }
         let want = &case["expect"];
         assert_eq!(started.map(u64::from), want["started"].as_u64(), "{name}");
+        assert_eq!(mark.as_deref(), want["mark"].as_str(), "{name}");
+        assert_eq!(from, want["from"].as_u64(), "{name}");
         assert_eq!(
             output,
             b64(want["output_base64"].as_str().unwrap()),
@@ -131,6 +139,11 @@ fn job_answers_read_as_the_vectors_say() {
                     assert_eq!(j.seen, w["seen"].as_u64().unwrap());
                     assert_eq!(j.ended, w["ended"].as_u64().unwrap());
                     assert_eq!(j.label, w["label"].as_str().unwrap());
+                    assert_eq!(j.mark, w["mark"].as_str().unwrap());
+                    assert_eq!(j.command, w["command"].as_str().unwrap());
+                    assert_eq!(j.args, ["-c", "true"]);
+                    assert_eq!(j.output_start, w["output_start"].as_u64().unwrap());
+                    assert_eq!(j.output_end, w["output_end"].as_u64().unwrap());
                 }
             }
             "kill" => {

@@ -50,7 +50,8 @@ struct Sink(Mutex<Vec<String>>);
 impl Sink {
     fn on(&self, e: JobEvent<'_>) {
         let line = match e {
-            JobEvent::Started(_) => "started".to_string(),
+            JobEvent::Started(..) => "started".to_string(),
+            JobEvent::Attached { .. } => "attached".to_string(),
             JobEvent::Output(b, _) => format!("out:{}", String::from_utf8_lossy(b)),
             JobEvent::Gap(n) => format!("gap:{n}"),
             JobEvent::ShellExit(c) => format!("shell:{c}"),
@@ -92,7 +93,7 @@ async fn a_cut_stream_is_reattached_at_its_offset_with_its_mark() {
     .await;
     let (r, lines) = run(&front, 1000).await;
     assert_eq!(r.unwrap(), JobEnd::Exit(0));
-    assert_eq!(lines, ["started", "out:hello", "out:world"]);
+    assert_eq!(lines, ["started", "out:hello", "attached", "out:world"]);
     let seen = front.seen.lock().unwrap();
     assert_eq!(seen[1]["op"], "attach");
     assert_eq!(seen[1]["offset"], 5);
@@ -108,7 +109,7 @@ async fn bytes_the_endpoint_no_longer_holds_are_a_gap_before_the_next_output() {
     .await;
     let (r, lines) = run(&front, 1000).await;
     assert_eq!(r.unwrap(), JobEnd::Exit(3));
-    assert_eq!(lines, ["started", "out:hello", "gap:3", "out:x"]);
+    assert_eq!(lines, ["started", "out:hello", "attached", "gap:3", "out:x"]);
 }
 
 #[tokio::test]
@@ -168,5 +169,5 @@ async fn a_front_that_is_down_for_minutes_does_not_end_the_handle() {
     .await;
     let (r, lines) = run(&front, 2000).await;
     assert_eq!(r.unwrap(), JobEnd::Exit(0));
-    assert_eq!(lines, ["started", "out:hello", "out:world"]);
+    assert_eq!(lines, ["started", "out:hello", "attached", "out:world"]);
 }

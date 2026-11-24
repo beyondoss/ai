@@ -246,7 +246,7 @@
           "type": "object"
         },
         "id": {
-          "description": "The job's id: 1 to 32 characters of [0-9a-z]. Default: a random one, returned.",
+          "description": "The job's id: 1 to 64 characters of [0-9a-z_-]. Default: a random one, returned.",
           "type": "string"
         },
         "label": {
