@@ -828,7 +828,7 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
     let mut tail = None;
     if kernel::output_sink(Kind::Job) == Dest::Spool {
         let made = Spool::create(spool_base(ctx), &mark).and_then(|(sp, w)| {
-            let made = Journal::create(&sp.access(), [0, 0], Vec::new(), 0)
+            let made = Journal::create(&sp.access(), sp.guard(), [0, 0], Vec::new(), 0)
                 .and_then(|j| Tail::open(&ctx.tails, &sp, Start::Zero).map(|t| (t, j)));
             match made {
                 Ok((t, j)) => Ok((sp, w, t, j)),
@@ -844,7 +844,9 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
                 {
                     let mut j = locked(&cell);
                     // The ring's chunks live in the spool, which a restart reads again.
-                    j.out = Ring::new(ctx.opts.job_output_retention, sp.ring_dir()).kept();
+                    j.out = Ring::new(ctx.opts.job_output_retention, sp.ring_dir())
+                        .holding(sp.guard())
+                        .kept();
                     j.spool = Some(sp);
                 }
                 tail = Some((t, journal));
@@ -1194,7 +1196,7 @@ fn rebuild(ctx: &Arc<Ctx>, sp: &Spool) -> Option<(Ring, Tail, Journal)> {
     if from.checked_add(total)? > kernel::OFFSET_MAX || from % FRAME_MAX as u64 != 0 {
         return None;
     }
-    let mut ring = Ring::recover(retain, sp.ring_dir(), from);
+    let mut ring = Ring::recover(retain, sp.ring_dir(), from).holding(sp.guard());
     let chunk_end = ring.end();
     if chunk_end > from + total {
         // Chunks the journal never covered: not one this journal can continue.
@@ -1219,6 +1221,7 @@ fn rebuild(ctx: &Arc<Ctx>, sp: &Spool) -> Option<(Ring, Tail, Journal)> {
     }
     let journal = Journal::create(
         &sp.access(),
+        sp.guard(),
         [start[0] + skipped[0], start[1] + skipped[1]],
         kept,
         ring.tail_len(),
@@ -1237,8 +1240,10 @@ fn restart_cold(ctx: &Arc<Ctx>, sp: &Spool) -> Option<(Ring, Tail, Journal)> {
     );
     let _ = std::fs::remove_dir_all(sp.ring_dir());
     let tail = Tail::open(&ctx.tails, sp, Start::Data).ok()?;
-    let journal = Journal::create(&sp.access(), tail.offsets(), Vec::new(), 0).ok()?;
-    let ring = Ring::new(ctx.opts.job_output_retention, sp.ring_dir()).kept();
+    let journal = Journal::create(&sp.access(), sp.guard(), tail.offsets(), Vec::new(), 0).ok()?;
+    let ring = Ring::new(ctx.opts.job_output_retention, sp.ring_dir())
+        .holding(sp.guard())
+        .kept();
     Some((ring, tail, journal))
 }
 
