@@ -562,6 +562,7 @@ impl Drop for Hub {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod hold_tests {
     use super::*;
     use crate::ring::Ring;
