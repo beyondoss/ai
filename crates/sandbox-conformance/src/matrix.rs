@@ -57,6 +57,18 @@ pub async fn run(plan: Plan) -> Vec<Cell> {
         )
     };
     cells.sort_by_key(order);
+    // A filter that matched no check for any driver is a mistake, not a pass.
+    if cells.is_empty() && plan.filter.is_some() {
+        cells.push(Cell::failed_to_run(
+            "matrix",
+            &plan.backends.join(","),
+            "matrix/empty",
+            format!(
+                "the filter {:?} matched no check for any driver",
+                plan.filter
+            ),
+        ));
+    }
     cells
 }
 
@@ -107,7 +119,15 @@ async fn run_backend(plan: &Plan, name: &str) -> Vec<Cell> {
             ));
             continue;
         }
-        cells.push(run_cell(plan, &d.name, name, &be, started.suites).await);
+        cells.extend(
+            leased(
+                &started,
+                &d.name,
+                name,
+                run_cell(plan, &d.name, name, &be, started.suites),
+            )
+            .await,
+        );
         opened.push((d, be));
     }
     // Relay: every ordered pair on this one sandbox. Pairs of a driver with itself use a second
@@ -125,15 +145,13 @@ async fn run_backend(plan: &Plan, name: &str) -> Vec<Cell> {
                 };
                 let filter = plan.filter.clone();
                 let keep = move |id: &str| filter.as_deref().is_none_or(|f| glob_match(f, id));
-                let checks =
-                    relay::run_pair(&plan.scenarios, a, b, same, started.suites, &keep).await;
-                if relay::ran(&checks) {
-                    cells.push(Cell::from_checks(
-                        &format!("relay:{}>{}", da.name, db.name),
-                        name,
-                        &checks,
-                    ));
-                }
+                let pair = format!("relay:{}>{}", da.name, db.name);
+                let one = async {
+                    let checks =
+                        relay::run_pair(&plan.scenarios, a, b, same, started.suites, &keep).await;
+                    relay::ran(&checks).then(|| Cell::from_checks(&pair, name, &checks))
+                };
+                cells.extend(leased(&started, &pair, name, one).await);
             }
         }
     }
@@ -146,7 +164,7 @@ async fn run_cell(
     backend: &str,
     be: &Backend,
     suites: Option<&[&str]>,
-) -> Cell {
+) -> Option<Cell> {
     let mut checks: Vec<Check> = Vec::new();
     for (_, file) in plan.scenarios.iter() {
         let suite = file["suite"].as_str().unwrap_or("");
@@ -164,6 +182,11 @@ async fn run_cell(
             checks.extend(run_scenario(sc, be).await);
         }
     }
+    // A filter that leaves this driver nothing to run skips its cell; a run where it left nothing
+    // for any cell fails in `run`.
+    if plan.filter.is_some() && checks.is_empty() {
+        return None;
+    }
     // A backend is only worth its cell if something ran.
     if !checks.iter().any(|c| c.status == Status::Pass)
         && checks.iter().all(|c| c.status != Status::Fail)
@@ -174,7 +197,32 @@ async fn run_cell(
             detail: "no check passed (is the filter right?)".into(),
         });
     }
-    Cell::from_checks(driver, backend, &checks)
+    Some(Cell::from_checks(driver, backend, &checks))
+}
+
+/// Run one cell on a backend whose lifetime is renewed first and bounds the cell: a cell that outlives
+/// its lease fails with that message, never on a dead backend.
+async fn leased(
+    started: &backends::Started,
+    driver: &str,
+    backend: &str,
+    cell: impl std::future::Future<Output = Option<Cell>>,
+) -> Option<Cell> {
+    let Some(lease) = &started.lease else {
+        return cell.await;
+    };
+    let failed = |why| Some(Cell::failed_to_run(driver, backend, "backend/lease", why));
+    let budget = match lease().await {
+        Ok(b) => b,
+        Err(why) => return failed(why),
+    };
+    match tokio::time::timeout(budget, cell).await {
+        Ok(c) => c,
+        Err(_) => failed(format!(
+            "the cell ran longer than its {} s lease on the backend, which would have expired under it",
+            budget.as_secs()
+        )),
+    }
 }
 
 /// `NAME=CMD`.

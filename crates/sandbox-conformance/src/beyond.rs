@@ -62,6 +62,7 @@ pub async fn start(name: &str) -> Result<Started, String> {
         caps: None,
         suites: None,
         vars: BTreeMap::new(),
+        lease: None,
         _guard: Box::new(()),
     })
 }
