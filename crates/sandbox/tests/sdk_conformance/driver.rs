@@ -659,20 +659,14 @@ impl Driver {
         let id = Self::job_id(req, "job")?;
         let offset = u64_arg(req, "offset")?.unwrap_or(0);
         let max = u64_arg(req, "max")?.unwrap_or(128 * 1024) as usize;
-        let c = self
-            .jobs()?
-            .read(&scope, &id, offset, max)
-            .await
-            .map_err(|e| job_err(&e))?;
-        if c.status == JobStatus::Gone && flag(req, "gone_as_error")? {
-            let j = JobError::classify(
-                beyond_sandbox::exec_endpoint::jobs::JobOp::Other,
-                404,
-                "the job does not exist or was removed",
-            )
-            .expect("404 is a job condition");
-            return Err(json!({ "kind": j.kind(), "detail": j.to_string(), "code": j.code() }));
+        let c = if flag(req, "gone_as_error")? {
+            NativeJobs::over(self.http()?)
+                .read_or_gone(&scope, &id, offset, max)
+                .await
+        } else {
+            self.jobs()?.read(&scope, &id, offset, max).await
         }
+        .map_err(|e| job_err(&e))?;
         let (state, code) = state_of(c.status);
         let mut out = json!({
             "state": state, "code": code, "offset": c.offset, "end": c.end,

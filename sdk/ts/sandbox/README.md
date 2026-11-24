@@ -140,6 +140,13 @@ exceeded the 16 MiB response cap; the command ran), `auth`, `timeout`, `transpor
 `exec`, `stream`, and `transport.run` / `transport.stream` take an optional `signal`. Aborting it closes the request: for a
 stream that kills the command, the same as stopping iteration. The failure is `transport` with detail mentioning abort.
 
+### Breaking
+
+- `Jobs.attach` is gone: use `collect` (follow to the end, collected) or `follow` (frames).
+- `Jobs.read` of a removed or unknown job throws `JobGoneError` (a `NotFoundError`) instead of returning `state: "gone"`. `sb.transport.jobs.read` still returns the wire's `gone`.
+- `Transport.jobs` (`JobOps`) gains `startHeld`, `keep` and `seen`; `kill` takes `{ remove, graceMs }` and `wipe` takes `{ graceMs }`. A custom transport must implement them.
+- A start of an existing id is `JobExistsError`, a full disk `DiskFullError`, and a stdin write's 409 and 429 are `StdinClosedError`, `StdinGapError` and `StdinBusyError` (all still `ConflictError`s).
+
 ## Bring your own transport
 
 ```ts

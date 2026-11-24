@@ -85,6 +85,13 @@ Job failures are typed, each a subclass of the kind it was before (`except NotFo
 `write_stdin`: `StdinClosedError` (`.reason` is `"never_opened"` or `"closed"`; retrying cannot succeed), `StdinGapError`
 (the bytes before it never came) and `StdinBusyError` (16 writes already wait: the same write, later, is safe).
 
+### Breaking
+
+- `Jobs.attach` / `AsyncJobs.attach` are renamed `collect` (follow to the end, collected); `follow` is unchanged.
+- `Jobs.read` of a removed or unknown job raises `JobGoneError` (a `NotFoundError`) instead of returning state `gone`.
+- A start of an existing id is `JobExistsError`, a full disk `DiskFullError`, and a stdin write's 409 and 429 are `StdinClosedError`, `StdinGapError` and `StdinBusyError` (all still `ConflictError`s).
+- A custom `job_call` / `job_stream` is passed `heartbeat_seconds`, `env`, `command`, `args` and `cwd` only when set.
+
 ## Authentication
 
 `token` is a string, or a function that returns one. The function is called on first use and once

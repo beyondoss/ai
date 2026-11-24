@@ -346,6 +346,29 @@ impl NativeJobs<'_> {
         .await
     }
 
+    /// [`SandboxJobs::read`] for a caller that wants a removed or unknown job as an error: the wire
+    /// answers state `gone`, this says [`JobError::Gone`] (as `Jobs.read` does in the TypeScript and
+    /// Python SDKs). [`SandboxJobs::read`] keeps the wire's `Gone` status.
+    pub async fn read_or_gone(
+        &self,
+        scope: &JobScope,
+        id: &JobId,
+        offset: u64,
+        max: usize,
+    ) -> std::io::Result<ReadChunk> {
+        let chunk = self.read(scope, id, offset, max).await?;
+        if chunk.status == JobStatus::Gone {
+            return Err(JobError::classify(
+                JobOp::Other,
+                404,
+                "the job does not exist or was removed",
+            )
+            .expect("404 is a job condition")
+            .into_io());
+        }
+        Ok(chunk)
+    }
+
     /// [`SandboxJobs::kill`] with the SIGTERM grace the caller names (wire `grace_ms`).
     pub async fn kill_grace(
         &self,
