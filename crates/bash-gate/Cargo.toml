@@ -27,3 +27,4 @@ verify = true
 # README) and the proof (`mise run verify:kernels -- --features <mut>`) both go red.
 mut_gate_ignores_limit = [] # a start is admitted at any count of running commands
 mut_quiet_never_hands_back = [] # a silent command is never handed back to the model
+mut_told_ignores_transcript = [] # an ended job whose notice the transcript holds is told again

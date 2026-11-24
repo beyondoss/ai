@@ -281,6 +281,7 @@ mut_cancel_skips_kill = []
 # Mutations of the bash kernel (`crates/bash-gate`): the bash limit and idle-yield tests go red under them.
 mut_gate_ignores_limit = ["beyond-bash-gate/mut_gate_ignores_limit"]
 mut_quiet_never_hands_back = ["beyond-bash-gate/mut_quiet_never_hands_back"]
+mut_told_ignores_transcript = ["beyond-bash-gate/mut_told_ignores_transcript"]
 # Mutations of the job-table kernel (`crates/execd-jobs`), under which the notify model goes red where the table and the notifier meet.
 mut_remove_keeps_entry = ["beyond-execd-jobs/mut_remove_keeps_entry"]
 mut_remove_live = ["beyond-execd-jobs/mut_remove_live"]

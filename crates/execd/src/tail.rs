@@ -25,15 +25,18 @@
 //! `O_EXCL` and opened `O_NOFOLLOW`, and it is deleted when the job is removed.
 
 use std::collections::HashMap;
-use std::fs::{self, DirBuilder, File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write as _};
 use std::os::fd::{AsFd, AsRawFd, RawFd};
-use std::os::unix::fs::{DirBuilderExt as _, FileExt as _, OpenOptionsExt as _};
+
+use crate::spool::Base;
+use std::os::unix::fs::{FileExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use nix::fcntl::{FallocateFlags, OFlag, fallocate};
+use nix::fcntl::{FallocateFlags, OFlag, fallocate, openat};
 use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify, WatchDescriptor};
+use nix::sys::stat::Mode;
 use nix::unistd::{Whence, lseek};
 use tokio::io::unix::AsyncFd;
 use tokio::sync::Notify;
@@ -43,10 +46,16 @@ use crate::proc::locked;
 /// Bytes read at once, and the step in which read bytes are returned to the filesystem.
 const STEP: usize = 64 * 1024;
 
-/// One job's spool directory.
+/// One job's spool directory, named relative to its held base (`spool::Base`): its files are made
+/// through a descriptor of the directory itself, and every later open goes through the base's
+/// descriptor (`/proc/self/fd/<base>/<mark>`), so no name swapped in above the base is followed.
+/// One descriptor serves every job of a base: an ended job holds none.
 #[derive(Debug)]
 pub(crate) struct Spool {
+    /// The name the ledger records.
     dir: PathBuf,
+    base: Base,
+    mark: String,
 }
 
 /// The two files a job's output goes to, opened for the job: a write end per stream.
@@ -61,19 +70,28 @@ fn open_flags() -> i32 {
 
 impl Spool {
     /// Create `<base>/<mark>` and its two files, `0700` and `0600`, and open them for writing in
-    /// append mode.
-    pub fn create(base: &Path, mark: &str) -> io::Result<(Self, Writers)> {
-        DirBuilder::new().recursive(true).mode(0o700).create(base)?;
-        let dir = base.join(mark);
-        DirBuilder::new().mode(0o700).create(&dir)?;
-        let spool = Self { dir };
+    /// append mode, every step relative to a descriptor, `O_NOFOLLOW`, `O_EXCL`.
+    pub fn create(base: &Base, mark: &str) -> io::Result<(Self, Writers)> {
+        let fd = base.make_dir(mark)?;
+        let spool = Self {
+            dir: base.path().join(mark),
+            base: base.clone(),
+            mark: mark.to_string(),
+        };
         let open = |name: &str| {
-            OpenOptions::new()
-                .append(true)
-                .create_new(true)
-                .mode(0o600)
-                .custom_flags(open_flags())
-                .open(spool.dir.join(name))
+            openat(
+                &fd,
+                name,
+                OFlag::O_WRONLY
+                    | OFlag::O_APPEND
+                    | OFlag::O_CREAT
+                    | OFlag::O_EXCL
+                    | OFlag::O_NOFOLLOW
+                    | OFlag::O_CLOEXEC,
+                Mode::from_bits_truncate(0o600),
+            )
+            .map(File::from)
+            .map_err(io::Error::from)
         };
         let w = (|| {
             Ok(Writers {
@@ -87,12 +105,19 @@ impl Spool {
         w.map(|w| (spool, w))
     }
 
-    /// The spool at `dir`, which a previous execd made (the ledger names it), if it is still there
-    /// and is a real directory.
-    pub fn at(dir: &Path) -> Option<Self> {
-        let meta = fs::symlink_metadata(dir).ok()?;
-        meta.is_dir().then(|| Self {
+    /// The spool at `dir`, which a previous execd made (the ledger names it), if it is in `base`
+    /// and is still there as a real directory.
+    pub fn at(base: &Base, dir: &Path) -> Option<Self> {
+        if dir.parent()? != base.path() {
+            return None;
+        }
+        let mark = dir.file_name()?.to_str()?;
+        // A real directory, never a link.
+        drop(base.open_dir(mark).ok()?);
+        Some(Self {
             dir: dir.to_path_buf(),
+            base: base.clone(),
+            mark: mark.to_string(),
         })
     }
 
@@ -101,28 +126,35 @@ impl Spool {
         &self.dir
     }
 
+    /// A path to this job's directory through the base's descriptor: what every open of a file in
+    /// the spool goes through.
+    pub fn access(&self) -> PathBuf {
+        self.base.access().join(&self.mark)
+    }
+
+    /// The base's descriptor, to be kept by everything that stores a path made by
+    /// [`Self::access`]: its number stays the base's for as long as one of them is alive.
+    pub fn guard(&self) -> Arc<std::os::fd::OwnedFd> {
+        self.base.guard()
+    }
+
     /// Where this job's ring keeps its chunk files: with the spool, so a restart finds them.
     pub fn ring_dir(&self) -> PathBuf {
-        self.dir.join("ring")
+        self.access().join("ring")
     }
 
     /// Delete the directory and the files in it. Idempotent.
     pub fn remove(&self) {
-        let _ = fs::remove_dir_all(&self.dir);
+        self.base.remove_dir_all(&self.mark);
     }
 
     /// Delete every spool under `base` that is not one of `keep`: the ones no job in the ledger
-    /// names (a job that ended or was removed before the restart).
-    pub fn retain(base: &Path, keep: &[&Path]) {
-        let Ok(entries) = fs::read_dir(base) else {
-            return;
-        };
-        for e in entries.flatten() {
-            let Ok(meta) = fs::symlink_metadata(e.path()) else {
-                continue;
-            };
-            if meta.is_dir() && !keep.contains(&e.path().as_path()) {
-                let _ = fs::remove_dir_all(e.path());
+    /// names (a job that ended or was removed before the restart). Only real directories, by name
+    /// relative to the held directory.
+    pub fn retain(base: &Base, keep: &[&Path]) {
+        for name in base.dirs() {
+            if !keep.contains(&base.path().join(&name).as_path()) {
+                base.remove_dir_all(&name);
             }
         }
     }
@@ -216,13 +248,13 @@ impl Tail {
     /// Open the job's files for reading and start watching them.
     pub fn open(hub: &Arc<Hub>, spool: &Spool, start: Start) -> io::Result<Self> {
         let streams = [
-            Stream::open(&spool.dir.join("out"), start, 0)?,
-            Stream::open(&spool.dir.join("err"), start, 1)?,
+            Stream::open(&spool.access().join("out"), start, 0)?,
+            Stream::open(&spool.access().join("err"), start, 1)?,
         ];
         let wake = Arc::new(Notify::new());
         let wds = [
-            hub.watch(&spool.dir.join("out"), &wake)?,
-            hub.watch(&spool.dir.join("err"), &wake)?,
+            hub.watch(&spool.access().join("out"), &wake)?,
+            hub.watch(&spool.access().join("err"), &wake)?,
         ];
         Ok(Self {
             streams,
@@ -291,6 +323,8 @@ const HEADER: usize = 16;
 /// the ring flushes a chunk, so it never holds more than the unfinished chunk plus one piece.
 pub(crate) struct Journal {
     dir: PathBuf,
+    /// Keeps the descriptor `dir` names open (see [`Spool::guard`]).
+    _hold: Arc<std::os::fd::OwnedFd>,
     file: File,
     /// The cursors of `out` and `err` at the first byte held.
     start: [u64; 2],
@@ -306,6 +340,7 @@ impl Journal {
     /// (a new job's: nothing, from zero).
     pub fn create(
         dir: &Path,
+        hold: Arc<std::os::fd::OwnedFd>,
         start: [u64; 2],
         pieces: Vec<(bool, Vec<u8>)>,
         ring_tail: usize,
@@ -313,6 +348,7 @@ impl Journal {
         let held = pieces.iter().map(|p| p.1.len()).sum();
         let mut j = Self {
             dir: dir.to_path_buf(),
+            _hold: hold,
             // Replaced by `rewrite`.
             file: File::open("/dev/null")?,
             start,
@@ -522,5 +558,143 @@ impl Hub {
 impl Drop for Hub {
     fn drop(&mut self) {
         self.stop.cancel();
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod hold_tests {
+    use super::*;
+    use crate::ring::Ring;
+    use crate::spool::JobsDir;
+
+    fn stable() -> (tempfile::TempDir, JobsDir) {
+        let base = tempfile::tempdir().unwrap();
+        let jobs = JobsDir::open(Some(base.path()), Some(Path::new("/state"))).unwrap();
+        (base, jobs)
+    }
+
+    fn names(d: &Path) -> Vec<String> {
+        let mut v: Vec<String> = fs::read_dir(d)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// A job's ring and journal keep the base's descriptor open, so after the server that made it is
+    /// gone its number is not another server's: a late flush fails in the removed directory, never
+    /// writes into a later server's spool of the same name. Red when the descriptor is not held.
+    #[test]
+    fn a_stale_ring_and_journal_never_write_into_a_later_servers_spool() {
+        let (_base1, jobs1) = stable();
+        let (a, _w) = Spool::create(jobs1.stable(), "a").unwrap();
+        let mut journal = Journal::create(&a.access(), a.guard(), [0, 0], Vec::new(), 0).unwrap();
+        let mut ring = Ring::new(1 << 20, a.ring_dir()).holding(a.guard()).kept();
+        a.remove();
+        drop(a);
+        drop(jobs1);
+        // A later server: with the numbers free it is given the first one's.
+        let (_base2, jobs2) = stable();
+        let (b, _wb) = Spool::create(jobs2.stable(), "a").unwrap();
+        let _b_journal = Journal::create(&b.access(), b.guard(), [0, 0], Vec::new(), 0).unwrap();
+        let before = names(&b.access());
+        let journal_before = fs::read(b.access().join("journal")).unwrap();
+        // The first one's flushes: a journal rewrite and a full chunk of the ring.
+        journal.record(false, b"x", 0);
+        ring.push(&vec![b'z'; 70_000], false);
+        assert_eq!(
+            names(&b.access()),
+            before,
+            "a stale writer reached a later spool"
+        );
+        assert_eq!(
+            fs::read(b.access().join("journal")).unwrap(),
+            journal_before
+        );
+    }
+
+    /// Every path under `d`, with each file's bytes: what a stale writer must leave as it was.
+    fn tree(d: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+        let mut out = Vec::new();
+        let mut stack = vec![d.to_path_buf()];
+        while let Some(p) = stack.pop() {
+            for e in fs::read_dir(&p).unwrap().flatten() {
+                if e.file_type().unwrap().is_dir() {
+                    out.push((e.path(), None));
+                    stack.push(e.path());
+                } else {
+                    out.push((e.path(), Some(fs::read(e.path()).unwrap())));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// The same server: job a is removed and job b made under the same base. a's stale ring and
+    /// journal neither touch b nor bring a's directory back, and nothing under the base gains a file.
+    /// Red when a stale writer can create its directory or reach b.
+    #[test]
+    fn a_removed_jobs_stale_ring_and_journal_touch_nothing_under_the_base() {
+        let (_base, jobs) = stable();
+        let (a, _w) = Spool::create(jobs.stable(), "a").unwrap();
+        let mut journal = Journal::create(&a.access(), a.guard(), [0, 0], Vec::new(), 0).unwrap();
+        let mut ring = Ring::new(1 << 20, a.ring_dir()).holding(a.guard()).kept();
+        a.remove();
+        drop(a);
+        let (b, _wb) = Spool::create(jobs.stable(), "b").unwrap();
+        let _b_journal = Journal::create(&b.access(), b.guard(), [0, 0], Vec::new(), 0).unwrap();
+        let b_listing = names(&b.access());
+        let b_journal = fs::read(b.access().join("journal")).unwrap();
+        let before = tree(jobs.stable().path());
+        journal.record(false, b"x", 0);
+        ring.push(&vec![b'z'; 70_000], false);
+        assert_eq!(
+            names(&b.access()),
+            b_listing,
+            "a stale writer reached job b"
+        );
+        assert_eq!(fs::read(b.access().join("journal")).unwrap(), b_journal);
+        assert!(
+            !jobs.stable().path().join("a").exists(),
+            "a's directory came back"
+        );
+        assert_eq!(tree(jobs.stable().path()), before, "the base changed");
+    }
+
+    /// `retain` and a job's removal go by name relative to the held directory and remove only real
+    /// directories: a planted link, and the directory it names, are never touched. Red against a
+    /// retain that follows links.
+    #[test]
+    fn retain_and_removal_never_follow_a_planted_link() {
+        let (base, jobs) = stable();
+        let victim = tempfile::tempdir().unwrap();
+        fs::create_dir(victim.path().join("keep")).unwrap();
+        fs::write(victim.path().join("keep/f"), b"precious").unwrap();
+        let _ = &base;
+        let root = jobs.stable().path().to_path_buf();
+        std::os::unix::fs::symlink(victim.path(), root.join("planted")).unwrap();
+        let (gone, _w) = Spool::create(jobs.stable(), "gone").unwrap();
+        // A job's directory name replaced by a link, then the job removed.
+        let (swapped, _w2) = Spool::create(jobs.stable(), "swapped").unwrap();
+        fs::rename(root.join("swapped"), root.join("swapped.moved")).unwrap();
+        std::os::unix::fs::symlink(victim.path(), root.join("swapped")).unwrap();
+        swapped.remove();
+        Spool::retain(jobs.stable(), &[]);
+        assert!(!root.join("gone").exists());
+        drop(gone);
+        assert_eq!(
+            fs::read(victim.path().join("keep/f")).unwrap(),
+            b"precious",
+            "a link's target was touched"
+        );
+        assert!(
+            fs::symlink_metadata(root.join("planted"))
+                .unwrap()
+                .is_symlink()
+        );
     }
 }

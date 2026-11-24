@@ -40,6 +40,8 @@ pub(crate) struct Ring {
     tail_e: Option<Vec<u8>>,
     /// The directory is not this ring's to delete: its owner (a job's spool) removes it.
     keep: bool,
+    /// Keeps open the descriptor `dir` names, when it is a path through one (a job's spool).
+    _hold: Option<std::sync::Arc<std::os::fd::OwnedFd>>,
 }
 
 impl Ring {
@@ -53,7 +55,14 @@ impl Ring {
             retain,
             tail_e: None,
             keep: false,
+            _hold: None,
         }
+    }
+
+    /// This ring's `dir` is a path through `fd`: it is kept open as long as the ring lives.
+    pub fn holding(mut self, fd: std::sync::Arc<std::os::fd::OwnedFd>) -> Self {
+        self._hold = Some(fd);
+        self
     }
 
     /// The ring's directory outlives this value (a job's spool directory, which a restarted execd
