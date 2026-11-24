@@ -104,6 +104,27 @@ mut_resume_end_drops_journal = [
 mut_resume_replays_chunked = [
   "beyond-execd-jobs/mut_resume_replays_chunked",
 ] # a journalled byte already in a chunk file is put in the ring again (X3)
+mut_stdin_replays = [
+  "beyond-execd-jobs/mut_stdin_replays",
+] # bytes below `written` are applied again (W2)
+mut_stdin_applies_ahead = [
+  "beyond-execd-jobs/mut_stdin_applies_ahead",
+] # a write ahead of `written` applies at once instead of waiting (W5)
+mut_stdin_writes_ended = [
+  "beyond-execd-jobs/mut_stdin_writes_ended",
+] # a write lands on an ended or removed job's stdin (W3)
+mut_stdin_writes_after_eof = [
+  "beyond-execd-jobs/mut_stdin_writes_after_eof",
+] # a write lands after EOF closed the stdin (W4)
+mut_stdin_waiters_unbounded = [
+  "beyond-execd-jobs/mut_stdin_waiters_unbounded",
+] # a job's stdin admits every waiting write (W1)
+mut_stdin_waiter_stuck = [
+  "beyond-execd-jobs/mut_stdin_waiter_stuck",
+] # the 16th waiter is refused as well, so a freed slot is never filled (W1-live)
+mut_stdin_waits_at_written = [
+  "beyond-execd-jobs/mut_stdin_waits_at_written",
+] # a write exactly at `written` waits for bytes that never come (W5-live, progress)
 # Mutations of `ring` (the crate `execd-ring`, which Verus proves), used only by `src/ring.rs`'s differential
 # test's red runs: each removes one guard.
 mut_window_before_base = [
