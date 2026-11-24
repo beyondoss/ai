@@ -606,6 +606,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "beyond-job-client"
+version = "0.1.0"
+dependencies = [
+ "vstd",
+]
+
+[[package]]
 name = "beyond-providers"
 version = "0.1.0"
 dependencies = [
