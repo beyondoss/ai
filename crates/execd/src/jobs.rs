@@ -1330,8 +1330,7 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
                 cell.clone(),
                 key.clone(),
                 pg,
-                Some(keeper),
-                None,
+                (Some(keeper), None),
                 rx,
                 tail,
             ));
@@ -1513,8 +1512,7 @@ async fn supervise_term(
     cell: JobCell,
     key: Key,
     pg: proc::Pg,
-    keeper: Option<proc::Proc>,
-    adopted_keeper: Option<proc::Pg>,
+    (keeper, adopted_keeper): (Option<proc::Proc>, Option<proc::Pg>),
     exit: tokio::sync::oneshot::Receiver<Option<(i32, Option<i32>)>>,
     tail: Option<(Arc<Tailing>, tokio::task::JoinHandle<()>)>,
 ) {
@@ -1744,8 +1742,7 @@ pub(crate) fn recover(ctx: &Arc<Ctx>) {
                                 cell,
                                 key,
                                 pg,
-                                None,
-                                Some(kpg),
+                                (None, Some(kpg)),
                                 rx,
                                 tail,
                             ));

@@ -383,7 +383,9 @@ fn keeper(args: &[OsString]) -> io::Result<()> {
         if !r_pipe.is_empty() {
             let mut b = [0u8; 1];
             // Nothing is ever written to it: EOF is the signal (the helper's `dup2` closed its end).
-            let n = rustix::io::read(ready_pipe.as_ref().unwrap(), &mut b).unwrap_or(0);
+            let n = ready_pipe
+                .as_ref()
+                .map_or(0, |p| rustix::io::read(p, &mut b).unwrap_or(0));
             if n == 0 {
                 ready_pipe = None;
                 ready = true;
@@ -751,9 +753,7 @@ pub(crate) fn connect_sync(dir: &Path, keeper_pid: i32) -> io::Result<(UnixStrea
     let s = UnixStream::connect(path)?;
     drop(d);
     let cred = rustix::net::sockopt::socket_peercred(&s)?;
-    if cred.uid != rustix::process::getuid()
-        || i32::try_from(cred.pid.as_raw_nonzero().get()).ok() != Some(keeper_pid)
-    {
+    if cred.uid != rustix::process::getuid() || cred.pid.as_raw_nonzero().get() != keeper_pid {
         return Err(io::Error::other(
             "the socket's peer is not this terminal's keeper",
         ));
@@ -785,6 +785,7 @@ pub(crate) fn connect_sync(dir: &Path, keeper_pid: i32) -> io::Result<(UnixStrea
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
