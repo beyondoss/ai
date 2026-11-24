@@ -51,7 +51,6 @@ fn job_streams_decode_as_the_vectors_say() {
                     output.extend(b);
                     streams.push(if s == Stream::Stderr { 'e' } else { 'o' });
                 }
-                JobFrame::Event(Event::Attached(..)) => {}
                 JobFrame::Event(Event::Gap(n)) => gap += n,
                 JobFrame::Event(Event::ShellExit(c)) => shell.push(c),
                 JobFrame::Heartbeat => {}

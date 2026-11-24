@@ -152,7 +152,15 @@ pub(super) async fn drive(
                     let o = Opening::Attach { offset, mark };
                     next = Some(open(h, o, &mut reader, &mut refusal).await?);
                 }
-                Action::CloseStream => reader = None,
+                Action::CloseStream => {
+                    // After the final frame the body is let end, so the endpoint sees a stream that
+                    // finished (and the connection goes back to the pool); any other close is a drop.
+                    if let Some(r) = reader.take()
+                        && matches!(ev, Ev::Frame(KFrame::Exit { .. }))
+                    {
+                        r.finish().await;
+                    }
+                }
                 Action::Deliver { len, dropped, .. } => {
                     if dropped > 0 {
                         events(JobEvent::Gap(dropped));
