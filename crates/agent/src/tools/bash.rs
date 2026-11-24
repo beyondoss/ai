@@ -282,7 +282,10 @@ impl Bash {
     /// target's remotely (and nothing at all when the target's home isn't known, rather than a guess).
     /// The join onto `root` is pure string work and identical either way.
     fn resolve_cwd(&self, cwd: Option<&str>, world: &PathWorld) -> Option<String> {
-        match (bash_gate::call_cwd(cwd.is_some(), !self.root.as_os_str().is_empty()), cwd) {
+        match (
+            bash_gate::call_cwd(cwd.is_some(), !self.root.as_os_str().is_empty()),
+            cwd,
+        ) {
             (bash_gate::Cwd::Named, Some(dir)) => {
                 Some(super::resolve_against_in(&self.root, dir, world))
             }

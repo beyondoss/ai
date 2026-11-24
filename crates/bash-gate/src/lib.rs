@@ -315,12 +315,24 @@ mod tests {
     /// B4: a command entry is a command server. Red under `mut_command_entry_refused`.
     #[test]
     fn a_command_entry_is_a_command_server() {
-        assert_eq!(mcp_entry_shape(McpType::Absent, true, false), McpShape::Command);
-        assert_eq!(mcp_entry_shape(McpType::Stdio, true, true), McpShape::Command);
+        assert_eq!(
+            mcp_entry_shape(McpType::Absent, true, false),
+            McpShape::Command
+        );
+        assert_eq!(
+            mcp_entry_shape(McpType::Stdio, true, true),
+            McpShape::Command
+        );
         assert_eq!(mcp_entry_shape(McpType::Absent, false, true), McpShape::Url);
         assert_eq!(mcp_entry_shape(McpType::Http, true, true), McpShape::Url);
-        assert_eq!(mcp_entry_shape(McpType::Other, true, true), McpShape::Refused);
-        assert_eq!(mcp_entry_shape(McpType::Stdio, false, true), McpShape::Refused);
+        assert_eq!(
+            mcp_entry_shape(McpType::Other, true, true),
+            McpShape::Refused
+        );
+        assert_eq!(
+            mcp_entry_shape(McpType::Stdio, false, true),
+            McpShape::Refused
+        );
     }
 
     /// B2: 60 s of silence hands a foreground call back; 59 s does not. Red under
