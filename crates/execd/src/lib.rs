@@ -47,6 +47,7 @@ mod ring;
 mod runas;
 mod spool;
 mod tail;
+mod term;
 
 pub use notify::{
     ATTEMPT_TIMEOUT, CallbackAttempt, CallbackKind, NOTIFY_VERSION, NotifyTarget, parse_notify,
