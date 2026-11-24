@@ -795,6 +795,26 @@ pub fn output_sink(kind: Kind) -> (s: Sink)
     }
 }
 
+/// Where a job's spool files live: the jobs directory (a disk, which the operator chose), or the
+/// ledger's directory (which may be a tmpfs, where 8 MiB per job would be RAM).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Root {
+    /// Under the jobs directory.
+    Jobs,
+    /// Under the ledger's state directory.
+    State,
+}
+
+/// S7: where a job's spool lives. Always under the jobs directory, with a ledger or without: the
+/// ledger only names the spool by its path, so a restart finds it there, and the state directory
+/// (tmpfs in a sandbox, by design) holds the ledger and nothing else.
+pub fn spool_root(ledger: bool) -> (r: Root)
+    ensures
+        r is Jobs,
+{
+    if cfg!(feature = "mut_spool_under_state") && ledger { Root::State } else { Root::Jobs }
+}
+
 /// Why execd is stopping: `SIGTERM` or `SIGINT` (a stop: the sandbox is stopping, so nothing may be left
 /// running), or `SIGHUP` (a restart: the next execd adopts the ledgered jobs). service-init sends
 /// `SIGTERM` for a sandbox stop and `SIGHUP` for a restart of execd (`workload_signal`).

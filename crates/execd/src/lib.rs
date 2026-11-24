@@ -444,7 +444,7 @@ pub fn serve(listener: tokio::net::TcpListener, opts: Options) -> std::io::Resul
     }
     // Before any command can be spawned: see `proc::release_signals`.
     proc::release_signals();
-    let spool = spool::JobsDir::open(opts.jobs_dir.as_deref())?;
+    let spool = spool::JobsDir::open(opts.jobs_dir.as_deref(), opts.state_dir.as_deref())?;
     // Fail closed: no authentication is only for a listener that only this host can reach.
     if opts.bearer.is_none()
         && opts.authorizer.is_none()

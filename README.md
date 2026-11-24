@@ -49,6 +49,7 @@ curl localhost:8080/v1/chat/completions \
 | [`crates/execd-jobs`](crates/execd-jobs)   | `beyond-execd-jobs`   | execd's job-table decisions as pure functions, proven in Verus.                         |
 | [`crates/execd-wire`](crates/execd-wire)   | `beyond-execd-wire`   | execd's heartbeat, one-shot first answer and job signal scope, proven in Verus.         |
 | [`crates/bash-gate`](crates/bash-gate)     | `beyond-bash-gate`    | The agent's bash running-command limit and hand-back, proven in Verus.                  |
+| [`crates/job-client`](crates/job-client)   | `beyond-job-client`   | The job cursor (one job incarnation at one output offset), proven in Verus.             |
 | [`crates/execd-ring`](crates/execd-ring)   | `beyond-execd-ring`   | execd's job-output ring decisions (offsets, retention, stderr ranges), proven in Verus. |
 | [`crates/sandbox-mcp`](crates/sandbox-mcp) | `beyond-sandbox-mcp`  | An MCP server that gives any agent exec, files, search and jobs in a sandbox.           |
 | `crates/demo`                              | `beyond-demo`         | Sandbox exec endpoint, key and grant minters, chat client for `deploy/demo`.            |

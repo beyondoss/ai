@@ -963,12 +963,18 @@ fn spool_failure(e: &std::io::Error) -> (u16, &'static str) {
     }
 }
 
-/// Where a job's spool files live: under the ledger's directory when there is one (they outlive
-/// this execd and a restart finds them by the job's mark), else under the jobs directory.
+/// Where a job's spool files live (S7, `kernel::spool_root`): under the jobs directory, never the
+/// ledger's. With a ledger it is a directory that outlives this execd (a restart finds the spool
+/// by the path the ledger names), else this execd's own.
 fn spool_base(ctx: &Ctx) -> std::path::PathBuf {
-    match (&ctx.opts.state_dir, ctx.jobs.ledger.enabled()) {
-        (Some(d), true) => d.join("spool"),
-        _ => ctx.spool.path().to_path_buf(),
+    match kernel::spool_root(ctx.jobs.ledger.enabled()) {
+        kernel::Root::Jobs if ctx.jobs.ledger.enabled() => ctx.spool.stable().to_path_buf(),
+        kernel::Root::Jobs => ctx.spool.path().to_path_buf(),
+        kernel::Root::State => ctx
+            .opts
+            .state_dir
+            .as_deref()
+            .map_or_else(|| ctx.spool.path().to_path_buf(), |d| d.join("spool")),
     }
 }
 

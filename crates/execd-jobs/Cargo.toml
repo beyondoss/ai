@@ -46,6 +46,7 @@ mut_recover_adopts_gone = [] # a restart adopts a job whose group is gone, so it
 mut_recover_reends_ended = [] # a restart drops an ended job whose group number is gone (R1)
 mut_recover_forgets_shell_status = [] # a restart ends a job whose shell had exited with the lost-status code, not the saved one (R3)
 mut_job_output_pipe = [] # a job's output goes to a pipe execd reads, so a write after a restart is SIGPIPE (S1)
+mut_spool_under_state = [] # a ledger puts the spools beside it, in the state directory (S7)
 mut_command_output_spool = [] # a command's output goes to a spool file, not the pipe its client reads (S2)
 mut_shutdown_signals_jobs = [] # execd's shutdown signals every recorded job's group (S3)
 mut_shutdown_orphans_unrecorded = [] # execd's shutdown leaves a job running that no ledger can ever find (S3b)
