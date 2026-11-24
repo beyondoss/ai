@@ -81,3 +81,25 @@ async fn a_driver_that_corrupts_read_fails_the_read_checks_only() {
 async fn a_driver_that_corrupts_stat_fails_the_stat_checks_only() {
     broken_op_fails_exactly_its_checks("stat").await;
 }
+
+/// A filter that matches no check for any driver is a failed run, not an empty pass; one that leaves
+/// some driver nothing skips that driver's cell instead (see `run_cell`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_filter_that_matches_nothing_fails_the_run() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../sdk/conformance/scenarios");
+    let plan = Plan {
+        drivers: vec![Driver {
+            name: "d".into(),
+            cmd: GOOD.into(),
+        }],
+        backends: vec!["embedded".into()],
+        scenarios: Arc::new(matrix::load(&dir).unwrap()),
+        filter: Some("no.such.scenario.*".into()),
+        bins: Binaries::default(),
+        parallel: 1,
+    };
+    let cells = matrix::run(plan).await;
+    assert_eq!(cells.len(), 1);
+    assert!(!cells[0].passes());
+    assert_eq!(cells[0].tally.failing, vec!["matrix/empty".to_string()]);
+}

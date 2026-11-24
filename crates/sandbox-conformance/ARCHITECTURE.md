@@ -103,7 +103,7 @@ pulling `alpine:3.20` and `debian:12-slim`. Each container is named after the pr
 execd's own `listening` line in `docker logs`, never a port probe (docker-proxy accepts before execd listens).
 
 `e2b` (`e2b.rs`) is never in a group or a glob: `--backend e2b` by exact name, and only with `E2B_API_KEY` set (`expand` refuses
-otherwise). It creates one VM with a hard auto-kill (`LIFETIME_SECS`, 25 minutes, set at create time), installs `execd` with the
+otherwise). It creates one VM with a hard auto-kill (`LIFETIME_SECS`, 25 minutes, set at create time and set again from now before every cell and relay pair through the sandbox timeout endpoint), so a full run is one invocation however long it takes; each cell is bounded by `CELL_SECS` and fails with a `backend/lease` message if it outlives its lease, never on a dead VM. It installs `execd` with the
 release's own `install-execd.sh` (`E2B_EXECD_VERSION`, default `v0.1.16`; the script checks the tarball's sha256, and the
 installed binary's is printed; `E2B_EXECD_BIN=/path/to/execd`, a static build, is uploaded through envd's files endpoint instead, to prove unreleased endpoint code), runs it as root with `EXECD_RUN_AS=user` and a random bearer, and waits for the public URL
 `https://8081-<id>.e2b.app/exec` to answer 401. The VM is created and driven with `curl`, the key handed over as a config on stdin so

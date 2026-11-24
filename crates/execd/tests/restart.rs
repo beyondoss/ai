@@ -334,3 +334,67 @@ async fn a_client_resumes_at_its_offset_across_a_crash_with_no_gap() {
     .await;
     until(a2, "w", "ended").await;
 }
+
+/// S7: with a ledger, a job's spool (its files, journal and ring chunks) is under the jobs
+/// directory, never the state directory, which in a sandbox is a tmpfs: 8 MiB per job there is RAM.
+/// A `SIGHUP` restart still answers `read` at the old offsets, because the ledger names the spool by
+/// its path. The state and jobs directories are different directories. Red under
+/// `mut_spool_under_state`.
+#[tokio::test]
+async fn a_ledgers_spools_are_in_the_jobs_directory_and_survive_a_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    let jobs = root.path().join("jobs");
+    std::fs::create_dir(&jobs).unwrap();
+    let settings = [
+        ("EXECD_STATE_DIR", state.to_str().unwrap()),
+        ("EXECD_JOBS_DIR", jobs.to_str().unwrap()),
+    ];
+    let mut first = Execd::start(&settings, &[]);
+    let a1 = SocketAddr::V4(first.addr);
+    // Past one chunk (64 KiB), then quiet, so the output is the same before and after.
+    let script = "i=0; while [ $i -lt 200 ]; do printf 'o%0900d\\n' $i; i=$((i+1)); done; echo done; exec sleep 300";
+    start(a1, "w", script).await;
+    let (before, _) = read_until(a1, "w", "done").await;
+    assert!(before.len() > 150_000, "{}", before.len());
+    let names = |d: &std::path::Path| -> Vec<String> {
+        std::fs::read_dir(d)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect()
+    };
+    let in_state = names(&state);
+    assert!(!in_state.iter().any(|n| n == "spool"), "{in_state:?}");
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(i32::try_from(first.child.id()).unwrap()),
+        nix::sys::signal::Signal::SIGHUP,
+    )
+    .unwrap();
+    first.child.wait().unwrap();
+
+    let second = Execd::start(&settings, &[]);
+    let a2 = SocketAddr::V4(second.addr);
+    let (after, _) = read_all(a2, "w").await;
+    assert_eq!(after, before, "the offsets moved across the restart");
+    let in_state = names(&state);
+    assert!(!in_state.iter().any(|n| n == "spool"), "{in_state:?}");
+    // The spool is where the jobs directory is: no file the ledger does not own is beside it.
+    let mut files = 0;
+    let mut stack = vec![jobs.clone()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            if e.file_type().unwrap().is_dir() {
+                stack.push(e.path());
+            } else {
+                files += 1;
+            }
+        }
+    }
+    assert!(files > 0, "no spool file under the jobs directory");
+    job(
+        a2,
+        json!({"op":"kill","scope":"s","ids":["w"],"grace_ms":200}),
+    )
+    .await;
+    until(a2, "w", "ended").await;
+}
