@@ -98,7 +98,7 @@ done
 description = "The step model (crates/job-client/tests/step_model.rs) under each step mutation it can reach: every run must go red. The mutations no model state reaches (an offset near u64::MAX, the classification rows, the wait cap, the silence limit) are Verus's alone. Pairs with `verify:job-client-mutants`."
 run = '''
 set -u
-for m in mut_reattach_from_zero mut_gap_not_counted mut_trailing_gap_dropped mut_echo_mark_unchecked mut_echo_skipped mut_reattach_after_exit mut_remove_on_exit_frame mut_remove_unscoped mut_exit_taken_stalls mut_backoff_never_reopens mut_start_fresh_key mut_start_lost_gives_up mut_watch_delivers mut_close_removes mut_budget_unbounded; do
+for m in mut_reattach_from_zero mut_gap_not_counted mut_trailing_gap_dropped mut_echo_mark_unchecked mut_echo_skipped mut_reattach_after_exit mut_remove_on_exit_frame mut_remove_unscoped mut_exit_taken_stalls mut_backoff_never_reopens mut_start_fresh_key mut_start_lost_gives_up mut_heartbeat_ends mut_watch_delivers mut_close_removes mut_gives_up_on_budget; do
   if cargo test -p beyond-job-client --locked --features "$m" --test step_model >/dev/null 2>&1; then
     echo "model stayed green under $m" >&2; exit 1
   fi
