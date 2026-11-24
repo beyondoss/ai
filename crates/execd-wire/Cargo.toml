@@ -28,5 +28,7 @@ verify = true
 # (named in the README) and the proof (`mise run verify:kernels -- --features <mut>`) both go red.
 mut_beat_late = [] # the heartbeat waits a whole interval more than it should: a stream goes silent for two
 mut_beat_never = [] # a quiet stream is never due a heartbeat
+mut_interval_unbounded = [] # a client's interval is taken at any size: a heartbeat slower than an idle limit
+mut_interval_off = [] # an interval of zero is taken: the heartbeat is off
 mut_oneshot_never_commits = [] # a one-shot still running at the first silence is not committed: its headers wait for the end
 mut_stray_not_signalled = [] # a job's signal reaches its group and not the marked processes that left it

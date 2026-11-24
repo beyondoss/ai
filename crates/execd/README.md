@@ -101,6 +101,28 @@ error that names the variable and the value (exit 2), and so is any argument: ex
 | `EXECD_WORKER_THREADS`     | `1`                                                | `1` one thread; `0` a worker per CPU; `N` workers                                                                                                                                     |
 | `EXECD_IDLE_TIMEOUT_MS`    | `0` (off)                                          | close a connection with no request in flight for this long (a stream in flight is never cut)                                                                                          |
 
+## The heartbeat interval
+
+A stream, a held job's stream and a long one-shot answer carry a heartbeat when they have been silent for a beat (5 s by default),
+so no proxy on the path sees a silence. A request may choose its own beat with the `Keepalive-Ping-Interval` header, a whole number
+of seconds (E2B's envd takes the same header):
+
+| header value                                         | beat                                                                                |
+| ---------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| `1` to `240`                                         | that many seconds                                                                   |
+| absent, `0`, negative, not an integer, or over `240` | the default, 5 s. There is no "off": a silent command is never left without a byte. |
+
+240 s is below every idle limit on Beyond's path (the gateway's 295 s, the edge's 300 s, the load balancer's 350 s), and the front
+lengthens its own stall limit for the request to stay over the interval. A longer interval means a dead connection is noticed later: a
+client that reads one frame per interval (and must keep its own silence limit above it: the agent's is 30 s) cannot tell a vanished sandbox from a quiet one sooner than one interval, so the "client sees a
+failure within 10 s" bound holds only at the default beat.
+
+## Errors
+
+An error before a command starts is the status below with `{"error": "<reason>"}`. A job start that cannot make its output spool
+because the sandbox's disk is full answers `507` (`the sandbox's disk is full: no room for the job's output`), as E2B's envd does for a
+full disk; any other failure to make the spool is `500`.
+
 No `EXECD_*` variable reaches the commands execd runs. The startup line logs execd's version.
 
 `GET /livez` (or `/healthz`) answers 200 without authentication, and nothing else is open. `SIGTERM` and `SIGINT` kill every running process

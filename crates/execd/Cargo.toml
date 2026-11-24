@@ -129,6 +129,12 @@ mut_beat_late = [
 mut_beat_never = [
   "beyond-execd-wire/mut_beat_never",
 ]
+mut_interval_unbounded = [
+  "beyond-execd-wire/mut_interval_unbounded",
+]
+mut_interval_off = [
+  "beyond-execd-wire/mut_interval_off",
+]
 mut_oneshot_never_commits = [
   "beyond-execd-wire/mut_oneshot_never_commits",
 ]

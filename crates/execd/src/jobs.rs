@@ -539,6 +539,7 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq, data: Vec<u8>) -> 
             let (resp, out) = http::stream_response();
             tokio::spawn(stream_job(
                 ctx.clone(),
+                req.beat,
                 k,
                 cell,
                 job.offset,
@@ -836,7 +837,8 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
             Err(e) => {
                 ctx.jobs.remove(&[(key, cell.clone())]);
                 crate::log_warn!("cannot make a job's spool: {e}");
-                return http::error_response(500, "cannot make the job's output spool");
+                let (status, why) = spool_failure(&e);
+                return http::error_response(status, why);
             }
         }
     }
@@ -885,8 +887,19 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
             });
         }
         let ctx2 = ctx.clone();
+        let beat = req.beat;
         tokio::spawn(async move {
-            let end = stream_job(ctx2.clone(), key, cell, 0, true, Some((pgid, opened)), out).await;
+            let end = stream_job(
+                ctx2.clone(),
+                beat,
+                key,
+                cell,
+                0,
+                true,
+                Some((pgid, opened)),
+                out,
+            )
+            .await;
             if let Some(o) = &ctx2.opts.observer {
                 o.stream_ended(seq, end, std::time::Instant::now());
             }
@@ -898,6 +911,19 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
             body["stdin"] = json!(true);
         }
         http::json_response(200, &body)
+    }
+}
+
+/// What a start answers when its output spool cannot be made: `507` with a plain reason when the
+/// disk is out of space (`ENOSPC`; E2B's envd answers `507` for the same), else `500`.
+fn spool_failure(e: &std::io::Error) -> (u16, &'static str) {
+    if e.kind() == std::io::ErrorKind::StorageFull {
+        (
+            507,
+            "the sandbox's disk is full: no room for the job's output",
+        )
+    } else {
+        (500, "cannot make the job's output spool")
     }
 }
 
@@ -1263,6 +1289,7 @@ fn bound(ctx: &Ctx, key: &Key, attached: &JobCell) -> Option<JobCell> {
 /// whose job dies with the connection unless it was kept by then. How the stream ended.
 async fn stream_job(
     ctx: Arc<Ctx>,
+    beat: Duration,
     key: Key,
     attached: JobCell,
     offset: u64,
@@ -1271,7 +1298,7 @@ async fn stream_job(
     out: mpsc::Sender<Bytes>,
 ) -> StreamEnd {
     // A job stream has no deadline of its own: it lives as long as the job or the connection.
-    let mut sink = Sink::new(out, ctx.opts.heartbeat, None);
+    let mut sink = Sink::new(out, beat, None);
     if let Ok(end) = follow(&ctx, &key, &attached, offset, started, &mut sink).await {
         return end;
     }
@@ -1395,5 +1422,21 @@ async fn follow(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod spool_failure_tests {
+    use super::spool_failure;
+
+    /// A start whose spool cannot be made for want of disk answers `507` with a reason a client
+    /// can act on; any other failure stays `500`. Red without the mapping (a bare `500`).
+    #[test]
+    fn a_full_disk_is_507_and_any_other_failure_is_500() {
+        let full = std::io::Error::from_raw_os_error(28) /* ENOSPC */;
+        assert_eq!(spool_failure(&full).0, 507);
+        assert!(spool_failure(&full).1.contains("disk is full"));
+        let other = std::io::Error::from_raw_os_error(13) /* EACCES */;
+        assert_eq!(spool_failure(&other).0, 500);
     }
 }
