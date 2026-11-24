@@ -116,13 +116,14 @@ pub(super) async fn drive(
         s = next_state;
         // The kernel took the first frame: the sink hears of the incarnation, and a stdin the
         // endpoint did not open is refused (an endpoint that predates job stdin says nothing).
-        if confirming && matches!(s.phase, step::Phase::Streaming) {
-            if let Ev::Frame(KFrame::Started { .. }) = ev {
-                if h.spec.is_some_and(|sp| sp.stdin_open) && !payload.stdin {
-                    return Err(predates("job stdin"));
-                }
-                events(JobEvent::Started(payload.pgid));
+        if confirming
+            && matches!(s.phase, step::Phase::Streaming)
+            && let Ev::Frame(KFrame::Started { .. }) = ev
+        {
+            if h.spec.is_some_and(|sp| sp.stdin_open) && !payload.stdin {
+                return Err(predates("job stdin"));
             }
+            events(JobEvent::Started(payload.pgid));
         }
         // The event the last I/O action produced, if it did.
         let mut next: Option<Ev> = None;
@@ -367,16 +368,8 @@ fn as_mark(text: Option<&str>, p: &mut Payload) -> Mark {
 }
 
 /// A typed failure as the error a jobs call returns.
-fn fault_error(
-    fault: Fault,
-    status: u16,
-    refusal: Option<Refusal>,
-    p: &Payload,
-) -> std::io::Error {
-    let body = refusal
-        .as_ref()
-        .map(|r| r.body.clone())
-        .unwrap_or_default();
+fn fault_error(fault: Fault, status: u16, refusal: Option<Refusal>, p: &Payload) -> std::io::Error {
+    let body = refusal.as_ref().map(|r| r.body.clone()).unwrap_or_default();
     match fault {
         Fault::JobGone => JobError::gone(if body.is_empty() {
             "the job does not exist, or its id now names another job".to_string()
@@ -388,7 +381,9 @@ fn fault_error(
         Fault::DiskFull => JobError::DiskFull { text: body }.into_io(),
         Fault::NotOffered => predates("job marks"),
         // No caller sends it: a Rust caller's deadline is a dropped future.
-        Fault::Deadline => std::io::Error::new(std::io::ErrorKind::TimedOut, "job stream: deadline"),
+        Fault::Deadline => {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "job stream: deadline")
+        }
         Fault::Auth | Fault::NoPty | Fault::Protocol => match refusal {
             Some(r) if r.status == status => r.error(),
             _ => std::io::Error::other(format!(

@@ -7,7 +7,9 @@
 use std::sync::{Arc, Mutex};
 
 use beyond_sandbox::exec_endpoint::HttpExecRunner;
-use beyond_sandbox::exec_endpoint::jobs::{JobEnd, JobError, JobEvent, JobId, JobScope, JobSpec, SandboxJobs};
+use beyond_sandbox::exec_endpoint::jobs::{
+    JobEnd, JobError, JobEvent, JobId, JobScope, JobSpec, SandboxJobs,
+};
 use beyond_sandbox::exec_endpoint::jobs_native::NativeJobs;
 use beyond_test_support::job_front::{JobFront, Reply, Script};
 use serde_json::Value;
@@ -147,7 +149,10 @@ async fn a_job_that_is_gone_is_not_retried() {
     .await;
     let (r, _) = run(&front, 1000).await;
     let e = r.unwrap_err();
-    assert!(matches!(JobError::of(&e), Some(JobError::Gone { .. })), "{e}");
+    assert!(
+        matches!(JobError::of(&e), Some(JobError::Gone { .. })),
+        "{e}"
+    );
     assert_eq!(front.seen.lock().unwrap().len(), 2);
 }
 

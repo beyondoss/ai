@@ -115,6 +115,18 @@ the processes, the output and the notify sender (`execd` is the reference); the 
 `JobScope::for_session` remains the Beyond agent helper that digests tenant + session. `Jobs::start` builds a kept
 job from program/args with optional cwd/label — the short path; `start_kept` still takes a full `JobSpec`.
 
+**The handle (`exec_endpoint/jobs_native/handle.rs`).** `run_held` and `follow` are one handle driven by the client
+kernel (`job_client::step`, proven in Verus): the shell sends the request the kernel names, turns what comes back into a
+kernel event (a status, a frame, a cut, a tick) and does the actions it returns. It keeps no reconnect counter, offset,
+gap or status table of its own. A cut stream is reopened at the offset the consumer has reached, asking for the mark the
+first frame named; a start is sent again with the same `idempotency_key`; a gap is told to the sink before the next
+output; and the handle ends only on the job's end, a terminal answer (`JobGone`, a refused credential, ...) or the
+caller dropping the future. A front that is down for any length of time is a `Reconnecting` log line, never an end.
+An endpoint that does not echo a mark (`started{mark}`, `attached{mark,from}`) is refused as `Unsupported` (the kernel's
+`NotOffered`): there is no version check and no capabilities op. `JobError::classify` takes a start's and an attach's
+statuses from the kernel's `classify`. `HttpExecRunner::with_time_divisor` is test-only: it runs the handle's clock and
+sleeps faster so a test of a minutes-long outage takes a fraction of a second; the default is the wall clock.
+
 ## Errors (`error.rs`)
 
 Layer-1 and most helpers still return `std::io::Error`. `SandboxError` is the FILES-OVER-EXEC kind vocabulary
