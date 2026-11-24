@@ -488,3 +488,55 @@ async fn a_planted_link_at_the_stable_directory_is_refused() {
         "the link's target was touched"
     );
 }
+
+/// The stable directory is checked once, at start, and then held open: a link swapped in at its
+/// name afterwards is not followed by a job's spool (a lower-privileged process could otherwise aim
+/// execd's writes anywhere). The spool is made in the directory execd opened, and what the link names
+/// is untouched.
+#[tokio::test]
+async fn a_link_swapped_in_after_start_is_not_followed() {
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    let jobs = root.path().join("jobs");
+    let victim = root.path().join("victim");
+    std::fs::create_dir(&jobs).unwrap();
+    std::fs::create_dir(&victim).unwrap();
+    let settings = [
+        ("EXECD_STATE_DIR", state.to_str().unwrap()),
+        ("EXECD_JOBS_DIR", jobs.to_str().unwrap()),
+    ];
+    let first = Execd::start(&settings, &[]);
+    let a1 = SocketAddr::V4(first.addr);
+    let stable = std::fs::read_dir(&jobs)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("execd-spool-")
+        })
+        .unwrap();
+    // After startup: the directory moves aside and a link to the victim takes its name.
+    let moved = root.path().join("moved");
+    std::fs::rename(&stable, &moved).unwrap();
+    std::os::unix::fs::symlink(&victim, &stable).unwrap();
+    start(a1, "w", "echo hi; exec sleep 300").await;
+    read_until(a1, "w", "hi").await;
+    let left: Vec<_> = std::fs::read_dir(&victim).unwrap().flatten().collect();
+    assert!(
+        left.is_empty(),
+        "a spool was made through the link: {left:?}"
+    );
+    assert!(
+        std::fs::read_dir(&moved).unwrap().count() > 0,
+        "the spool is not in the directory execd opened"
+    );
+    job(
+        a1,
+        json!({"op":"kill","scope":"s","ids":["w"],"grace_ms":200}),
+    )
+    .await;
+    until(a1, "w", "ended").await;
+}

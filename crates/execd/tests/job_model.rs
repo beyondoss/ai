@@ -1106,7 +1106,7 @@ fn production_calls_the_kernel() {
         "kernel::window(",
         "match kernel::spool_root(ctx.jobs.ledger.enabled())",
         "kernel::Root::Stable => ctx.spool.stable()",
-        "kernel::Root::PerServer => ctx.spool.path()",
+        "kernel::Root::PerServer => ctx.spool.server()",
         "kernel::bound(",
         "kernel::follow(",
         "Pick::",

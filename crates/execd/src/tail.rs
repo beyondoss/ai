@@ -25,15 +25,18 @@
 //! `O_EXCL` and opened `O_NOFOLLOW`, and it is deleted when the job is removed.
 
 use std::collections::HashMap;
-use std::fs::{self, DirBuilder, File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write as _};
 use std::os::fd::{AsFd, AsRawFd, RawFd};
-use std::os::unix::fs::{DirBuilderExt as _, FileExt as _, OpenOptionsExt as _};
+
+use crate::spool::Base;
+use std::os::unix::fs::{FileExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use nix::fcntl::{FallocateFlags, OFlag, fallocate};
+use nix::fcntl::{FallocateFlags, OFlag, fallocate, openat};
 use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify, WatchDescriptor};
+use nix::sys::stat::Mode;
 use nix::unistd::{Whence, lseek};
 use tokio::io::unix::AsyncFd;
 use tokio::sync::Notify;
@@ -43,10 +46,15 @@ use crate::proc::locked;
 /// Bytes read at once, and the step in which read bytes are returned to the filesystem.
 const STEP: usize = 64 * 1024;
 
-/// One job's spool directory.
+/// One job's spool directory, held open: everything in it is made and opened through the
+/// descriptor, so no name swapped in above it (or inside, by anyone but us) is followed.
 #[derive(Debug)]
 pub(crate) struct Spool {
+    /// The name the ledger records.
     dir: PathBuf,
+    fd: std::os::fd::OwnedFd,
+    base: Base,
+    mark: String,
 }
 
 /// The two files a job's output goes to, opened for the job: a write end per stream.
@@ -61,19 +69,29 @@ fn open_flags() -> i32 {
 
 impl Spool {
     /// Create `<base>/<mark>` and its two files, `0700` and `0600`, and open them for writing in
-    /// append mode.
-    pub fn create(base: &Path, mark: &str) -> io::Result<(Self, Writers)> {
-        // The base is made by its owner (`spool::JobsDir`), never here, and never through a link.
-        let dir = base.join(mark);
-        DirBuilder::new().mode(0o700).create(&dir)?;
-        let spool = Self { dir };
+    /// append mode, every step relative to a descriptor, `O_NOFOLLOW`, `O_EXCL`.
+    pub fn create(base: &Base, mark: &str) -> io::Result<(Self, Writers)> {
+        let fd = base.make_dir(mark)?;
+        let spool = Self {
+            dir: base.path().join(mark),
+            fd,
+            base: base.clone(),
+            mark: mark.to_string(),
+        };
         let open = |name: &str| {
-            OpenOptions::new()
-                .append(true)
-                .create_new(true)
-                .mode(0o600)
-                .custom_flags(open_flags())
-                .open(spool.dir.join(name))
+            openat(
+                &spool.fd,
+                name,
+                OFlag::O_WRONLY
+                    | OFlag::O_APPEND
+                    | OFlag::O_CREAT
+                    | OFlag::O_EXCL
+                    | OFlag::O_NOFOLLOW
+                    | OFlag::O_CLOEXEC,
+                Mode::from_bits_truncate(0o600),
+            )
+            .map(File::from)
+            .map_err(io::Error::from)
         };
         let w = (|| {
             Ok(Writers {
@@ -87,12 +105,19 @@ impl Spool {
         w.map(|w| (spool, w))
     }
 
-    /// The spool at `dir`, which a previous execd made (the ledger names it), if it is still there
-    /// and is a real directory.
-    pub fn at(dir: &Path) -> Option<Self> {
-        let meta = fs::symlink_metadata(dir).ok()?;
-        meta.is_dir().then(|| Self {
+    /// The spool at `dir`, which a previous execd made (the ledger names it), if it is in `base`
+    /// and is still there as a real directory.
+    pub fn at(base: &Base, dir: &Path) -> Option<Self> {
+        if dir.parent()? != base.path() {
+            return None;
+        }
+        let mark = dir.file_name()?.to_str()?;
+        let fd = base.open_dir(mark).ok()?;
+        Some(Self {
             dir: dir.to_path_buf(),
+            fd,
+            base: base.clone(),
+            mark: mark.to_string(),
         })
     }
 
@@ -101,32 +126,29 @@ impl Spool {
         &self.dir
     }
 
+    /// A path to the directory that is the held one whatever its name now names: what every open
+    /// of a file in the spool goes through.
+    pub fn access(&self) -> PathBuf {
+        PathBuf::from(format!("/proc/self/fd/{}", self.fd.as_raw_fd()))
+    }
+
     /// Where this job's ring keeps its chunk files: with the spool, so a restart finds them.
     pub fn ring_dir(&self) -> PathBuf {
-        self.dir.join("ring")
+        self.access().join("ring")
     }
 
     /// Delete the directory and the files in it. Idempotent.
     pub fn remove(&self) {
-        let _ = fs::remove_dir_all(&self.dir);
+        self.base.remove_dir_all(&self.mark);
     }
 
     /// Delete every spool under `base` that is not one of `keep`: the ones no job in the ledger
-    /// names (a job that ended or was removed before the restart).
-    pub fn retain(base: &Path, keep: &[&Path]) {
-        // A link at the base is not ours: it could name any directory, and this runs as root.
-        if !fs::symlink_metadata(base).is_ok_and(|m| m.is_dir()) {
-            return;
-        }
-        let Ok(entries) = fs::read_dir(base) else {
-            return;
-        };
-        for e in entries.flatten() {
-            let Ok(meta) = fs::symlink_metadata(e.path()) else {
-                continue;
-            };
-            if meta.is_dir() && !keep.contains(&e.path().as_path()) {
-                let _ = fs::remove_dir_all(e.path());
+    /// names (a job that ended or was removed before the restart). Only real directories, by name
+    /// relative to the held directory.
+    pub fn retain(base: &Base, keep: &[&Path]) {
+        for name in base.dirs() {
+            if !keep.contains(&base.path().join(&name).as_path()) {
+                base.remove_dir_all(&name);
             }
         }
     }
@@ -220,13 +242,13 @@ impl Tail {
     /// Open the job's files for reading and start watching them.
     pub fn open(hub: &Arc<Hub>, spool: &Spool, start: Start) -> io::Result<Self> {
         let streams = [
-            Stream::open(&spool.dir.join("out"), start, 0)?,
-            Stream::open(&spool.dir.join("err"), start, 1)?,
+            Stream::open(&spool.access().join("out"), start, 0)?,
+            Stream::open(&spool.access().join("err"), start, 1)?,
         ];
         let wake = Arc::new(Notify::new());
         let wds = [
-            hub.watch(&spool.dir.join("out"), &wake)?,
-            hub.watch(&spool.dir.join("err"), &wake)?,
+            hub.watch(&spool.access().join("out"), &wake)?,
+            hub.watch(&spool.access().join("err"), &wake)?,
         ];
         Ok(Self {
             streams,

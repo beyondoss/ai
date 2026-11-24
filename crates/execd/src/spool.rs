@@ -23,6 +23,11 @@
 
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io;
+use std::os::fd::{AsRawFd as _, OwnedFd};
+use std::sync::Arc;
+
+use nix::fcntl::{OFlag, open, openat};
+use nix::sys::stat::{Mode, fstat, mkdirat};
 use std::os::unix::fs::{DirBuilderExt as _, FileExt as _, MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -36,29 +41,93 @@ const PREFIX: &str = "execd-jobs-";
 /// there the spools the ledger names.
 const STABLE: &str = "execd-spool-";
 
-/// Make the stable directory `dir` (non-recursive, `0700`) unless it exists, then check what is
-/// there: a real directory (not a link), ours, mode `0700`. Anything else is refused.
-fn open_stable(dir: &Path, uid: u32) -> io::Result<()> {
-    make_job_dir(dir)?;
-    let meta = fs::symlink_metadata(dir)?;
-    let bad = |why: &str| {
-        Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("{} {why}", dir.display()),
-        ))
-    };
-    if !meta.is_dir() {
-        return bad("is not a real directory");
-    }
-    if meta.uid() != uid {
-        return bad("is owned by another user");
-    }
-    if meta.mode() & 0o7777 != 0o700 {
-        return bad("is not mode 0700");
-    }
-    Ok(())
+/// A directory execd holds open: spools are made and removed relative to the descriptor, so a link
+/// swapped in at the directory's name after it was checked is never followed.
+#[derive(Clone, Debug)]
+pub(crate) struct Base {
+    /// The name the ledger records for what is made here.
+    path: PathBuf,
+    fd: Arc<OwnedFd>,
 }
 
+impl Base {
+    /// Open `dir` (a real directory, never through a link: `O_NOFOLLOW`) and check it from the
+    /// descriptor, not the name: ours, mode `0700`.
+    fn open(dir: &Path, uid: u32) -> io::Result<Self> {
+        let bad = |why: &str| {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{} {why}", dir.display()),
+            ))
+        };
+        let fd = match open(
+            dir,
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(nix::errno::Errno::ELOOP | nix::errno::Errno::ENOTDIR) => {
+                return bad("is not a real directory");
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let st = fstat(&fd)?;
+        if st.st_uid != uid {
+            return bad("is owned by another user");
+        }
+        if st.st_mode & 0o7777 != 0o700 {
+            return bad("is not mode 0700");
+        }
+        Ok(Self {
+            path: dir.to_path_buf(),
+            fd: Arc::new(fd),
+        })
+    }
+
+    /// The name spools made here are recorded under.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// A path that names this directory itself, whatever its name now names: for the opens that
+    /// are path-based (`/proc/self/fd/N/...`), and for nothing the ledger records.
+    pub fn access(&self) -> PathBuf {
+        PathBuf::from(format!("/proc/self/fd/{}", self.fd.as_raw_fd()))
+    }
+
+    /// Make the directory `name` here, `0700`, and open it. The name is never followed.
+    pub fn make_dir(&self, name: &str) -> io::Result<OwnedFd> {
+        mkdirat(&self.fd, name, Mode::from_bits_truncate(0o700))?;
+        self.open_dir(name).map_err(io::Error::from)
+    }
+
+    /// Open the directory `name` here (a real directory, never a link).
+    pub fn open_dir(&self, name: &str) -> nix::Result<OwnedFd> {
+        openat(
+            &self.fd,
+            name,
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+    }
+
+    /// Remove the directory `name` here and all it holds. Idempotent. It goes by way of the
+    /// descriptor's own path, whose last component is not followed.
+    pub fn remove_dir_all(&self, name: &str) {
+        let _ = fs::remove_dir_all(self.access().join(name));
+    }
+
+    /// The names of the real directories here.
+    pub fn dirs(&self) -> Vec<String> {
+        let Ok(rd) = fs::read_dir(self.access()) else {
+            return Vec::new();
+        };
+        rd.flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect()
+    }
+}
 /// FNV-1a of a path's bytes: a name that is the same for every execd, of any version, that is given
 /// the same ledger directory (`DefaultHasher` makes no such promise).
 fn ledger_tag(state: &Path) -> String {
@@ -76,7 +145,10 @@ fn ledger_tag(state: &Path) -> String {
 /// execd's directory for job output.
 pub(crate) struct JobsDir {
     path: PathBuf,
-    stable: PathBuf,
+    /// This server's directory, held open.
+    server: Base,
+    /// The ledger's spools' directory, held open (with a ledger only).
+    stable: Option<Base>,
     next: AtomicU64,
 }
 
@@ -92,22 +164,33 @@ impl JobsDir {
         let tag: String = rnd.iter().map(|b| format!("{b:02x}")).collect();
         let path = base.join(format!("{PREFIX}{uid}-{me}-{tag}"));
         DirBuilder::new().mode(0o700).create(&path)?;
-        let stable = base.join(format!(
-            "{STABLE}{}",
-            state.map_or_else(String::new, ledger_tag)
-        ));
-        if let Some(Err(e)) = state.map(|_| open_stable(&stable, uid)) {
-            crate::log_error!(
-                "refusing to start: the spool directory {} is not ours alone ({e}); \
-                 a process that can write {} may have planted it",
-                stable.display(),
-                base.display()
-            );
+        let server = Base::open(&path, uid).inspect_err(|_| {
             let _ = fs::remove_dir_all(&path);
-            return Err(e);
-        }
+        })?;
+        // With a ledger: made non-recursively (`0700`) unless it exists, then opened once, never
+        // through a link, and checked from the descriptor. It is the only handle used from here on.
+        let stable = match state {
+            None => None,
+            Some(state) => {
+                let dir = base.join(format!("{STABLE}{}", ledger_tag(state)));
+                match make_job_dir(&dir).and_then(|()| Base::open(&dir, uid)) {
+                    Ok(b) => Some(b),
+                    Err(e) => {
+                        crate::log_error!(
+                            "refusing to start: the spool directory {} is not ours alone ({e}); \
+                             a process that can write {} may have planted it",
+                            dir.display(),
+                            base.display()
+                        );
+                        let _ = fs::remove_dir_all(&path);
+                        return Err(e);
+                    }
+                }
+            }
+        };
         let dir = Self {
             path,
+            server,
             stable,
             next: AtomicU64::new(0),
         };
@@ -121,14 +204,14 @@ impl JobsDir {
             .join(self.next.fetch_add(1, Ordering::Relaxed).to_string())
     }
 
-    /// The directory itself, where a job's spool files go when there is no ledger.
-    pub fn path(&self) -> &Path {
-        &self.path
+    /// The directory a ledger's spools live in (S7): in the jobs directory's base, not the ledger's.
+    pub fn stable(&self) -> &Base {
+        self.stable.as_ref().unwrap_or(&self.server)
     }
 
-    /// The directory a ledger's spools live in (S7): in the jobs directory's base, not the ledger's.
-    pub fn stable(&self) -> &Path {
-        &self.stable
+    /// This server's own directory, held open.
+    pub fn server(&self) -> &Base {
+        &self.server
     }
 
     /// Say what the directory is on, and warn where retained output would be RAM.
@@ -358,7 +441,6 @@ mod tests {
         // A planted link: refused, and what it names is untouched.
         std::os::unix::fs::symlink(outside.path(), &stable).unwrap();
         assert!(JobsDir::open(Some(base.path()), Some(state)).is_err());
-        crate::tail::Spool::retain(&stable, &[]);
         assert!(outside.path().join("victim").is_dir());
         fs::remove_file(&stable).unwrap();
         // A directory too open: refused.
@@ -369,7 +451,7 @@ mod tests {
         fs::set_permissions(&stable, fs::Permissions::from_mode(0o700)).unwrap();
         for _ in 0..2 {
             let d = JobsDir::open(Some(base.path()), Some(state)).unwrap();
-            assert_eq!(d.stable(), stable);
+            assert_eq!(d.stable().path(), stable);
         }
         // No leftover per-server directory from the refusals.
         let left: Vec<_> = fs::read_dir(base.path())
@@ -387,6 +469,6 @@ mod tests {
         // `/` is root's: when we are not root it is not ours; as root, any other uid will do.
         let d = base.path().join("d");
         fs::create_dir(&d).unwrap();
-        assert!(open_stable(&d, me.wrapping_add(1)).is_err());
+        assert!(Base::open(&d, me.wrapping_add(1)).is_err());
     }
 }
