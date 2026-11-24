@@ -182,13 +182,12 @@ pub(crate) async fn run(
         stream_ended(shared, link);
     }
     match outcome {
-        Some(Ok(end)) => return Ok(status_result(end.code())),
+        Some(Ok(end)) => Ok(status_result(end.code())),
         // The handle reconnects a cut stream itself, however long the front is down, so an error is
         // the job's end (gone, lost) or one a retry cannot change.
-        Some(Err(e)) => return Err(e.to_string()),
-        None => return steered(shared, link, &mut ctl, Phase::Released).await,
+        Some(Err(e)) => Err(e.to_string()),
+        None => steered(shared, link, &mut ctl, Phase::Released).await,
     }
-    steered(shared, link, &mut ctl, Phase::Follow(FollowKind::Holding)).await
 }
 
 /// A held foreground command has run for [`exec_notify::keep_gate::KEEP_AFTER_MS`]: hand it to the
@@ -925,5 +924,63 @@ mod notify_tests {
         let result = task.await.unwrap().unwrap();
         assert_eq!(result.code, Some(0));
         assert_eq!(session.kernel().job(&job), None, "held, as today");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod front_tests {
+    use super::*;
+    use beyond_test_support::job_front::{JobFront, Reply};
+
+    /// bug-agent-front-outage-60s: a kept job's command outlives any number of front restarts. The
+    /// front is down for far longer than three minutes of the handle's clock (the handle's waits run
+    /// 2000 times faster here; the default is the wall clock) and the command's output and end still
+    /// arrive. Red before the handle: the follow loop gave up after 120 breaks, about a minute.
+    #[tokio::test]
+    async fn a_front_down_for_minutes_does_not_end_a_kept_job() {
+        let b64 = |s: &str| {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode(s)
+        };
+        let mark = "00ff00ff00ff00ff1a";
+        let (first, second) = (b64("hello"), b64("world"));
+        let front = JobFront::start(std::sync::Arc::new(move |i, _| match i {
+            0 => Reply::Stream(vec![
+                format!(r#"{{"started":4242,"mark":"{mark}","stdin":false}}"#),
+                format!(r#"{{"stdout":"{first}"}}"#),
+            ]),
+            1..=130 => Reply::Down,
+            _ => Reply::Stream(vec![
+                format!(r#"{{"attached":{{"mark":"{mark}","from":5}}}}"#),
+                format!(r#"{{"stdout":"{second}"}}"#),
+                r#"{"exit_code":0}"#.into(),
+            ]),
+        }))
+        .await;
+        let runner = std::sync::Arc::new(
+            crate::exec_endpoint::HttpExecRunner::new(&front.url)
+                .unwrap()
+                .with_time_divisor(2000),
+        );
+        let jobs = Arc::new(BashJobs::new(EndPolicy::KeepRunning));
+        let link = SandboxLink::new(
+            runner.sandbox_jobs().unwrap(),
+            JobScope::under("/tmp/unused", "s"),
+            JobId::parse("j1").unwrap(),
+            true,
+        );
+        let shared = Arc::new(JobShared::in_sandbox(link.clone(), 0, &jobs));
+        let spec = JobSpec {
+            program: "sh".into(),
+            args: vec!["-c".into(), "true".into()],
+            cwd: None,
+            label: "t".into(),
+            env: Vec::new(),
+            stdin_open: false,
+        };
+        let result = run(&shared, &link, &spec).await.unwrap();
+        assert_eq!(result.code, Some(0));
+        assert_eq!(shared.offset(), 10, "hello and world, once each");
     }
 }

@@ -164,6 +164,14 @@ pub(super) async fn drive(
                         JobEnd::Exit(code)
                     });
                 }
+                // Not an end: the front has been out of reach for a while. Said once a second try is
+                // spent, then on every further miss; the handle keeps going until the job ends.
+                Action::Reconnecting { attempts, since_ms } => {
+                    tracing::warn!(
+                        job = %h.id, attempts, since_ms,
+                        "the exec endpoint is out of reach; reconnecting to the job"
+                    );
+                }
                 Action::Sleep { until_ms } => {
                     tokio::time::sleep(clock.wait(until_ms)).await;
                     next = Some(Ev::Tick);
@@ -379,10 +387,8 @@ fn fault_error(
         Fault::JobExists => JobError::Exists { text: body }.into_io(),
         Fault::DiskFull => JobError::DiskFull { text: body }.into_io(),
         Fault::NotOffered => predates("job marks"),
-        Fault::Unreachable => std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "job stream: the endpoint could not be reached",
-        ),
+        // No caller sends it: a Rust caller's deadline is a dropped future.
+        Fault::Deadline => std::io::Error::new(std::io::ErrorKind::TimedOut, "job stream: deadline"),
         Fault::Auth | Fault::NoPty | Fault::Protocol => match refusal {
             Some(r) if r.status == status => r.error(),
             _ => std::io::Error::other(format!(
