@@ -28,9 +28,10 @@ verus! {
 // Constants.
 // ---------------------------------------------------------------------------------------------
 
-/// Failed opens in a row (no confirmed reattach between them) after which the handle gives up with
-/// `Unreachable`. The first wait is 250 ms and the longest 30 s, so this is about three minutes.
-pub const BUDGET: u32 = 12;
+/// Failed opens in a row (no confirmed reattach between them) after which every further failed open also
+/// tells the shell `Reconnecting{attempts, since_ms}`. Reconnecting never ends the handle: it is a status.
+/// The first wait is 250 ms and the longest 30 s, so this is about three minutes.
+pub const RECONNECTING_AFTER: u32 = 12;
 
 /// The longest wait before a reopen, whatever the server's `Retry-After` says.
 pub const BACKOFF_CAP_MS: u64 = 30_000;
@@ -173,8 +174,9 @@ pub enum Fault {
     DiskFull,
     /// A start refused because no pseudo-terminal is free.
     NoPty,
-    /// The budget is spent. The `Fail` action carries the cursor offset to resume from.
-    Unreachable,
+    /// The caller's deadline passed (the shell sent [`Event::Deadline`]). The `Fail` action carries the
+    /// cursor offset to resume from.
+    Deadline,
     /// The endpoint predates marks: it did not echo the mark.
     NotOffered,
     /// A status or frame that is wrong and will not be right on a retry; the status is in the action.
@@ -220,8 +222,10 @@ pub struct State {
     /// A gap the stream reported that the consumer has not been told of yet: the next chunk carries it.
     /// It is per connection: a reattach asks from `offset` and the server reports the gap again.
     pub pending: u64,
-    /// Failed opens since the last confirmed reattach.
+    /// Failed opens since the last confirmed reattach (saturating).
     pub misses: u32,
+    /// The clock when the first of those failed.
+    pub since_ms: u64,
     /// When a [`Phase::Backoff`] ends, milliseconds on the shell's clock.
     pub until_ms: u64,
     /// The heartbeat the request chose, whole seconds; 0 for the default.
@@ -264,6 +268,8 @@ pub enum Event {
     ExitTaken,
     /// The consumer stopped: detach, never kill.
     Close,
+    /// The caller's deadline passed. The shell owns the clock for it; the kernel only obeys.
+    Deadline,
 }
 
 /// What the shell does.
@@ -275,6 +281,8 @@ pub enum Action {
     OpenAttach { offset: u64, mark: Mark, silence_ms: u64 },
     /// Release the connection, if one is open.
     CloseStream,
+    /// Status, not an end: `attempts` failed opens in a row since `since_ms`, and the handle keeps trying.
+    Reconnecting { attempts: u32, since_ms: u64 },
     /// Hand the consumer `len` bytes (the frame just decoded) at offset `at`, with `dropped` bytes lost
     /// just before them, at `[at - dropped, at)`.
     Deliver { at: u64, len: u64, dropped: u64 },
@@ -323,7 +331,6 @@ pub open spec fn rank_of(p: Phase) -> int {
 
 /// The invariant of every state this module makes and keeps.
 pub open spec fn wf(s: State) -> bool {
-    &&& !(s.phase is Done) ==> s.misses < BUDGET
     &&& s.mark.len <= 32
     &&& (s.phase is Streaming || s.phase is ExitHeld || s.phase is Removing || s.flow is Remove)
         ==> s.mark.len > 0
@@ -586,7 +593,7 @@ pub open spec fn post_gaps(s: State, ev: Event, s2: State, out: Seq<Action>) -> 
 }
 
 /// B: the reconnect budget resets on a confirmed reattach only (the echo with the held mark), never on a
-/// bare connect, and gives up exactly when the budget is spent.
+/// bare connect; after `RECONNECTING_AFTER` it says `Reconnecting` and keeps going.
 pub open spec fn post_budget(s: State, ev: Event, s2: State, out: Seq<Action>) -> bool {
     &&& wf(s2)
     &&& s2.misses < s.misses ==> {
@@ -595,18 +602,23 @@ pub open spec fn post_budget(s: State, ev: Event, s2: State, out: Seq<Action>) -
         &&& s2.phase is Streaming
     }
     &&& (s.phase is Confirming && good_echo(s, ev)) ==> s2.misses == 0 && s2.phase is Streaming
-    &&& (s2.misses > s.misses) ==> s2.misses == s.misses + 1
-    &&& forall|i: int| 0 <= i < out.len() ==> (is_fail_with(#[trigger] out[i], Fault::Unreachable)
-        ==> s.misses + 1 >= BUDGET)
+    &&& (s2.misses > s.misses) ==> s2.misses as int == min_int(s.misses as int + 1, u32::MAX as int)
     &&& ((s.phase is Starting || s.phase is Opening || s.phase is Confirming || s.phase is Streaming
-        || s.phase is Removing) && ev is Broke && s.misses + 1 >= BUDGET) ==> {
-        &&& s2.phase is Done
-        &&& fails_with(out, Fault::Unreachable)
-    }
-    &&& ((s.phase is Starting || s.phase is Opening || s.phase is Confirming || s.phase is Streaming
-        || s.phase is Removing) && ev is Broke && s.misses + 1 < BUDGET) ==> {
+        || s.phase is Removing) && ev is Broke) ==> {
         &&& s2.phase is Backoff
-        &&& s2.misses == s.misses + 1
+        &&& s2.misses as int == min_int(s.misses as int + 1, u32::MAX as int)
+    }
+    &&& forall|i: int| 0 <= i < out.len() ==> match #[trigger] out[i] {
+        Action::Reconnecting { attempts, since_ms } => {
+            &&& attempts >= RECONNECTING_AFTER
+            &&& attempts == s2.misses
+            &&& since_ms == s2.since_ms
+        },
+        _ => true,
+    }
+    &&& (s2.phase is Backoff && s2.misses > s.misses && s2.misses >= RECONNECTING_AFTER) ==> {
+        &&& out.len() > 0
+        &&& out[out.len() - 1] == (Action::Reconnecting { attempts: s2.misses, since_ms: s2.since_ms })
     }
 }
 
@@ -669,7 +681,7 @@ pub open spec fn post_remove(s: State, ev: Event, now: u64, s2: State, out: Seq<
 }
 
 /// C: classification. A request's answer is classified by one table; a terminal class finishes with its
-/// fault, a retry class waits and tries again (or gives up when the budget is spent), and a good answer
+/// fault, a retry class waits and tries again (never ending the handle), and a good answer
 /// goes on.
 pub open spec fn post_classify(s: State, ev: Event, s2: State, out: Seq<Action>) -> bool {
     (s.phase is Starting || s.phase is Opening || s.phase is Removing) && ev is Answered ==> {
@@ -680,9 +692,7 @@ pub open spec fn post_classify(s: State, ev: Event, s2: State, out: Seq<Action>)
                 &&& !(s.phase is Removing) ==> (s2.phase is Confirming && out.len() == 0)
             },
             Class::Retry => {
-                &&& (s2.phase is Backoff || (s2.phase is Done && fails_with(out, Fault::Unreachable)))
-                &&& forall|i: int| 0 <= i < out.len() ==> (is_fail(#[trigger] out[i])
-                    ==> is_fail_with(out[i], Fault::Unreachable))
+                &&& s2.phase is Backoff
             },
             Class::Terminal(f) => {
                 &&& s2.phase is Done
@@ -704,7 +714,7 @@ pub open spec fn post_backoff(s: State, ev: Event, now: u64, s2: State, out: Seq
         _ => true,
     }
     &&& ((s.phase is Starting || s.phase is Opening || s.phase is Removing) && ev is Answered
-        && class_of(op_of(s.phase), ev_status(ev)) is Retry && s.misses + 1 < BUDGET) ==> {
+        && class_of(op_of(s.phase), ev_status(ev)) is Retry) ==> {
         &&& s2.phase is Backoff
         &&& s2.until_ms as int >= min_int(
             now as int + min_int(ev_retry_after_ms(ev), BACKOFF_CAP_MS as int),
@@ -757,14 +767,14 @@ pub open spec fn post_silence(s: State, s2: State, out: Seq<Action>) -> bool {
 }
 
 /// K: the start key. Every send of the start carries the key of the first send, and a lost start is sent
-/// again rather than given up while the budget lasts.
+/// again rather than given up.
 pub open spec fn post_key(s: State, ev: Event, s2: State, out: Seq<Action>) -> bool {
     &&& s2.key == s.key
     &&& forall|i: int| 0 <= i < out.len() ==> match #[trigger] out[i] {
         Action::Start { key, .. } => key == s.key && s.flow is Start && s.mark.len == 0,
         _ => true,
     }
-    &&& (s.phase is Starting && ev is Broke && s.misses + 1 < BUDGET) ==> {
+    &&& (s.phase is Starting && ev is Broke) ==> {
         &&& s2.phase is Backoff
         &&& s2.flow is Start
     }
@@ -790,10 +800,32 @@ pub open spec fn post_end(s: State, ev: Event, s2: State, out: Seq<Action>) -> b
         &&& forall|i: int| 0 <= i < out.len() ==> (#[trigger] out[i] == Action::CloseStream
             || out[i] == Action::Detached)
     }
+    &&& (ev is Deadline && !(s.phase is Done)) ==> {
+        &&& s2.phase is Done
+        &&& fails_with(out, Fault::Deadline)
+    }
     &&& s.phase is Done ==> (s2 == s && out.len() == 0)
     &&& (s2.phase is Done && !(s.phase is Done)) ==> (out.len() > 0 && is_terminal_action(out[out.len() - 1]))
     &&& !(s2.phase is Done) ==> forall|i: int| 0 <= i < out.len() ==> !is_terminal_action(#[trigger] out[i])
     &&& forall|i: int| 0 <= i < out.len() ==> (is_terminal_action(#[trigger] out[i]) ==> i == out.len() - 1)
+}
+
+/// A: only these end a handle: the job's end (the exit taken, the remove answered), JobGone or a mark
+/// mismatch, a terminal class (auth, not-offered, protocol, 500, no pty on a start, exists, disk full), the
+/// caller's close or deadline. A failed open, a cut, silence, a tick, a retryable answer never do, however
+/// many came before: reconnecting is a status, never an end.
+pub open spec fn post_only_these_end(s: State, ev: Event, s2: State, out: Seq<Action>) -> bool {
+    &&& (ev is Broke || ev is Tick) ==> !(s2.phase is Done) || s.phase is Done
+    &&& ((s.phase is Starting || s.phase is Opening || s.phase is Removing) && ev is Answered
+        && class_of(op_of(s.phase), ev_status(ev)) is Retry) ==> !(s2.phase is Done)
+    &&& forall|i: int| 0 <= i < out.len() ==> match #[trigger] out[i] {
+        Action::Fail { fault, .. } => {
+            &&& fault is JobGone || fault is JobExists || fault is DiskFull || fault is NoPty
+                || fault is NotOffered || fault is Protocol || fault is Auth || fault is Deadline
+            &&& (fault is Deadline) == (ev is Deadline)
+        },
+        _ => true,
+    }
 }
 
 /// Everything `step` promises.
@@ -812,6 +844,7 @@ pub open spec fn step_post(s: State, ev: Event, now: u64, s2: State, out: Seq<Ac
     &&& post_key(s, ev, s2, out)
     &&& post_watch(s, s2, out)
     &&& post_end(s, ev, s2, out)
+    &&& post_only_these_end(s, ev, s2, out)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1009,47 +1042,53 @@ fn detach(s: State, close: bool) -> (r: (State, Vec<Action>))
     (t, out)
 }
 
-/// A failed open or a cut: wait and reopen, or give up when the budget is spent.
+/// A failed open or a cut: wait and reopen. Never gives up; after `RECONNECTING_AFTER` failures in a row it
+/// also says `Reconnecting`.
 fn backoff(s: State, retry_after_s: u32, now: u64, draw: u32, close: bool) -> (r: (State, Vec<Action>))
-    requires
-        s.misses < BUDGET,
     ensures
-        s.misses + 1 >= BUDGET ==> r.0 == (State { phase: Phase::Done, pending: 0, ..s }),
-        s.misses + 1 >= BUDGET && close ==> r.1@ == seq![
-            Action::CloseStream,
-            Action::Fail { fault: Fault::Unreachable, status: 0, offset: s.offset },
-        ],
-        s.misses + 1 >= BUDGET && !close ==> r.1@ == seq![
-            Action::Fail { fault: Fault::Unreachable, status: 0, offset: s.offset },
-        ],
-        s.misses + 1 < BUDGET ==> r.0 == (State {
+        r.0 == (State {
             phase: Phase::Backoff,
-            misses: (s.misses + 1) as u32,
+            misses: r.0.misses,
+            since_ms: r.0.since_ms,
             pending: 0,
             until_ms: r.0.until_ms,
             ..s
         }),
-        s.misses + 1 < BUDGET && close ==> r.1@ == seq![
-            Action::CloseStream,
-            Action::Sleep { until_ms: r.0.until_ms },
-        ],
-        s.misses + 1 < BUDGET && !close ==> r.1@ == seq![Action::Sleep { until_ms: r.0.until_ms }],
-        s.misses + 1 < BUDGET ==> r.0.until_ms >= now,
-        s.misses + 1 < BUDGET ==> r.0.until_ms as int <= now as int + BACKOFF_CAP_MS as int,
-        s.misses + 1 < BUDGET ==> r.0.until_ms as int >= min_int(
+        r.0.misses as int == min_int(s.misses as int + 1, u32::MAX as int),
+        r.0.since_ms == (if s.misses == 0 { now } else { s.since_ms }),
+        r.0.until_ms >= now,
+        r.0.until_ms as int <= now as int + BACKOFF_CAP_MS as int,
+        r.0.until_ms as int >= min_int(
             now as int + min_int(1000 * (retry_after_s as int), BACKOFF_CAP_MS as int),
             u64::MAX as int,
         ),
+        (r.0.misses < RECONNECTING_AFTER && close) ==> r.1@ == seq![
+            Action::CloseStream,
+            Action::Sleep { until_ms: r.0.until_ms },
+        ],
+        (r.0.misses < RECONNECTING_AFTER && !close) ==> r.1@ == seq![Action::Sleep { until_ms: r.0.until_ms }],
+        (r.0.misses >= RECONNECTING_AFTER && close) ==> r.1@ == seq![
+            Action::CloseStream,
+            Action::Sleep { until_ms: r.0.until_ms },
+            Action::Reconnecting { attempts: r.0.misses, since_ms: r.0.since_ms },
+        ],
+        (r.0.misses >= RECONNECTING_AFTER && !close) ==> r.1@ == seq![
+            Action::Sleep { until_ms: r.0.until_ms },
+            Action::Reconnecting { attempts: r.0.misses, since_ms: r.0.since_ms },
+        ],
 {
-    let n = s.misses + 1;
-    if n >= BUDGET && !cfg!(feature = "mut_budget_unbounded") {
-        return fail(s, Fault::Unreachable, 0, close);
+    let n = if s.misses == u32::MAX { s.misses } else { s.misses + 1 };
+    if cfg!(feature = "mut_gives_up_on_budget") && n >= RECONNECTING_AFTER {
+        return fail(s, Fault::Protocol, 0, close);
     }
     let w = wait_ms(n, retry_after_s, draw);
     let until = until_of(now, w);
     let mut t = s;
     t.phase = Phase::Backoff;
     t.misses = n;
+    if s.misses == 0 {
+        t.since_ms = now;
+    }
     t.pending = 0;
     t.until_ms = until;
     let mut out = Vec::new();
@@ -1057,6 +1096,9 @@ fn backoff(s: State, retry_after_s: u32, now: u64, draw: u32, close: bool) -> (r
         out.push(Action::CloseStream);
     }
     out.push(Action::Sleep { until_ms: until });
+    if n >= RECONNECTING_AFTER {
+        out.push(Action::Reconnecting { attempts: n, since_ms: t.since_ms });
+    }
     (t, out)
 }
 
@@ -1135,13 +1177,14 @@ fn open_action(s: State, draw_key: u64) -> (r: (State, Vec<Action>))
 // ---------------------------------------------------------------------------------------------
 
 #[allow(unused_variables)]
-/// A close, from any phase but done: detach. It never removes or kills.
+/// A close or the caller's deadline, from any phase but done: detach (a close never removes or kills), or
+/// fail with `Deadline` carrying the cursor.
 fn step_close(s: State, ev: Event, now: u64) -> (r: (State, Vec<Action>))
     requires
         wf(s),
         wf_ev(ev),
         !(s.phase is Done),
-        ev is Close,
+        ev is Close || ev is Deadline,
     ensures
         wf(r.0),
         post_offsets(s, ev, r.0, r.1@),
@@ -1157,10 +1200,14 @@ fn step_close(s: State, ev: Event, now: u64) -> (r: (State, Vec<Action>))
         post_key(s, ev, r.0, r.1@),
         post_watch(s, r.0, r.1@),
         post_end(s, ev, r.0, r.1@),
+        post_only_these_end(s, ev, r.0, r.1@),
 {
     let open = matches!(s.phase, Phase::Starting) || matches!(s.phase, Phase::Opening)
         || matches!(s.phase, Phase::Confirming) || matches!(s.phase, Phase::Streaming)
         || matches!(s.phase, Phase::Removing);
+    if matches!(ev, Event::Deadline) {
+        return fail(s, Fault::Deadline, 0, open);
+    }
     if cfg!(feature = "mut_close_removes") && matches!(s.phase, Phase::ExitHeld) {
         let (t, mut out) = detach(s, false);
         out.push(Action::Remove { mark: s.mark });
@@ -1176,6 +1223,7 @@ fn step_idle(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<Action
         wf_ev(ev),
         s.phase is Idle,
         !(ev is Close),
+        !(ev is Deadline),
     ensures
         wf(r.0),
         post_offsets(s, ev, r.0, r.1@),
@@ -1191,6 +1239,7 @@ fn step_idle(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<Action
         post_key(s, ev, r.0, r.1@),
         post_watch(s, r.0, r.1@),
         post_end(s, ev, r.0, r.1@),
+        post_only_these_end(s, ev, r.0, r.1@),
 {
     if matches!(ev, Event::Go) {
         return open_action(s, draw as u64);
@@ -1204,6 +1253,7 @@ fn step_backoff(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<Act
         wf_ev(ev),
         s.phase is Backoff,
         !(ev is Close),
+        !(ev is Deadline),
     ensures
         wf(r.0),
         post_offsets(s, ev, r.0, r.1@),
@@ -1219,6 +1269,7 @@ fn step_backoff(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<Act
         post_key(s, ev, r.0, r.1@),
         post_watch(s, r.0, r.1@),
         post_end(s, ev, r.0, r.1@),
+        post_only_these_end(s, ev, r.0, r.1@),
 {
     if matches!(ev, Event::Tick) {
         if now >= s.until_ms {
@@ -1241,6 +1292,7 @@ fn step_request(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<Act
         wf_ev(ev),
         s.phase is Starting || s.phase is Opening || s.phase is Removing,
         !(ev is Close),
+        !(ev is Deadline),
     ensures
         wf(r.0),
         post_offsets(s, ev, r.0, r.1@),
@@ -1256,6 +1308,7 @@ fn step_request(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<Act
         post_key(s, ev, r.0, r.1@),
         post_watch(s, r.0, r.1@),
         post_end(s, ev, r.0, r.1@),
+        post_only_these_end(s, ev, r.0, r.1@),
 {
     match ev {
         Event::Answered { status, retry_after_s } => {
@@ -1293,7 +1346,7 @@ fn step_request(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<Act
         },
         Event::Broke => {
             if cfg!(feature = "mut_start_lost_gives_up") && matches!(s.phase, Phase::Starting) {
-                return fail(s, Fault::Unreachable, 0, true);
+                return fail(s, Fault::Protocol, 0, true);
             }
             backoff(s, 0, now, draw, true)
         },
@@ -1308,6 +1361,7 @@ fn step_confirming(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<
         wf_ev(ev),
         s.phase is Confirming,
         !(ev is Close),
+        !(ev is Deadline),
     ensures
         wf(r.0),
         post_offsets(s, ev, r.0, r.1@),
@@ -1323,6 +1377,7 @@ fn step_confirming(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<
         post_key(s, ev, r.0, r.1@),
         post_watch(s, r.0, r.1@),
         post_end(s, ev, r.0, r.1@),
+        post_only_these_end(s, ev, r.0, r.1@),
 {
     match ev {
         Event::Frame(f) => match f {
@@ -1367,6 +1422,7 @@ fn step_streaming(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<A
         wf_ev(ev),
         s.phase is Streaming,
         !(ev is Close),
+        !(ev is Deadline),
     ensures
         wf(r.0),
         post_offsets(s, ev, r.0, r.1@),
@@ -1382,6 +1438,7 @@ fn step_streaming(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<A
         post_key(s, ev, r.0, r.1@),
         post_watch(s, r.0, r.1@),
         post_end(s, ev, r.0, r.1@),
+        post_only_these_end(s, ev, r.0, r.1@),
 {
     match ev {
         Event::Frame(f) => match f {
@@ -1468,6 +1525,7 @@ fn step_exit_held(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<A
         wf_ev(ev),
         s.phase is ExitHeld,
         !(ev is Close),
+        !(ev is Deadline),
     ensures
         wf(r.0),
         post_offsets(s, ev, r.0, r.1@),
@@ -1483,6 +1541,7 @@ fn step_exit_held(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<A
         post_key(s, ev, r.0, r.1@),
         post_watch(s, r.0, r.1@),
         post_end(s, ev, r.0, r.1@),
+        post_only_these_end(s, ev, r.0, r.1@),
 {
     match ev {
         Event::ExitTaken => {
@@ -1538,11 +1597,12 @@ pub fn step(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<Action>
         post_key(s, ev, r.0, r.1@),
         post_watch(s, r.0, r.1@),
         post_end(s, ev, r.0, r.1@),
+        post_only_these_end(s, ev, r.0, r.1@),
 {
     if matches!(s.phase, Phase::Done) {
         return (s, Vec::new());
     }
-    if matches!(ev, Event::Close) {
+    if matches!(ev, Event::Close) || matches!(ev, Event::Deadline) {
         return step_close(s, ev, now);
     }
     match s.phase {
@@ -1620,6 +1680,7 @@ impl State {
             offset: 0,
             pending: 0,
             misses: 0,
+            since_ms: 0,
             until_ms: 0,
             beat_s,
         }
@@ -1643,6 +1704,7 @@ impl State {
             offset,
             pending: 0,
             misses: 0,
+            since_ms: 0,
             until_ms: 0,
             beat_s,
         }

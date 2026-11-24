@@ -97,6 +97,7 @@ struct St {
     exits: u8,
     exit_taken: bool,
     starts: u8,
+    peak: u32,
     start_lost: bool,
     saw_gap_chunk: bool,
     saw_gap_exit: bool,
@@ -120,6 +121,7 @@ const B_REMOVE: u32 = 1 << 4;
 const B_KEY: u32 = 1 << 5;
 const B_ECHO: u32 = 1 << 6;
 const B_FRESH: u32 = 1 << 7;
+const B_GIVEUP: u32 = 1 << 8;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum A {
@@ -135,6 +137,8 @@ enum A {
     TakeExit,
     /// The consumer stops.
     Close,
+    /// The caller's deadline passes.
+    Deadline,
     /// The job writes a byte.
     Produce,
     /// The ring drops its oldest byte.
@@ -192,6 +196,7 @@ impl Cfg {
             exits: 0,
             exit_taken: false,
             starts: 0,
+            peak: 0,
             start_lost: false,
             saw_gap_chunk: false,
             saw_gap_exit: false,
@@ -205,6 +210,7 @@ impl Cfg {
     fn feed(&self, s: &mut St, ev: Event, now: u64, draw: u32) {
         let before = s.c;
         let conn_before = s.conn.clone();
+        let req_before = s.req.clone();
         let (c2, acts) = kernel_step(s.c, ev, now, draw);
         s.c = c2;
         if before.phase != Phase::Streaming && c2.phase == Phase::Streaming && s.held.is_none() {
@@ -280,6 +286,7 @@ impl Cfg {
                     s.cover = end;
                 }
                 Action::Sleep { until_ms } => s.wake = Some(until_ms),
+                Action::Reconnecting { .. } => {}
                 Action::Remove { mark } => {
                     if !s.exit_taken || Some(mark) != s.held.map(mark_of) {
                         s.bad |= B_REMOVE;
@@ -289,13 +296,26 @@ impl Cfg {
                 }
                 Action::Fail { fault, .. } => {
                     s.ended = Some(Ended::Fault(fault));
-                    if self.legacy && fault != Fault::NotOffered && fault != Fault::Unreachable {
-                        // a legacy endpoint is only ever met with NotOffered (or a spent budget)
-                    }
                 }
                 Action::Finish => s.ended = Some(Ended::Finished),
                 Action::Detached => s.ended = Some(Ended::Detached),
             }
+        }
+        s.peak = s.peak.max(s.c.misses);
+        // Reconnecting is a status: a cut, a tick or a busy answer never ends the handle, however
+        // many came before.
+        let busy = matches!(ev, Event::Broke | Event::Tick)
+            || matches!(
+                ev,
+                Event::Answered {
+                    status: 429 | 502 | 504,
+                    ..
+                }
+            )
+            || (matches!(ev, Event::Answered { status: 503, .. })
+                && !matches!(req_before, Req::Start { .. }));
+        if busy && s.ended.is_some() {
+            s.bad |= B_GIVEUP;
         }
     }
 }
@@ -317,6 +337,7 @@ impl Model for Cfg {
             out.push(A::TakeExit);
         }
         out.push(A::Close);
+        out.push(A::Deadline);
         // The shell's first request.
         if s.c.phase == Phase::Idle {
             out.push(A::Draw(0));
@@ -373,6 +394,10 @@ impl Model for Cfg {
             }
             A::Close => {
                 self.feed(&mut n, Event::Close, 0, 0);
+                n.conn = None;
+            }
+            A::Deadline => {
+                self.feed(&mut n, Event::Deadline, 0, 0);
                 n.conn = None;
             }
             A::TakeExit => {
@@ -513,6 +538,7 @@ impl Model for Cfg {
             always!("M6 a start is sent again with its first key", B_KEY),
             always!("M7 no echo, no stream", B_ECHO),
             always!("M8 a job is never created twice for one handle", B_FRESH),
+            always!("M9 reconnecting never ends the handle", B_GIVEUP),
         ];
         if self.legacy {
             p.push(Property::<Self>::sometimes(
@@ -533,8 +559,16 @@ impl Model for Cfg {
             ));
         }
         p.push(Property::<Self>::sometimes(
-            "W3 the budget is spent: Unreachable",
-            |_, s| s.ended == Some(Ended::Fault(Fault::Unreachable)),
+            "W3 the front is down past the notice and the handle streams again",
+            |_, s| {
+                s.peak > job_client::step::RECONNECTING_AFTER
+                    && s.reattached
+                    && s.c.phase == Phase::Streaming
+            },
+        ));
+        p.push(Property::<Self>::sometimes(
+            "W10 the caller's deadline ends it",
+            |_, s| s.ended == Some(Ended::Fault(Fault::Deadline)),
         ));
         if self.flow == Flow::Attach {
             p.push(Property::<Self>::sometimes(
@@ -637,7 +671,7 @@ impl Cfg {
 }
 
 fn check(cfg: Cfg) -> usize {
-    let checker = cfg.checker().target_max_depth(34).spawn_bfs().join();
+    let checker = cfg.checker().target_max_depth(44).spawn_bfs().join();
     checker.assert_properties();
     checker.unique_state_count()
 }
