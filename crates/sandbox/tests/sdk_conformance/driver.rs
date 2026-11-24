@@ -382,6 +382,10 @@ impl Driver {
                     "frames", "unbounded_stream", "exit_signal", "exec_env", "job_streams",
                     "job_stdin", "job_signal_op"
                 ],
+                "missing": {
+                    "job_errors": "the Rust client reports a job condition as a std::io::ErrorKind, not as the typed errors of the TypeScript and Python SDKs",
+                    "job_options": "the driver has no ops for a held start, keep, seen, grace_ms or heartbeat_seconds yet",
+                },
             }));
         }
         if let Some(e) = &self.connect_error {

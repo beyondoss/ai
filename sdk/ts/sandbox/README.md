@@ -47,7 +47,7 @@ Transport  run, stream, jobs                           raw exec; replace it with
 
 1. **Transport** is the whole interface a sandbox needs:
    `run(command, args, { cwd, timeoutMs, stdin }) -> { exitCode, stdout, stderr }` with bytes in and out, `stream` (frames), and
-   `jobs` (start, list, read, attach, kill, remove, wipe). One protocol, no versions: every endpoint is `execd`.
+   `jobs` (start, startHeld, list, read, attach, keep, seen, kill, remove, wipe, writeStdin, signal). One protocol, no versions: every endpoint is `execd`.
    `HttpTransport({ url, token })` is the default: `token` is a string, or `() => Promise<string>` which is called again once on
    a `401`, retrying that request once. That is the only retry the package makes.
 2. **`Files` and `Jobs`** take any `Transport`: `new Files(transport)`. They never touch anything but the transport, so a helper
@@ -103,10 +103,26 @@ The sandbox is not trusted on download: a member with `..` or an absolute name, 
 
 ### Jobs
 
-`jobs.start(scope, id, { command, args, cwd, label })`, `list`, `read(scope, id, { offset, max })`, `follow` (frames) /
-`collect` (follow to the end into one result; `attach` is a deprecated alias), `kill`, `remove`, `wipe`. A job is owned by
-the sandbox: it keeps running when you disconnect, and its last 8 MiB of output is readable from any offset. The sandbox
-keeps them; the client validates and forwards. `scope` is 1 to 64 of `[0-9a-z-]`, an id 1 to 32 of `[0-9a-z]`.
+`jobs.start(scope, id, { command, args, cwd, label, env, stdinOpen })`, `list`, `read(scope, id, { offset, max })`, `follow`
+(frames) / `collect` (follow to the end into one result), `kill(scope, ids, { remove, graceMs })`, `remove`,
+`wipe(scope, { graceMs })`, `writeStdin(scope, id, at, data, eof)` (positional bytes into the job's stdin, which needs
+`stdinOpen: true` at start), `signal(scope, ids, "SIGINT")` (one of `SIGHUP SIGINT SIGQUIT SIGUSR1 SIGUSR2 SIGTERM SIGKILL`,
+sent at once with no grace; `kill` is the TERM, grace, KILL escalation). A job is owned by the sandbox: it keeps
+running when you disconnect, and its last 8 MiB of output is readable from any offset. The sandbox keeps them; the client
+validates and forwards. `scope` is 1 to 64 of `[0-9a-z-]`, an id 1 to 32 of `[0-9a-z]`.
+
+The wire's other options are there under the wire's names: `startHeld` (`hold: true`: the job lives only as long as its
+stream unless you `keep` it), `keep(scope, id, { num, kind, seen })`, `seen(scope, id, offset)`, `graceMs` (the SIGTERM grace
+of `kill` and `wipe`, default 300 ms) and `heartbeatSeconds` (1 to 240, sent as the `Keepalive-Ping-Interval` header; the
+client treats a stream as dead after two beats and ten seconds of silence, never under 30 s). `keep`'s `notify` is not
+offered: it carries a bearer token, which this client does not hold.
+
+Job failures are typed, each a subclass of the kind it was before (so `catch (e) { if (e instanceof NotFoundError) ... }` keeps
+working): `JobGoneError` (a `NotFoundError`: `attach` of a job that is not there, or a `read` whose job was removed), `JobExistsError` (a
+`ConflictError`: `start` of an id that exists), `DiskFullError` (an `IoError`: `start` on a full disk, 507), and for `writeStdin`:
+`StdinClosedError` (`reason: "never_opened" | "closed"`; retrying cannot succeed), `StdinGapError` (bytes before it never came) and
+`StdinBusyError` (16 writes already wait: the same write, later, is safe). Calling `sb.transport.jobs.read` directly keeps the wire's
+`state: "gone"` instead of throwing.
 
 The TypeScript surface takes a `JobSpec` options object (idiomatic optional `cwd` / `label`). The Python client uses
 positional `command, args` plus keyword-only options — same protocol, language-shaped call.

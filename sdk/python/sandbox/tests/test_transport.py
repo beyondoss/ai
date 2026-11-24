@@ -37,6 +37,7 @@ class Endpoint:
     def __init__(self) -> None:
         self.requests: list[dict[str, Any]] = []
         self.auth: list[str | None] = []
+        self.beats: list[str | None] = []  # Keepalive-Ping-Interval, per request
         self.handler: Handler = lambda h, body: reply(
             h, 200, {"exit_code": 0, "stdout": "", "stderr": ""}
         )
@@ -50,6 +51,7 @@ class Endpoint:
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 endpoint.requests.append(body)
                 endpoint.auth.append(self.headers.get("Authorization"))
+                endpoint.beats.append(self.headers.get("Keepalive-Ping-Interval"))
                 endpoint.handler(self, body)
 
             def log_message(self, *args: object) -> None:

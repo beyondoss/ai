@@ -69,7 +69,10 @@ async fn main() {
             }
             Ok(req) if req["op"] == "hello" => {
                 json!({"id": req["id"], "ok": {"driver": "agent-reference", "protocol": 1,
-                    "ops": Driver::ops_with(true), "features": FEATURES}})
+                "ops": Driver::ops_with(true), "features": FEATURES, "missing": {
+                    "job_errors": "the Rust client reports a job condition as a std::io::ErrorKind (NotFound, InvalidInput, BrokenPipe), not as JobGone, JobExists, DiskFull or the stdin errors the TypeScript and Python SDKs have",
+                    "job_options": "the driver has no ops for a held start, keep, seen, grace_ms or heartbeat_seconds yet, though the Rust client carries the wire fields",
+                }}})
             }
             Ok(req) => {
                 if driver.is_none() {

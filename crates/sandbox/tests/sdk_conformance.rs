@@ -212,6 +212,9 @@ async fn reference_agent_passes_every_scenario() {
         .await;
         be.work = work.to_string_lossy().into_owned();
         let mut tally = Tally::default();
+        // Checks a scenario made unsupported by a feature this driver declares it lacks, with the
+        // reason in `hello.missing` (DRIVER.md): not an op the reference driver is missing.
+        let mut declared_missing = 0;
         for (_, file) in &files {
             let suite = file["suite"].as_str().unwrap();
             if !profile.suites.is_empty() && !profile.suites.contains(&suite) {
@@ -232,6 +235,12 @@ async fn reference_agent_passes_every_scenario() {
                         _ => {}
                     }
                 }
+                declared_missing += checks
+                    .iter()
+                    .filter(|c| {
+                        c.status == Status::Unsupported && c.detail.contains(" lacks feature ")
+                    })
+                    .count();
                 tally.add(&checks);
             }
         }
@@ -248,7 +257,7 @@ async fn reference_agent_passes_every_scenario() {
         // A transport that owns no jobs does not offer the job ops: the scenarios that use them are
         // unsupported for it, and for no other profile.
         if !profile.local {
-            grand.unsupported += tally.unsupported;
+            grand.unsupported += tally.unsupported - declared_missing;
         }
         grand.passed += tally.passed;
         grand.failed += tally.failed;
@@ -265,7 +274,10 @@ async fn reference_agent_passes_every_scenario() {
         grand_failures.join("\n")
     );
     assert!(grand.passed > 0);
-    assert_eq!(grand.unsupported, 0, "the reference driver has every op");
+    assert_eq!(
+        grand.unsupported, 0,
+        "the reference driver has every op (a feature it declares missing is not an op)"
+    );
 }
 
 /// The wire shape FILES-OVER-EXEC.md states as exact: a write is one command with the content on stdin.

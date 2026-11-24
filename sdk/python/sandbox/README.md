@@ -72,6 +72,19 @@ an options-object `await Sandbox.connect({ url, token })`.
 and keyword-only for the rest. The TypeScript client takes a `JobSpec` object instead — same wire
 protocol, each language shaped for its callers.
 
+The wire's other job options are keyword arguments under the wire's names: `jobs.start_held(...)` (`hold: true`: the job lives
+only as long as its event stream unless you `jobs.keep(scope, id, num=, kind=, seen=)` it), `jobs.seen(scope, id, offset)`,
+`grace_ms` on `kill` and `wipe` (the SIGTERM grace, default 300 ms) and `heartbeat_seconds` on `follow`, `collect`,
+`start` and `start_held` (1 to 240, the `Keepalive-Ping-Interval` header; a stream is presumed dead after two beats and ten
+seconds of silence, never under 30 s). `keep`'s `notify` is not offered: it carries a bearer token, which this client does
+not hold. `jobs.collect` follows a job to its end and returns everything (it was `attach`).
+
+Job failures are typed, each a subclass of the kind it was before (`except NotFoundError` keeps working): `JobGoneError`
+(a `NotFoundError`: `follow` or `collect` of a job that is not there, or a `read` whose job was removed), `JobExistsError`
+(a `ConflictError`: `start` of an id that exists), `DiskFullError` (an `IoError`: `start` on a full disk, 507), and for
+`write_stdin`: `StdinClosedError` (`.reason` is `"never_opened"` or `"closed"`; retrying cannot succeed), `StdinGapError`
+(the bytes before it never came) and `StdinBusyError` (16 writes already wait: the same write, later, is safe).
+
 ## Authentication
 
 `token` is a string, or a function that returns one. The function is called on first use and once
@@ -164,7 +177,7 @@ Both return a `Transfer(files, dirs, links, bytes)`; `AsyncSandbox` has the same
   stderr together); over the cap the call raises `TooLargeError` and says the command ran. Streams are never
   buffered whole.
 - Closing a stream (`with`, `.close()`) kills the command. Jobs outlive the connection that started
-  them: start with `jobs.start`, follow with `jobs.attach` or `jobs.follow`, stop with `jobs.kill`.
+  them: start with `jobs.start`, follow with `jobs.collect` (to the end, collected) or `jobs.follow` (events), stop with `jobs.kill`.
 - One connection per request, no pooling and no proxy support: the standard library's `socket` and
   `ssl`, or `asyncio` streams, and nothing else. TLS verifies the certificate against the system
   roots (the default context is built once per transport); pass `ssl_context=` to change that.
