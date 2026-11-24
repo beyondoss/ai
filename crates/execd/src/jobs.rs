@@ -34,7 +34,7 @@ use bytes::Bytes;
 use nix::sys::signal::Signal;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::exec::{self, Cut, Sink};
@@ -539,13 +539,12 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq, data: Vec<u8>) -> 
             let (resp, out) = http::stream_response();
             tokio::spawn(stream_job(
                 ctx.clone(),
-                req.beat,
                 k,
                 cell,
                 job.offset,
                 false,
                 None,
-                out,
+                Sink::new(out, req.beat, None),
             ));
             resp
         }
@@ -891,13 +890,12 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
         tokio::spawn(async move {
             let end = stream_job(
                 ctx2.clone(),
-                beat,
                 key,
                 cell,
                 0,
                 true,
                 Some((pgid, opened)),
-                out,
+                Sink::new(out, beat, None),
             )
             .await;
             if let Some(o) = &ctx2.opts.observer {
@@ -1289,16 +1287,14 @@ fn bound(ctx: &Ctx, key: &Key, attached: &JobCell) -> Option<JobCell> {
 /// whose job dies with the connection unless it was kept by then. How the stream ended.
 async fn stream_job(
     ctx: Arc<Ctx>,
-    beat: Duration,
     key: Key,
     attached: JobCell,
     offset: u64,
     hold: bool,
     started: Option<(i32, bool)>,
-    out: mpsc::Sender<Bytes>,
+    mut sink: Sink,
 ) -> StreamEnd {
     // A job stream has no deadline of its own: it lives as long as the job or the connection.
-    let mut sink = Sink::new(out, beat, None);
     if let Ok(end) = follow(&ctx, &key, &attached, offset, started, &mut sink).await {
         return end;
     }
