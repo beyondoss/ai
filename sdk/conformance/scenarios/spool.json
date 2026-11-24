@@ -1,0 +1,123 @@
+{
+  "suite": "spool",
+  "version": 1,
+  "description": "Where a kept job's output lives, with the ledger on as execd is deployed (EXECD_STATE_DIR on a tmpfs, EXECD_JOBS_DIR on disk). A backend that runs execd that way defines SPOOL_STATE and SPOOL_JOBS (`requires.vars`); everywhere else the scenario is skipped, visibly.",
+  "scenarios": [
+    {
+      "id": "spool.kept-job-output-is-on-disk-not-in-ram",
+      "description": "A kept job that writes 8 MiB leaves its retained output under the jobs directory; the state directory (a tmpfs) holds only the ledger; the sandbox's Shmem grows by under 1 MiB.",
+      "requires": {
+        "vars": [
+          "SPOOL_STATE",
+          "SPOOL_JOBS"
+        ],
+        "not_root": true
+      },
+      "steps": [
+        {
+          "id": "state-is-tmpfs",
+          "op": "exec",
+          "command": "sudo",
+          "args": [
+            "-n",
+            "sh",
+            "-c",
+            "stat -f -c %T ${SPOOL_STATE}"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "tmpfs\n"
+            }
+          }
+        },
+        {
+          "id": "jobs-is-not-tmpfs",
+          "op": "exec",
+          "command": "sudo",
+          "args": [
+            "-n",
+            "sh",
+            "-c",
+            "t=$(stat -f -c %T ${SPOOL_JOBS}); echo $t; test $t != tmpfs && test $t != ramfs"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0
+            }
+          }
+        },
+        {
+          "id": "start",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "sp01",
+          "command": "sh",
+          "args": [
+            "-c",
+            "b=$(awk '/^Shmem:/{print $2}' /proc/meminfo); yes | head -c 8388608; sleep 3; a=$(awk '/^Shmem:/{print $2}' /proc/meminfo); echo $((a-b)) > ${ROOT}/shmem_delta; exec sleep 300"
+          ],
+          "label": "",
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              }
+            }
+          }
+        },
+        {
+          "id": "shmem-grew-under-1mib",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "d=$(cat ${ROOT}/shmem_delta) || exit 1; echo shmem_delta_kb=$d; test $d -lt 1024"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0
+            }
+          },
+          "poll": {
+            "timeout_ms": 15000,
+            "interval_ms": 200
+          }
+        },
+        {
+          "id": "spool-is-under-jobs-dir",
+          "op": "exec",
+          "command": "sudo",
+          "args": [
+            "-n",
+            "sh",
+            "-c",
+            "n=$(find ${SPOOL_JOBS}/execd-spool-* -type f -printf '%s\\n' | awk '{s+=$1} END{print s+0}'); echo spool_bytes=$n; test $n -ge 7340032"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0
+            }
+          }
+        },
+        {
+          "id": "state-holds-only-the-ledger",
+          "op": "exec",
+          "command": "sudo",
+          "args": [
+            "-n",
+            "sh",
+            "-c",
+            "ls -A ${SPOOL_STATE}"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": "execd-jobs.json\n"
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

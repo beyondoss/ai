@@ -109,7 +109,7 @@ installed binary's is printed; `E2B_EXECD_BIN=/path/to/execd`, a static build, i
 `https://8081-<id>.e2b.app/exec` to answer 401. The VM is created and driven with `curl`, the key handed over as a config on stdin so
 it is never in a process listing. The guard deletes the VM on drop; its id is also on the reaper registry (`e <id>`), so the
 watchdog deletes it through the API if the harness is killed. `mise run test:clients:e2b` runs it; the differential test runs
-against it only with `DIFFERENTIAL_BACKENDS=e2b`.
+against it only with `DIFFERENTIAL_BACKENDS=e2b`. execd is launched as Beyond deploys it: `EXECD_STATE_DIR=/run/execd-state` (tmpfs, the ledger) and `EXECD_JOBS_DIR=/var/tmp` (disk), defined as `${SPOOL_STATE}` and `${SPOOL_JOBS}` for the `spool` suite.
 
 `beyond` (`beyond.rs`) is likewise only ever named: `--backend beyond`, and only with `BEYOND_EXEC_URL` and `BEYOND_EXEC_TOKEN_CMD` set
 (`expand` refuses otherwise). The harness does not create the sandbox: the operator makes one (`POST /sandboxes`, then
