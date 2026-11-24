@@ -117,6 +117,7 @@ impl SessionLoop {
             if let Some(old) = self.bash_jobs.scope() {
                 crate::tools::bash_sandbox::wipe(self.exec_cell.runner(), &old).await;
             }
+            self.bash_jobs.set_told(&self.session.messages);
             self.bash_jobs
                 .set_scope(Some(crate::exec_endpoint::jobs::JobScope::for_session(
                     self.mode.tenant(),

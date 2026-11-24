@@ -391,6 +391,9 @@ struct Parked {
     job: Job,
     /// Its finish notice has been delivered (or it was reported by an attached wait).
     notified: bool,
+    /// The session's persisted transcript already holds its finish notice (a replica told it, persisted
+    /// the report and died before deleting the job's directory): [`bash_gate::end_due`].
+    told_persisted: bool,
     /// A notice already said its shell exited leaving processes running.
     orphan_notified: bool,
 }
@@ -458,6 +461,8 @@ pub struct BashJobs {
     unchecked: Mutex<Vec<(u64, String)>>,
     /// Unchecked jobs the sandbox no longer had when it was checked: reported by the next notices.
     checked_gone: Mutex<Vec<(u64, String)>>,
+    /// Jobs whose finish notice the session's transcript holds ([`Self::set_told`]).
+    told: Mutex<std::collections::BTreeSet<u64>>,
     /// Sandbox jobs a tool call has taken out of the table ([`Self::take`]), while it has them.
     in_call: Mutex<Vec<Weak<JobShared>>>,
     /// exec notify: the session's notify driver, where the host registered one (`serve --service`).
@@ -485,6 +490,7 @@ impl BashJobs {
             reattach: Mutex::new(None),
             unchecked: Mutex::new(Vec::new()),
             checked_gone: Mutex::new(Vec::new()),
+            told: Mutex::new(Default::default()),
             in_call: Mutex::new(Vec::new()),
             notify: Mutex::new(None),
         }
@@ -687,11 +693,24 @@ impl BashJobs {
         super::bash_sandbox::remove_all(garbage).await;
     }
 
-    /// Park a job read back from the sandbox under its own number. `notified` when its end was
-    /// already reported; its shell's exit (if any) always was.
+    /// The finish notices this session's transcript already holds: what is told survives a replica
+    /// in the persisted transcript, not in the job's directory (deleted only after the report is
+    /// persisted, so a replica that dies between leaves it). Set before a reattach reads jobs back.
+    pub fn set_told(&self, messages: &[agent_core::Message]) {
+        *lock(&self.told) = read_transcript(messages).told;
+    }
+
+    /// Whether the transcript holds job `id`'s finish notice.
+    pub(crate) fn told_end(&self, id: u64) -> bool {
+        lock(&self.told).contains(&id)
+    }
+
+    /// Park a job read back from the sandbox under its own number. Its end is told only if the
+    /// transcript does not hold it yet ([`Self::set_told`]); its shell's exit (if any) always was.
     pub(crate) fn insert_reattached(&self, id: u64, job: Job) {
         self.see_id(id);
         let mut parked = Parked::new(job);
+        parked.told_persisted = self.told_end(id);
         parked.orphan_notified = true;
         lock(&self.table).insert(id, parked);
     }
@@ -959,7 +978,7 @@ impl BashJobs {
         // Retention: ended jobs whose notice is out wait for `bash_job`, at most `MAX_ENDED_JOBS`.
         let ended: Vec<u64> = table
             .iter()
-            .filter(|(_, p)| p.notified && p.job.shared.ended())
+            .filter(|(_, p)| (p.notified || p.told_persisted) && p.job.shared.ended())
             .map(|(id, _)| *id)
             .collect();
         if ended.len() > MAX_ENDED_JOBS {
@@ -1046,17 +1065,16 @@ impl Parked {
         Self {
             job,
             notified: false,
+            told_persisted: false,
             orphan_notified: false,
         }
     }
 
     fn notice_due(&self) -> bool {
         let state = lock(&self.job.shared.state);
-        if state.end.is_some() {
-            !self.notified
-        } else {
-            state.orphans.is_some() && !self.orphan_notified
-        }
+        let ended = state.end.is_some();
+        bash_gate::end_due(ended, self.notified, self.told_persisted)
+            || (!ended && state.orphans.is_some() && !self.orphan_notified)
     }
 }
 
@@ -1270,6 +1288,8 @@ struct LeftRunning {
 #[derive(Default)]
 struct TranscriptJobs {
     max_id: u64,
+    /// Jobs whose end the transcript tells: a finish notice, or a `bash_job` result that reports it.
+    told: std::collections::BTreeSet<u64>,
     running: BTreeMap<u64, LeftRunning>,
 }
 
@@ -1432,6 +1452,7 @@ impl TranscriptJobs {
             return;
         }
         self.running.remove(&id);
+        self.told.insert(id);
     }
 
     /// Finish notices in a user turn's text: `[job N's command … left … running` makes a yielded
@@ -1449,6 +1470,7 @@ impl TranscriptJobs {
                 }
             } else {
                 self.running.remove(&id);
+                self.told.insert(id);
             }
         }
     }

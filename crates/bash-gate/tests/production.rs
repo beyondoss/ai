@@ -19,7 +19,21 @@ fn production_calls_the_verified_kernel() {
         !jobs.contains("running.len() >= MAX_RUNNING_JOBS"),
         "a limit test outside the kernel"
     );
+    let mode = read("agent/src/mode.rs");
+    assert!(
+        mode.contains("bash_gate::tool_root_source("),
+        "mode.rs no longer asks the kernel where the tools are rooted"
+    );
+    let mcp = read("agent/src/mcp_json.rs");
+    assert!(
+        mcp.contains("bash_gate::mcp_entry_shape("),
+        "mcp_json.rs no longer asks the kernel what an entry is"
+    );
     let bash = read("agent/src/tools/bash.rs");
+    assert!(
+        bash.contains("bash_gate::call_cwd("),
+        "bash.rs no longer asks the kernel where a call runs"
+    );
     assert!(
         bash.contains("bash_gate::yield_reason("),
         "bash.rs no longer calls yield_reason"
@@ -47,6 +61,9 @@ fn the_decisions_are_in_the_verified_block() {
     for decision in [
         "pub fn admit_start(",
         "pub fn yield_reason(",
+        "pub fn call_cwd(",
+        "pub fn tool_root_source(",
+        "pub fn mcp_entry_shape(",
         "pub proof fn lemma_a_start_stops_nothing(",
         "pub proof fn lemma_a_call_returns_by_its_ceiling(",
     ] {
