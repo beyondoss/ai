@@ -2678,16 +2678,16 @@ nothing on a timer contacts the sandbox; that a job has one attempt in flight; a
 lands in its own transcript. One mutation per guard shows each property can fail. The wider bounds
 run with `NOTIFY_MODEL_FULL=1`.
 
-**Known gap: a crash can report a sandbox job's end twice.** This is today's behaviour for every
-kept job, held stream or not, and not part of notify. A job's end is reported in a turn (a wake turn,
-or the run its notice joined), and its record in the sandbox is deleted afterwards, at the top of
-`serve`'s loop (`BashJobs::collect_garbage`), once that turn is persisted. A replica that dies
-between the two leaves the record, and the next owner's open reconcile reports the end again. The
-fix is its own change: a ledger of reported ends kept as entries in the transcript's segment log,
-appended in the same batch as the message that carries the end (the only unit the store commits
-atomically and fences against a superseded owner, so never a side file), carried into every new
-base, dropped by `reset_for_new_session`, and consulted by the open reconcile, which then removes
-the record without reporting it again.
+**A sandbox job's end is told once, across a crash.** A job's end is reported in a turn (a wake
+turn, or the run its notice joined), and its record in the sandbox is deleted afterwards, at the top
+of `serve`'s loop (`BashJobs::collect_garbage`), once that turn is persisted. A replica that dies
+between the two leaves the record, ended. What survives is the transcript: before the open
+reconcile (and again on a transcript switch) `BashJobs::set_told` reads the finish notices the
+persisted transcript holds, and a reattached job in that set is never due (`bash_gate::end_due`,
+B3, proven in Verus; `Parked::told_persisted`); `read_back` queues its record for deletion without
+reporting it. A replica that died before persisting leaves no notice in the transcript, so the next
+one tells it. Test: `tests/bash_sandbox_jobs.rs`
+(`a_reopened_job_whose_end_the_transcript_holds_is_not_told_again`).
 
 Tests: `tests/sandbox_jobs.rs` runs every operation against the mock (held streaming, a hold dropped
 before and after `keep`, leftovers, a `SIGTERM`-ignoring kill, the cap's gap, `wipe` scoped to one
