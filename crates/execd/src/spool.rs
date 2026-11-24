@@ -84,6 +84,11 @@ impl Base {
         })
     }
 
+    /// The descriptor itself, shared: held by whatever stores a path made by [`Self::access`].
+    pub fn guard(&self) -> Arc<OwnedFd> {
+        self.fd.clone()
+    }
+
     /// The name spools made here are recorded under.
     pub fn path(&self) -> &Path {
         &self.path
