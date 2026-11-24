@@ -7,7 +7,8 @@
 //!
 //! **Bounds.** On disk, at most the job's retention plus one chunk per job; each chunk file is
 //! deleted when its bytes are evicted, a job's directory when the job is dropped, and the whole
-//! directory when the server shuts down or is dropped. In memory, a job holds a path and at most
+//! directory when the server shuts down or is dropped. With a ledger the spools are not here but in
+//! `<base>/execd-spool-<tag>/<mark>/`, which outlives the server so a restart finds them. In memory, a job holds a path and at most
 //! one unfinished chunk.
 //!
 //! **Safety.** The directories are created `0700` and the files `0600`, each with `create_new`
@@ -28,15 +29,37 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 const PREFIX: &str = "execd-jobs-";
 
+/// The directory, beside the per-server ones, that holds the spools of a server with a ledger:
+/// `execd-spool-<hash of the ledger's directory>`, so two servers with their own ledgers in one jobs
+/// directory never clean up each other's spools. It is not named like the per-server ones, so the
+/// stale-directory cleanup never reads it, and no server removes it when it stops: a restart finds
+/// there the spools the ledger names.
+const STABLE: &str = "execd-spool-";
+
+/// FNV-1a of a path's bytes: a name that is the same for every execd, of any version, that is given
+/// the same ledger directory (`DefaultHasher` makes no such promise).
+fn ledger_tag(state: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt as _;
+    let h = state
+        .as_os_str()
+        .as_bytes()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+            (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3)
+        });
+    format!("{h:016x}")
+}
+
 /// execd's directory for job output.
 pub(crate) struct JobsDir {
     path: PathBuf,
+    stable: PathBuf,
     next: AtomicU64,
 }
 
 impl JobsDir {
     /// Create this server's directory under `base` (default `$TMPDIR`, else `/tmp`).
-    pub fn open(base: Option<&Path>) -> io::Result<Self> {
+    pub fn open(base: Option<&Path>, state: Option<&Path>) -> io::Result<Self> {
         let base = base_dir(base);
         // The owner of /proc/self is the process's effective uid.
         let uid = fs::metadata("/proc/self")?.uid();
@@ -48,6 +71,10 @@ impl JobsDir {
         DirBuilder::new().mode(0o700).create(&path)?;
         let dir = Self {
             path,
+            stable: base.join(format!(
+                "{STABLE}{}",
+                state.map_or_else(String::new, ledger_tag)
+            )),
             next: AtomicU64::new(0),
         };
         dir.log_filesystem();
@@ -63,6 +90,11 @@ impl JobsDir {
     /// The directory itself, where a job's spool files go when there is no ledger.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The directory a ledger's spools live in (S7): in the jobs directory's base, not the ledger's.
+    pub fn stable(&self) -> &Path {
+        &self.stable
     }
 
     /// Say what the directory is on, and warn where retained output would be RAM.
@@ -270,7 +302,7 @@ mod tests {
     fn a_jobs_directory_is_private_and_goes_away_with_its_server() {
         use std::os::unix::fs::PermissionsExt as _;
         let base = tempfile::tempdir().unwrap();
-        let dir = JobsDir::open(Some(base.path())).unwrap();
+        let dir = JobsDir::open(Some(base.path()), None).unwrap();
         let path = dir.path.clone();
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,

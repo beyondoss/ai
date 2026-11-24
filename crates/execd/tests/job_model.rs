@@ -1104,6 +1104,7 @@ fn production_calls_the_kernel() {
         "Ev::Remove {",
         "Ev::Disconnect {",
         "kernel::window(",
+        "kernel::spool_root(",
         "kernel::bound(",
         "kernel::follow(",
         "Pick::",
