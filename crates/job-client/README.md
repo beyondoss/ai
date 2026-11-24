@@ -70,6 +70,9 @@ The properties are registered in Beyond's `proof/properties.toml` (C1 as `kind =
 
 No `assume`, `admit` or `external_body`.
 
+`mise run verify:job-client-mutants` runs every mutant in turn and fails if any verifies green (or fails to
+build instead of failing Verus), printing each mutant's red line.
+
 ## What stays outside `verus!`
 
 - `encode` and `decode` over `String` and `&str`: one-line wrappers that turn the proven byte functions'
