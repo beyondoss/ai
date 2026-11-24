@@ -810,20 +810,41 @@ pub open spec fn post_end(s: State, ev: Event, s2: State, out: Seq<Action>) -> b
     &&& forall|i: int| 0 <= i < out.len() ==> (is_terminal_action(#[trigger] out[i]) ==> i == out.len() - 1)
 }
 
-/// A: only these end a handle: the job's end (the exit taken, the remove answered), JobGone or a mark
-/// mismatch, a terminal class (auth, not-offered, protocol, 500, no pty on a start, exists, disk full), the
-/// caller's close or deadline. A failed open, a cut, silence, a tick, a retryable answer never do, however
-/// many came before: reconnecting is a status, never an end.
+/// A: only these events end a handle (move it from live to done), and each only as stated: the consumer's
+/// `Close` or `Deadline`; the consumer taking the exit when no remove is owed; an answer whose class is
+/// terminal, or the answer to the remove; a frame that is not the echo of the held mark while confirming, an
+/// echo of another mark or a bad frame or an overflowing count while streaming. Every other event leaves a
+/// live handle live: a heartbeat, output, a gap, the exit frame, a 2xx or retry-class answer, a cut, a tick,
+/// however many failed opens came before. Reconnecting is a status, never an end.
 pub open spec fn post_only_these_end(s: State, ev: Event, s2: State, out: Seq<Action>) -> bool {
-    &&& (ev is Broke || ev is Tick) ==> !(s2.phase is Done) || s.phase is Done
+    &&& (s2.phase is Done && !(s.phase is Done)) ==> {
+        ||| ev is Close
+        ||| ev is Deadline
+        ||| ev is ExitTaken
+        ||| ev is Answered
+        ||| ev is Frame
+    }
+    &&& (ev is ExitTaken && s2.phase is Done && !(s.phase is Done)) ==> (s.phase is ExitHeld
+        && !s.remove_on_exit)
+    &&& (ev is Answered && s2.phase is Done && !(s.phase is Done)) ==> {
+        &&& s.phase is Starting || s.phase is Opening || s.phase is Removing
+        &&& (class_of(op_of(s.phase), ev_status(ev)) is Terminal || (s.phase is Removing
+            && class_of(op_of(s.phase), ev_status(ev)) is Ok))
+    }
     &&& ((s.phase is Starting || s.phase is Opening || s.phase is Removing) && ev is Answered
-        && class_of(op_of(s.phase), ev_status(ev)) is Retry) ==> !(s2.phase is Done)
+        && !(class_of(op_of(s.phase), ev_status(ev)) is Terminal)
+        && !(s.phase is Removing && class_of(op_of(s.phase), ev_status(ev)) is Ok)) ==> !(s2.phase is Done)
+    &&& (s.phase is Streaming && ev is Frame && ev->Frame_0 is Heartbeat) ==> !(s2.phase is Done)
+    &&& (s.phase is Streaming && is_output(ev) && s.offset as int + s.pending as int + output_len(ev)
+        <= u64::MAX as int) ==> !(s2.phase is Done)
+    &&& (s.phase is Streaming && is_gap(ev) && s.pending as int + gap_len(ev) <= u64::MAX as int)
+        ==> !(s2.phase is Done)
+    &&& (s.phase is Streaming && is_exit_frame(ev) && s.offset as int + s.pending as int <= u64::MAX as int)
+        ==> !(s2.phase is Done)
+    &&& (s.phase is Confirming && good_echo(s, ev)) ==> !(s2.phase is Done)
+    &&& ((ev is Broke || ev is Tick) && !(s.phase is Done)) ==> !(s2.phase is Done)
     &&& forall|i: int| 0 <= i < out.len() ==> match #[trigger] out[i] {
-        Action::Fail { fault, .. } => {
-            &&& fault is JobGone || fault is JobExists || fault is DiskFull || fault is NoPty
-                || fault is NotOffered || fault is Protocol || fault is Auth || fault is Deadline
-            &&& (fault is Deadline) == (ev is Deadline)
-        },
+        Action::Fail { fault, .. } => (fault is Deadline) == (ev is Deadline),
         _ => true,
     }
 }
@@ -1078,9 +1099,6 @@ fn backoff(s: State, retry_after_s: u32, now: u64, draw: u32, close: bool) -> (r
         ],
 {
     let n = if s.misses == u32::MAX { s.misses } else { s.misses + 1 };
-    if cfg!(feature = "mut_gives_up_on_budget") && n >= RECONNECTING_AFTER {
-        return fail(s, Fault::Protocol, 0, close);
-    }
     let w = wait_ms(n, retry_after_s, draw);
     let until = until_of(now, w);
     let mut t = s;
@@ -1147,12 +1165,8 @@ fn open_action(s: State, draw_key: u64) -> (r: (State, Vec<Action>))
     match s.flow {
         Flow::Start => {
             t.phase = Phase::Starting;
-            let key = if cfg!(feature = "mut_start_fresh_key") && matches!(s.phase, Phase::Backoff) {
-                draw_key
-            } else {
-                s.key
-            };
-            out.push(Action::Start { key, silence_ms: silence });
+            let _ = draw_key;
+            out.push(Action::Start { key: s.key, silence_ms: silence });
         },
         Flow::Attach => {
             t.phase = Phase::Opening;
@@ -1605,7 +1619,7 @@ pub fn step(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<Action>
     if matches!(ev, Event::Close) || matches!(ev, Event::Deadline) {
         return step_close(s, ev, now);
     }
-    match s.phase {
+    let r = match s.phase {
         Phase::Idle => step_idle(s, ev, now, draw),
         Phase::Backoff => step_backoff(s, ev, now, draw),
         Phase::Starting | Phase::Opening | Phase::Removing => step_request(s, ev, now, draw),
@@ -1613,7 +1627,28 @@ pub fn step(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<Action>
         Phase::Streaming => step_streaming(s, ev, now, draw),
         Phase::ExitHeld => step_exit_held(s, ev, now, draw),
         Phase::Done => (s, Vec::new()),
+    };
+    // The mutations of the properties on `step` itself act here, on what the phase functions returned, so the
+    // proof goes red at `step`'s own clauses.
+    if cfg!(feature = "mut_gives_up_on_budget") && matches!(ev, Event::Broke) && r.0.misses >= RECONNECTING_AFTER {
+        return fail(s, Fault::Protocol, 0, true);
     }
+    if cfg!(feature = "mut_heartbeat_ends")
+        && matches!(s.phase, Phase::Streaming)
+        && matches!(ev, Event::Frame(Frame::Heartbeat))
+    {
+        return fail(s, Fault::Protocol, 0, true);
+    }
+    if cfg!(feature = "mut_start_fresh_key") && matches!(s.phase, Phase::Backoff) && matches!(ev, Event::Tick)
+        && r.1.len() == 1
+    {
+        if let Action::Start { silence_ms, .. } = r.1[0] {
+            let mut out = Vec::new();
+            out.push(Action::Start { key: draw as u64, silence_ms });
+            return (r.0, out);
+        }
+    }
+    r
 }
 
 // ---------------------------------------------------------------------------------------------

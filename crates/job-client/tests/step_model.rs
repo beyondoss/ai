@@ -25,9 +25,12 @@
 //! - M6 a start is sent again with the key of its first send; the server never runs two jobs for one
 //!   handle.
 //! - M7 an endpoint that does not echo marks is never streamed: the handle fails closed.
-//! - Witnesses (`sometimes`): the handle finishes after delivering the exit and removing the job; it gives
-//!   up `Unreachable`; it ends `JobGone` when the id was reused; a gap is delivered in a chunk and with the
-//!   exit; it reattaches after a cut and goes on.
+//! - M9 reconnecting never ends the handle: a cut, a tick or a busy answer is never followed by an end,
+//!   however many failed opens came before.
+//! - Witnesses (`sometimes`): the handle finishes after delivering the exit and removing the job; the front
+//!   stays down past the notice threshold and the handle still streams again; the caller's deadline ends it;
+//!   it ends `JobGone` when the id was reused; a gap is delivered in a chunk and with the exit; it reattaches
+//!   after a cut and goes on.
 //!
 //! Mutations: `cargo test -p beyond-job-client --features <mut> --test step_model the_model` MUST fail for
 //! each `mut_*` feature of `step.rs`.
