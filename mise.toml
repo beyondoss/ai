@@ -84,13 +84,25 @@ description = "Prove every kernel crate (crates/exec-notify, crates/execd-jobs, 
 run = ".github/scripts/verify-kernels.sh"
 
 [tasks."verify:job-client-mutants"]
-description = "crates/job-client under each of its nine mut_* features: every proof must go red (a Verus verification failure, not a build error). Pairs with `verify:kernels`, which must be green without a feature."
+description = "crates/job-client under each of its mut_* features (the cursor's and the step function's, read from its Cargo.toml): every proof must go red (a Verus verification failure, not a build error). Pairs with `verify:kernels`, which must be green without a feature."
 run = '''
 set -u
-for m in mut_offset_truncated mut_check_skipped mut_check_skips_a_byte mut_trailing_accepted mut_prefix_accepted mut_scope_unchecked mut_id_unchecked mut_mark_unchecked mut_rejects_max_offset; do
+for m in $(grep -oE '^mut_[a-z0-9_]+' crates/job-client/Cargo.toml); do
   out=$(KERNEL_CRATES=crates/job-client .github/scripts/verify-kernels.sh --features "$m" 2>&1) && { echo "proof stayed green under $m" >&2; exit 1; }
   line=$(grep -E "verification results:: .* [1-9][0-9]* errors" <<<"$out") || { echo "$m: failed without a Verus verification result (build error?)" >&2; exit 1; }
   echo "red under $m: $line"
+done
+'''
+
+[tasks."test:job-client-model-mutants"]
+description = "The step model (crates/job-client/tests/step_model.rs) under each step mutation it can reach: every run must go red. The mutations no model state reaches (an offset near u64::MAX, the classification rows, the wait cap, the silence limit) are Verus's alone. Pairs with `verify:job-client-mutants`."
+run = '''
+set -u
+for m in mut_reattach_from_zero mut_gap_not_counted mut_trailing_gap_dropped mut_echo_mark_unchecked mut_echo_skipped mut_reattach_after_exit mut_remove_on_exit_frame mut_remove_unscoped mut_exit_taken_stalls mut_backoff_never_reopens mut_start_fresh_key mut_start_lost_gives_up mut_heartbeat_ends mut_watch_delivers mut_close_removes mut_gives_up_on_budget; do
+  if cargo test -p beyond-job-client --locked --features "$m" --test step_model >/dev/null 2>&1; then
+    echo "model stayed green under $m" >&2; exit 1
+  fi
+  echo "model red under $m"
 done
 '''
 
