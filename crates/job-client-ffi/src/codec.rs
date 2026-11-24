@@ -3,8 +3,8 @@
 //! `tests/no_decision.rs` fails on a branch, a loop or a comparison in this file.
 //!
 //! Layout. All integers little-endian. A mark is 33 bytes: its length, then 32 bytes. A state is the
-//! 77 bytes `[phase, flow, mode, remove_on_exit, key u64, mark, offset u64, pending u64, misses u32,
-//! until_ms u64, beat_s u32]`. Tags are the order the variants are declared in `job_client::step`.
+//! 85 bytes `[phase, flow, mode, remove_on_exit, key u64, mark, offset u64, pending u64, misses u32,
+//! since_ms u64, until_ms u64, beat_s u32]`. Tags are the order the variants are declared in `job_client::step`, except the action `Reconnecting`, which is 10.
 
 use job_client::step::{
     Action, Class, Event, Flow, Frame, Mark, Mode, Op, Phase, State, classify as k_classify,
@@ -97,6 +97,7 @@ impl Rd<'_> {
             offset: self.u64()?,
             pending: self.u64()?,
             misses: self.u32()?,
+            since_ms: self.u64()?,
             until_ms: self.u64()?,
             beat_s: self.u32()?,
         })
@@ -131,6 +132,7 @@ impl Rd<'_> {
             4 => Ok(Event::Tick),
             5 => Ok(Event::ExitTaken),
             6 => Ok(Event::Close),
+            7 => Ok(Event::Deadline),
             _ => Err(BAD_INPUT),
         }
     }
@@ -151,6 +153,7 @@ fn put_state(v: &mut Vec<u8>, s: &State) {
     v.extend_from_slice(&s.offset.to_le_bytes());
     v.extend_from_slice(&s.pending.to_le_bytes());
     v.extend_from_slice(&s.misses.to_le_bytes());
+    v.extend_from_slice(&s.since_ms.to_le_bytes());
     v.extend_from_slice(&s.until_ms.to_le_bytes());
     v.extend_from_slice(&s.beat_s.to_le_bytes());
 }
@@ -209,6 +212,11 @@ fn put_action(v: &mut Vec<u8>, a: &Action) {
         }
         Action::Finish => v.push(8),
         Action::Detached => v.push(9),
+        Action::Reconnecting { attempts, since_ms } => {
+            v.push(10);
+            v.extend_from_slice(&attempts.to_le_bytes());
+            v.extend_from_slice(&since_ms.to_le_bytes());
+        }
     }
 }
 

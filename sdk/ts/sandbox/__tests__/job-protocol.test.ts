@@ -300,3 +300,139 @@ describe("the wire options, under their wire names", () => {
     expect(silenceMs(240)).toBe(490_000);
   });
 });
+
+describe("the mark on the wire", () => {
+  async function answering(
+    answer: (b: { job: Record<string, unknown> }) => [number, unknown],
+  ) {
+    const bodies: Array<{ job: Record<string, any> }> = [];
+    const e = await fakeEndpoint((r, res) => {
+      const b = r.body as { job: Record<string, any> };
+      bodies.push(b);
+      const [status, v] = answer(b);
+      json(res, status, v);
+    });
+    closers.push(e.close);
+    return { t: new HttpTransport({ url: e.url }), bodies };
+  }
+
+  it("a job id may hold `-` and `_` and be 64 long, and no more", async () => {
+    const { t } = await answering(() => [200, { started: 5, mark: "m" }]);
+    const jobs = new Jobs(t);
+    for (const ok of ["a-b_c", "-", "_", "z".repeat(64)]) {
+      expect(await jobs.start("s", ok, { command: "true" })).toEqual({
+        pgid: 5,
+        mark: "m",
+      });
+    }
+    for (const bad of ["", "A", "a.b", "a/b", "z".repeat(65)]) {
+      await expect(jobs.start("s", bad, { command: "true" })).rejects
+        .toMatchObject({ kind: "invalid_request" });
+    }
+  });
+
+  it("start without a mark is not_offered; held start too", async () => {
+    const { t } = await answering(() => [200, { started: 5 }]);
+    await expect(t.jobs.start("s", "aa", { command: "true" })).rejects
+      .toMatchObject({ kind: "not_offered" });
+    const e = await fakeEndpoint((_r, res) => {
+      res.writeHead(200, { "content-type": "application/x-ndjson" });
+      res.end("{\"started\":42}\n{\"exit_code\":0}\n");
+    });
+    closers.push(e.close);
+    const h = new HttpTransport({ url: e.url });
+    await expect((async () => {
+      for await (
+        const _ of new Jobs(h).startHeld("s", "aa", { command: "true" })
+      ) {
+        /* none */
+      }
+    })()).rejects.toMatchObject({ kind: "not_offered" });
+  });
+
+  it("list carries mark, command, args and the output window", async () => {
+    const { t } = await answering(() => [
+      200,
+      {
+        jobs: [{
+          id: "aa",
+          state: "running",
+          code: null,
+          mark: "0a1b",
+          command: "sh",
+          args: ["-c", "x"],
+          outputStart: 2,
+          outputEnd: 9,
+        }],
+      },
+    ]);
+    expect((await t.jobs.list("s"))[0]).toMatchObject({
+      mark: "0a1b",
+      command: "sh",
+      args: ["-c", "x"],
+      outputStart: 2,
+      outputEnd: 9,
+    });
+  });
+
+  async function attaching(body: string) {
+    const bodies: Array<{ job: Record<string, any> }> = [];
+    const e = await fakeEndpoint((r, res) => {
+      bodies.push(r.body as { job: Record<string, any> });
+      res.writeHead(200, { "content-type": "application/x-ndjson" });
+      res.end(body);
+    });
+    closers.push(e.close);
+    return { jobs: new Jobs(new HttpTransport({ url: e.url })), bodies };
+  }
+
+  it("attach sends mark and output, yields `attached` first, and collect exposes it", async () => {
+    const { jobs, bodies } = await attaching(
+      "{\"attached\":{\"mark\":\"0a1b\",\"from\":4}}\n{\"exit_code\":0}\n",
+    );
+    const out = await jobs.collect("s", "aa", 4, {
+      mark: "0a1b",
+      output: false,
+    });
+    expect(out.attached).toEqual({ mark: "0a1b", from: 4 });
+    expect(bodies[0]!.job).toMatchObject({
+      op: "attach",
+      offset: 4,
+      mark: "0a1b",
+      output: false,
+    });
+    const frames = [];
+    for await (const f of jobs.follow("s", "aa")) frames.push(f.type);
+    // The stream starts at 4 for a follow from 0: the kernel tells the consumer of the 4 bytes between.
+    expect(frames).toEqual(["attached", "gap", "exit"]);
+    expect(bodies[1]!.job).not.toHaveProperty("mark");
+  });
+
+  it("an attach that does not begin with `attached` is not_offered", async () => {
+    const { jobs } = await attaching("{\"exit_code\":0}\n");
+    await expect(jobs.collect("s", "aa")).rejects.toMatchObject({
+      kind: "not_offered",
+    });
+  });
+
+  it("remove sends marks and returns what it skipped; no report is not_offered", async () => {
+    const { t, bodies } = await answering((b) =>
+      b.job.marks
+        ? [200, { running: ["a"], mismatch: ["b"] }]
+        : [200, {}]
+    );
+    const jobs = new Jobs(t);
+    expect(await jobs.remove("s", ["a", "b"], { marks: { b: "m" } })).toEqual({
+      running: ["a"],
+      mismatch: ["b"],
+    });
+    expect(bodies[0]!.job).toMatchObject({
+      ids: ["a", "b"],
+      marks: { b: "m" },
+    });
+    await expect(jobs.remove("s", ["a"])).rejects.toMatchObject({
+      kind: "not_offered",
+    });
+    expect(await jobs.remove("s", [])).toEqual({ running: [], mismatch: [] });
+  });
+});

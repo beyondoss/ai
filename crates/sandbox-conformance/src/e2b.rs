@@ -31,6 +31,11 @@ const CELL_SECS: u64 = LIFETIME_SECS - 60;
 /// The port `execd` listens on in the VM.
 const PORT: u16 = 8081;
 const HOME: &str = "/home/user";
+/// Where execd keeps its ledger and where it spools job output, as Beyond deploys it: the state
+/// directory on a tmpfs (the ledger dies with the VM, as its processes do), the jobs directory on
+/// disk. The scenarios in `spool.json` name them (`requires.vars`).
+const STATE_DIR: &str = "/run/execd-state";
+const JOBS_DIR: &str = "/var/tmp";
 /// The release installed: its `execd-<tag>-linux-<arch>.tar.gz`, checked against its `.sha256`.
 const DEFAULT_TAG: &str = "v0.1.16";
 const READY_WITHIN: Duration = Duration::from_secs(90);
@@ -333,6 +338,7 @@ pub async fn start(name: &str) -> Result<Started, String> {
     let launch = format!(
         "sudo env -u SUDO_COMMAND -u SUDO_USER -u SUDO_UID -u SUDO_GID EXECD_LISTEN=0.0.0.0:{PORT} \
          EXECD_ROOT={HOME}/work EXECD_HOME={HOME} EXECD_RUN_AS=user EXECD_BEARER=\"$BEARER\" \
+         EXECD_STATE_DIR={STATE_DIR} EXECD_JOBS_DIR={JOBS_DIR} \
          setsid nohup {HOME}/bin/execd >/tmp/execd.log 2>&1 < /dev/null &\nsleep 1"
     );
     let (c, o, e) = vm.run(&launch, json!({"BEARER": bearer})).await?;
@@ -389,7 +395,10 @@ pub async fn start(name: &str) -> Result<Started, String> {
         work: format!("{HOME}/work"),
         caps: None,
         suites: None,
-        vars: BTreeMap::new(),
+        vars: BTreeMap::from([
+            ("SPOOL_STATE".into(), STATE_DIR.into()),
+            ("SPOOL_JOBS".into(), JOBS_DIR.into()),
+        ]),
         lease: Some(Arc::new({
             let vm = vm.clone();
             move || {

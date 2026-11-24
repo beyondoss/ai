@@ -8,13 +8,13 @@ It holds **no logic**. Each export decodes its bytes, makes one call into the pr
 constant of the kernel, if an export is anything but one `io(.., codec::<fn>)` call, or if the crate reaches into the kernel
 by any path but its three proven functions and its types. It is outside the Verus run (`.github/scripts/verify-kernels.sh`).
 
-## ABI (version 1)
+## ABI (version 2)
 
 All exports take `(in_ptr, in_len, out_ptr, out_cap)` and return the answer's length, or a negative code: `-1` bad input
 (cut short, unknown tag, not a mark), `-2` the output buffer is too small, `-3` the cursor's fields are not a cursor. A
 native caller passes its own buffers (`ctypes.create_string_buffer`); a WASM host writes into memory from `jc_alloc(n)` /
 `jc_free(p, n)`. Nothing is kept between calls: the state is a value the caller holds and passes back. All integers are
-little endian; a mark is 33 bytes (its length, then 32); a state is 77 opaque bytes that only the kernel makes.
+little endian; a mark is 33 bytes (its length, then 32); a state is 85 opaque bytes that only the kernel makes.
 
 | Export                | Input                                             | Answer                               |
 | --------------------- | ------------------------------------------------- | ------------------------------------ |

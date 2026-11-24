@@ -12,7 +12,7 @@ use std::ptr::NonNull;
 use crate::codec;
 
 /// The ABI's version: the layout of every record in `codec.rs`. A change to a layout bumps it.
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
 
 type Call = fn(&[u8], &mut [u8]) -> Result<usize, i32>;
 

@@ -8,7 +8,10 @@
 //!   command keeps running as a held job: after [`IDLE_YIELD_MS`] of silence, at the call's ceiling,
 //!   or at the model's own `timeout_ms`. Returning is the whole effect: a hand-back kills nothing, and
 //!   a call that has waited past its ceiling always returns (progress).
-//!
+//! * **B5, the working directory** ([`call_cwd`], [`tool_root_source`]): a hosted session's tools are
+//!   rooted in the grant's `workspace_root`, and a call that names no `cwd` runs there.
+//! * **B4, the shape of an `.mcp.json` entry** ([`mcp_entry_shape`]): a `command` entry is a command
+//!   server, which a hosted session runs in its own sandbox.
 //! * **B3, a job's end is told once** ([`end_due`]): the session is told that a sandbox job ended
 //!   once, across a replica's death. What survives is the transcript: a notice it already holds is
 //!   told, whatever the sandbox's directory for the job still says. An ended job whose notice
@@ -176,6 +179,116 @@ pub proof fn lemma_a_call_returns_by_its_ceiling(ceiling: u64, timeout_ms: Optio
 {
 }
 
+/// Where a call runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cwd {
+    /// The model named a `cwd`: it is resolved against the tool's root.
+    Named,
+    /// The call named none: it runs in the tool's root.
+    Root,
+    /// The call named none and the tool has no root: it inherits the process's cwd.
+    Inherit,
+}
+
+/// B5. Where a call runs, given whether the model named a `cwd` and whether the tool has a root.
+/// A call that names none runs in the root whenever there is one, and inherits only without one.
+pub fn call_cwd(named: bool, has_root: bool) -> (r: Cwd)
+    ensures
+        named ==> r is Named,
+        (!named && has_root) ==> r is Root,
+        (!named && !has_root) ==> r is Inherit,
+{
+    if named {
+        Cwd::Named
+    } else if has_root && !cfg!(feature = "mut_cwd_ignores_root") {
+        Cwd::Root
+    } else {
+        Cwd::Inherit
+    }
+}
+
+/// Where a session's tools are rooted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RootSource {
+    /// The grant's `workspace_root`, a path inside the session's sandbox.
+    Workspace,
+    /// No root: the process's own cwd.
+    Process,
+}
+
+/// B5. A hosted (service) session's tools are rooted in the grant's `workspace_root`; only a local
+/// or replica process is rooted in its own cwd. With `call_cwd`, a hosted call that names no `cwd`
+/// runs in the workspace root (the root is never empty there: a grant with a relative or empty
+/// `workspace_root` is refused at open, `service.rs`).
+pub fn tool_root_source(service: bool) -> (r: RootSource)
+    ensures
+        service ==> r is Workspace,
+        !service ==> r is Process,
+{
+    if service { RootSource::Workspace } else { RootSource::Process }
+}
+
+/// The `"type"` an `.mcp.json` entry names, reduced to what decides its shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum McpType {
+    /// No `"type"`.
+    Absent,
+    /// `stdio`.
+    Stdio,
+    /// `http`, `streamable-http`, `streamableHttp` or `sse`.
+    Http,
+    /// Any other value.
+    Other,
+}
+
+/// What an `.mcp.json` entry is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum McpShape {
+    /// A `command` server: a hosted session runs it as a job in its own sandbox, never on the replica.
+    Command,
+    /// A `url` server, dialed over HTTP.
+    Url,
+    /// Neither: skipped with a warning.
+    Refused,
+}
+
+/// B4. An `.mcp.json` entry's shape, given its `"type"` and whether it carries a `command` and a
+/// `url`. An entry with a `command` and no `"type"` (or `stdio`) is a command server, whatever else
+/// it carries; a `url` entry with no `command` (or an http `"type"`) is a url server; a `stdio` entry
+/// without a `command`, an unknown `"type"`, and an entry with neither are refused.
+pub fn mcp_entry_shape(kind: McpType, has_command: bool, has_url: bool) -> (r: McpShape)
+    ensures
+        (kind is Absent || kind is Stdio) && has_command ==> r is Command,
+        (kind is Absent || kind is Http) && !has_command && has_url ==> r is Url,
+        kind is Http && has_url ==> r is Url,
+        kind is Other ==> r is Refused,
+        !has_command && !has_url ==> r is Refused,
+        kind is Stdio && !has_command ==> r is Refused,
+{
+    match kind {
+        McpType::Other => McpShape::Refused,
+        McpType::Stdio => {
+            if has_command && !cfg!(feature = "mut_command_entry_refused") {
+                McpShape::Command
+            } else {
+                McpShape::Refused
+            }
+        },
+        McpType::Http => {
+            if has_url { McpShape::Url } else { McpShape::Refused }
+        },
+        McpType::Absent => {
+            if has_command && !cfg!(feature = "mut_command_entry_refused") {
+                McpShape::Command
+            } else if has_url {
+                McpShape::Url
+            } else {
+                McpShape::Refused
+            }
+        },
+    }
+}
+
 /// B3. Whether a job's end notice is due. `told_live` is this process having delivered it;
 /// `told_persisted` is the session's persisted transcript already holding it (a replica that died
 /// between persisting the report and deleting the job's directory left the job behind, ended). The
@@ -205,6 +318,40 @@ mod tests {
         assert_eq!(admit_start(MAX_RUNNING_JOBS - 1), Admit::Start);
         assert_eq!(admit_start(MAX_RUNNING_JOBS), Admit::Refuse);
         assert_eq!(admit_start(MAX_RUNNING_JOBS + 5), Admit::Refuse);
+    }
+
+    /// B5: a call that names no cwd runs in the root, and a hosted session is rooted in the workspace.
+    /// Red under `mut_cwd_ignores_root`.
+    #[test]
+    fn a_call_without_cwd_runs_in_the_root() {
+        assert_eq!(call_cwd(false, true), Cwd::Root);
+        assert_eq!(call_cwd(false, false), Cwd::Inherit);
+        assert_eq!(call_cwd(true, true), Cwd::Named);
+        assert_eq!(tool_root_source(true), RootSource::Workspace);
+        assert_eq!(tool_root_source(false), RootSource::Process);
+    }
+
+    /// B4: a command entry is a command server. Red under `mut_command_entry_refused`.
+    #[test]
+    fn a_command_entry_is_a_command_server() {
+        assert_eq!(
+            mcp_entry_shape(McpType::Absent, true, false),
+            McpShape::Command
+        );
+        assert_eq!(
+            mcp_entry_shape(McpType::Stdio, true, true),
+            McpShape::Command
+        );
+        assert_eq!(mcp_entry_shape(McpType::Absent, false, true), McpShape::Url);
+        assert_eq!(mcp_entry_shape(McpType::Http, true, true), McpShape::Url);
+        assert_eq!(
+            mcp_entry_shape(McpType::Other, true, true),
+            McpShape::Refused
+        );
+        assert_eq!(
+            mcp_entry_shape(McpType::Stdio, false, true),
+            McpShape::Refused
+        );
     }
 
     /// B3: a notice the transcript holds is not due again; an ended job it does not hold is. Red

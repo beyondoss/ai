@@ -87,6 +87,5 @@ export {
   TimeoutError,
   TooLargeError,
   TransportError,
-  UnreachableError,
 } from "./errors.js";
 export type { ErrorKind } from "./errors.js";

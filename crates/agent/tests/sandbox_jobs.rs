@@ -110,7 +110,8 @@ fn recorder(heard: &Mutex<Heard>) -> impl Fn(JobEvent<'_>) + Send + Sync + '_ {
     move |e| {
         let mut h = heard.lock().unwrap();
         match e {
-            JobEvent::Started(pgid) => h.started = Some(pgid),
+            JobEvent::Started(pgid, _) => h.started = Some(pgid),
+            JobEvent::Attached { .. } => {}
             JobEvent::Output(b, _) => h.output.extend_from_slice(b),
             JobEvent::Gap(n) => h.gaps += n,
             JobEvent::ShellExit(c) => h.shell_exit = Some(c),
@@ -262,7 +263,8 @@ async fn a_job_started_kept_is_followed_by_polling() {
         .jobs
         .start_kept(&sb.scope, &id, &sh("echo a; sleep 0.6; echo b; exit 5"))
         .await
-        .unwrap();
+        .unwrap()
+        .pgid;
     assert!(pgid > 1);
     let listed = sb.jobs.list(&sb.scope).await.unwrap();
     assert!(listed[0].kept && listed[0].num.is_none());
@@ -302,7 +304,8 @@ async fn kill_stops_a_job_that_ignores_sigterm_and_removes_it() {
             &sh("trap '' TERM; sleep 60 & sleep 60 & wait"),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .pgid;
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(group_alive(pgid));
     let survivors = sb
@@ -375,7 +378,8 @@ async fn wipe_kills_every_job_of_the_scope_and_no_other() {
             sb.jobs
                 .start_kept(&sb.scope, id, &sh("sleep 60"))
                 .await
-                .unwrap(),
+                .unwrap()
+                .pgid,
         );
     }
     let theirs = JobId::fresh();
@@ -383,7 +387,8 @@ async fn wipe_kills_every_job_of_the_scope_and_no_other() {
         .jobs
         .start_kept(&other, &theirs, &sh("sleep 60"))
         .await
-        .unwrap();
+        .unwrap()
+        .pgid;
     assert_eq!(sb.jobs.list(&sb.scope).await.unwrap().len(), 2);
     assert_eq!(
         sb.jobs.list(&other).await.unwrap().len(),
@@ -409,14 +414,15 @@ async fn remove_deletes_only_jobs_whose_processes_are_gone() {
         .jobs
         .start_kept(&sb.scope, &running, &sh("sleep 60"))
         .await
-        .unwrap();
+        .unwrap()
+        .pgid;
     sb.jobs
         .start_kept(&sb.scope, &done, &sh("true"))
         .await
         .unwrap();
     sb.wait_status(&done, JobStatus::ended).await;
     sb.jobs
-        .remove(&sb.scope, &[running.clone(), done.clone()])
+        .remove(&sb.scope, &[running.clone(), done.clone()], &[])
         .await
         .unwrap();
     let left: Vec<JobId> = sb

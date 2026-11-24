@@ -2,13 +2,13 @@ import {
   AuthError,
   DiskFullError,
   EndpointError,
+  InvalidRequestError,
   JobExistsError,
   JobGoneError,
   NotOfferedError,
   ProtocolError,
   TimeoutError,
   TransportError,
-  UnreachableError,
 } from "./errors.js";
 import type { SandboxError } from "./errors.js";
 import { decodeJobLine } from "./http.js";
@@ -16,11 +16,11 @@ import type { JobLine } from "./http.js";
 import { Kernel } from "./kernel/kernel.js";
 import type { Fault, KEvent, KState } from "./kernel/kernel.js";
 import type {
+  AttachOptions,
   JobFrame,
   JobOpened,
   JobOps,
   JobSpec,
-  ReqOptions,
 } from "./transport.js";
 
 /**
@@ -56,7 +56,6 @@ function faultError(
   status: number,
   detail: string,
   id: string,
-  cursor: () => string | undefined,
 ): SandboxError {
   const said = detail === "" ? `status ${status}` : detail;
   switch (fault) {
@@ -68,11 +67,8 @@ function faultError(
       return new DiskFullError(said);
     case "no_pty":
       return new EndpointError(said, status);
-    case "unreachable":
-      return new UnreachableError(
-        `job ${id}: the endpoint stayed unreachable; resume from the cursor`,
-        cursor(),
-      );
+    case "deadline":
+      return new TimeoutError(`job ${id}: the deadline passed`);
     case "not_offered":
       return new NotOfferedError(
         "the endpoint did not name the job's mark: it predates marks, so a cursor cannot be trusted to name one job",
@@ -96,18 +92,31 @@ const sleep = (ms: number): Promise<void> =>
 export async function* held(
   ops: JobOps,
   init: HeldInit,
-  req: ReqOptions = {},
+  req: AttachOptions = {},
 ): AsyncGenerator<JobFrame, void, void> {
   const k = await Kernel.load();
-  const policy = { beatS: req.heartbeatSeconds ?? 0 };
-  let st: KState = init.flow === "start"
-    ? k.stateForStart(randomKey(), policy)
-    : k.stateForAttach(init.mark ?? "", init.offset, policy);
+  const policy = {
+    beatS: req.heartbeatSeconds ?? 0,
+    watch: req.output === false,
+  };
+  let st: KState;
+  try {
+    st = init.flow === "start"
+      ? k.stateForStart(randomKey(), policy)
+      : k.stateForAttach(req.mark ?? "", init.offset, policy);
+  } catch (e) {
+    // The kernel refuses a mark that is not 1 to 32 hex digits: nothing was sent.
+    throw new InvalidRequestError("a job mark is 1 to 32 hex digits", {
+      cause: e,
+    });
+  }
   let conn: JobOpened | undefined;
   let lines: AsyncIterator<Uint8Array> | undefined;
   let line: JobLine | undefined;
   let refused = "";
   let ev: KEvent | undefined = { t: "go" };
+  /** The first `attached` frame is the consumer's; a reattach's is the kernel's. */
+  let told = init.flow === "start";
 
   /** Send `open` and report its answer as an event. */
   const send = async (open: Parameters<JobOps["open"]>[0]): Promise<KEvent> => {
@@ -176,9 +185,16 @@ export async function* held(
               offset: a.offset,
               mark: a.mark,
               silenceMs: a.silenceMs,
+              ...(req.output === undefined ? {} : { output: req.output }),
               ...(req.heartbeatSeconds === undefined
                 ? {}
                 : { heartbeatSeconds: req.heartbeatSeconds }),
+            });
+            break;
+          case "reconnecting":
+            req.onReconnecting?.({
+              attempts: a.attempts,
+              sinceMs: Date.now() - a.sinceMs,
             });
             break;
           case "closeStream":
@@ -209,13 +225,6 @@ export async function* held(
               a.status,
               a.fault === "protocol" && wasFrame ? (line?.note ?? "") : refused,
               init.id,
-              () => {
-                try {
-                  return k.cursorOf(st, init.scope, init.id);
-                } catch {
-                  return undefined;
-                }
-              },
             );
           case "finish":
           case "detached":
@@ -227,24 +236,31 @@ export async function* held(
             );
         }
       }
-      if (wasFrame && line?.pgid !== undefined && r.actions.length === 0) {
+      if (wasFrame && r.actions.length === 0 && line !== undefined) {
         const f = line;
-        line = undefined;
-        if (
-          init.flow === "start" && init.spec.stdinOpen === true
-          && f.stdin !== true
-        ) {
-          throw new NotOfferedError(
-            "the endpoint predates job stdin: it ran the job without it",
-          );
+        const fr = f.frame;
+        if (fr.t === "started") {
+          if (
+            init.flow === "start" && init.spec.stdinOpen === true
+            && f.stdin !== true
+          ) {
+            throw new NotOfferedError(
+              "the endpoint predates job stdin: it ran the job without it",
+            );
+          }
+          yield {
+            type: "started",
+            pgid: f.pgid ?? 0,
+            mark: fr.mark,
+            ...(f.stdin === true ? { stdin: true } : {}),
+          };
+        } else if (fr.t === "attached" && !told) {
+          told = true;
+          yield { type: "attached", mark: fr.mark, from: fr.from };
+        } else if (f.shellExit !== undefined) {
+          yield { type: "shell_exit", code: f.shellExit };
         }
-        yield {
-          type: "started",
-          pgid: f.pgid ?? 0,
-          ...(f.stdin === true ? { stdin: true } : {}),
-        };
-      } else if (wasFrame && line?.shellExit !== undefined) {
-        yield { type: "shell_exit", code: line.shellExit };
+        line = undefined;
       }
     }
   } finally {

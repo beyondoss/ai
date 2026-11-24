@@ -14,7 +14,7 @@ export type Fault =
   | "job_exists"
   | "disk_full"
   | "no_pty"
-  | "unreachable"
+  | "deadline"
   | "not_offered"
   | "protocol"
   | "auth";
@@ -23,7 +23,7 @@ const FAULTS: readonly Fault[] = [
   "job_exists",
   "disk_full",
   "no_pty",
-  "unreachable",
+  "deadline",
   "not_offered",
   "protocol",
   "auth",
@@ -47,13 +47,15 @@ export type KEvent =
   | { t: "broke" }
   | { t: "tick" }
   | { t: "exitTaken" }
-  | { t: "close" };
+  | { t: "close" }
+  | { t: "deadline" };
 
 /** What the shell does. */
 export type KAction =
   | { t: "start"; key: bigint; silenceMs: number }
   | { t: "openAttach"; offset: number; mark: string; silenceMs: number }
   | { t: "closeStream" }
+  | { t: "reconnecting"; attempts: number; sinceMs: number }
   | { t: "deliver"; at: number; len: number; dropped: number }
   | { t: "deliverExit"; code: number; signal: number; dropped: number }
   | { t: "sleep"; untilMs: number }
@@ -92,10 +94,10 @@ interface Exports {
 type Call = (inp: number, n: number, out: number, cap: number) => number;
 
 /** The ABI `codec.rs` lays out. A change to a layout there bumps `ABI_VERSION`, and this must follow. */
-const ABI_VERSION = 1;
-/** Room for any one call's input or answer: a state (77 B) and an event (45 B at most), or a cursor. */
+const ABI_VERSION = 2;
+/** Room for any one call's input or answer: a state (85 B) and an event (45 B at most), or a cursor. */
 const BUF = 1024;
-const STATE = 77;
+const STATE = 85;
 
 const MAX_SAFE = BigInt(Number.MAX_SAFE_INTEGER);
 
@@ -152,6 +154,11 @@ class Rd {
   u16(): number {
     const x = this.v.getUint16(this.o, true);
     this.o += 2;
+    return x;
+  }
+  u32(): number {
+    const x = this.v.getUint32(this.o, true);
+    this.o += 4;
     return x;
   }
   i32(): number {
@@ -235,6 +242,9 @@ function eventBytes(w: Wr, e: KEvent): void {
     case "close":
       w.u8(6);
       return;
+    case "deadline":
+      w.u8(7);
+      return;
   }
 }
 
@@ -279,6 +289,8 @@ function readAction(r: Rd): KAction {
       return { t: "finish" };
     case 9:
       return { t: "detached" };
+    case 10:
+      return { t: "reconnecting", attempts: r.u32(), sinceMs: r.u64("time") };
     default:
       throw new ProtocolError(`kernel: unknown action ${tag}`);
   }

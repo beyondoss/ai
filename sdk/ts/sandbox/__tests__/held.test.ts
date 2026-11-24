@@ -8,7 +8,6 @@ import {
   JobExistsError,
   JobGoneError,
   NotOfferedError,
-  UnreachableError,
 } from "../src/errors.js";
 import { HttpTransport } from "../src/http.js";
 import { Jobs } from "../src/jobs.js";
@@ -145,21 +144,24 @@ describe("a refusal is one typed error, from the kernel's table", () => {
   });
 });
 
-describe("a handle that cannot reach the endpoint gives up with a cursor", () => {
-  it("spends its budget on failed opens, then fails Unreachable with the cursor to resume from", async () => {
+describe("a handle that cannot reach the endpoint keeps trying and says so", () => {
+  it("reports Reconnecting from the 12th failed open on, and finishes the job when the endpoint returns", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "Date"] });
     try {
       const { s, jobs } = await rig({
         output: "0123456789",
         cutAfter: [4],
-        refuse: Array.from({ length: 100 }, () => [503] as [number]),
+        refuse: Array.from({ length: 20 }, () => [503] as [number]),
       });
+      const statuses: Array<{ attempts: number }> = [];
       let settled: unknown = "pending";
       const got: JobFrame[] = [];
       void (async () => {
-        for await (const f of jobs.startHeld("s", "aa", { command: "true" })) {
-          got.push(f);
-        }
+        for await (
+          const f of jobs.startHeld("s", "aa", { command: "true" }, {
+            onReconnecting: (st) => statuses.push(st),
+          })
+        ) got.push(f);
       })().then(() => (settled = null), (e: unknown) => (settled = e));
       // Virtual time moves the kernel's waits; the loopback server answers in real time, so each turn
       // waits a real few milliseconds, for as long as it takes (the test's own timeout bounds it).
@@ -167,14 +169,24 @@ describe("a handle that cannot reach the endpoint gives up with a cursor", () =>
         await vi.advanceTimersByTimeAsync(31_000);
         await realSleep(5);
       }
-      expect(settled).toBeInstanceOf(UnreachableError);
-      const cursor = (settled as UnreachableError).cursor;
-      expect(cursor).toMatch(
-        new RegExp(`^j1\\.s\\.aa\\.${MARK}\\.0000000000000004\\.[0-9a-f]{4}$`),
-      );
-      expect(bytes(got)).toBe("0123");
-      // The budget is the kernel's (12 failures in a row: the cut, then 11 failed opens), not a number here.
-      expect(s.attaches).toHaveLength(11);
+      // Never an end: all the bytes, once each, and the exit.
+      expect(settled).toBeNull();
+      expect(bytes(got)).toBe("0123456789");
+      expect(got.at(-1)).toEqual({ type: "exit", code: 0 });
+      // 20 refused opens after the cut; the status starts at the 12th failure in a row and counts up.
+      expect(s.attaches).toHaveLength(21);
+      expect(statuses.map((x) => x.attempts)).toEqual([
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+      ]);
     } finally {
       vi.useRealTimers();
     }

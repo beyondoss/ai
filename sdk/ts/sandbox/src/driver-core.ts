@@ -176,6 +176,11 @@ const jobJson = (j: JobInfo): Json => ({
   started: j.started,
   ended: j.ended,
   label: j.label,
+  mark: j.mark,
+  command: j.command,
+  args: j.args,
+  output_start: j.outputStart,
+  output_end: j.outputEnd,
 });
 
 export class Driver {
@@ -228,6 +233,7 @@ export class Driver {
               "job_signal_op",
               "job_errors",
               "job_options",
+              "job_marks",
             ],
           },
         };
@@ -301,7 +307,7 @@ export class Driver {
         const cwd = optStr(req, "cwd");
         const label = optStr(req, "label");
         const env = optEnv(req);
-        const pgid = await jobs.start(str(req, "scope"), str(req, "job"), {
+        const started = await jobs.start(str(req, "scope"), str(req, "job"), {
           command: str(req, "command"),
           args: strings(req, "args"),
           ...(cwd !== undefined ? { cwd } : {}),
@@ -309,7 +315,7 @@ export class Driver {
           ...(env !== undefined ? { env } : {}),
           ...(flag(req, "stdin_open") ? { stdinOpen: true } : {}),
         });
-        return { pgid };
+        return { pgid: started.pgid, mark: started.mark };
       }
       case "job_start_held": {
         // Start held, learn the pgid from the first frame, optionally `keep`, then drop the
@@ -331,7 +337,7 @@ export class Driver {
           for await (const f of stream) {
             if (f.type !== "started") continue;
             if (flag(req, "keep")) await jobs.keep(scope, job);
-            return { pgid: f.pgid };
+            return { pgid: f.pgid, mark: f.mark };
           }
         } finally {
           await stream.return(undefined);
@@ -393,17 +399,26 @@ export class Driver {
         };
       }
       case "job_attach": {
+        const mark = optStr(req, "mark");
+        const output = req.output === undefined || req.output === null
+          ? undefined
+          : flag(req, "output");
         const a = await jobs.collect(
           str(req, "scope"),
           str(req, "job"),
           optCount(req, "offset") ?? 0,
-          heartbeat(req),
+          {
+            ...heartbeat(req),
+            ...(mark !== undefined ? { mark } : {}),
+            ...(output !== undefined ? { output } : {}),
+          },
         );
         // As `exec_stream` ends: `signal` in place of `exit_code` for a death by signal.
         const end = a.signal === undefined
           ? { exit_code: a.exitCode }
           : { signal: a.signal };
         return {
+          ...(a.attached ? { attached: a.attached } : {}),
           ...end,
           output_b64: b64(a.output),
           ...(a.stderr.length > 0 ? { stderr_b64: b64(a.stderr) } : {}),
@@ -441,9 +456,29 @@ export class Driver {
             str(req, "signal"),
           ),
         };
-      case "job_remove":
-        await jobs.remove(str(req, "scope"), strings(req, "jobs"));
-        return {};
+      case "job_remove": {
+        const raw = req.marks;
+        let marks: Record<string, string> | undefined;
+        if (raw !== undefined && raw !== null) {
+          if (typeof raw !== "object" || Array.isArray(raw)) {
+            throw invalid("`marks` must be an object of strings");
+          }
+          marks = {};
+          for (const [k, v] of Object.entries(raw)) {
+            if (typeof v !== "string") {
+              throw invalid("`marks` must be an object of strings");
+            }
+            marks[k] = v;
+          }
+        }
+        return {
+          ...(await jobs.remove(
+            str(req, "scope"),
+            strings(req, "jobs"),
+            marks !== undefined ? { marks } : {},
+          )),
+        };
+      }
       case "job_wipe":
         return {
           survivors: (await jobs.wipe(str(req, "scope"), {

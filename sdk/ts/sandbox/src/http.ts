@@ -30,8 +30,11 @@ import {
   type JobOpened,
   type JobOps,
   type JobSpec,
+  type JobStarted,
   type JobState,
   type KeepFields,
+  type RemoveOptions,
+  type RemoveResult,
   type ReqOptions,
   type RunOptions,
   type RunResult,
@@ -916,7 +919,7 @@ class HttpJobs implements JobOps {
     id: string,
     spec: JobSpec,
     req: ReqOptions = {},
-  ): Promise<number> {
+  ): Promise<JobStarted> {
     await this.t.proveEnv(spec.env);
     let ex: Exchange;
     try {
@@ -930,10 +933,12 @@ class HttpJobs implements JobOps {
         throw new TooLargeError("a job answer exceeded the response cap");
       }
       let started: unknown;
+      let mark: unknown;
       let echoed = false;
       try {
         const v: unknown = JSON.parse(text(body));
         started = isRecord(v) ? v.started : undefined;
+        mark = isRecord(v) ? v.mark : undefined;
         echoed = isRecord(v) && v.stdin === true;
       } catch {
         started = undefined;
@@ -953,7 +958,12 @@ class HttpJobs implements JobOps {
           `the endpoint did not report the job's start: ${excerpt(body)}`,
         );
       }
-      return started;
+      if (typeof mark !== "string" || mark === "") {
+        throw new NotOfferedError(
+          "the endpoint predates job marks: it did not name the job's incarnation",
+        );
+      }
+      return { pgid: started, mark };
     } finally {
       ex.close();
     }
@@ -981,6 +991,7 @@ class HttpJobs implements JobOps {
           id: o.id,
           offset: o.offset,
           ...(o.mark === "" ? {} : { mark: o.mark }),
+          ...(o.output === undefined ? {} : { output: o.output }),
         }),
         heartbeatSeconds: hb,
       };
@@ -1037,6 +1048,13 @@ class HttpJobs implements JobOps {
         started: count(j.started),
         ended: count(j.ended),
         label: typeof j.label === "string" ? j.label : "",
+        mark: typeof j.mark === "string" ? j.mark : "",
+        command: typeof j.command === "string" ? j.command : "",
+        args: Array.isArray(j.args)
+          ? j.args.filter((a): a is string => typeof a === "string")
+          : [],
+        outputStart: count(j.outputStart),
+        outputEnd: count(j.outputEnd),
       });
     }
     return out;
@@ -1129,10 +1147,28 @@ class HttpJobs implements JobOps {
   async remove(
     scope: string,
     ids: string[],
-    req?: ReqOptions,
-  ): Promise<void> {
-    if (ids.length === 0) return;
-    await this.t.jobCall(this.job("remove", scope, { ids }), req);
+    req?: RemoveOptions,
+  ): Promise<RemoveResult> {
+    if (ids.length === 0) return { running: [], mismatch: [] };
+    const v = await this.t.jobCall(
+      this.job("remove", scope, {
+        ids,
+        ...(req?.marks !== undefined ? { marks: req.marks } : {}),
+      }),
+      req,
+    );
+    const strings = (a: unknown): string[] | null =>
+      Array.isArray(a) && a.every((x) => typeof x === "string")
+        ? (a as string[])
+        : null;
+    const running = strings(v.running);
+    const mismatch = strings(v.mismatch);
+    if (!running || !mismatch) {
+      throw new NotOfferedError(
+        "the endpoint predates job marks: remove did not report what it skipped",
+      );
+    }
+    return { running, mismatch };
   }
 
   async writeStdin(

@@ -122,7 +122,7 @@ reopens at, the wait before each retry, the silence limit, when it gives up) is 
 (`crates/job-client`, proven in Verus), compiled to WASM and inlined in the package (`src/kernel/wasm.ts`, about 14 KB
 gzipped; no fetch, no file, no dependency). `src/held.ts` only does the I/O the kernel names. A cut stream is reopened at
 the offset reached, asking for the mark the handle holds; a gap the server states is delivered as a `gap` frame; when the
-kernel's budget is spent the error is `UnreachableError`, carrying a cursor that resumes the job. An endpoint that does not
+kernel's budget is spent it says so through `onReconnecting({ attempts, sinceMs })` and keeps trying until the job ends, the endpoint refuses for good, or you stop iterating. An endpoint that does not
 name the job's mark (it predates marks) is `NotOfferedError`: the handle fails closed rather than follow a job it cannot
 identify. `crates/job-client-ffi/build.sh` rebuilds the WASM; CI fails when the committed bytes are not what the sources build to.
 
