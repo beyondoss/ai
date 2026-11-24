@@ -76,6 +76,8 @@ pub(crate) struct Job {
     pub notifier: Notifier,
     /// The job's open stdin, when it was started with `stdin_open`.
     stdin: Option<Arc<JobStdin>>,
+    /// Streams open on it now (an `attach`, a held start): a terminal someone watches is attached.
+    streams: usize,
 }
 
 impl Job {
@@ -190,6 +192,41 @@ impl Jobs {
             }
         }
         (alive, kept, owed)
+    }
+
+    /// The kept terminals that have not ended and whose keeper holds them: what a host that sleeps
+    /// idle machines asks of each (a read, not a decision).
+    pub fn terminals(&self) -> Vec<crate::Terminal> {
+        let cells = locked(&self.map).all();
+        let mut out = Vec::new();
+        for ((scope, id), cell) in cells {
+            let (pgid, mark, (rdev, fs), attached) = {
+                let j = locked(&cell);
+                if j.removed
+                    || !matches!(j.k.term, Term::Open { .. })
+                    || !matches!(j.k.alive(), Alive::Kept)
+                {
+                    continue;
+                }
+                let ids = j
+                    .stdin
+                    .as_ref()
+                    .and_then(|s| s.term.as_ref())
+                    .map_or((0, 0), |t| (t.pts_rdev, t.pts_fs));
+                (j.k.pgid(), j.mark.clone(), ids, j.streams > 0)
+            };
+            // The same members the kill path signals: the group and every marked process that left it.
+            out.push(crate::Terminal {
+                scope,
+                id,
+                pgid,
+                pts_rdev: rdev,
+                pts_fs: fs,
+                attached,
+                members: proc::job_members(pgid, &mark),
+            });
+        }
+        out
     }
 
     fn get(&self, key: &Key) -> Option<JobCell> {
@@ -1179,7 +1216,7 @@ async fn launch_term(
     let (rd, wr) = stream.into_split();
     Ok(TermLead {
         keeper,
-        link: Arc::new(term::Link::new(pid, wr)),
+        link: Arc::new(term::Link::new(pid, wr, term::pts_ids(pgid))),
         rd,
         frames,
         pgid,
@@ -1214,6 +1251,7 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
             notify: None,
             notifier: Notifier::default(),
             stdin: None,
+            streams: 0,
         }));
         map.insert(key.clone(), cell.clone());
         cell
@@ -1719,6 +1757,7 @@ pub(crate) fn recover(ctx: &Arc<Ctx>) {
             notify: None,
             notifier: Notifier::default(),
             stdin: None,
+            streams: 0,
         }));
         {
             let mut map = locked(&ctx.jobs.map);
@@ -1741,7 +1780,7 @@ pub(crate) fn recover(ctx: &Arc<Ctx>) {
                     match adopted {
                         Ok(stream) => {
                             let (rd, wr) = stream.into_split();
-                            let link = Arc::new(term::Link::new(kpid, wr));
+                            let link = Arc::new(term::Link::new(kpid, wr, term::pts_ids(pgid)));
                             let stdin = JobStdin::terminal(link, written);
                             locked(&cell).stdin = Some(stdin.clone());
                             let kpg = proc::adopt_group(kpid);
@@ -1922,6 +1961,32 @@ fn bound(ctx: &Ctx, key: &Key, attached: &JobCell) -> Option<JobCell> {
     kernel::bound(found, same)
 }
 
+/// One open stream on a job, counted for [`Jobs::terminals`] while it lives.
+struct Attach {
+    ctx: Arc<Ctx>,
+    cell: JobCell,
+}
+
+impl Attach {
+    fn new(ctx: &Arc<Ctx>, cell: &JobCell) -> Self {
+        locked(cell).streams += 1;
+        ctx.jobs.bump_activity();
+        Self {
+            ctx: ctx.clone(),
+            cell: cell.clone(),
+        }
+    }
+}
+
+impl Drop for Attach {
+    fn drop(&mut self) {
+        let mut j = locked(&self.cell);
+        j.streams = j.streams.saturating_sub(1);
+        drop(j);
+        self.ctx.jobs.bump_activity();
+    }
+}
+
 /// Stream a job's output from `offset` to its end. `started`: a held start, which says so first and
 /// whose job dies with the connection unless it was kept by then. How the stream ended.
 async fn stream_job(
@@ -1933,6 +1998,8 @@ async fn stream_job(
     started: Option<(i32, bool, Option<Size>)>,
     mut sink: Sink,
 ) -> StreamEnd {
+    // While it is open the job is attached (a host that lets idle machines sleep asks).
+    let _open = Attach::new(&ctx, &attached);
     // A job stream has no deadline of its own: it lives as long as the job or the connection.
     if let Ok(end) = follow(&ctx, &key, &attached, offset, started, &mut sink).await {
         return end;

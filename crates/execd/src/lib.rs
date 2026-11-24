@@ -317,6 +317,25 @@ pub struct KeptJob {
     pub id: String,
 }
 
+/// A kept terminal that has not ended and whose keeper holds it: what a host that lets idle machines
+/// sleep needs to tell a terminal waiting at its prompt from one at work.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Terminal {
+    pub scope: String,
+    pub id: String,
+    /// The session's process group.
+    pub pgid: i32,
+    /// The slave's device number (`st_rdev` of its `/dev/pts/N`); 0 if it could not be read.
+    pub pts_rdev: u64,
+    /// The `st_dev` of the devpts the slave lives on: a nested devpts reuses `st_rdev` numbers, so
+    /// the two together name the slave. 0 if it could not be read.
+    pub pts_fs: u64,
+    /// A stream (`attach`, a held start) is open on it now.
+    pub attached: bool,
+    /// The job's processes: its group plus every marked process that left it (the set `kill` signals).
+    pub members: Vec<u32>,
+}
+
 /// What the server is doing now.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Activity {
@@ -332,6 +351,8 @@ pub struct Activity {
     /// abandoned at the attempt limit, or the job is removed. A host that pauses idle machines
     /// must stay awake while this is not zero.
     pub callbacks_owed: usize,
+    /// Every kept terminal that has not ended (see [`Terminal`]).
+    pub terminals: Vec<Terminal>,
 }
 
 /// Everything a request handler shares.
@@ -390,6 +411,7 @@ impl Handle {
             running_kept,
             jobs_alive,
             callbacks_owed,
+            terminals: self.ctx.jobs.terminals(),
         }
     }
 

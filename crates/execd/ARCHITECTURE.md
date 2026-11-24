@@ -187,6 +187,10 @@ ledger entry has the keeper's pid and the size): an answer is adopted open at th
 A hung-up terminal is still a job: it ends when its processes do. A held terminal nobody kept dies with its client, every
 process of its session included (`Kill{marked}`).
 
+**Behaviour change for every held job.** A held start nobody kept that loses its client dies with the group and every process that carries its mark (`Kill{marked}`), on a dropped stream and when a restarted execd finds one in the ledger. Before, a restart's recovery killed the group alone. One guarantee for every job; for a terminal it is what makes a shell's job-control groups die with it.
+
+**For an embedding host.** `Handle::activity().terminals` lists each kept terminal that has not ended: `{scope, id, pgid, pts_rdev, pts_fs, attached, members}` (the slave's `st_rdev` and the `st_dev` of its devpts, whether a stream is open on it, and the job's processes: its group plus the marked ones that left it, the set `kill` signals). `Options::helper_exe` names the binary a keeper is started from when the host is not execd's own binary (a test binary); `EXECD_TERMINALS_MAX` caps open terminals (503 beyond it) and exists so a test can reach that refusal without filling the machine's ptys. A write refused because the terminal hung up is `409 {"error": "the terminal hung up", "written": N}`; the SDKs type it `StdinClosed` with reason `hung_up`.
+
 Every decision is the kernel's: `size_ok`, `write_gate` (a terminal has no end of input; nothing goes to one that hung up),
 `resizable`, `Ev::Resize` (applied at once if the job runs, at the spawn if it is still spawning), `Ev::Hangup`, `recover`'s
 `Keeper`, `sinks`, and the keeper's own `execd_jobs::keeper::step` (what it copies, applies, writes and tells, and when it

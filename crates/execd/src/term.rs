@@ -712,16 +712,34 @@ pub(crate) fn full_env(cmd: &Command) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The device number of the terminal the session `pgid` leads, from its standard input (the slave).
+/// and the `st_dev` of the devpts it lives on (a nested devpts reuses the same device numbers).
+/// `(0, 0)` if it could not be read.
+pub(crate) fn pts_ids(pgid: i32) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::metadata(format!("/proc/{pgid}/fd/0")).map_or((0, 0), |m| (m.rdev(), m.dev()))
+}
+
 /// A connection to a terminal's keeper, as execd holds it.
 pub(crate) struct Link {
     pub keeper_pid: i32,
+    /// The slave's device number (`st_rdev` of its `/dev/pts/N`), or 0 if it could not be read.
+    pub pts_rdev: u64,
+    /// The `st_dev` of the devpts the slave lives on.
+    pub pts_fs: u64,
     writer: tokio::sync::Mutex<Option<tokio::net::unix::OwnedWriteHalf>>,
 }
 
 impl Link {
-    pub fn new(keeper_pid: i32, w: tokio::net::unix::OwnedWriteHalf) -> Self {
+    pub fn new(
+        keeper_pid: i32,
+        w: tokio::net::unix::OwnedWriteHalf,
+        (pts_rdev, pts_fs): (u64, u64),
+    ) -> Self {
         Self {
             keeper_pid,
+            pts_rdev,
+            pts_fs,
             writer: tokio::sync::Mutex::new(Some(w)),
         }
     }
