@@ -14,7 +14,7 @@ use tokio::io::{AsyncBufReadExt as _, BufReader};
 
 /// What a scenario's `requires.features` may name (sdk/conformance/DRIVER.md): this client reads the
 /// raw stream, so it has all of them.
-const FEATURES: [&str; 7] = [
+const FEATURES: [&str; 9] = [
     "frames",
     "unbounded_stream",
     "exit_signal",
@@ -22,6 +22,8 @@ const FEATURES: [&str; 7] = [
     "job_streams",
     "job_stdin",
     "job_signal_op",
+    "job_errors",
+    "job_options",
 ];
 
 fn config() -> Config {
@@ -69,10 +71,7 @@ async fn main() {
             }
             Ok(req) if req["op"] == "hello" => {
                 json!({"id": req["id"], "ok": {"driver": "agent-reference", "protocol": 1,
-                "ops": Driver::ops_with(true), "features": FEATURES, "missing": {
-                    "job_errors": "the Rust client reports a job condition as a std::io::ErrorKind (NotFound, InvalidInput, BrokenPipe), not as JobGone, JobExists, DiskFull or the stdin errors the TypeScript and Python SDKs have",
-                    "job_options": "the driver has no ops for a held start, keep, seen, grace_ms or heartbeat_seconds yet, though the Rust client carries the wire fields",
-                }}})
+                "ops": Driver::ops_with(true), "features": FEATURES}})
             }
             Ok(req) => {
                 if driver.is_none() {

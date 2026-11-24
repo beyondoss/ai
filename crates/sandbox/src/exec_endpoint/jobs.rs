@@ -166,6 +166,149 @@ pub struct StdinWritten {
 /// The most decoded bytes one `write_stdin` carries.
 pub const WRITE_MAX: usize = 128 * 1024;
 
+/// Which job operation a refusal answers: the same status means different things for each.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobOp {
+    /// `start`: `409` an id that exists, `507` a full disk.
+    Start,
+    /// `attach`, `keep`, `seen`: `404` no such job.
+    Other,
+    /// A stdin `write`: `404`, `409` (no stdin, closed, or a gap), `429`.
+    Write,
+}
+
+/// Why a stdin was closed to a write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StdinClosedReason {
+    /// The job was started without `stdin_open`.
+    NeverOpened,
+    /// EOF was sent, the job ended or its reader left. Retrying cannot succeed.
+    Closed,
+}
+
+/// A job condition the endpoint refuses with, told apart as the TypeScript and Python SDKs tell
+/// them (`JobGoneError`, `JobExistsError`, ...). It is the source of the [`std::io::Error`] the
+/// jobs client returns, so existing `ErrorKind` matches keep working ([`Self::io_kind`]) and a caller
+/// that wants the condition reads it with [`JobError::of`]. [`Self::classify`] is the one table.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JobError {
+    /// The job does not exist or was removed (`404`).
+    Gone { text: String },
+    /// `start` of an id that exists (`409`); the first job is left alone.
+    Exists { text: String },
+    /// `start` on a full disk (`507`).
+    DiskFull { text: String },
+    /// A stdin write the job cannot take (`409`).
+    StdinClosed {
+        reason: StdinClosedReason,
+        text: String,
+    },
+    /// A stdin write whose earlier bytes never came (`409` `gap`).
+    StdinGap { text: String },
+    /// A stdin write while 16 others wait (`429`): the same write, later, is safe.
+    StdinBusy { text: String },
+}
+
+impl JobError {
+    /// The condition of an endpoint's refusal `status` with `body`, for the operation `op`.
+    /// `None` for a status that is no job condition (it stays the plain endpoint error).
+    pub fn classify(op: JobOp, status: u16, body: &str) -> Option<Self> {
+        let text = match op {
+            JobOp::Write => format!("job stdin: {body}"),
+            _ => body.to_string(),
+        };
+        Some(match (op, status) {
+            (JobOp::Start, 409) => Self::Exists { text },
+            (JobOp::Start, 507) => Self::DiskFull { text },
+            (JobOp::Other | JobOp::Write, 404) => Self::Gone { text },
+            (JobOp::Write, 409) if body.contains("has no stdin") => Self::StdinClosed {
+                reason: StdinClosedReason::NeverOpened,
+                text,
+            },
+            (JobOp::Write, 409) if body.contains("\"gap\"") => Self::StdinGap { text },
+            (JobOp::Write, 409) => Self::StdinClosed {
+                reason: StdinClosedReason::Closed,
+                text,
+            },
+            (JobOp::Write, 429) => Self::StdinBusy { text },
+            _ => return None,
+        })
+    }
+
+    /// The condition behind `e`, if it is one.
+    pub fn of(e: &std::io::Error) -> Option<&JobError> {
+        e.get_ref()?.downcast_ref::<JobError>()
+    }
+
+    /// The conformance vocabulary: its `code` (DRIVER.md, `job_errors`).
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Gone { .. } => "job_gone",
+            Self::Exists { .. } => "job_exists",
+            Self::DiskFull { .. } => "disk_full",
+            Self::StdinClosed {
+                reason: StdinClosedReason::NeverOpened,
+                ..
+            } => "stdin_never_opened",
+            Self::StdinClosed { .. } => "stdin_closed",
+            Self::StdinGap { .. } => "stdin_gap",
+            Self::StdinBusy { .. } => "stdin_busy",
+        }
+    }
+
+    /// The conformance error `kind` it is a finer type of.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Gone { .. } => "not_found",
+            Self::DiskFull { .. } => "io",
+            _ => "conflict",
+        }
+    }
+
+    /// The [`std::io::ErrorKind`] this client has always reported for it (a stdin write: `NotFound`,
+    /// `InvalidInput` for no stdin, `TimedOut` for a gap, `BrokenPipe` for closed or busy).
+    pub fn io_kind(&self) -> std::io::ErrorKind {
+        use std::io::ErrorKind::{
+            AlreadyExists, BrokenPipe, InvalidInput, NotFound, StorageFull, TimedOut,
+        };
+        match self {
+            Self::Gone { .. } => NotFound,
+            Self::Exists { .. } => AlreadyExists,
+            Self::DiskFull { .. } => StorageFull,
+            Self::StdinClosed {
+                reason: StdinClosedReason::NeverOpened,
+                ..
+            } => InvalidInput,
+            Self::StdinGap { .. } => TimedOut,
+            Self::StdinClosed { .. } | Self::StdinBusy { .. } => BrokenPipe,
+        }
+    }
+
+    /// This condition as the error a jobs call returns.
+    pub fn into_io(self) -> std::io::Error {
+        std::io::Error::new(self.io_kind(), self)
+    }
+
+    fn text(&self) -> &str {
+        match self {
+            Self::Gone { text }
+            | Self::Exists { text }
+            | Self::DiskFull { text }
+            | Self::StdinClosed { text, .. }
+            | Self::StdinGap { text }
+            | Self::StdinBusy { text } => text,
+        }
+    }
+}
+
+impl std::fmt::Display for JobError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.text())
+    }
+}
+
+impl std::error::Error for JobError {}
+
 /// The signals a job can be sent (`signal`): names only.
 pub const JOB_SIGNALS: [&str; 7] = [
     "SIGHUP", "SIGINT", "SIGQUIT", "SIGUSR1", "SIGUSR2", "SIGTERM", "SIGKILL",

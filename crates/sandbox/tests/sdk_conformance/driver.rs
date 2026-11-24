@@ -17,8 +17,9 @@ use beyond_sandbox::Sandbox;
 use beyond_sandbox::exec::CommandRunner;
 use beyond_sandbox::exec_endpoint::HttpExecRunner;
 use beyond_sandbox::exec_endpoint::jobs::{
-    JobEnd, JobEvent, JobId, JobScope, JobSpec, JobStatus, Stream,
+    JobEnd, JobError, JobEvent, JobId, JobScope, JobSpec, JobStatus, Stream,
 };
+use beyond_sandbox::exec_endpoint::jobs_native::NativeJobs;
 use beyond_sandbox::fs::shell::{Capabilities, SearchEngine};
 use beyond_sandbox::fs::{FileKind, FsBackend, FsError, SearchQuery};
 use sandbox_conformance::trees::{Layout, Tree};
@@ -49,6 +50,9 @@ pub struct CapsOverride {
 
 pub struct Driver {
     sb: Sandbox,
+    /// The HTTP runner under `sb`, when it is one: the jobs ops that take a grace or a heartbeat go
+    /// to its [`NativeJobs`] directly (the `Jobs` trait carries neither).
+    http: Option<Arc<HttpExecRunner>>,
     jobs_root: Option<PathBuf>,
     /// Set only when `CONFORMANCE_CAPS` overrides what the probe found, which needs the probe up
     /// front: the error every op returns when that probe's request failed (an outage is not a
@@ -65,6 +69,18 @@ fn err(kind: &str, detail: impl Into<String>) -> Value {
 
 fn io_err(e: &std::io::Error) -> Value {
     classify(&e.to_string(), Some(e.kind()))
+}
+
+/// A job op's error: a job condition carries its `code` beside its `kind` (DRIVER.md, `job_errors`);
+/// a heartbeat out of range is `invalid_request`; anything else is as [`io_err`].
+fn job_err(e: &std::io::Error) -> Value {
+    if let Some(j) = JobError::of(e) {
+        return json!({ "kind": j.kind(), "detail": j.to_string(), "code": j.code() });
+    }
+    if e.kind() == std::io::ErrorKind::InvalidInput && e.to_string().contains("heartbeat_seconds") {
+        return err("invalid_request", e.to_string());
+    }
+    io_err(e)
 }
 
 fn fs_err(e: &FsError) -> Value {
@@ -250,7 +266,9 @@ impl Driver {
             runner = runner.bearer(beyond_sandbox::TokenSource::fixed(token.clone()));
         }
         let runner = Arc::new(runner);
-        Self::build(runner, cfg).await
+        let mut d = Self::build(runner.clone(), cfg).await;
+        d.http = Some(runner);
+        d
     }
 
     /// The same driver over any other [`CommandRunner`]: the layers above the transport, unchanged.
@@ -293,6 +311,7 @@ impl Driver {
         };
         Self {
             sb,
+            http: None,
             jobs_root: cfg.jobs_root.clone(),
             connect_error,
         }
@@ -328,6 +347,9 @@ impl Driver {
         if jobs {
             ops.extend([
                 "job_start",
+                "job_start_held",
+                "job_keep",
+                "job_seen",
                 "job_list",
                 "job_read",
                 "job_attach",
@@ -380,12 +402,8 @@ impl Driver {
                 "ops": self.ops(),
                 "features": [
                     "frames", "unbounded_stream", "exit_signal", "exec_env", "job_streams",
-                    "job_stdin", "job_signal_op"
+                    "job_stdin", "job_signal_op", "job_errors", "job_options"
                 ],
-                "missing": {
-                    "job_errors": "the Rust client reports a job condition as a std::io::ErrorKind, not as the typed errors of the TypeScript and Python SDKs",
-                    "job_options": "the driver has no ops for a held start, keep, seen, grace_ms or heartbeat_seconds yet",
-                },
             }));
         }
         if let Some(e) = &self.connect_error {
@@ -414,6 +432,9 @@ impl Driver {
             "exec" => self.exec(req).await,
             "exec_stream" => self.exec_stream(req).await,
             "job_start" => self.job_start(req).await,
+            "job_start_held" => self.job_start_held(req).await,
+            "job_keep" => self.job_keep(req).await,
+            "job_seen" => self.job_seen(req).await,
             "job_list" => self.job_list(req).await,
             "job_read" => self.job_read(req).await,
             "job_attach" => self.job_attach(req).await,
@@ -529,8 +550,87 @@ impl Driver {
             .jobs()?
             .start_kept(&scope, &id, &spec)
             .await
-            .map_err(|e| io_err(&e))?;
+            .map_err(|e| job_err(&e))?;
         Ok(json!({ "pgid": pgid }))
+    }
+
+    /// Start held, learn the pgid from the first frame, optionally `keep`, then drop the stream: a
+    /// job nobody kept dies with it (wire `hold: true`).
+    async fn job_start_held(&self, req: &Value) -> Out {
+        let scope = self.scope(req)?;
+        let id = Self::job_id(req, "job")?;
+        let spec = JobSpec {
+            program: str_arg(req, "command")?.to_string(),
+            args: strings(req, "args")?,
+            cwd: opt_str(req, "cwd")?.map(str::to_string),
+            label: opt_str(req, "label")?.unwrap_or("").to_string(),
+            env: env_arg(req)?,
+            stdin_open: flag(req, "stdin_open")?,
+        };
+        let keep = flag(req, "keep")?;
+        let beat = self.beat(req)?;
+        let http = self.http()?;
+        let native = NativeJobs::over(http);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = |ev: JobEvent<'_>| {
+            if let JobEvent::Started(pgid) = ev {
+                let _ = tx.send(pgid);
+            }
+        };
+        let held = native.run_held_beat(&scope, &id, &spec, beat, &sink);
+        tokio::pin!(held);
+        let pgid = tokio::select! {
+            r = &mut held => {
+                return Err(match r {
+                    Err(e) => job_err(&e),
+                    Ok(_) => err("protocol", "the held start ended before `started`"),
+                });
+            }
+            p = rx.recv() => p.ok_or_else(|| err("protocol", "the held start ended before `started`"))?,
+        };
+        if keep {
+            self.jobs()?
+                .keep(&scope, &id, None, "", 0)
+                .await
+                .map_err(|e| job_err(&e))?;
+        }
+        // Dropping the future closes the stream.
+        Ok(json!({ "pgid": pgid }))
+    }
+
+    async fn job_keep(&self, req: &Value) -> Out {
+        let scope = self.scope(req)?;
+        let id = Self::job_id(req, "job")?;
+        let num = u64_arg(req, "num")?;
+        let kind = opt_str(req, "kind")?.unwrap_or("");
+        let seen = u64_arg(req, "seen")?.unwrap_or(0);
+        self.jobs()?
+            .keep(&scope, &id, num, kind, seen)
+            .await
+            .map_err(|e| job_err(&e))?;
+        Ok(json!({}))
+    }
+
+    async fn job_seen(&self, req: &Value) -> Out {
+        let scope = self.scope(req)?;
+        let id = Self::job_id(req, "job")?;
+        let offset = u64_arg(req, "offset")?.unwrap_or(0);
+        self.jobs()?
+            .seen(&scope, &id, offset)
+            .await
+            .map_err(|e| job_err(&e))?;
+        Ok(json!({}))
+    }
+
+    fn http(&self) -> Result<&HttpExecRunner, Value> {
+        self.http
+            .as_deref()
+            .ok_or_else(|| err("unsupported", "this exec is not the HTTP client"))
+    }
+
+    /// `heartbeat_seconds`: a count; the client refuses what the endpoint would silently replace.
+    fn beat(&self, req: &Value) -> Result<Option<u32>, Value> {
+        Ok(u64_arg(req, "heartbeat_seconds")?.map(|n| u32::try_from(n).unwrap_or(u32::MAX)))
     }
 
     async fn job_list(&self, req: &Value) -> Out {
@@ -563,7 +663,16 @@ impl Driver {
             .jobs()?
             .read(&scope, &id, offset, max)
             .await
-            .map_err(|e| io_err(&e))?;
+            .map_err(|e| job_err(&e))?;
+        if c.status == JobStatus::Gone && flag(req, "gone_as_error")? {
+            let j = JobError::classify(
+                beyond_sandbox::exec_endpoint::jobs::JobOp::Other,
+                404,
+                "the job does not exist or was removed",
+            )
+            .expect("404 is a job condition");
+            return Err(json!({ "kind": j.kind(), "detail": j.to_string(), "code": j.code() }));
+        }
         let (state, code) = state_of(c.status);
         let mut out = json!({
             "state": state, "code": code, "offset": c.offset, "end": c.end,
@@ -585,20 +694,25 @@ impl Driver {
         let out = Mutex::new(Vec::new());
         let errs = Mutex::new(Vec::new());
         let gaps = Mutex::new(0u64);
-        let end = self
-            .jobs()?
-            .follow(&scope, &id, offset, &|ev: JobEvent<'_>| match ev {
-                JobEvent::Output(b, s) => {
-                    out.lock().unwrap().extend_from_slice(b);
-                    if s == Stream::Stderr {
-                        errs.lock().unwrap().extend_from_slice(b);
-                    }
+        let sink = |ev: JobEvent<'_>| match ev {
+            JobEvent::Output(b, s) => {
+                out.lock().unwrap().extend_from_slice(b);
+                if s == Stream::Stderr {
+                    errs.lock().unwrap().extend_from_slice(b);
                 }
-                JobEvent::Gap(n) => *gaps.lock().unwrap() += n,
-                JobEvent::Started(_) | JobEvent::ShellExit(_) => {}
-            })
-            .await
-            .map_err(|e| io_err(&e))?;
+            }
+            JobEvent::Gap(n) => *gaps.lock().unwrap() += n,
+            JobEvent::Started(_) | JobEvent::ShellExit(_) => {}
+        };
+        let end = match self.beat(req)? {
+            Some(beat) => {
+                NativeJobs::over(self.http()?)
+                    .follow_beat(&scope, &id, offset, Some(beat), &sink)
+                    .await
+            }
+            None => self.jobs()?.follow(&scope, &id, offset, &sink).await,
+        }
+        .map_err(|e| job_err(&e))?;
         let mut v = json!({
             "output_b64": b64(&out.lock().unwrap()),
             "gap": *gaps.lock().unwrap(),
@@ -621,11 +735,15 @@ impl Driver {
             .map(|s| JobId::parse(s).ok_or_else(|| err("invalid_request", "bad job id")))
             .collect::<Result<_, _>>()?;
         let remove = flag(req, "remove")?;
-        let survivors = self
-            .jobs()?
-            .kill(&scope, &ids, remove)
-            .await
-            .map_err(|e| io_err(&e))?;
+        let survivors = match u64_arg(req, "grace_ms")? {
+            Some(grace) => {
+                NativeJobs::over(self.http()?)
+                    .kill_grace(&scope, &ids, remove, grace)
+                    .await
+            }
+            None => self.jobs()?.kill(&scope, &ids, remove).await,
+        }
+        .map_err(|e| io_err(&e))?;
         let survivors: Vec<Value> = survivors
             .iter()
             .map(|(id, d)| json!({ "id": id.as_str(), "detail": d }))
@@ -654,6 +772,7 @@ impl Driver {
             Err(e) => {
                 use std::io::ErrorKind::{BrokenPipe, InvalidInput, NotFound, TimedOut};
                 Err(match e.kind() {
+                    _ if JobError::of(&e).is_some() => job_err(&e),
                     NotFound => err("not_found", e.to_string()),
                     BrokenPipe | TimedOut | InvalidInput => err("conflict", e.to_string()),
                     _ => io_err(&e),
@@ -699,7 +818,15 @@ impl Driver {
 
     async fn job_wipe(&self, req: &Value) -> Out {
         let scope = self.scope(req)?;
-        let survivors = self.jobs()?.wipe(&scope).await.map_err(|e| io_err(&e))?;
+        let survivors = match u64_arg(req, "grace_ms")? {
+            Some(grace) => {
+                NativeJobs::over(self.http()?)
+                    .wipe_grace(&scope, grace)
+                    .await
+            }
+            None => self.jobs()?.wipe(&scope).await,
+        }
+        .map_err(|e| io_err(&e))?;
         Ok(json!({ "survivors": survivors }))
     }
 
