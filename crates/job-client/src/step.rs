@@ -1659,3 +1659,46 @@ impl State {
 pub fn silence_limit_ms(beat: Option<u32>) -> u64 {
     silence_ms(beat.unwrap_or(0))
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    use super::*;
+
+    #[test]
+    fn the_silence_limit_follows_the_heartbeat() {
+        assert_eq!(silence_limit_ms(None), 30_000);
+        assert_eq!(silence_limit_ms(Some(1)), 30_000);
+        assert_eq!(silence_limit_ms(Some(10)), 30_000);
+        assert_eq!(silence_limit_ms(Some(11)), 32_000);
+        assert_eq!(silence_limit_ms(Some(60)), 130_000);
+        assert_eq!(silence_limit_ms(Some(240)), 490_000);
+    }
+
+    #[test]
+    fn a_mark_is_hex_of_one_to_thirty_two_bytes() {
+        assert!(Mark::from_bytes(b"").is_none());
+        assert!(Mark::from_bytes(b"0g").is_none());
+        assert!(Mark::from_bytes(&[b'a'; 33]).is_none());
+        let m = Mark::from_bytes(b"00ff1a").unwrap();
+        assert_eq!(m.as_bytes(), b"00ff1a");
+        assert_ne!(m, Mark::from_bytes(b"00ff1").unwrap());
+        assert!(mark_eq(&m, &Mark::from_bytes(b"00ff1a").unwrap()));
+    }
+
+    #[test]
+    fn a_handle_resumed_from_a_cursor_reopens_at_its_offset_and_mark() {
+        let c = crate::Cursor::from_parts("sess-1", "a1b2c3", "00ff1a", 4096).unwrap();
+        let s = State::for_cursor(&c, Mode::Follow, false, 0);
+        let (s, acts) = step(s, Event::Go, 0, 0);
+        assert_eq!(s.phase, Phase::Opening);
+        assert_eq!(
+            acts,
+            vec![Action::OpenAttach {
+                offset: 4096,
+                mark: Mark::from_bytes(b"00ff1a").unwrap(),
+                silence_ms: 30_000,
+            }]
+        );
+    }
+}
