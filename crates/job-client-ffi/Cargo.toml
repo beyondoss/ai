@@ -1,0 +1,33 @@
+[package]
+name = "beyond-job-client-ffi"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The job client's kernel behind a C ABI: one WASM module for the TypeScript SDK and one native library for ctypes. No logic of its own."
+
+# `rlib` for the tests, `cdylib` for the native library (Python's ctypes) and the WASM module
+# (`build.sh`, `wasm32-unknown-unknown`). Not a Verus crate: it holds no decision, and
+# `tests/no_decision.rs` fails if it grows one.
+[lib]
+name = "job_client_ffi"
+path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
+
+# An exported function is `#[unsafe(no_mangle)]`, which the workspace's `unsafe_code = "forbid"` refuses
+# and a crate cannot lower. So this crate repeats the workspace lints with that one change, and the
+# only `unsafe` is in `src/abi.rs` (the pointer-to-slice step every export shares).
+[lints.rust]
+unsafe_code = "deny"
+unused_must_use = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(beyond_loom)', 'cfg(verus_only)'] }
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+[dependencies]
+beyond-job-client = { path = "../job-client" }

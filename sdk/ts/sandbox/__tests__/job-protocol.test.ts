@@ -11,7 +11,7 @@ import {
   StdinClosedError,
   StdinGapError,
 } from "../src/errors.js";
-import { decodeJobFrame, HttpTransport } from "../src/http.js";
+import { decodeJobLine, HttpTransport } from "../src/http.js";
 import { Jobs } from "../src/jobs.js";
 import { silenceMs } from "../src/transport.js";
 import { fakeEndpoint, json } from "./fake-endpoint.js";
@@ -25,20 +25,37 @@ const line = (v: unknown) => utf8(JSON.stringify(v));
 
 describe("job frames keep their stream", () => {
   it("decodes stdout and stderr frames apart, and the stdin echo", () => {
-    expect(decodeJobFrame(line({ stdout: b64("a") }))).toMatchObject({
-      type: "output",
+    expect(decodeJobLine(line({ stdout: b64("a") }))).toMatchObject({
+      frame: { t: "output", len: 1 },
       stream: "stdout",
     });
-    const e = decodeJobFrame(line({ stderr: b64("b") }));
-    expect(e).toMatchObject({ type: "output", stream: "stderr" });
-    expect(decodeJobFrame(line({ started: 7, stdin: true }))).toEqual({
-      type: "started",
+    expect(decodeJobLine(line({ stderr: b64("b") }))).toMatchObject({
+      frame: { t: "output", len: 1 },
+      stream: "stderr",
+    });
+    expect(decodeJobLine(line({ started: 7, stdin: true }))).toMatchObject({
       pgid: 7,
       stdin: true,
     });
-    expect(decodeJobFrame(line({ started: 7 }))).toMatchObject({
-      stdin: false,
+    expect(decodeJobLine(line({ started: 7 }))).toMatchObject({ stdin: false });
+  });
+
+  it("reads the mark an endpoint echoes, and says `bad` for what is not a frame", () => {
+    expect(
+      decodeJobLine(line({ attached: { mark: "00ff", from: 9 } })).frame,
+    ).toEqual({ t: "attached", mark: "00ff", from: 9 });
+    expect(decodeJobLine(line({ started: 7, mark: "00ff" })).frame).toEqual({
+      t: "started",
+      mark: "00ff",
     });
+    for (
+      const v of [{ error: "boom" }, { gap: -1 }, { exit_code: 1.5 }, {
+        timed_out: true,
+      }]
+    ) {
+      expect(decodeJobLine(line(v)).frame).toEqual({ t: "bad" });
+    }
+    expect(decodeJobLine(utf8("{nope")).frame).toEqual({ t: "bad" });
   });
 });
 
@@ -159,7 +176,7 @@ describe("typed job errors (each a subclass of today's kind)", () => {
     const t = await failing(404, { error: "no such job" });
     const gone = await fail(
       (async () => {
-        for await (const _ of t.jobs.attach("s", "aa", 0)) { /* none */ }
+        for await (const _ of new Jobs(t).follow("s", "aa", 0)) { /* none */ }
       })(),
     );
     expect(gone).toBeInstanceOf(JobGoneError);
@@ -243,13 +260,13 @@ describe("the wire options, under their wire names", () => {
   it("a held start sends hold: true with stream, and the heartbeat header", async () => {
     const e = await fakeEndpoint((_r, res) => {
       res.writeHead(200, { "content-type": "application/x-ndjson" });
-      res.end("{\"started\":42}\n{\"exit_code\":0}\n");
+      res.end("{\"started\":42,\"mark\":\"00ff\"}\n{\"exit_code\":0}\n");
     });
     closers.push(e.close);
     const t = new HttpTransport({ url: e.url });
     const frames = [];
     for await (
-      const f of t.jobs.startHeld("s", "aa", { command: "true" }, {
+      const f of new Jobs(t).startHeld("s", "aa", { command: "true" }, {
         heartbeatSeconds: 60,
       })
     ) frames.push(f);

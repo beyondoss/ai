@@ -16,6 +16,7 @@ import {
   TooLargeError,
   TransportError,
 } from "./errors.js";
+import type { KFrame } from "./kernel/kernel.js";
 import {
   DEFAULT_KILL_GRACE_MS,
   type Frame,
@@ -24,8 +25,9 @@ import {
   isJobId,
   JOB_SIGNALS,
   type JobChunk,
-  type JobFrame,
   type JobInfo,
+  type JobOpen,
+  type JobOpened,
   type JobOps,
   type JobSpec,
   type JobState,
@@ -171,7 +173,7 @@ export class HttpTransport implements Transport {
           `exec endpoint ${this.url} answered a stream request with something that is not a stream`,
         );
       }
-      for await (const line of this.lines(ex)) {
+      for await (const line of this.lines(ex, silenceMs())) {
         for (const f of decodeFrameLine(line, this.url)) {
           if (f === "heartbeat") continue;
           if (f.type === "error") {
@@ -259,8 +261,11 @@ export class HttpTransport implements Transport {
     this.envProved = true;
   }
 
-  /** POST one request. Resolves once the status is known to be a success. */
-  async post(body: Body, signal?: AbortSignal): Promise<Exchange> {
+  /**
+   * POST one request. Resolves with the answer whatever its status: the one 401 refresh is made here,
+   * and nothing else is retried. The caller reads `ex.res.ok` and closes `ex`.
+   */
+  async postRaw(body: Body, signal?: AbortSignal): Promise<Exchange> {
     checkHeartbeat(body.heartbeatSeconds);
     const payload: Record<string, unknown> = {
       command: body.command,
@@ -286,33 +291,41 @@ export class HttpTransport implements Transport {
         signal,
         body.heartbeatSeconds,
       );
-      if (ex.res.ok) return ex;
-      const status = ex.res.status;
-      let detail: string;
-      let over = false;
-      try {
-        const r = await this.readCapped(ex);
-        detail = excerpt(r.body);
-        over = r.over;
-      } finally {
-        ex.close();
-      }
       if (
-        status === 401 && typeof this.tokenSource === "function" && !refreshed
+        ex.res.ok || ex.res.status !== 401
+        || typeof this.tokenSource !== "function"
+        || refreshed
       ) {
-        refreshed = true;
-        continue;
+        return ex;
       }
-      const msg = `exec endpoint ${this.url} returned ${status}: ${detail}`;
-      if (status === 401 || status === 403) throw new AuthError(msg);
-      // 422 + over-cap: the body may be empty (Content-Length over the cap) or truncated, so the
-      // excerpt can lack the word "cap" — `over` is then the client's own verdict that the answer
-      // was too large (the command ran).
-      if (status === 422 && (over || detail.includes("cap"))) {
-        throw new TooLargeError(msg);
-      }
-      throw new EndpointError(msg, status);
+      ex.close();
+      refreshed = true;
     }
+  }
+
+  /** POST one request. Resolves once the status is known to be a success. */
+  async post(body: Body, signal?: AbortSignal): Promise<Exchange> {
+    const ex = await this.postRaw(body, signal);
+    if (ex.res.ok) return ex;
+    const status = ex.res.status;
+    let detail: string;
+    let over = false;
+    try {
+      const r = await this.readCapped(ex);
+      detail = excerpt(r.body);
+      over = r.over;
+    } finally {
+      ex.close();
+    }
+    const msg = `exec endpoint ${this.url} returned ${status}: ${detail}`;
+    if (status === 401 || status === 403) throw new AuthError(msg);
+    // 422 + over-cap: the body may be empty (Content-Length over the cap) or truncated, so the
+    // excerpt can lack the word "cap" — `over` is then the client's own verdict that the answer
+    // was too large (the command ran).
+    if (status === 422 && (over || detail.includes("cap"))) {
+      throw new TooLargeError(msg);
+    }
+    throw new EndpointError(msg, status);
   }
 
   private async send(
@@ -465,13 +478,12 @@ export class HttpTransport implements Transport {
 
   /**
    * The lines of a streamed body, each without its newline. Presumes a dead connection after
-   * {@link silenceMs} of silence: 30 s, or longer when the request chose a slower heartbeat.
+   * `silenceLimit` ms of silence.
    */
   async *lines(
     ex: Exchange,
-    heartbeatSeconds?: number,
+    silenceLimit: number,
   ): AsyncGenerator<Uint8Array> {
-    const silenceLimit = silenceMs(heartbeatSeconds);
     const reader = ex.res.body?.getReader();
     if (!reader) return;
     // `start` is the first unread byte: we copy each line once and only compact
@@ -947,52 +959,62 @@ class HttpJobs implements JobOps {
     }
   }
 
-  async *startHeld(
-    scope: string,
-    id: string,
-    spec: JobSpec,
-    req: ReqOptions = {},
-  ): AsyncGenerator<JobFrame> {
-    await this.t.proveEnv(spec.env);
-    let ex: Exchange;
-    try {
-      ex = await this.t.post(this.startBody(scope, id, spec, true, req));
-    } catch (e) {
-      throw jobFailure(e, id, "start");
-    }
-    try {
-      if (!isNdjson(ex.res)) {
-        throw new ProtocolError(
-          `exec endpoint ${this.t.url} answered a job stream with something that is not a stream`,
-        );
-      }
-      let first = true;
-      for await (const line of this.t.lines(ex, req.heartbeatSeconds)) {
-        const f = decodeJobFrame(line);
-        if (f === "heartbeat") continue;
-        if (first) {
-          first = false;
-          if (f.type !== "started") {
-            throw new ProtocolError(
-              "the endpoint's held start did not begin with `started`",
-            );
-          }
-          if (spec.stdinOpen === true && f.stdin !== true) {
-            // Closing the stream kills the held job (nothing was kept).
-            throw new NotOfferedError(
-              "the endpoint predates job stdin: it ran the job without it",
-            );
-          }
-        }
-        yield f;
-        if (f.type === "exit" || f.type === "signal") return;
-      }
-      throw new TransportError(
-        "job stream: the stream ended before the job's final frame",
+  async open(o: JobOpen): Promise<JobOpened> {
+    const hb = o.heartbeatSeconds;
+    let body: Body;
+    if (o.op === "start") {
+      await this.t.proveEnv(o.spec.env);
+      body = this.startBody(
+        o.scope,
+        o.id,
+        o.spec,
+        true,
+        hb === undefined ? {} : { heartbeatSeconds: hb },
       );
-    } finally {
-      ex.close();
+    } else {
+      body = {
+        command: "true",
+        args: [],
+        timeoutMs: STREAM_DEADLINE_MS,
+        stream: true,
+        job: this.job("attach", o.scope, {
+          id: o.id,
+          offset: o.offset,
+          ...(o.mark === "" ? {} : { mark: o.mark }),
+        }),
+        heartbeatSeconds: hb,
+      };
     }
+    const ex = await this.t.postRaw(body);
+    const status = ex.res.status;
+    if (!ex.res.ok) {
+      try {
+        const r = await this.t.readCapped(ex);
+        return {
+          status,
+          retryAfterS:
+            Number.parseInt(ex.res.headers.get("retry-after") ?? "", 10) || 0,
+          detail: excerpt(r.body),
+          lines: (async function*() {})(),
+          close: () => {},
+        };
+      } finally {
+        ex.close();
+      }
+    }
+    if (!isNdjson(ex.res)) {
+      ex.close();
+      throw new ProtocolError(
+        `exec endpoint ${this.t.url} answered a job stream with something that is not a stream`,
+      );
+    }
+    return {
+      status,
+      retryAfterS: 0,
+      detail: "",
+      lines: this.t.lines(ex, o.silenceMs),
+      close: () => ex.close(),
+    };
   }
 
   async list(scope: string, req?: ReqOptions): Promise<JobInfo[]> {
@@ -1056,45 +1078,6 @@ class HttpJobs implements JobOps {
       data,
       ...(stderrRanges ? { stderrRanges } : {}),
     };
-  }
-
-  async *attach(
-    scope: string,
-    id: string,
-    offset: number,
-    req: ReqOptions = {},
-  ): AsyncGenerator<JobFrame> {
-    let ex: Exchange;
-    try {
-      ex = await this.t.post({
-        command: "true",
-        args: [],
-        timeoutMs: STREAM_DEADLINE_MS,
-        stream: true,
-        job: this.job("attach", scope, { id, offset }),
-        heartbeatSeconds: req.heartbeatSeconds,
-      });
-    } catch (e) {
-      throw jobFailure(e, id, "attach");
-    }
-    try {
-      if (!isNdjson(ex.res)) {
-        throw new ProtocolError(
-          `exec endpoint ${this.t.url} answered a job stream with something that is not a stream`,
-        );
-      }
-      for await (const line of this.t.lines(ex, req.heartbeatSeconds)) {
-        const f = decodeJobFrame(line);
-        if (f === "heartbeat") continue;
-        yield f;
-        if (f.type === "exit" || f.type === "signal") return;
-      }
-      throw new TransportError(
-        "job stream: the stream ended before the job's final frame",
-      );
-    } finally {
-      ex.close();
-    }
   }
 
   async keep(
@@ -1211,29 +1194,56 @@ class HttpJobs implements JobOps {
   }
 }
 
-/** One line of a job stream: the stream frames plus `started` and `gap`. */
-export function decodeJobFrame(line: Uint8Array): JobFrame | "heartbeat" {
+/** What one line of a job stream said: the frame the kernel is told of, and what the shell keeps of it. */
+export interface JobLine {
+  frame: KFrame;
+  /** An output frame's bytes: they stay here, and the kernel is told only their length. */
+  data?: Uint8Array;
+  stream?: "stdout" | "stderr";
+  /** A `started` frame's process group and whether it says the job's stdin is open. */
+  pgid?: number;
+  stdin?: boolean;
+  /** A `shell_exit` frame's code: not final, and not the kernel's business. */
+  shellExit?: number;
+  /** Why the frame is `bad`. */
+  note?: string;
+}
+
+const bad = (note: string): JobLine => ({ frame: { t: "bad" }, note });
+
+/** A non-negative integer of the wire: a byte count or an offset. */
+const wireCount = (v: unknown): v is number =>
+  Number.isSafeInteger(v) && (v as number) >= 0;
+
+/** A 32-bit signed integer of the wire. */
+const int32 = (v: unknown): v is number =>
+  typeof v === "number" && (v | 0) === v;
+
+/** One line of a job stream, read for the facts the kernel decides on. Never throws. */
+export function decodeJobLine(line: Uint8Array): JobLine {
   let s = text(line);
   if (s.endsWith("\r")) s = s.slice(0, -1);
-  if (s.trim() === "") return "heartbeat";
+  if (s.trim() === "") return { frame: { t: "heartbeat" } };
   let v: unknown;
   try {
     v = JSON.parse(s);
   } catch (e) {
-    throw new ProtocolError(
-      `job stream: unparseable job frame (${errorText(e)}): ${s.slice(0, 200)}`,
-    );
+    return bad(`unparseable job frame (${errorText(e)}): ${s.slice(0, 200)}`);
   }
-  if (!isRecord(v)) {
-    throw new ProtocolError(
-      `job stream: unparseable job frame: ${s.slice(0, 200)}`,
-    );
-  }
-  if (typeof v.error === "string") {
-    throw new TransportError(`job stream: ${v.error}`);
+  if (!isRecord(v)) return bad(`unparseable job frame: ${s.slice(0, 200)}`);
+  if (typeof v.error === "string") return bad(v.error);
+  if (isRecord(v.attached)) {
+    const { mark, from } = v.attached;
+    return typeof mark === "string" && wireCount(from)
+      ? { frame: { t: "attached", mark, from } }
+      : bad("an `attached` frame without its mark and offset");
   }
   if (typeof v.started === "number") {
-    return { type: "started", pgid: v.started, stdin: v.stdin === true };
+    return {
+      frame: { t: "started", mark: typeof v.mark === "string" ? v.mark : "" },
+      pgid: v.started,
+      stdin: v.stdin === true,
+    };
   }
   const stream = typeof v.stdout === "string"
     ? "stdout"
@@ -1242,23 +1252,29 @@ export function decodeJobFrame(line: Uint8Array): JobFrame | "heartbeat" {
     : null;
   if (stream !== null) {
     const data = fromBase64(String(v[stream]));
-    if (!data) {
-      throw new ProtocolError("job stream: output is not standard base64");
-    }
-    return { type: "output", data, stream };
+    if (!data) return bad("output is not standard base64");
+    return { frame: { t: "output", len: data.length }, data, stream };
   }
-  if (typeof v.gap === "number") return { type: "gap", bytes: v.gap };
-  if (typeof v.shell_exit === "number" && Number.isInteger(v.shell_exit)) {
-    return { type: "shell_exit", code: v.shell_exit };
+  if (typeof v.gap === "number") {
+    return wireCount(v.gap)
+      ? { frame: { t: "gap", n: v.gap } }
+      : bad("a gap that is not a count");
   }
-  if (typeof v.exit_code === "number" && Number.isInteger(v.exit_code)) {
-    return { type: "exit", code: v.exit_code };
+  if (typeof v.shell_exit === "number") {
+    return int32(v.shell_exit)
+      ? { frame: { t: "heartbeat" }, shellExit: v.shell_exit }
+      : bad("a shell_exit that is not an integer");
   }
-  if (typeof v.signal === "number" && Number.isInteger(v.signal)) {
-    return { type: "signal", signal: v.signal };
+  if (typeof v.exit_code === "number") {
+    return int32(v.exit_code)
+      ? { frame: { t: "exit", code: v.exit_code, signal: 0 } }
+      : bad("an exit_code that is not an integer");
   }
-  if (v.timed_out === true) {
-    throw new TransportError("job stream: the endpoint timed the job out");
+  if (typeof v.signal === "number") {
+    return int32(v.signal)
+      ? { frame: { t: "exit", code: 0, signal: v.signal } }
+      : bad("a signal that is not an integer");
   }
-  return "heartbeat";
+  if (v.timed_out === true) return bad("the endpoint timed the job out");
+  return { frame: { t: "heartbeat" } };
 }

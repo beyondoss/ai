@@ -711,6 +711,9 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: mise run install:ts
       - run: mise run check:ts
+      # The WASM the package inlines is what crates/job-client{,-ffi} build to.
+      - run: rustup target add wasm32-unknown-unknown
+      - run: crates/job-client-ffi/build.sh --check
       - run: mise run build:ts
       - run: cargo build -p beyond-execd --locked
       - run: mise run test:ts

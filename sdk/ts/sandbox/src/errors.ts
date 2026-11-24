@@ -307,3 +307,22 @@ export function classifyFailure(prefix: string, stderr: string): SandboxError {
   }
   return new IoError(detail);
 }
+
+/**
+ * A held job's stream stayed unreachable until the client's retry budget was spent. The job is
+ * not known to be gone: `cursor` resumes it, at the output offset and incarnation the handle had
+ * reached, once the endpoint answers again.
+ */
+export class UnreachableError extends TransportError {
+  /** A cursor string (`crates/job-client`), or `undefined` before the job's mark was known. */
+  readonly cursor: string | undefined;
+
+  constructor(
+    detail: string,
+    cursor: string | undefined,
+    options?: { cause?: unknown },
+  ) {
+    super(detail, options);
+    this.cursor = cursor;
+  }
+}
