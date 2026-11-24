@@ -358,13 +358,7 @@ impl NativeJobs<'_> {
     ) -> std::io::Result<ReadChunk> {
         let chunk = self.read(scope, id, offset, max).await?;
         if chunk.status == JobStatus::Gone {
-            return Err(JobError::classify(
-                JobOp::Other,
-                404,
-                "the job does not exist or was removed",
-            )
-            .expect("404 is a job condition")
-            .into_io());
+            return Err(JobError::gone("the job does not exist or was removed").into_io());
         }
         Ok(chunk)
     }

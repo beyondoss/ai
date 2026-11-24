@@ -235,6 +235,11 @@ impl JobError {
         })
     }
 
+    /// The condition of a job that does not exist or was removed (what `404` and state `gone` say).
+    pub fn gone(text: impl Into<String>) -> Self {
+        Self::Gone { text: text.into() }
+    }
+
     /// The condition behind `e`, if it is one.
     pub fn of(e: &std::io::Error) -> Option<&JobError> {
         e.get_ref()?.downcast_ref::<JobError>()
