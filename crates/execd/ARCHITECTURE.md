@@ -337,8 +337,15 @@ A job's ring chunks therefore live in its spool (`<state>/spool/<mark>/ring/`), 
 dependency: a job needs room to start (`507` when the disk is full, `500` for any other reason its spool cannot be made), and a job writing to a full disk sees `ENOSPC`, as any
 write to a file does.
 
-**Shutdown.** `SIGTERM` or `SIGINT` stops the accept loop and drops every open connection; the kernel decides each registered
-group (`job_kernel::shutdown_of(kind, recorded)`, `recorded` is whether there is a ledger):
+**Shutdown.** Two signals stop execd, and they differ in what happens to jobs (service-init sends `SIGTERM` for a sandbox stop and
+`SIGHUP` for a restart of execd, `workload_signal`). Both stop the accept loop and drop every open connection; the kernel then decides
+each registered group (`job_kernel::shutdown_of(kind, recorded, stop)`, `recorded` is whether there is a ledger).
+
+**A stop (`SIGTERM`, `SIGINT`) ends every group (S6)**, a job's included, with or without a ledger: jobs get `SIGTERM`, then `SIGKILL` after
+a 300 ms grace (`JOB_STOP_GRACE`), commands are killed, and the ledger is emptied so the next execd adopts nothing.
+`mut_term_keeps_jobs` (a stop that behaves as a restart) fails Verus and `tests/restart.rs::a_sigterm_to_execd_ends_every_job_even_with_a_ledger`.
+
+**A restart (`SIGHUP`)** decides as follows (`Handle::restart`); `SIGHUP` for the workload's own commands is unchanged (they start with `SIG_DFL`):
 
 | group                        | signalled | record in the ledger                           |
 | ---------------------------- | --------- | ---------------------------------------------- |
@@ -353,7 +360,7 @@ disconnect (R2 above). Who restarts execd and keeps its process group out of the
 
 Proven in Verus (`execd-jobs`, `output_sink` and `shutdown_of`): five `mut_*` features each turn one clause red
 (`mut_job_output_pipe`, `mut_command_output_spool`, `mut_shutdown_signals_jobs`, `mut_shutdown_orphans_unrecorded`,
-`mut_shutdown_forgets_jobs`, `mut_shutdown_spares_commands`), and `tests/restart.rs` drives the binary through S1, S3 and S4.
+`mut_shutdown_forgets_jobs`, `mut_shutdown_spares_commands`), and `tests/restart.rs` drives the binary through S1, S3 (a `SIGHUP`), S4 and S6 (a `SIGTERM`).
 
 **Measured** (`benches/jobs_first_byte.py`, n=40 per run, three runs each, release builds, this 2-CPU ext4/tmpfs host), before
 the pipe and after the file:
@@ -486,8 +493,8 @@ runs (ten minutes of job-table seeds, two of parser seeds, four of each fuzz tar
 even `trap` it, and a customer's `Ctrl-C` to a job would do nothing (E2B starts sandbox-exec that way). A _handler_
 is reset to the default by `exec`, so `serve` installs do-nothing handlers (tokio's signal driver, safe) for `HUP`, `INT`,
 `QUIT`, `TERM`, `USR1`, `USR2` and `ALRM` before any spawn (`proc::release_signals`), and every command starts with
-`SIG_DFL`. The cost: execd itself survives a stray `SIGHUP`/`SIGUSR1`/`SIGQUIT`; it still stops on `SIGTERM` and `SIGINT`
-where `main` waits for them. `tests/signals.rs` starts execd with all of them ignored and shows a one-shot dying of
+`SIG_DFL`. The cost: execd itself survives a stray `SIGHUP`/`SIGUSR1`/`SIGQUIT`; it still stops on `SIGTERM` and `SIGINT`,
+and restarts on `SIGHUP`, where `main` waits for them (the do-nothing handler is for the commands' sake; `main` listens too). `tests/signals.rs` starts execd with all of them ignored and shows a one-shot dying of
 each and a job's `trap` running on each.
 
 - **Groups.** Every command and job is the leader of a new process group. Liveness is `kill(-pgid, 0)`; a kill is `killpg`. Both
@@ -520,10 +527,11 @@ each and a job's `trap` running on each.
   run inline, since they take microseconds; only a scan of `/proc` goes to the blocking pool. The spawn and reap locks are
   still needed (a host can embed `execd::serve` in a multi-thread runtime, as the test mock does) and cost two uncontended
   atomics per spawn.
-- **Shutdown.** `SIGTERM` or `SIGINT` stops the accept loop, drops every open connection (which drops every in-flight handler, and
-  with it the guard that kills that handler's group), then decides every group still registered by `job_kernel::shutdown_of`:
-  commands are killed; jobs are left running and kept in the ledger when there is one, killed when there is not (see "A job's
-  output is a file; a shutdown leaves its groups"); and exits.
+- **Shutdown.** `SIGTERM` or `SIGINT` (a stop) stops the accept loop, drops every open connection (which drops every in-flight
+  handler, and with it the guard that kills that handler's group), ends every job (`SIGTERM`, then `SIGKILL` after 300 ms) and
+  kills every command, ledger or not, and exits. `SIGHUP` (a restart) decides every group by `job_kernel::shutdown_of`: commands
+  are killed; jobs are left running and kept in the ledger when there is one, killed when there is not (see "A job's output is a
+  file; a shutdown leaves its groups"); and exits.
 - **Embedding.** The library never sets a subreaper. `serve` starts its own reaper (it listens for `SIGCHLD`); a host that
   wants the PID 1 duties calls `become_subreaper` first, as the binary does.
 

@@ -237,25 +237,34 @@ async fn run(cli: Config, inherited: Option<String>) -> Result<(), Box<dyn std::
         );
     }
 
-    wait_for_signal().await;
-    let killed = server.shutdown().await;
+    let stop = wait_for_signal().await;
+    let killed = match stop {
+        execd::job_kernel::Stop::Term => server.shutdown().await,
+        execd::job_kernel::Stop::Hup => server.restart().await,
+    };
     execd::log_info!("execd stopped killed_groups={killed}");
     Ok(())
 }
 
-async fn wait_for_signal() {
+/// Wait for the signal that stops execd: `SIGTERM` or `SIGINT` stop it (every job ends), `SIGHUP`
+/// restarts it (ledgered jobs run on for the next execd). The workload's own `SIGHUP` disposition is
+/// untouched: commands still get the default (`proc::release_signals`).
+async fn wait_for_signal() -> execd::job_kernel::Stop {
+    use execd::job_kernel::Stop;
     use tokio::signal::unix::{SignalKind, signal};
-    let (Ok(mut term), Ok(mut int)) = (
+    let (Ok(mut term), Ok(mut int), Ok(mut hup)) = (
         signal(SignalKind::terminate()),
         signal(SignalKind::interrupt()),
+        signal(SignalKind::hangup()),
     ) else {
         // No signal handling to wait on: serve until killed.
         std::future::pending::<()>().await;
-        return;
+        return Stop::Term;
     };
     tokio::select! {
-        _ = term.recv() => execd::log_info!("SIGTERM"),
-        _ = int.recv() => execd::log_info!("SIGINT"),
+        _ = term.recv() => { execd::log_info!("SIGTERM"); Stop::Term }
+        _ = int.recv() => { execd::log_info!("SIGINT"); Stop::Term }
+        _ = hup.recv() => { execd::log_info!("SIGHUP"); Stop::Hup }
     }
 }
 

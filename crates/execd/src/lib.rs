@@ -71,6 +71,10 @@ pub use proc::become_subreaper;
 pub use runas::{HELPER_FLAG, Resolved, RunAs, helper_main};
 pub use spool::remove_stale_jobs_dirs;
 
+/// How long a stop (`SIGTERM`) gives a job's processes to leave after their own `SIGTERM` before
+/// `SIGKILL` (the `grace_ms` default of a job `kill`).
+pub const JOB_STOP_GRACE: Duration = Duration::from_millis(300);
+
 /// The spec's heartbeat: a stream silent for this long gets `{}` (streaming).
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(execd_wire::HEARTBEAT_MS);
 
@@ -331,6 +335,9 @@ pub(crate) struct Ctx {
     pub tails: Arc<tail::Hub>,
     /// Set when a shutdown begins: a held job's client leaving with it is not a client leaving.
     pub stopping: std::sync::atomic::AtomicBool,
+    /// Set with `stopping` when the shutdown is a restart (`SIGHUP`): a held job nobody kept is left
+    /// for the next execd instead of killed with its connection.
+    pub restarting: std::sync::atomic::AtomicBool,
     pub groups: proc::Groups,
     /// The callback client, built on the first attempt: a deployment that never keeps a job with
     /// `notify` never pays for it.
@@ -381,16 +388,40 @@ impl Handle {
         self.ctx.activity.subscribe()
     }
 
-    /// Stop accepting, drop every open connection, and decide each process group still running
-    /// ([`job_kernel::shutdown_of`]): a command's is killed; a job's is left running and kept in
-    /// the ledger when there is one (`Options::state_dir`), for the next execd to adopt, and killed
-    /// when there is not. Returns how many groups it killed.
+    /// A stop (`SIGTERM`, `SIGINT`): stop accepting, drop every open connection and end every process
+    /// group, a job's included, with or without a ledger (S6): jobs get `SIGTERM`, then `SIGKILL`
+    /// after `JOB_STOP_GRACE`; a command's group is killed. The ledger is emptied. Returns how many
+    /// groups it ended.
     pub async fn shutdown(self) -> usize {
+        self.shutdown_for(job_kernel::Stop::Term).await
+    }
+
+    /// A restart (`SIGHUP`): as a stop, except that a job's group is left running and kept in the
+    /// ledger when there is one (`Options::state_dir`), for the next execd to adopt (S3, S4), and
+    /// killed when there is not. Returns how many groups it killed.
+    pub async fn restart(self) -> usize {
+        self.shutdown_for(job_kernel::Stop::Hup).await
+    }
+
+    async fn shutdown_for(self, stop: job_kernel::Stop) -> usize {
         self.ctx.stopping.store(true, Ordering::Release);
+        self.ctx
+            .restarting
+            .store(stop == job_kernel::Stop::Hup, Ordering::Release);
         self.stop.cancel();
         let _ = self.accept.await;
-        let killed = self.ctx.groups.shutdown();
-        if self.ctx.groups.at_shutdown(job_kernel::Kind::Job).record {
+        let ended = if stop == job_kernel::Stop::Term {
+            jobs::stop_all(&self.ctx, JOB_STOP_GRACE).await
+        } else {
+            0
+        };
+        let killed = ended + self.ctx.groups.shutdown(stop);
+        if self
+            .ctx
+            .groups
+            .at_shutdown(job_kernel::Kind::Job, stop)
+            .record
+        {
             self.ctx.jobs.save();
         } else {
             self.ctx.jobs.forget();
@@ -445,6 +476,7 @@ pub fn serve(listener: tokio::net::TcpListener, opts: Options) -> std::io::Resul
         spool,
         tails: tail::Hub::new()?,
         stopping: std::sync::atomic::AtomicBool::new(false),
+        restarting: std::sync::atomic::AtomicBool::new(false),
         groups: proc::Groups::new(ledger_on),
         client: tokio::sync::OnceCell::new(),
         epoch: Instant::now(),

@@ -274,6 +274,22 @@ async fn stop_jobs(jobs: &[(proc::Pg, String)], grace: Duration) {
     }
 }
 
+/// A stop of execd: end every job that has not ended (`SIGTERM`, `SIGKILL` after `grace`), as a
+/// `wipe` of every scope does.
+pub(crate) async fn stop_all(ctx: &Arc<Ctx>, grace: Duration) -> usize {
+    let cells = locked(&ctx.jobs.map).all();
+    let targets: Vec<(proc::Pg, String)> = cells
+        .into_iter()
+        .filter_map(|(_, c)| {
+            let mut j = locked(&c);
+            let act = kernel::step(&mut j.k, Ev::Stop);
+            (act == Act::Stop).then(|| (j.pg(), j.mark.clone()))
+        })
+        .collect();
+    stop_jobs(&targets, grace).await;
+    targets.len()
+}
+
 /// Fuzz seam: whether `job` is a well-formed job operation (and its `notify`, if it has one, passes
 /// the grammar). Never panics.
 pub(crate) fn fuzz_job(job: &Value) -> bool {
@@ -1301,8 +1317,8 @@ async fn stream_job(
     // The connection is gone before the job's end: a held job nobody kept dies with it. Not when it
     // went because execd is stopping and the kernel leaves this job's group alone (S3): the next
     // execd finds the unkept held start in the ledger and ends it as any disconnect does.
-    let stopping =
-        ctx.stopping.load(Ordering::Acquire) && !ctx.groups.at_shutdown(Kind::Job).signal;
+    let stopping = ctx.restarting.load(Ordering::Acquire)
+        && !ctx.groups.at_shutdown(Kind::Job, kernel::Stop::Hup).signal;
     if hold
         && !stopping
         && let Some(cell) = bound(&ctx, &key, &attached)

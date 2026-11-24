@@ -49,6 +49,7 @@ mut_job_output_pipe = [] # a job's output goes to a pipe execd reads, so a write
 mut_command_output_spool = [] # a command's output goes to a spool file, not the pipe its client reads (S2)
 mut_shutdown_signals_jobs = [] # execd's shutdown signals every recorded job's group (S3)
 mut_shutdown_orphans_unrecorded = [] # execd's shutdown leaves a job running that no ledger can ever find (S3b)
+mut_term_keeps_jobs = [] # a stop (SIGTERM) leaves ledgered jobs running as a restart does (S6)
 mut_shutdown_forgets_jobs = [] # execd's shutdown empties the ledger of its jobs (S4)
 mut_shutdown_spares_commands = [] # execd's shutdown leaves a command's group running with no client (S5)
 mut_resume_cursor_lags = [] # a restart reads a stream again from its cursor, journalled bytes included (X1)

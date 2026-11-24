@@ -207,10 +207,10 @@ async fn a_job_writes_through_a_restart_of_execd_and_the_new_one_reads_it() {
     until(a2, "w", "ended").await;
 }
 
-/// S3: a `SIGTERM` to execd is a shutdown, not a kill: with a ledger every job's group runs on and
-/// the next execd adopts it. Red under `mut_shutdown_signals_jobs`.
+/// S3: a `SIGHUP` to execd is a restart, not a kill (service-init sends it for a restart of execd): with a
+/// ledger every job's group runs on and the next execd adopts it. Red under `mut_shutdown_signals_jobs`.
 #[tokio::test]
-async fn a_sigterm_to_execd_leaves_its_jobs_running() {
+async fn a_sighup_to_execd_leaves_its_jobs_running() {
     let state = tempfile::tempdir().unwrap();
     let s = state.path().join("ledger");
     let settings = [("EXECD_STATE_DIR", s.to_str().unwrap())];
@@ -221,7 +221,7 @@ async fn a_sigterm_to_execd_leaves_its_jobs_running() {
     until(a1, "done", "ended").await;
     nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(i32::try_from(first.child.id()).unwrap()),
-        nix::sys::signal::Signal::SIGTERM,
+        nix::sys::signal::Signal::SIGHUP,
     )
     .unwrap();
     first.child.wait().unwrap();
@@ -246,6 +246,42 @@ async fn a_sigterm_to_execd_leaves_its_jobs_running() {
     )
     .await;
     until(a2, "live", "ended").await;
+}
+
+/// S6: a `SIGTERM` to execd is a stop (service-init sends it for a sandbox stop), so with a ledger too
+/// every job's group is ended, and the next execd adopts nothing. Red under `mut_term_keeps_jobs`.
+#[tokio::test]
+async fn a_sigterm_to_execd_ends_every_job_even_with_a_ledger() {
+    let state = tempfile::tempdir().unwrap();
+    let s = state.path().join("ledger");
+    let settings = [("EXECD_STATE_DIR", s.to_str().unwrap())];
+    let mut first = Execd::start(&settings, &[]);
+    let a1 = SocketAddr::V4(first.addr);
+    let pgid = start(a1, "live", "exec sleep 300").await;
+    start(a1, "done", "exit 4").await;
+    until(a1, "done", "ended").await;
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(i32::try_from(first.child.id()).unwrap()),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .unwrap();
+    first.child.wait().unwrap();
+    let group = nix::unistd::Pid::from_raw(i32::try_from(pgid).unwrap());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while nix::sys::signal::killpg(group, None).is_ok() {
+        assert!(
+            Instant::now() < deadline,
+            "execd's stop left the job's group running"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Nothing is in the ledger for the next execd to adopt.
+    let second = Execd::start(&settings, &[]);
+    let a2 = SocketAddr::V4(second.addr);
+    assert!(
+        state_of(a2, "live").await.is_none(),
+        "a stopped job was adopted"
+    );
 }
 
 /// X1, X2: a client that resumes through `read` at its offset sees no gap across a crash of execd:
