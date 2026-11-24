@@ -616,6 +616,55 @@ mod hold_tests {
         );
     }
 
+    /// Every path under `d`, with each file's bytes: what a stale writer must leave as it was.
+    fn tree(d: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+        let mut out = Vec::new();
+        let mut stack = vec![d.to_path_buf()];
+        while let Some(p) = stack.pop() {
+            for e in fs::read_dir(&p).unwrap().flatten() {
+                if e.file_type().unwrap().is_dir() {
+                    out.push((e.path(), None));
+                    stack.push(e.path());
+                } else {
+                    out.push((e.path(), Some(fs::read(e.path()).unwrap())));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// The same server: job a is removed and job b made under the same base. a's stale ring and
+    /// journal neither touch b nor bring a's directory back, and nothing under the base gains a file.
+    /// Red when a stale writer can create its directory or reach b.
+    #[test]
+    fn a_removed_jobs_stale_ring_and_journal_touch_nothing_under_the_base() {
+        let (_base, jobs) = stable();
+        let (a, _w) = Spool::create(jobs.stable(), "a").unwrap();
+        let mut journal = Journal::create(&a.access(), a.guard(), [0, 0], Vec::new(), 0).unwrap();
+        let mut ring = Ring::new(1 << 20, a.ring_dir()).holding(a.guard()).kept();
+        a.remove();
+        drop(a);
+        let (b, _wb) = Spool::create(jobs.stable(), "b").unwrap();
+        let _b_journal = Journal::create(&b.access(), b.guard(), [0, 0], Vec::new(), 0).unwrap();
+        let b_listing = names(&b.access());
+        let b_journal = fs::read(b.access().join("journal")).unwrap();
+        let before = tree(jobs.stable().path());
+        journal.record(false, b"x", 0);
+        ring.push(&vec![b'z'; 70_000], false);
+        assert_eq!(
+            names(&b.access()),
+            b_listing,
+            "a stale writer reached job b"
+        );
+        assert_eq!(fs::read(b.access().join("journal")).unwrap(), b_journal);
+        assert!(
+            !jobs.stable().path().join("a").exists(),
+            "a's directory came back"
+        );
+        assert_eq!(tree(jobs.stable().path()), before, "the base changed");
+    }
+
     /// `retain` and a job's removal go by name relative to the held directory and remove only real
     /// directories: a planted link, and the directory it names, are never touched. Red against a
     /// retain that follows links.
