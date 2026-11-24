@@ -9,6 +9,14 @@
 //!   beat ([`lemma_never_silent_past_a_beat`]), and a silence of any length, 335 s included, has a
 //!   heartbeat in every beat-long window ([`lemma_silence_is_carried`]); the beat is 5 s, below the
 //!   295 s the gateway allows without a byte ([`lemma_beat_below_idle`]).
+//! * **W1b, the interval a client chooses** ([`beat_ms`]): a request may name its own beat, as whole
+//!   seconds in the `Keepalive-Ping-Interval` header (E2B's envd takes the same header). Proven: the
+//!   beat in force is the client's when it is in 1 to 240 s, else the default, and never outside
+//!   1 to 240 s unless the default is ([`lemma_interval_is_in_range_or_default`]); 240 s is below
+//!   the gateway's 295 s, the edge's 300 s and the load balancer's 350 s
+//!   ([`lemma_interval_below_idle`]), so a stream at any accepted interval is never silent past
+//!   one interval ([`lemma_never_silent_past_a_beat`]) and never past an idle limit. There is no
+//!   "off": zero and below take the default.
 //! * **W2, the one-shot's first answer** ([`oneshot_mode`]): a command that has not answered by the
 //!   first beat gets its `200` headers then (the answer is committed), whatever it ends in; one that
 //!   has answers as ever, status and all.
@@ -26,9 +34,21 @@ verus! {
 /// The spec's heartbeat: a stream silent this long gets `{}`; a one-shot a space (W1).
 pub const HEARTBEAT_MS: u64 = 5_000;
 
+/// The shortest interval a client may ask for, in seconds (W1b).
+pub const MIN_INTERVAL_S: u64 = 1;
+
+/// The longest interval a client may ask for, in seconds (W1b): under the gateway's 295 s, the edge's
+/// 300 s and the load balancer's 350 s, with the front lengthening its own stall to stay over it.
+pub const MAX_INTERVAL_S: u64 = 240;
+
 /// The longest a response may go without a byte before the gateway cuts it: instd's gateway cuts a
 /// response with no headers at 295 s.
 pub const GATEWAY_IDLE_MS: u64 = 295_000;
+
+/// The edge's read timeout (300 s) and the load balancer's idle timeout (350 s): the outer hops
+/// the gateway's limit nests inside (`api/opkernel` `limits.rs`).
+pub const EDGE_IDLE_MS: u64 = 300_000;
+pub const LB_IDLE_MS: u64 = 350_000;
 
 /// The front's stall limit for a stream with no byte (api/app/execfront `StallStream`, 45 s): the tightest
 /// limit a heartbeat has to cross, and the one Beyond's `configured_limits_nest` takes the heartbeat under.
@@ -93,6 +113,77 @@ pub proof fn lemma_beat_below_idle()
         FRONT_STALL_MS < GATEWAY_IDLE_MS,
         HEARTBEAT_MS < GATEWAY_IDLE_MS,
         HEARTBEAT_MS as int * 59 == GATEWAY_IDLE_MS as int,
+{
+}
+
+/// Whether `secs` is an interval a client may ask for.
+pub open spec fn interval_ok(secs: int) -> bool {
+    MIN_INTERVAL_S as int <= secs && secs <= MAX_INTERVAL_S as int
+}
+
+/// W1b. The beat, in milliseconds, a request runs at: the client's interval (whole seconds, as the
+/// header carried it; `None` when it is absent or not an integer) when it is in 1 to 240 s, else
+/// `default_ms`. Zero, a negative number and anything over 240 take the default: there is no way to
+/// turn the heartbeat off.
+#[allow(clippy::manual_range_contains, clippy::if_same_then_else)]
+pub fn beat_ms(requested_s: Option<i64>, default_ms: u64) -> (ms: u64)
+    ensures
+        requested_s is Some && interval_ok(requested_s->Some_0 as int)
+            ==> ms as int == requested_s->Some_0 as int * 1000,
+        !(requested_s is Some && interval_ok(requested_s->Some_0 as int)) ==> ms == default_ms,
+{
+    match requested_s {
+        Some(s) => {
+            if cfg!(feature = "mut_interval_unbounded") && s >= 1 && s <= 1_000_000 {
+                (s as u64) * 1000
+            } else if cfg!(feature = "mut_interval_off") && s >= 0 && s <= 240 {
+                (s as u64) * 1000
+            } else if s >= 1 && s <= 240 {
+                (s as u64) * 1000
+            } else {
+                default_ms
+            }
+        },
+        None => default_ms,
+    }
+}
+
+/// **W1b, the interval is in range or the default.** Whatever a client sends, the beat in force is
+/// either the default or a whole number of seconds from 1 to 240 (never zero: no "off"; never over
+/// 240 s).
+pub proof fn lemma_interval_is_in_range_or_default(requested_s: Option<i64>, default_ms: u64, ms: u64)
+    requires
+        0 < default_ms,
+        ms == (if requested_s is Some && interval_ok(requested_s->Some_0 as int) {
+            requested_s->Some_0 as int * 1000
+        } else {
+            default_ms as int
+        }),
+    ensures
+        0 < ms,
+        ms == default_ms || (ms as int % 1000 == 0 && interval_ok(ms as int / 1000)),
+{
+    if requested_s is Some && interval_ok(requested_s->Some_0 as int) {
+        let s = requested_s->Some_0 as int;
+        assert(ms as int == s * 1000);
+        assert(ms as int % 1000 == 0 && ms as int / 1000 == s) by (nonlinear_arith)
+            requires ms as int == s * 1000;
+    }
+}
+
+/// **W1b, every interval a client may choose is below every idle limit.** The longest, 240 s, is
+/// under the gateway's 295 s, which is under the edge's 300 s and the load balancer's 350 s
+/// (`api/opkernel` `limits.rs`), so no hop sees a silence as long as a limit; the default is one of
+/// them (5 s); and the shortest is a real beat (1 s), never zero.
+pub proof fn lemma_interval_below_idle()
+    ensures
+        MAX_INTERVAL_S as int * 1000 < GATEWAY_IDLE_MS as int,
+        GATEWAY_IDLE_MS < EDGE_IDLE_MS,
+        EDGE_IDLE_MS < LB_IDLE_MS,
+        MAX_INTERVAL_S as int * 1000 < EDGE_IDLE_MS as int,
+        MAX_INTERVAL_S as int * 1000 < LB_IDLE_MS as int,
+        interval_ok(HEARTBEAT_MS as int / 1000),
+        0 < MIN_INTERVAL_S,
 {
 }
 
@@ -264,6 +355,39 @@ mod tests {
         }
         assert!(worst <= BEAT, "a gap of {worst} ns");
         assert!(worst < GATEWAY_IDLE_MS * NS_PER_MS);
+    }
+
+    /// W1b: 1 to 240 whole seconds is the client's; zero, a negative, an unparsable (`None`) and over
+    /// 240 are the default. Red under `mut_interval_unbounded` and `mut_interval_off`.
+    #[test]
+    fn a_clients_interval_is_taken_from_one_to_240_seconds_and_nothing_else() {
+        let d = HEARTBEAT_MS;
+        assert_eq!(beat_ms(Some(1), d), 1_000);
+        assert_eq!(beat_ms(Some(30), d), 30_000);
+        assert_eq!(beat_ms(Some(240), d), 240_000);
+        for out in [0, -1, i64::MIN, 241, 295, 1_000, i64::MAX] {
+            assert_eq!(beat_ms(Some(out), d), d, "{out} is not an interval");
+        }
+        assert_eq!(beat_ms(None, d), d, "absent or unparsable");
+        assert_eq!(beat_ms(None, 50), 50, "the default is the caller's");
+    }
+
+    /// W1b: a stream at the longest interval is never silent past it, and it is under every idle
+    /// limit. Red under `mut_interval_unbounded`.
+    #[test]
+    fn the_longest_interval_is_under_every_idle_limit() {
+        let beat = beat_ms(Some(500), HEARTBEAT_MS) * NS_PER_MS;
+        assert_eq!(beat, HEARTBEAT_MS * NS_PER_MS);
+        let longest = beat_ms(Some(240), HEARTBEAT_MS);
+        assert!(longest < GATEWAY_IDLE_MS);
+        let beat = longest * NS_PER_MS;
+        let (mut last, mut now, mut worst) = (0u64, 0u64, 0u64);
+        while now < 335_000 * NS_PER_MS {
+            now += quiet_wait(now - last, beat);
+            worst = worst.max(now - last);
+            last = now;
+        }
+        assert!(worst <= beat && worst < GATEWAY_IDLE_MS * NS_PER_MS);
     }
 
     /// W2: a command that has not ended by the first beat is committed. Red under

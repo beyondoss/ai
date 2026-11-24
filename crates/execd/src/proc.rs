@@ -500,7 +500,8 @@ pub(crate) struct Groups {
 #[derive(Default)]
 struct GroupSet {
     live: BTreeMap<Pg, job_kernel::Kind>,
-    closed: bool,
+    /// Set once the shutdown has begun: why.
+    closed: Option<job_kernel::Stop>,
 }
 
 impl Groups {
@@ -511,16 +512,20 @@ impl Groups {
         }
     }
 
-    /// What a shutdown does to a group of this kind (S3 to S5).
-    pub fn at_shutdown(&self, kind: job_kernel::Kind) -> job_kernel::Shutdown {
-        job_kernel::shutdown_of(kind, self.recorded)
+    /// What a shutdown for `stop` does to a group of this kind (S3 to S6).
+    pub fn at_shutdown(
+        &self,
+        kind: job_kernel::Kind,
+        stop: job_kernel::Stop,
+    ) -> job_kernel::Shutdown {
+        job_kernel::shutdown_of(kind, self.recorded, stop)
     }
 
     pub fn insert(&self, pg: Pg, kind: job_kernel::Kind) {
         let mut g = locked(&self.set);
-        if g.closed {
+        if let Some(stop) = g.closed {
             drop(g);
-            if self.at_shutdown(kind).signal {
+            if self.at_shutdown(kind, stop).signal {
                 kill_group(pg);
             }
         } else {
@@ -535,15 +540,15 @@ impl Groups {
     /// Decide each registered group's fate ([`job_kernel::shutdown_of`]): SIGKILL the ones it says
     /// to, leave the rest running (a recorded job: the next execd adopts it), forget them all, and
     /// close the set. How many it killed.
-    pub fn shutdown(&self) -> usize {
+    pub fn shutdown(&self, stop: job_kernel::Stop) -> usize {
         let all = {
             let mut g = locked(&self.set);
-            g.closed = true;
+            g.closed = Some(stop);
             std::mem::take(&mut g.live)
         };
         let mut killed = 0;
         for (&pg, &kind) in &all {
-            if self.at_shutdown(kind).signal {
+            if self.at_shutdown(kind, stop).signal {
                 kill_group(pg);
                 killed += 1;
             }

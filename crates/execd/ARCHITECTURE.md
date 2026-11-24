@@ -86,6 +86,14 @@ stderr ending in `command exceeded its timeout`. A request without `timeout_ms` 
 that a descendant holds open. The group is then killed (the spec's SHOULD for one-shot), and it is killed if the client leaves
 first.
 
+**The beat is the request's.** `Keepalive-Ping-Interval` (whole seconds) names a request's own heartbeat; `http::beat_of` reads it and
+`execd_wire::beat_ms` (W1b, proven in Verus) decides: 1 to 240 s is the client's, anything else (absent, 0, negative, not an integer,
+over 240) is `Options::heartbeat`. It rides on `Request::beat` to the one-shot envelope, the stream and a job's stream. 240 s is below the
+gateway's 295 s, the edge's 300 s and the load balancer's 350 s; the front lengthens its own stall limit for the request. A longer
+interval means a vanished client is noticed later by the heartbeat write, so the 10 s bound below holds only at the default
+(`TCP_USER_TIMEOUT` stays twice `Options::heartbeat`: it counts unacknowledged data, so a frame sent after a long interval is still
+dropped within 10 s of going unacknowledged).
+
 **A long command's answer starts early.** A command that answers within one heartbeat (`Options::heartbeat`, 5 s) gets
 its answer as ever, status included. One still running then gets `200` headers at that first silence and one space per
 heartbeat after it, then the answer: instd's gateway cuts a response with no headers at 295 s, which ended every longer
@@ -326,11 +334,18 @@ gap, logged. Proven in Verus (`resume`, `replay_skip`; `mut_resume_cursor_lags`,
 `mut_resume_replays_chunked` are red); `tests/restart.rs` drives a crash mid-write and compares the answer before and after.
 
 A job's ring chunks therefore live in its spool (`<state>/spool/<mark>/ring/`), not the jobs directory, and the disk under it is a
-dependency: a job needs room to start (`500`: its spool cannot be made), and a job writing to a full disk sees `ENOSPC`, as any
+dependency: a job needs room to start (`507` when the disk is full, `500` for any other reason its spool cannot be made), and a job writing to a full disk sees `ENOSPC`, as any
 write to a file does.
 
-**Shutdown.** `SIGTERM` or `SIGINT` stops the accept loop and drops every open connection; the kernel decides each registered
-group (`job_kernel::shutdown_of(kind, recorded)`, `recorded` is whether there is a ledger):
+**Shutdown.** Two signals stop execd, and they differ in what happens to jobs (service-init sends `SIGTERM` for a sandbox stop and
+`SIGHUP` for a restart of execd, `workload_signal`). Both stop the accept loop and drop every open connection; the kernel then decides
+each registered group (`job_kernel::shutdown_of(kind, recorded, stop)`, `recorded` is whether there is a ledger).
+
+**A stop (`SIGTERM`, `SIGINT`) ends every group (S6)**, a job's included, with or without a ledger: jobs get `SIGTERM`, then `SIGKILL` after
+a 300 ms grace (`JOB_STOP_GRACE`), commands are killed, and the ledger is emptied so the next execd adopts nothing.
+`mut_term_keeps_jobs` (a stop that behaves as a restart) fails Verus and `tests/restart.rs::a_sigterm_to_execd_ends_every_job_even_with_a_ledger`.
+
+**A restart (`SIGHUP`)** decides as follows (`Handle::restart`); `SIGHUP` for the workload's own commands is unchanged (they start with `SIG_DFL`):
 
 | group                        | signalled | record in the ledger                           |
 | ---------------------------- | --------- | ---------------------------------------------- |
@@ -345,7 +360,7 @@ disconnect (R2 above). Who restarts execd and keeps its process group out of the
 
 Proven in Verus (`execd-jobs`, `output_sink` and `shutdown_of`): five `mut_*` features each turn one clause red
 (`mut_job_output_pipe`, `mut_command_output_spool`, `mut_shutdown_signals_jobs`, `mut_shutdown_orphans_unrecorded`,
-`mut_shutdown_forgets_jobs`, `mut_shutdown_spares_commands`), and `tests/restart.rs` drives the binary through S1, S3 and S4.
+`mut_shutdown_forgets_jobs`, `mut_shutdown_spares_commands`), and `tests/restart.rs` drives the binary through S1, S3 (a `SIGHUP`), S4 and S6 (a `SIGTERM`).
 
 **Measured** (`benches/jobs_first_byte.py`, n=40 per run, three runs each, release builds, this 2-CPU ext4/tmpfs host), before
 the pipe and after the file:
@@ -478,8 +493,8 @@ runs (ten minutes of job-table seeds, two of parser seeds, four of each fuzz tar
 even `trap` it, and a customer's `Ctrl-C` to a job would do nothing (E2B starts sandbox-exec that way). A _handler_
 is reset to the default by `exec`, so `serve` installs do-nothing handlers (tokio's signal driver, safe) for `HUP`, `INT`,
 `QUIT`, `TERM`, `USR1`, `USR2` and `ALRM` before any spawn (`proc::release_signals`), and every command starts with
-`SIG_DFL`. The cost: execd itself survives a stray `SIGHUP`/`SIGUSR1`/`SIGQUIT`; it still stops on `SIGTERM` and `SIGINT`
-where `main` waits for them. `tests/signals.rs` starts execd with all of them ignored and shows a one-shot dying of
+`SIG_DFL`. The cost: execd itself survives a stray `SIGHUP`/`SIGUSR1`/`SIGQUIT`; it still stops on `SIGTERM` and `SIGINT`,
+and restarts on `SIGHUP`, where `main` waits for them (the do-nothing handler is for the commands' sake; `main` listens too). `tests/signals.rs` starts execd with all of them ignored and shows a one-shot dying of
 each and a job's `trap` running on each.
 
 - **Groups.** Every command and job is the leader of a new process group. Liveness is `kill(-pgid, 0)`; a kill is `killpg`. Both
@@ -512,10 +527,11 @@ each and a job's `trap` running on each.
   run inline, since they take microseconds; only a scan of `/proc` goes to the blocking pool. The spawn and reap locks are
   still needed (a host can embed `execd::serve` in a multi-thread runtime, as the test mock does) and cost two uncontended
   atomics per spawn.
-- **Shutdown.** `SIGTERM` or `SIGINT` stops the accept loop, drops every open connection (which drops every in-flight handler, and
-  with it the guard that kills that handler's group), then decides every group still registered by `job_kernel::shutdown_of`:
-  commands are killed; jobs are left running and kept in the ledger when there is one, killed when there is not (see "A job's
-  output is a file; a shutdown leaves its groups"); and exits.
+- **Shutdown.** `SIGTERM` or `SIGINT` (a stop) stops the accept loop, drops every open connection (which drops every in-flight
+  handler, and with it the guard that kills that handler's group), ends every job (`SIGTERM`, then `SIGKILL` after 300 ms) and
+  kills every command, ledger or not, and exits. `SIGHUP` (a restart) decides every group by `job_kernel::shutdown_of`: commands
+  are killed; jobs are left running and kept in the ledger when there is one, killed when there is not (see "A job's output is a
+  file; a shutdown leaves its groups"); and exits.
 - **Embedding.** The library never sets a subreaper. `serve` starts its own reaper (it listens for `SIGCHLD`); a host that
   wants the PID 1 duties calls `become_subreaper` first, as the binary does.
 
@@ -532,7 +548,7 @@ cold callers. No limit here is invented: each is the spec's, the agent's own, or
 | streams buffers               | two 64 KiB read buffers, one frame in each of two depth-1 channels, hyper's write buffer (400 KiB, its default)                                                                                                      | A frame carries at most 64 KiB (the spec). Depth 1 is the least that lets the next frame be built while the last is written; nothing observable depends on it.                                                                                                                                                                                                                                                                                                                                                  | the stream ending                                                                 | N streams hold N times a few hundred KiB. A stalled client holds the same, and stalls its command.                                                                                                |
 | Settle on exit                | 100 ms quiet on the pipe (measured by the reader, not by whoever waits for it), or what the pipe held at the exit (`FIONREAD`, not its nominal `F_GETPIPE_SZ` size: a pipe can hold more) plus 64 KiB of late writes | The spec's grace is 100 ms (the client's). What a command wrote and had not had read is in its pipes when it exits, however much that is.                                                                                                                                                                                                                                                                                                                                                                       | the readers finishing                                                             | one timer per exiting stream                                                                                                                                                                      |
 | Leftover wait                 | until a `SIGCHLD`, with a 5 s fallback, while a shell has exited and its group lives                                                                                                                                 | The reaper collects execd's children at once, so the last member of a group is nearly always collected and a waiter is woken for it; the slow tick (a heartbeat period) covers a zombie whose live parent is neither execd nor in the group, and only sets how late that is noticed. Without a subreaper (an embedding host) it polls every 50 ms.                                                                                                                                                              | the group emptying, the deadline, or the client leaving                           | one `/proc` scan per 5 s tick per waiting stream, only while leftovers live                                                                                                                       |
-| Heartbeat                     | every 5 s of silence                                                                                                                                                                                                 | The spec.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | the stream ending                                                                 | one timer per stream                                                                                                                                                                              |
+| Heartbeat                     | every 5 s of silence, or the request's own `Keepalive-Ping-Interval` (1 to 240 s)                                                                                                                                    | The spec.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | the stream ending                                                                 | one timer per stream                                                                                                                                                                              |
 | Stream lifetime               | the command's `timeout_ms` (a job stream has none)                                                                                                                                                                   | The spec: the endpoint enforces it and kills the group. A request without `timeout_ms`, or one too large to represent, waits 30 years, tokio's own "never".                                                                                                                                                                                                                                                                                                                                                     | the deadline, the client leaving, or the command ending                           | bounded by the clients                                                                                                                                                                            |
 | Job output                    | the last 8 MiB per job (`JOB_OUTPUT_RETENTION`), in whole chunks of 64 KiB **on disk** (`EXECD_JOBS_DIR`), so between 8 MiB and 8 MiB plus one chunk; in memory, one unfinished chunk                                | The spec: the endpoint keeps at least the last 8 MiB.                                                                                                                                                                                                                                                                                                                                                                                                                                                           | a chunk's eviction; the job's `remove`, `kill` with `remove`, or `wipe`; shutdown | N jobs hold N times 8 MiB of files                                                                                                                                                                |
 | Job table                     | one entry per job started and not removed                                                                                                                                                                            | The agent keeps at most `MAX_YIELDED_JOBS` (4) + `MAX_INTENDED_JOBS` (8) running and `MAX_ENDED_JOBS` (8) ended per session and removes them with the session, so a session holds at most 20 entries. execd adds no second limit; an ended job whose client never removes it stays until execd exits.                                                                                                                                                                                                           | `remove`, `wipe`, `kill` with `remove`                                            | N sessions hold N times 20 entries, 160 MiB of files at the floor                                                                                                                                 |
@@ -552,7 +568,7 @@ cold callers. No limit here is invented: each is the spec's, the agent's own, or
 
 A client that opens a stream and stops reading holds the buffers above for as long as its command lives, and no more: the
 command blocks on a full pipe and writes nothing further. The command's own `timeout_ms` ends it, as does the client closing, and
-the kernel drops a peer that stopped acknowledging after 10 s of unsent heartbeat. `tests/endpoint.rs` runs a command that
+the kernel drops a peer that stopped acknowledging after 10 s of unsent heartbeat. (At a client-chosen interval the stream is silent that long between heartbeats; the user timeout is unchanged.) `tests/endpoint.rs` runs a command that
 writes 256 MiB against a client that never reads and asserts it stalls and stays stalled.
 
 ### How it is tested against a plain process

@@ -145,6 +145,28 @@ pub(crate) struct Request {
     /// `env`, once it passed [`parse_env`] (empty until the handler has checked it).
     #[serde(skip)]
     pub env_pairs: Vec<(String, String)>,
+    /// The heartbeat this request runs at: the client's `Keepalive-Ping-Interval` when it is a
+    /// whole number of seconds from 1 to 240, else the server's ([`beat_of`]). Set by the handler.
+    #[serde(skip)]
+    pub beat: std::time::Duration,
+}
+
+/// The request header a client names its heartbeat interval in, whole seconds (E2B's envd takes the
+/// same one). Its value is checked by [`beat_of`].
+pub(crate) const INTERVAL_HEADER: &str = "keepalive-ping-interval";
+
+/// The heartbeat a request runs at: the kernel's decision (W1b) over the header's integer, or over
+/// `None` when it is absent, not UTF-8 or not an integer.
+pub(crate) fn beat_of(
+    headers: &hyper::HeaderMap,
+    default: std::time::Duration,
+) -> std::time::Duration {
+    let asked = headers
+        .get(INTERVAL_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<i64>().ok());
+    let default_ms = u64::try_from(default.as_millis()).unwrap_or(u64::MAX);
+    std::time::Duration::from_millis(crate::wire_kernel::beat_ms(asked, default_ms))
 }
 
 /// The most variables one command's `env` names.
@@ -569,6 +591,7 @@ async fn route(ctx: Arc<Ctx>, req: HttpRequest<Incoming>, checked: bool) -> Resp
             return error_response(400, &format!("bad request: {e}"));
         }
     };
+    req.beat = beat_of(&parts.headers, ctx.opts.heartbeat);
     if let Some(env) = req.env.take().filter(|_| req.runs_command()) {
         match parse_env(&env) {
             Ok(pairs) => req.env_pairs = pairs,

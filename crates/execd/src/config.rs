@@ -40,7 +40,7 @@ execd takes no arguments; it is configured by environment variables:
   EXECD_RUN_AS                    run every command as user, uid, user:group or uid:gid; execd must be root
   EXECD_MAX_RESPONSE_BYTES        the most output one answer carries (default 16777216)
   EXECD_JOBS_DIR                  where a kept job's last 8 MiB of output is spooled (default $TMPDIR, else /tmp)
-  EXECD_STATE_DIR                 where the jobs ledger and each job's output files are kept, so a restart or stop of execd leaves its jobs running and finds them (default none: a stop kills them; use a tmpfs directory)
+  EXECD_STATE_DIR                 where the jobs ledger and each job's output files are kept, so a restart (SIGHUP) of execd leaves its jobs running and finds them; a stop (SIGTERM) always ends them (default none: a restart kills them too; use a tmpfs directory)
   EXECD_LOG                       off, error, warn, info, debug or trace (default info)
   EXECD_WORKER_THREADS            1 (default) one thread, 0 a worker per CPU, N workers
   EXECD_IDLE_TIMEOUT_MS           close a connection with no request in flight for this long; 0 (default) never

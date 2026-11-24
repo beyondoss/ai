@@ -86,6 +86,9 @@ mut_shutdown_signals_jobs = [
 mut_shutdown_orphans_unrecorded = [
   "beyond-execd-jobs/mut_shutdown_orphans_unrecorded",
 ] # execd's shutdown leaves a job running that no ledger can find (S3b)
+mut_term_keeps_jobs = [
+  "beyond-execd-jobs/mut_term_keeps_jobs",
+]
 mut_shutdown_forgets_jobs = [
   "beyond-execd-jobs/mut_shutdown_forgets_jobs",
 ] # execd's shutdown empties the ledger of its jobs (S4; `tests/restart.rs`)
@@ -128,6 +131,12 @@ mut_beat_late = [
 ]
 mut_beat_never = [
   "beyond-execd-wire/mut_beat_never",
+]
+mut_interval_unbounded = [
+  "beyond-execd-wire/mut_interval_unbounded",
+]
+mut_interval_off = [
+  "beyond-execd-wire/mut_interval_off",
 ]
 mut_oneshot_never_commits = [
   "beyond-execd-wire/mut_oneshot_never_commits",

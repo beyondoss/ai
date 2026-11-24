@@ -34,7 +34,7 @@ use bytes::Bytes;
 use nix::sys::signal::Signal;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::exec::{self, Cut, Sink};
@@ -272,6 +272,22 @@ async fn stop_jobs(jobs: &[(proc::Pg, String)], grace: Duration) {
     while any_live(&jobs).await && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// A stop of execd: end every job that has not ended (`SIGTERM`, `SIGKILL` after `grace`), as a
+/// `wipe` of every scope does.
+pub(crate) async fn stop_all(ctx: &Arc<Ctx>, grace: Duration) -> usize {
+    let cells = locked(&ctx.jobs.map).all();
+    let targets: Vec<(proc::Pg, String)> = cells
+        .into_iter()
+        .filter_map(|(_, c)| {
+            let mut j = locked(&c);
+            let act = kernel::step(&mut j.k, Ev::Stop);
+            (act == Act::Stop).then(|| (j.pg(), j.mark.clone()))
+        })
+        .collect();
+    stop_jobs(&targets, grace).await;
+    targets.len()
 }
 
 /// Fuzz seam: whether `job` is a well-formed job operation (and its `notify`, if it has one, passes
@@ -544,7 +560,7 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq, data: Vec<u8>) -> 
                 job.offset,
                 false,
                 None,
-                out,
+                Sink::new(out, req.beat, None),
             ));
             resp
         }
@@ -836,7 +852,8 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
             Err(e) => {
                 ctx.jobs.remove(&[(key, cell.clone())]);
                 crate::log_warn!("cannot make a job's spool: {e}");
-                return http::error_response(500, "cannot make the job's output spool");
+                let (status, why) = spool_failure(&e);
+                return http::error_response(status, why);
             }
         }
     }
@@ -885,8 +902,18 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
             });
         }
         let ctx2 = ctx.clone();
+        let beat = req.beat;
         tokio::spawn(async move {
-            let end = stream_job(ctx2.clone(), key, cell, 0, true, Some((pgid, opened)), out).await;
+            let end = stream_job(
+                ctx2.clone(),
+                key,
+                cell,
+                0,
+                true,
+                Some((pgid, opened)),
+                Sink::new(out, beat, None),
+            )
+            .await;
             if let Some(o) = &ctx2.opts.observer {
                 o.stream_ended(seq, end, std::time::Instant::now());
             }
@@ -898,6 +925,19 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
             body["stdin"] = json!(true);
         }
         http::json_response(200, &body)
+    }
+}
+
+/// What a start answers when its output spool cannot be made: `507` with a plain reason when the
+/// disk is out of space (`ENOSPC`; E2B's envd answers `507` for the same), else `500`.
+fn spool_failure(e: &std::io::Error) -> (u16, &'static str) {
+    if e.kind() == std::io::ErrorKind::StorageFull {
+        (
+            507,
+            "the sandbox's disk is full: no room for the job's output",
+        )
+    } else {
+        (500, "cannot make the job's output spool")
     }
 }
 
@@ -1268,18 +1308,17 @@ async fn stream_job(
     offset: u64,
     hold: bool,
     started: Option<(i32, bool)>,
-    out: mpsc::Sender<Bytes>,
+    mut sink: Sink,
 ) -> StreamEnd {
     // A job stream has no deadline of its own: it lives as long as the job or the connection.
-    let mut sink = Sink::new(out, ctx.opts.heartbeat, None);
     if let Ok(end) = follow(&ctx, &key, &attached, offset, started, &mut sink).await {
         return end;
     }
     // The connection is gone before the job's end: a held job nobody kept dies with it. Not when it
     // went because execd is stopping and the kernel leaves this job's group alone (S3): the next
     // execd finds the unkept held start in the ledger and ends it as any disconnect does.
-    let stopping =
-        ctx.stopping.load(Ordering::Acquire) && !ctx.groups.at_shutdown(Kind::Job).signal;
+    let stopping = ctx.restarting.load(Ordering::Acquire)
+        && !ctx.groups.at_shutdown(Kind::Job, kernel::Stop::Hup).signal;
     if hold
         && !stopping
         && let Some(cell) = bound(&ctx, &key, &attached)
@@ -1395,5 +1434,21 @@ async fn follow(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod spool_failure_tests {
+    use super::spool_failure;
+
+    /// A start whose spool cannot be made for want of disk answers `507` with a reason a client
+    /// can act on; any other failure stays `500`. Red without the mapping (a bare `500`).
+    #[test]
+    fn a_full_disk_is_507_and_any_other_failure_is_500() {
+        let full = std::io::Error::from_raw_os_error(28) /* ENOSPC */;
+        assert_eq!(spool_failure(&full).0, 507);
+        assert!(spool_failure(&full).1.contains("disk is full"));
+        let other = std::io::Error::from_raw_os_error(13) /* EACCES */;
+        assert_eq!(spool_failure(&other).0, 500);
     }
 }

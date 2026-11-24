@@ -795,6 +795,15 @@ pub fn output_sink(kind: Kind) -> (s: Sink)
     }
 }
 
+/// Why execd is stopping: `SIGTERM` or `SIGINT` (a stop: the sandbox is stopping, so nothing may be left
+/// running), or `SIGHUP` (a restart: the next execd adopts the ledgered jobs). service-init sends
+/// `SIGTERM` for a sandbox stop and `SIGHUP` for a restart of execd (`workload_signal`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stop {
+    Term,
+    Hup,
+}
+
 /// What execd's shutdown (a `SIGTERM`, a restart) does with one group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Shutdown {
@@ -804,7 +813,11 @@ pub struct Shutdown {
     pub record: bool,
 }
 
-/// S3, S4, S5: what a shutdown of execd does to a group. `recorded` is whether execd keeps a
+/// S6: a stop (`SIGTERM`, `SIGINT`) ends every group, a job's included, with or without a ledger, and keeps no
+/// record of it (a ledger that kept a job the stop ended would make the next execd adopt a group that is gone).
+/// A restart (`SIGHUP`) is S3 to S5. The `mut_term_keeps_jobs` mutant makes a stop a restart.
+///
+/// S3, S4, S5: what a restart of execd does to a group. `recorded` is whether execd keeps a
 /// ledger (`EXECD_STATE_DIR`), so a next execd can find a job's group.
 ///
 /// - S3: a recorded job's group is never signalled: its processes run on, and the next execd adopts
@@ -813,14 +826,25 @@ pub struct Shutdown {
 /// - S4: a recorded job's record is kept, and only a recorded job's.
 /// - S5: a command's group is signalled, since its client's connection ends with execd; it has no
 ///   record.
-pub fn shutdown_of(kind: Kind, recorded: bool) -> (r: Shutdown)
+pub fn shutdown_of(kind: Kind, recorded: bool, stop: Stop) -> (r: Shutdown)
     ensures
-        (kind is Job && recorded) ==> !r.signal,
-        (kind is Job && !recorded) ==> r.signal,
-        (kind is Job && recorded) ==> r.record,
-        !(kind is Job && recorded) ==> !r.record,
-        kind is Command ==> r.signal,
+        // S6: a stop ends every group, with or without a ledger, and records nothing.
+        stop is Term ==> (r.signal && !r.record),
+        // A restart keeps a ledgered job and ends an unledgered one, as a disconnect does.
+        stop is Hup ==> ((kind is Job && recorded) ==> !r.signal),
+        stop is Hup ==> ((kind is Job && !recorded) ==> r.signal),
+        stop is Hup ==> ((kind is Job && recorded) ==> r.record),
+        stop is Hup ==> (!(kind is Job && recorded) ==> !r.record),
+        stop is Hup ==> (kind is Command ==> r.signal),
 {
+    match stop {
+        Stop::Term => {
+            if !cfg!(feature = "mut_term_keeps_jobs") {
+                return Shutdown { signal: true, record: false };
+            }
+        },
+        Stop::Hup => {},
+    }
     match kind {
         Kind::Job => Shutdown {
             signal: if recorded { cfg!(feature = "mut_shutdown_signals_jobs") } else { !cfg!(feature = "mut_shutdown_orphans_unrecorded") },

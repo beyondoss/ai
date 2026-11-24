@@ -186,7 +186,15 @@ async fn assert_spawns_work_with(e: &Execd, why: &str, jobs_start: bool) {
             String::from_utf8_lossy(&a.body)
         );
     } else {
-        assert_eq!(a.status, 500, "job start ({why})");
+        // A full disk is `507` with a reason, as E2B's envd answers one; the start is not a bare `500`.
+        assert_eq!(a.status, 507, "job start ({why})");
+        assert!(
+            a.json()["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("disk is full")),
+            "job start ({why}): {}",
+            String::from_utf8_lossy(&a.body)
+        );
         assert_eq!(read(e, &id, 0).await.state, "gone", "job start ({why})");
     }
 }

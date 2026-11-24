@@ -312,7 +312,7 @@ fn answer(code: i32, stdout: &[u8], stderr: &[u8]) -> Value {
 /// status is the answer's own: the `422` of an output over the cap arrives as its `{"error"}` body
 /// under `200`, which a client reads as an answer with no `exit_code`.
 pub(crate) async fn envelope(ctx: &Arc<Ctx>, req: Request) -> Resp {
-    let beat = ctx.opts.heartbeat;
+    let beat = req.beat;
     let mut run = Box::pin(run_oneshot(ctx.clone(), req));
     // The first beat of silence: the wait is the kernel's (W1), and what it ends in its mode (W2).
     let first = beat_wait(Duration::ZERO, beat);
@@ -601,11 +601,7 @@ pub(crate) fn stream(ctx: &Arc<Ctx>, req: Request) -> Resp {
 
 async fn run_stream(ctx: Arc<Ctx>, req: Request, out: mpsc::Sender<Bytes>) {
     let line = Line::new("stream", &req.command);
-    let mut sink = Sink::new(
-        out,
-        ctx.opts.heartbeat,
-        req.timeout_ms.map(Duration::from_millis),
-    );
+    let mut sink = Sink::new(out, req.beat, req.timeout_ms.map(Duration::from_millis));
     let mut cmd = command_for(&ctx, &req, crate::job_kernel::Kind::Command);
     cmd.stdin(Stdio::null());
     let mut proc = match proc::spawn(&mut cmd) {
