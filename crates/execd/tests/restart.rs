@@ -386,6 +386,16 @@ async fn a_ledgers_spools_are_in_the_jobs_directory_and_survive_a_restart() {
             if e.file_type().unwrap().is_dir() {
                 stack.push(e.path());
             } else {
+                // Every file is in the stable directory, not a per-server one (which goes with its execd).
+                let rel = e.path().strip_prefix(&jobs).unwrap().to_path_buf();
+                let top = rel
+                    .components()
+                    .next()
+                    .unwrap()
+                    .as_os_str()
+                    .to_string_lossy()
+                    .into_owned();
+                assert!(top.starts_with("execd-spool-"), "{rel:?}");
                 files += 1;
             }
         }
@@ -397,4 +407,84 @@ async fn a_ledgers_spools_are_in_the_jobs_directory_and_survive_a_restart() {
     )
     .await;
     until(a2, "w", "ended").await;
+}
+
+/// A forked disk: the jobs directory comes back holding spools no ledger names (the ledger is not
+/// there, or is another's). The next execd removes them at start, before it serves, and keeps
+/// the stable directory itself. Red if the stale cleanup stops looking in the stable directory.
+#[tokio::test]
+async fn a_forked_disks_stale_spools_are_removed_before_serving() {
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    let jobs = root.path().join("jobs");
+    std::fs::create_dir(&jobs).unwrap();
+    let settings = [
+        ("EXECD_STATE_DIR", state.to_str().unwrap()),
+        ("EXECD_JOBS_DIR", jobs.to_str().unwrap()),
+    ];
+    let mut first = Execd::start(&settings, &[]);
+    let stable: Vec<_> = std::fs::read_dir(&jobs)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("execd-spool-")
+        })
+        .collect();
+    assert_eq!(stable.len(), 1, "{stable:?}");
+    let stable = stable[0].clone();
+    crash(&mut first);
+    // Spools of jobs that no ledger names.
+    let stale = stable.join("deadbeef");
+    std::fs::create_dir_all(stale.join("ring")).unwrap();
+    std::fs::write(stale.join("out"), vec![b'x'; 100_000]).unwrap();
+    let second = Execd::start(&settings, &[]);
+    assert!(
+        !stale.exists(),
+        "a spool no ledger names survived the start"
+    );
+    assert!(stable.is_dir());
+    drop(second);
+}
+
+/// A process that plants a link at the stable directory's name gets a refusal, not a deletion:
+/// execd does not start, and what the link names is untouched.
+#[tokio::test]
+async fn a_planted_link_at_the_stable_directory_is_refused() {
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    let jobs = root.path().join("jobs");
+    let victim = root.path().join("victim");
+    std::fs::create_dir_all(victim.join("keep")).unwrap();
+    std::fs::create_dir(&jobs).unwrap();
+    let settings = [
+        ("EXECD_STATE_DIR", state.to_str().unwrap()),
+        ("EXECD_JOBS_DIR", jobs.to_str().unwrap()),
+    ];
+    // Learn the name from a first start, then replace the directory with a link.
+    let mut first = Execd::start(&settings, &[]);
+    let stable = std::fs::read_dir(&jobs)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("execd-spool-")
+        })
+        .unwrap();
+    crash(&mut first);
+    std::fs::remove_dir_all(&stable).unwrap();
+    std::os::unix::fs::symlink(&victim, &stable).unwrap();
+    let (status, log) = Execd::run_to_exit(&settings, &[], false);
+    assert!(!status.success(), "execd served with a planted link: {log}");
+    assert!(log.contains("refusing to start"), "{log}");
+    assert!(
+        victim.join("keep").is_dir(),
+        "the link's target was touched"
+    );
 }

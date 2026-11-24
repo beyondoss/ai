@@ -63,7 +63,7 @@ impl Spool {
     /// Create `<base>/<mark>` and its two files, `0700` and `0600`, and open them for writing in
     /// append mode.
     pub fn create(base: &Path, mark: &str) -> io::Result<(Self, Writers)> {
-        DirBuilder::new().recursive(true).mode(0o700).create(base)?;
+        // The base is made by its owner (`spool::JobsDir`), never here, and never through a link.
         let dir = base.join(mark);
         DirBuilder::new().mode(0o700).create(&dir)?;
         let spool = Self { dir };
@@ -114,6 +114,10 @@ impl Spool {
     /// Delete every spool under `base` that is not one of `keep`: the ones no job in the ledger
     /// names (a job that ended or was removed before the restart).
     pub fn retain(base: &Path, keep: &[&Path]) {
+        // A link at the base is not ours: it could name any directory, and this runs as root.
+        if !fs::symlink_metadata(base).is_ok_and(|m| m.is_dir()) {
+            return;
+        }
         let Ok(entries) = fs::read_dir(base) else {
             return;
         };

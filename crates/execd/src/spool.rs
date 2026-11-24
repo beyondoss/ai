@@ -36,6 +36,29 @@ const PREFIX: &str = "execd-jobs-";
 /// there the spools the ledger names.
 const STABLE: &str = "execd-spool-";
 
+/// Make the stable directory `dir` (non-recursive, `0700`) unless it exists, then check what is
+/// there: a real directory (not a link), ours, mode `0700`. Anything else is refused.
+fn open_stable(dir: &Path, uid: u32) -> io::Result<()> {
+    make_job_dir(dir)?;
+    let meta = fs::symlink_metadata(dir)?;
+    let bad = |why: &str| {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} {why}", dir.display()),
+        ))
+    };
+    if !meta.is_dir() {
+        return bad("is not a real directory");
+    }
+    if meta.uid() != uid {
+        return bad("is owned by another user");
+    }
+    if meta.mode() & 0o7777 != 0o700 {
+        return bad("is not mode 0700");
+    }
+    Ok(())
+}
+
 /// FNV-1a of a path's bytes: a name that is the same for every execd, of any version, that is given
 /// the same ledger directory (`DefaultHasher` makes no such promise).
 fn ledger_tag(state: &Path) -> String {
@@ -69,12 +92,23 @@ impl JobsDir {
         let tag: String = rnd.iter().map(|b| format!("{b:02x}")).collect();
         let path = base.join(format!("{PREFIX}{uid}-{me}-{tag}"));
         DirBuilder::new().mode(0o700).create(&path)?;
+        let stable = base.join(format!(
+            "{STABLE}{}",
+            state.map_or_else(String::new, ledger_tag)
+        ));
+        if let Some(Err(e)) = state.map(|_| open_stable(&stable, uid)) {
+            crate::log_error!(
+                "refusing to start: the spool directory {} is not ours alone ({e}); \
+                 a process that can write {} may have planted it",
+                stable.display(),
+                base.display()
+            );
+            let _ = fs::remove_dir_all(&path);
+            return Err(e);
+        }
         let dir = Self {
             path,
-            stable: base.join(format!(
-                "{STABLE}{}",
-                state.map_or_else(String::new, ledger_tag)
-            )),
+            stable,
             next: AtomicU64::new(0),
         };
         dir.log_filesystem();
@@ -311,5 +345,48 @@ mod tests {
         fs::write(path.join("x"), b"y").unwrap();
         drop(dir);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn the_stable_directory_is_refused_when_it_is_a_link_or_not_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = tempfile::tempdir().unwrap();
+        let state = Path::new("/state");
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir(outside.path().join("victim")).unwrap();
+        let stable = base.path().join(format!("{STABLE}{}", ledger_tag(state)));
+        // A planted link: refused, and what it names is untouched.
+        std::os::unix::fs::symlink(outside.path(), &stable).unwrap();
+        assert!(JobsDir::open(Some(base.path()), Some(state)).is_err());
+        crate::tail::Spool::retain(&stable, &[]);
+        assert!(outside.path().join("victim").is_dir());
+        fs::remove_file(&stable).unwrap();
+        // A directory too open: refused.
+        fs::create_dir(&stable).unwrap();
+        fs::set_permissions(&stable, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(JobsDir::open(Some(base.path()), Some(state)).is_err());
+        // Ours and private: taken, again and again (idempotent).
+        fs::set_permissions(&stable, fs::Permissions::from_mode(0o700)).unwrap();
+        for _ in 0..2 {
+            let d = JobsDir::open(Some(base.path()), Some(state)).unwrap();
+            assert_eq!(d.stable(), stable);
+        }
+        // No leftover per-server directory from the refusals.
+        let left: Vec<_> = fs::read_dir(base.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(PREFIX))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    #[test]
+    fn a_stable_directory_of_another_owner_is_refused() {
+        let base = tempfile::tempdir().unwrap();
+        let me = fs::metadata("/proc/self").unwrap().uid();
+        // `/` is root's: when we are not root it is not ours; as root, any other uid will do.
+        let d = base.path().join("d");
+        fs::create_dir(&d).unwrap();
+        assert!(open_stable(&d, me.wrapping_add(1)).is_err());
     }
 }
