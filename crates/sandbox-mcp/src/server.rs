@@ -1097,6 +1097,7 @@ impl SandboxMcp {
             label: a.label.unwrap_or_default(),
             env: a.env.into_inner().unwrap_or_default().into_iter().collect(),
             stdin_open: a.stdin_open.unwrap_or(false),
+            pty: None,
         };
         let t = self.target().await?;
         let pgid = t.sandbox.jobs()?.start_kept(&scope, &id, &spec).await?;

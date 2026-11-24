@@ -1,6 +1,7 @@
 import { concat, fromBase64, text, toBase64 } from "./bytes.js";
 import {
   AuthError,
+  ConflictError,
   DiskFullError,
   EndpointError,
   InvalidRequestError,
@@ -30,6 +31,8 @@ import {
   type JobSpec,
   type JobState,
   type KeepFields,
+  type PtyInfo,
+  type PtySize,
   type ReqOptions,
   type RunOptions,
   type RunResult,
@@ -745,6 +748,25 @@ function jobSignal(
     : {};
 }
 
+/** A terminal's size as the wire echoes it, or null when absent or not two integers from 1 to 1024. */
+function ptySize(v: unknown): PtySize | null {
+  if (!isRecord(v)) return null;
+  const { cols, rows } = v;
+  const ok = (n: unknown): n is number =>
+    typeof n === "number" && Number.isInteger(n) && n >= 1 && n <= 1024;
+  return ok(cols) && ok(rows) ? { cols, rows } : null;
+}
+
+/** The `pty` member of a `list` entry or `read` answer: present on terminals only. */
+function ptyInfo(
+  v: Record<string, unknown>,
+): { pty: PtyInfo } | Record<string, never> {
+  const size = ptySize(v.pty);
+  return size && isRecord(v.pty)
+    ? { pty: { ...size, open: v.pty.open === true } }
+    : {};
+}
+
 function badJob(what: string, v: unknown): ProtocolError {
   return new ProtocolError(
     `unreadable job ${what}: ${JSON.stringify(v)?.slice(0, 200)}`,
@@ -804,7 +826,7 @@ function writtenIn(detail: string): number | undefined {
 function jobFailure(
   e: unknown,
   id: string,
-  op: "start" | "attach" | "write" | "other",
+  op: "start" | "attach" | "write" | "resize" | "other",
 ): unknown {
   if (!(e instanceof EndpointError)) return e;
   const { status, detail } = e;
@@ -845,7 +867,14 @@ function jobFailure(
     if (status === 429) {
       return new StdinBusyError(`job stdin: ${detail}`, cause);
     }
-    if (status === 413) return new InvalidRequestError(detail, cause);
+    // 400 is a terminal's refusal of `eof`; 413 a write over the cap.
+    if (status === 400 || status === 413) {
+      return new InvalidRequestError(detail, cause);
+    }
+  }
+  if (op === "resize") {
+    if (status === 400) return new InvalidRequestError(detail, cause);
+    if (status === 409) return new ConflictError(`job ${id}: ${detail}`, cause);
   }
   return e;
 }
@@ -864,7 +893,7 @@ class HttpJobs implements JobOps {
   /** One non-stream job op: its JSON answer, a refusal typed. */
   private async call(
     id: string,
-    kind: "attach" | "write" | "other",
+    kind: "attach" | "write" | "resize" | "other",
     job: Record<string, unknown>,
     req?: ReqOptions,
   ): Promise<Record<string, unknown>> {
@@ -893,6 +922,9 @@ class HttpJobs implements JobOps {
         hold,
         label: spec.label ?? "",
         stdin_open: spec.stdinOpen === true,
+        ...(spec.pty
+          ? { pty: { cols: spec.pty.cols, rows: spec.pty.rows } }
+          : {}),
       }),
       env: spec.env,
       heartbeatSeconds: req.heartbeatSeconds,
@@ -919,12 +951,24 @@ class HttpJobs implements JobOps {
       }
       let started: unknown;
       let echoed = false;
+      let ptyEchoed = false;
       try {
         const v: unknown = JSON.parse(text(body));
         started = isRecord(v) ? v.started : undefined;
         echoed = isRecord(v) && v.stdin === true;
+        ptyEchoed = isRecord(v) && ptySize(v.pty) !== null;
       } catch {
         started = undefined;
+      }
+      if (spec.pty !== undefined && !ptyEchoed) {
+        // Started without its terminal: stop it, so no program runs that expects one.
+        await this.kill(scope, [id], {
+          remove: true,
+          graceMs: DEFAULT_KILL_GRACE_MS,
+        }).catch(() => {});
+        throw new NotOfferedError(
+          "the endpoint predates job terminals: it ran the job without one",
+        );
       }
       if (spec.stdinOpen === true && !echoed) {
         // Started without its stdin: stop it, so nothing is left running that reads EOF.
@@ -983,6 +1027,12 @@ class HttpJobs implements JobOps {
               "the endpoint predates job stdin: it ran the job without it",
             );
           }
+          if (spec.pty !== undefined && f.pty === undefined) {
+            // Closing the stream kills the held job (nothing was kept).
+            throw new NotOfferedError(
+              "the endpoint predates job terminals: it ran the job without one",
+            );
+          }
         }
         yield f;
         if (f.type === "exit" || f.type === "signal") return;
@@ -1015,6 +1065,7 @@ class HttpJobs implements JobOps {
         started: count(j.started),
         ended: count(j.ended),
         label: typeof j.label === "string" ? j.label : "",
+        ...ptyInfo(j),
       });
     }
     return out;
@@ -1055,6 +1106,7 @@ class HttpJobs implements JobOps {
       end: count(v.end),
       data,
       ...(stderrRanges ? { stderrRanges } : {}),
+      ...ptyInfo(v),
     };
   }
 
@@ -1175,6 +1227,24 @@ class HttpJobs implements JobOps {
     return { written: v.written, closed: v.closed === true };
   }
 
+  async resize(
+    scope: string,
+    id: string,
+    cols: number,
+    rows: number,
+    req?: ReqOptions,
+  ): Promise<PtySize> {
+    const v = await this.call(
+      id,
+      "resize",
+      this.job("resize", scope, { id, cols, rows }),
+      req,
+    );
+    const size = ptySize(v);
+    if (!size) throw badJob("resize", v);
+    return size;
+  }
+
   async signal(
     scope: string,
     ids: string[],
@@ -1233,7 +1303,13 @@ export function decodeJobFrame(line: Uint8Array): JobFrame | "heartbeat" {
     throw new TransportError(`job stream: ${v.error}`);
   }
   if (typeof v.started === "number") {
-    return { type: "started", pgid: v.started, stdin: v.stdin === true };
+    const pty = ptySize(v.pty);
+    return {
+      type: "started",
+      pgid: v.started,
+      stdin: v.stdin === true,
+      ...(pty ? { pty } : {}),
+    };
   }
   const stream = typeof v.stdout === "string"
     ? "stdout"

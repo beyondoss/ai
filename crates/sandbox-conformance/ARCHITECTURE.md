@@ -119,6 +119,12 @@ after it ends. `mise run test:clients:beyond` runs it. Against current Beyond ma
 every relay pair. The edge streams request bodies; it buffers and caps them only for namespaces with a middleware, and its WAF
 inspects only a 16 KiB prefix (beyondoss/beyond#563, #564).
 
+A local backend's execd is a process the harness owns, so it offers the `host` steps (DRIVER.md, Host steps): `restart_execd`
+(SIGHUP, execd's restart; then start another on the same port, root, job and state directories) and `kill_keepers` (SIGKILL the terminal keepers
+whose spool is under the backend's own job directory, `EXECD_JOBS_DIR`; each local backend now has its own job and state, `EXECD_STATE_DIR`, directories). A
+backend that cannot do an action a scenario `requires.host`s reports that scenario unsupported. The container backends, `e2b`
+and `beyond` offer none: nothing supervises the endpoint's process there.
+
 A backend's extra directories are variables (`${RO}`, `${LOCKED}`, `${TINY}`) that a scenario names in `requires.vars`; the
 `environments` suite is skipped, visibly, everywhere else.
 

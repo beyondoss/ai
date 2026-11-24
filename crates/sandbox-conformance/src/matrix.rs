@@ -91,15 +91,17 @@ async fn run_backend(plan: &Plan, name: &str) -> Vec<Cell> {
             bearer: started.bearer.clone(),
             caps: started.caps.clone(),
         };
-        let (cell_name, auth, work, vars) = (
+        let (cell_name, auth, work, vars, host) = (
             format!("{}__{}", d.name, name),
             started.bearer.is_some(),
             started.work.clone(),
             started.vars.clone(),
+            started.host.clone(),
         );
         async move {
             let mut be = Backend::open(&cell_name, Box::new(connector), auth, &work).await;
             be.vars = vars;
+            be.host = host;
             be
         }
     };
