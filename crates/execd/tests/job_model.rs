@@ -42,7 +42,8 @@
 //! - L2 (`k = 1`): a stream that has sent everything of an ended job sends its final frame next.
 //!   Fairness assumed: the supervisor and the stream task are always scheduled.
 //!
-//! Not modelled: bytes (the ring is two counters: its content is the fuzz target `ring`'s), stdin,
+//! Not modelled: bytes (the ring is two counters: its content is the fuzz target `ring`'s), stdin (its decisions, `stdin_plan` and
+//! `admit_waiter`, are the kernel's and proven in Verus; this model only checks production calls them),
 //! the notify kernel (`exec-notify`'s own), and time (the kernel reads none: `now` is only
 //! recorded).
 //!
@@ -1109,6 +1110,11 @@ fn production_calls_the_kernel() {
         "kernel::Root::PerServer => ctx.spool.server()",
         "kernel::bound(",
         "kernel::follow(",
+        "kernel::stdin_plan(",
+        "kernel::admit_waiter(",
+        "kernel::advance(",
+        "kernel::remaining(",
+        "kernel::closes(",
         "Pick::",
         ".take(checked, Arc::ptr_eq)",
         "map: Mutex<kernel::Table<JobCell>>",
@@ -1121,6 +1127,7 @@ fn production_calls_the_kernel() {
     assert!(!prod.contains("HashMap<Key"), "jobs.rs keeps its own map");
     // No decision of the job's life is made outside the kernel: its state is only written there.
     for banned in [
+        "*w += ",
         ".removed =",
         ".kept =",
         ".seen =",
