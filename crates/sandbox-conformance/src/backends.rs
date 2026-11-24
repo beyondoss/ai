@@ -80,6 +80,13 @@ pub fn expand(requested: &[String]) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+pub type Lease = std::sync::Arc<
+    dyn Fn() -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<std::time::Duration, String>> + Send>,
+        > + Send
+        + Sync,
+>;
+
 pub struct Started {
     pub name: String,
     pub url: String,
@@ -90,6 +97,9 @@ pub struct Started {
     /// The suites this backend runs; `None` is all of them.
     pub suites: Option<&'static [&'static str]>,
     pub vars: BTreeMap<String, String>,
+    /// Called before each cell: renews the backend's lifetime and returns how long the cell may take.
+    /// `None` for a backend that cannot expire.
+    pub lease: Option<Lease>,
     pub(crate) _guard: Box<dyn Any + Send + Sync>,
 }
 
@@ -245,6 +255,7 @@ async fn local(
         caps,
         suites: None,
         vars: BTreeMap::new(),
+        lease: None,
         _guard: Box::new(Local {
             _leader: leader,
             _child: child,
@@ -289,6 +300,7 @@ async fn embedded(name: &str) -> Result<Started, String> {
         caps: None,
         suites: None,
         vars: BTreeMap::new(),
+        lease: None,
         _guard: Box::new((mock, dir)),
     })
 }
@@ -459,6 +471,7 @@ async fn docker(name: &str, bins: &Binaries, image: &str, c: Container) -> Resul
         caps: None,
         suites: None,
         vars: c.vars,
+        lease: None,
         _guard: Box::new(guard),
     })
 }
