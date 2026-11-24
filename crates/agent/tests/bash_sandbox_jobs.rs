@@ -121,6 +121,10 @@ struct Front {
     url: String,
     conns: Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>,
     keeps: Arc<std::sync::atomic::AtomicUsize>,
+    /// While set, a connection is accepted and dropped: the front is down.
+    down: Arc<std::sync::atomic::AtomicBool>,
+    /// Connections dropped while it was down.
+    refused: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Front {
@@ -135,11 +139,19 @@ impl Front {
         let conns: Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>> = Arc::default();
         let keeps = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (c, k) = (conns.clone(), keeps.clone());
+        let is_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let refused = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (d, r) = (is_down.clone(), refused.clone());
         tokio::spawn(async move {
             loop {
                 let Ok((down, _)) = listener.accept().await else {
                     return;
                 };
+                if d.load(Relaxed) {
+                    r.fetch_add(1, Relaxed);
+                    drop(down);
+                    continue;
+                }
                 let Ok(up) = tokio::net::TcpStream::connect(&target).await else {
                     continue;
                 };
@@ -170,7 +182,13 @@ impl Front {
                     .extend([a.abort_handle(), b.abort_handle()]);
             }
         });
-        Self { url, conns, keeps }
+        Self {
+            url,
+            conns,
+            keeps,
+            down: is_down,
+            refused,
+        }
     }
 
     /// The replica serving the streams goes away; the next connection reaches the sandbox again.
@@ -178,6 +196,15 @@ impl Front {
         for h in self.conns.lock().unwrap().drain(..) {
             h.abort();
         }
+    }
+
+    /// The front goes down (every connection is dropped) or comes back.
+    fn set_down(&self, down: bool) {
+        self.down.store(down, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn refused(&self) -> usize {
+        self.refused.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn keeps(&self) -> usize {
@@ -571,6 +598,45 @@ fn lines_of(out: &str) -> Vec<u32> {
     out.lines()
         .filter_map(|l| l.strip_prefix("line ")?.trim().parse().ok())
         .collect()
+}
+
+/// B4: no count of breaks ends the follow. The front is down for far more than 120 breaks (the old
+/// cap, a minute of real waits; here each wait is 1 ms), then comes back: the command's output and
+/// its end arrive, once, in order.
+#[tokio::test]
+async fn a_kept_command_is_followed_through_a_front_outage_longer_than_the_old_cap() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (sb, front) = Sandbox::behind_a_front().await;
+    let a = sb.replica(EndPolicy::KeepRunning);
+    let call = tokio::spawn({
+        let bash = a.bash.clone();
+        async move { call(bash.as_ref(), json!({ "command": COUNTING })).await }
+    });
+    // Past KEEP_AFTER_MS (30 s) the command is kept; the front then goes down, with a short wait
+    // between follows so that the outage spans many breaks.
+    tokio::time::sleep(Duration::from_secs(33)).await;
+    beyond_agent::tools::bash_sandbox::FOLLOW_PAUSE_US.store(1_000, Relaxed);
+    front.set_down(true);
+    front.restart();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while front.refused() < 400 {
+        assert!(
+            Instant::now() < deadline,
+            "only {} refused",
+            front.refused()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    front.set_down(false);
+    let out = call.await.unwrap().unwrap();
+    beyond_agent::tools::bash_sandbox::FOLLOW_PAUSE_US.store(0, Relaxed);
+    assert_eq!(
+        lines_of(&out),
+        (1..=40).collect::<Vec<_>>(),
+        "every line once, in order, after an outage of {} breaks: {out}",
+        front.refused()
+    );
+    sb.wipe().await;
 }
 
 #[tokio::test]

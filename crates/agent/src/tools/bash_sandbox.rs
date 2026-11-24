@@ -21,6 +21,7 @@ use super::exec::{CommandRunner, ExecResult, Kill};
 use super::job_notify::SessionNotify;
 use super::job_notify::kernel::{Action, Event, KeepOutcome, ListedEnd};
 use crate::exec_endpoint::jobs::{JobEvent, JobId, JobScope, JobSpec, JobStatus, SandboxJobs};
+use bash_gate::{Follow, Seen, follow_after_break};
 
 /// What a sandbox job's leftovers are called, when its shell exits leaving them running.
 pub(crate) const SANDBOX_LEFTOVERS: &str = "processes in the sandbox";
@@ -326,11 +327,23 @@ async fn steered(
                             None => Err(format!("{LOST_END} ({e})")),
                         });
                     }
-                    (Some(Err(e)), FollowKind::Holding)
-                        if resumes(shared, link, &mut breaks).await =>
-                    {
-                        tracing::info!(job = %link.id, error = %e, "a followed job's stream broke; following it again");
-                        Phase::Follow(kind)
+                    (Some(Err(e)), FollowKind::Holding) => {
+                        // The release row (the session's own cancel) ends the wait too.
+                        let again = tokio::select! {
+                            r = resumes(shared, link, &mut breaks) => Some(r),
+                            () = ctl.until(|c| matches!(c, Ctl::Close)) => None,
+                        };
+                        match again {
+                            Some(true) => {
+                                tracing::info!(job = %link.id, error = %e, "a followed job's stream broke; following it again");
+                                Phase::Follow(kind)
+                            }
+                            Some(false) => {
+                                stream_ended(shared, link);
+                                return Err(e);
+                            }
+                            None => Phase::Released,
+                        }
                     }
                     (Some(r), FollowKind::Holding) => {
                         stream_ended(shared, link);
@@ -347,25 +360,42 @@ async fn steered(
 
 /// A kept job's followed stream breaks without the job having ended (the front serving it was
 /// restarted, as a rolling deploy does, and the next connection reaches the sandbox through a
-/// peer). Whether to follow again, from the offset reached: the job is still the sandbox's
-/// (running, or ended and not yet read to its end), and the breaks since the stream last delivered
-/// anything number fewer than [`MAX_BREAKS`]. Waits a moment first, so a front that is down is
-/// not spun on. `Lost` and `Gone` are the job's end, which the error reports.
+/// peer). What to do next is the kernel's ([`follow_after_break`], B4): while the job is still the
+/// sandbox's, follow again from the offset reached, after a wait that grows from 500 ms to 5 s. Only
+/// the job's end (`Lost`, `Gone`, which the error reports) or a terminal error class stops it; no
+/// count of breaks and no timer does. The session's own cancel drops the wait (the caller selects
+/// on it).
 async fn resumes(shared: &JobShared, link: &SandboxLink, breaks: &mut Breaks) -> bool {
     let at = shared.offset();
     if breaks.at != Some(at) {
         *breaks = Breaks { at: Some(at), n: 0 };
     }
-    breaks.n += 1;
-    if breaks.n > MAX_BREAKS {
-        return false;
-    }
-    tokio::time::sleep(BREAK_PAUSE).await;
-    match link.store.read(&link.scope, &link.id, at, 0).await {
-        Ok(chunk) => !matches!(chunk.status, JobStatus::Lost | JobStatus::Gone),
+    let seen = match link.store.read(&link.scope, &link.id, at, 0).await {
+        Ok(chunk) if matches!(chunk.status, JobStatus::Lost | JobStatus::Gone) => Seen::Over,
+        Ok(_) => Seen::Held,
+        Err(e) if refused(&e) => Seen::Refused,
         // The sandbox cannot be reached this moment (a front with no replica yet): try again.
-        Err(_) => true,
+        Err(_) => Seen::Unreachable,
+    };
+    let decision = follow_after_break(seen, breaks.n);
+    breaks.n = breaks.n.saturating_add(1);
+    match decision {
+        Follow::Again { wait_ms } => {
+            tokio::time::sleep(pause(wait_ms)).await;
+            true
+        }
+        Follow::Stop(_) => false,
     }
+}
+
+/// An error no retry changes: the caller is not allowed, the endpoint does not offer the call, or
+/// the answer is malformed.
+fn refused(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::{InvalidData, InvalidInput, PermissionDenied, Unsupported};
+    matches!(
+        e.kind(),
+        PermissionDenied | Unsupported | InvalidData | InvalidInput
+    )
 }
 
 /// The offset a followed stream last broke at, and how many times in a row.
@@ -375,9 +405,18 @@ struct Breaks {
     n: u32,
 }
 
-/// Breaks at one offset after which a kept job is no longer followed (about a minute).
-const MAX_BREAKS: u32 = 120;
-const BREAK_PAUSE: Duration = Duration::from_millis(500);
+/// Test-only: when nonzero, every follow wait is this many microseconds (read here and nowhere
+/// else), so a test can hold the front down for more breaks than a real wait allows. Zero, the
+/// default, is the kernel's wait.
+#[doc(hidden)]
+pub static FOLLOW_PAUSE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn pause(wait_ms: u64) -> Duration {
+    match FOLLOW_PAUSE_US.load(Ordering::Relaxed) {
+        0 => Duration::from_millis(wait_ms),
+        us => Duration::from_micros(us),
+    }
+}
 
 /// The stream holding a job (or the follow standing for it) delivered its final frame or broke:
 /// a proving or closing job is held as today from here (the release table's `proving, held` row).

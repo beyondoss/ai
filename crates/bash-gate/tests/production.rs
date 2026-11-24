@@ -19,6 +19,15 @@ fn production_calls_the_verified_kernel() {
         !jobs.contains("running.len() >= MAX_RUNNING_JOBS"),
         "a limit test outside the kernel"
     );
+    let sandbox = read("agent/src/tools/bash_sandbox.rs");
+    assert!(
+        sandbox.contains("follow_after_break("),
+        "bash_sandbox.rs no longer calls follow_after_break"
+    );
+    assert!(
+        !sandbox.contains("MAX_BREAKS"),
+        "a cap on breaks outside the kernel"
+    );
     let bash = read("agent/src/tools/bash.rs");
     assert!(
         bash.contains("bash_gate::yield_reason("),

@@ -14,6 +14,13 @@
 //!   told, whatever the sandbox's directory for the job still says. An ended job whose notice
 //!   nobody holds is always due (the retry after a restart tells it).
 //!
+//!
+//! * **B4, a kept job is followed while the turn lives** ([`follow_after_break`], [`backoff_ms`]):
+//!   when the followed stream of a kept job breaks, the follow goes on, after a wait that grows from
+//!   [`FOLLOW_BACKOFF_BASE_MS`] to at most [`FOLLOW_BACKOFF_CAP_MS`], and stops only on the job's end
+//!   (`Lost`, `Gone`), a terminal error class, or the turn's own cancel. No count of breaks and no
+//!   timer ends it: a front that is down for an hour is followed for an hour.
+//!
 //! Durations are in nanoseconds; this crate reads no clock.
 
 use vstd::prelude::*;
@@ -191,6 +198,167 @@ pub fn end_due(ended: bool, told_live: bool, told_persisted: bool) -> (r: bool)
     }
 }
 
+/// The first wait before following a broken stream again (B4).
+pub const FOLLOW_BACKOFF_BASE_MS: u64 = 500;
+
+/// No wait before a follow is longer than this (B4).
+pub const FOLLOW_BACKOFF_CAP_MS: u64 = 5_000;
+
+/// The wait after `breaks` breaks at one offset: 500 ms, doubling, capped.
+pub open spec fn backoff_spec(breaks: int) -> int {
+    if breaks <= 0 { 500 } else if breaks == 1 { 1000 } else if breaks == 2 { 2000 }
+    else if breaks == 3 { 4000 } else { 5000 }
+}
+
+/// **B4, backoff.** The wait before the next follow is the spec's, so it is at least
+/// [`FOLLOW_BACKOFF_BASE_MS`] (a down front is not spun on) and at most [`FOLLOW_BACKOFF_CAP_MS`]
+/// (the wait never grows without bound), for every count of breaks.
+pub fn backoff_ms(breaks: u32) -> (ms: u64)
+    ensures
+        ms as int == backoff_spec(breaks as int),
+        FOLLOW_BACKOFF_BASE_MS <= ms,
+        ms <= FOLLOW_BACKOFF_CAP_MS,
+{
+    if cfg!(feature = "mut_backoff_no_cap") {
+        if breaks >= 4 { 10_000 } else if breaks == 3 { 4000 } else if breaks == 2 { 2000 }
+        else if breaks == 1 { 1000 } else { 500 }
+    } else if cfg!(feature = "mut_backoff_spins") {
+        0
+    } else if breaks == 0 {
+        500
+    } else if breaks == 1 {
+        1000
+    } else if breaks == 2 {
+        2000
+    } else if breaks == 3 {
+        4000
+    } else {
+        5000
+    }
+}
+
+/// What the agent sees when the followed stream of a kept job has broken.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Seen {
+    /// The sandbox answered and the job is still its own: running, or ended and not yet read to
+    /// its end.
+    Held,
+    /// The sandbox answered `Lost` or `Gone`: the job's end.
+    Over,
+    /// The sandbox could not be reached this moment (a front with no replica yet, a reset, a
+    /// timeout): a retryable answer.
+    Unreachable,
+    /// An answer no retry changes: not authorised, not offered, a protocol error.
+    Refused,
+    /// The turn's own cancel.
+    Cancelled,
+}
+
+/// Why a follow ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StopWhy {
+    Over,
+    Refused,
+    Cancelled,
+}
+
+/// What to do after a break.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Follow {
+    /// Follow again from the offset reached, after `wait_ms`.
+    Again { wait_ms: u64 },
+    Stop(StopWhy),
+}
+
+/// **B4.** What to do after the stream broke for the `breaks`th time at one offset, having `seen`.
+///
+/// * Safety: the follow stops only when the job is over, the answer is terminal, or the turn is
+///   cancelled; each of those stops it, with its own reason.
+/// * Liveness: a `Held` or `Unreachable` answer is always followed again (so once the front answers,
+///   the next follow reattaches), after a wait of at most [`FOLLOW_BACKOFF_CAP_MS`], whatever
+///   `breaks` is.
+pub fn follow_after_break(seen: Seen, breaks: u32) -> (r: Follow)
+    ensures
+        (r is Stop) ==> (seen is Over || seen is Refused || seen is Cancelled),
+        (seen is Over) ==> r == Follow::Stop(StopWhy::Over),
+        (seen is Refused) ==> r == Follow::Stop(StopWhy::Refused),
+        (seen is Cancelled) ==> r == Follow::Stop(StopWhy::Cancelled),
+        (seen is Held || seen is Unreachable) ==> r == (Follow::Again { wait_ms: backoff_spec(breaks as int) as u64 }),
+{
+    match seen {
+        Seen::Held | Seen::Unreachable => {
+            if cfg!(feature = "mut_follow_gives_up") && breaks > 120 {
+                Follow::Stop(StopWhy::Over)
+            } else {
+                Follow::Again { wait_ms: backoff_ms(breaks) }
+            }
+        },
+        Seen::Over => {
+            if cfg!(feature = "mut_follow_past_the_end") {
+                Follow::Again { wait_ms: backoff_ms(breaks) }
+            } else {
+                Follow::Stop(StopWhy::Over)
+            }
+        },
+        Seen::Refused => Follow::Stop(StopWhy::Refused),
+        Seen::Cancelled => {
+            if cfg!(feature = "mut_follow_past_cancel") {
+                Follow::Again { wait_ms: backoff_ms(breaks) }
+            } else {
+                Follow::Stop(StopWhy::Cancelled)
+            }
+        },
+    }
+}
+
+/// **B4, progress.** The ranking function is the front's remaining outage in probes. Under the
+/// fairness axiom F (the front eventually answers: some probe `n` sees `Held`) and a front that
+/// is merely unreachable before it, no probe up to `n` stops the follow, each waits at most the cap,
+/// and probe `n` follows again, so the stream reattaches after at most `n + 1` waits of at most
+/// [`FOLLOW_BACKOFF_CAP_MS`] each, whatever `n` is: no count of breaks ends the follow.
+pub proof fn lemma_follow_reattaches_once_the_front_answers(trace: Seq<Seen>, n: int)
+    requires
+        0 <= n < trace.len(),
+        trace[n] is Held,
+        forall|i: int| 0 <= i < n ==> #[trigger] trace[i] is Unreachable,
+    ensures
+        forall|i: int| 0 <= i <= n ==> (#[trigger] follow_spec(trace[i], i) is Again
+            && follow_wait(follow_spec(trace[i], i)) <= FOLLOW_BACKOFF_CAP_MS as int),
+{
+    assert forall|i: int| 0 <= i <= n implies (#[trigger] follow_spec(trace[i], i) is Again
+        && follow_wait(follow_spec(trace[i], i)) <= FOLLOW_BACKOFF_CAP_MS as int) by {
+        assert(trace[i] is Held || trace[i] is Unreachable);
+    }
+}
+
+/// [`follow_after_break`] as a spec, for the lemmas.
+pub open spec fn follow_spec(seen: Seen, breaks: int) -> Follow {
+    match seen {
+        Seen::Held | Seen::Unreachable => Follow::Again { wait_ms: backoff_spec(breaks) as u64 },
+        Seen::Over => Follow::Stop(StopWhy::Over),
+        Seen::Refused => Follow::Stop(StopWhy::Refused),
+        Seen::Cancelled => Follow::Stop(StopWhy::Cancelled),
+    }
+}
+
+/// The wait a follow decision carries (0 for a stop).
+pub open spec fn follow_wait(f: Follow) -> int {
+    match f {
+        Follow::Again { wait_ms } => wait_ms as int,
+        Follow::Stop(_) => 0,
+    }
+}
+
+/// **B4, backoff.** The wait never shrinks as breaks pile up and never passes the cap.
+pub proof fn lemma_backoff_is_monotone_and_capped(a: int, b: int)
+    requires
+        a <= b,
+    ensures
+        backoff_spec(a) <= backoff_spec(b),
+        backoff_spec(a) <= FOLLOW_BACKOFF_CAP_MS as int,
+{
+}
+
 } // verus!
 
 #[cfg(test)]
@@ -239,5 +407,37 @@ mod tests {
             Some(Why::Ceiling)
         );
         assert_eq!(yield_reason(hold, 1, 1, None), None);
+    }
+
+    /// B4: a stream that keeps breaking is followed again at every count (no cap), the wait grows
+    /// to 5 s and stays there; only the job's end, a terminal answer or a cancel stops it. Red
+    /// under `mut_follow_gives_up`, `mut_follow_past_the_end`, `mut_follow_past_cancel`,
+    /// `mut_backoff_no_cap`, `mut_backoff_spins`.
+    #[test]
+    fn a_broken_stream_is_followed_until_the_job_is_over() {
+        for n in [0u32, 1, 3, 4, 120, 121, 10_000, u32::MAX] {
+            for seen in [Seen::Held, Seen::Unreachable] {
+                let f = follow_after_break(seen, n);
+                assert!(
+                    matches!(f, Follow::Again { wait_ms }
+                        if (FOLLOW_BACKOFF_BASE_MS..=FOLLOW_BACKOFF_CAP_MS).contains(&wait_ms)),
+                    "{n} breaks: {f:?}"
+                );
+            }
+        }
+        assert_eq!(backoff_ms(0), 500);
+        assert_eq!(backoff_ms(1_000), 5_000);
+        assert_eq!(
+            follow_after_break(Seen::Over, 0),
+            Follow::Stop(StopWhy::Over)
+        );
+        assert_eq!(
+            follow_after_break(Seen::Refused, 0),
+            Follow::Stop(StopWhy::Refused)
+        );
+        assert_eq!(
+            follow_after_break(Seen::Cancelled, 0),
+            Follow::Stop(StopWhy::Cancelled)
+        );
     }
 }

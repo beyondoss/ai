@@ -2523,8 +2523,10 @@ it holds after its drain wait (Beyond's execfront, 90 s). So a held command stil
 `exec_notify::keep_gate::KEEP_AFTER_MS` (30 s) after it started is **kept** with no job number
 (`keep_foreground`, in `run`): from then on a broken stream costs only the live copy, and `run`
 follows the job again from the offset its output reached (`resumes`: after each break it reads the job's state, and
-follows again unless it is `Lost` or `Gone`, up to 120 breaks at one offset), so every output byte
-arrives once, in order, through any number of front restarts. The decision is the kernel's
+follows again after a wait of 500 ms growing to 5 s; only the job's end (`Lost`, `Gone`), a terminal
+error class or the session's own cancel stops it, never a count of breaks or a timer: bash-gate's
+`follow_after_break`, B4), so every output byte arrives once, in order, through any number and any length of front
+restarts. The decision is the kernel's
 `keep_due` (Verus-proven: never before 30 s, never twice, always at or after it), so a command
 under 30 s costs no extra request. A kept foreground command has no number and is nobody's job to
 list: it ends by its own exit, by an explicit kill (cancelling the call drops the `Job`, whose
