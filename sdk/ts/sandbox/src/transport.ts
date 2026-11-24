@@ -145,25 +145,115 @@ export function isJobId(s: string): boolean {
   return /^[0-9a-z]{1,32}$/.test(s);
 }
 
+/** The SIGTERM grace a `kill` or `wipe` gives a job before SIGKILL when the caller names none. */
+export const DEFAULT_KILL_GRACE_MS = 300;
+
+/** The silence limit of a stream whose heartbeat the client did not choose (the endpoint beats every 5 s). */
+const DEFAULT_SILENCE_MS = 30_000;
+
+/** The fewest and most whole seconds a request may ask `Keepalive-Ping-Interval` for. */
+export const HEARTBEAT_MIN_S = 1;
+export const HEARTBEAT_MAX_S = 240;
+
+/**
+ * How long a stream may go without any frame (a heartbeat is a frame) before it is presumed dead,
+ * given the heartbeat the request asked for (`undefined`: the endpoint's own, 5 s). Two beats and
+ * ten seconds of slack, never under today's 30 s, so a stream that asked for a 60 s beat is not
+ * killed by its own client. A pure function of its argument: it moves into the client kernel
+ * unchanged (B1).
+ */
+export function silenceMs(heartbeatSeconds?: number): number {
+  if (heartbeatSeconds === undefined) return DEFAULT_SILENCE_MS;
+  return Math.max(DEFAULT_SILENCE_MS, heartbeatSeconds * 2000 + 10_000);
+}
+
+/** Options that shape one request, whatever the op. */
+export interface ReqOptions {
+  /**
+   * The heartbeat this request's stream runs at, whole seconds 1 to 240: sent as the
+   * `Keepalive-Ping-Interval` request header. Absent: the endpoint's own (5 s).
+   */
+  heartbeatSeconds?: number;
+}
+
+/**
+ * What `keep` records. Wire names. (`notify` is left out on purpose: it carries a bearer token the
+ * callback is authenticated with, which an SDK handle must not hold; the agent uses it through its
+ * own client.)
+ */
+export interface KeepFields {
+  /** The job's number in the agent's listing; absent: nobody's numbered job, only kept. */
+  num?: number;
+  kind?: string;
+  /** The offset of the output a person has been shown. */
+  seen?: number;
+}
+
 /**
  * The sandbox's jobs: commands it keeps. `scope` is the opaque name of one session's jobs; `id` is
- * 1 to 32 characters of `[0-9a-z]`.
+ * 1 to 32 characters of `[0-9a-z]`. Every wire op is here under its wire name, with every field it
+ * takes. An op never reconnects and never retries.
  */
 export interface JobOps {
-  /** Start a job that the sandbox keeps from the start; its process group. */
-  start(scope: string, id: string, spec: JobSpec): Promise<number>;
-  list(scope: string): Promise<JobInfo[]>;
+  /** Start a job that the sandbox keeps from the start (`hold: false`); its process group. */
+  start(
+    scope: string,
+    id: string,
+    spec: JobSpec,
+    req?: ReqOptions,
+  ): Promise<number>;
+  /**
+   * Start a job held by this stream (`hold: true`): the first frame is `started`, and if the stream
+   * closes before the job's final frame and no `keep` arrived, the sandbox kills the job's group.
+   */
+  startHeld(
+    scope: string,
+    id: string,
+    spec: JobSpec,
+    req?: ReqOptions,
+  ): AsyncIterable<JobFrame>;
+  list(scope: string, req?: ReqOptions): Promise<JobInfo[]>;
+  /** Up to `max` bytes from `offset`. An unknown or removed job answers state `gone`. */
   read(
     scope: string,
     id: string,
     offset: number,
     max: number,
+    req?: ReqOptions,
   ): Promise<JobChunk>;
   /** Follow a job's output from `offset`; the last frame is `exit`. Closing the iterator detaches. */
-  attach(scope: string, id: string, offset: number): AsyncIterable<JobFrame>;
-  kill(scope: string, ids: string[], remove: boolean): Promise<Survivor[]>;
-  remove(scope: string, ids: string[]): Promise<void>;
-  wipe(scope: string): Promise<Survivor[]>;
+  attach(
+    scope: string,
+    id: string,
+    offset: number,
+    req?: ReqOptions,
+  ): AsyncIterable<JobFrame>;
+  /** Hand a held job to the sandbox for good, recording `num`, `kind` and `seen`. */
+  keep(
+    scope: string,
+    id: string,
+    fields: KeepFields,
+    req?: ReqOptions,
+  ): Promise<void>;
+  /** Record the offset of the output a person has been shown (wire op `seen`). */
+  seen(
+    scope: string,
+    id: string,
+    offset: number,
+    req?: ReqOptions,
+  ): Promise<void>;
+  kill(
+    scope: string,
+    ids: string[],
+    fields: { remove: boolean; graceMs: number },
+    req?: ReqOptions,
+  ): Promise<Survivor[]>;
+  remove(scope: string, ids: string[], req?: ReqOptions): Promise<void>;
+  wipe(
+    scope: string,
+    fields: { graceMs: number },
+    req?: ReqOptions,
+  ): Promise<Survivor[]>;
   /** Positional write to the job's stdin (see the spec's "Job stdin"). */
   writeStdin(
     scope: string,
@@ -171,9 +261,15 @@ export interface JobOps {
     at: number,
     data: Uint8Array,
     eof: boolean,
+    req?: ReqOptions,
   ): Promise<StdinWritten>;
   /** Send a named signal to each running job's group; the ids that were signalled. */
-  signal(scope: string, ids: string[], signal: string): Promise<string[]>;
+  signal(
+    scope: string,
+    ids: string[],
+    signal: string,
+    req?: ReqOptions,
+  ): Promise<string[]>;
 }
 
 /**

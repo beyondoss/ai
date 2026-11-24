@@ -91,6 +91,10 @@ class AsyncJobTransport(AsyncTransport, Protocol):
 
     async def job_stream(self, job: dict[str, Any]) -> AsyncJobFrameStream: ...
 
+    # A caller that chose a heartbeat also passes ``heartbeat_seconds``, and one that starts a job
+    # with ``env`` passes ``env``; a held start passes ``command``, ``args``, ``cwd`` too. A
+    # transport is only ever passed what is set, so one without a parameter keeps working.
+
 
 class _Response:
     def __init__(
@@ -163,8 +167,13 @@ class _Response:
 
 
 class _Frames:
-    def __init__(self, resp: _Response, decoder: _wire.StreamDecoder[Any]) -> None:
-        self._resp, self._decoder = resp, decoder
+    def __init__(
+        self,
+        resp: _Response,
+        decoder: _wire.StreamDecoder[Any],
+        silence: float = _wire.SILENCE_S,
+    ) -> None:
+        self._resp, self._decoder, self._silence = resp, decoder, silence
         self._pending: deque[Any] = deque()
         self._closed = False
 
@@ -177,7 +186,7 @@ class _Frames:
                 await self.aclose()
                 raise StopAsyncIteration
             try:
-                data = await self._resp.next_chunk(_wire.SILENCE_S)
+                data = await self._resp.next_chunk(self._silence)
                 if data:
                     self._pending.extend(self._decoder.feed(data))
                 else:
@@ -246,10 +255,19 @@ class AsyncHttpTransport:
             value_ = self._token_value
         return [("Authorization", f"Bearer {value_}")] if value_ else []
 
-    async def _open(self, body: bytes, timeout_ms: int, *, refresh: bool = False) -> _Response:
+    async def _open(
+        self,
+        body: bytes,
+        timeout_ms: int,
+        *,
+        refresh: bool = False,
+        heartbeat_seconds: int | None = None,
+    ) -> _Response:
         deadline = time.monotonic() + timeout_ms / 1000 + _wire.GRACE_S
+        beat = _wire.check_heartbeat(heartbeat_seconds)
+        extra = [] if beat is None else [(_wire.HEARTBEAT_HEADER, str(beat))]
         request = _http.build_request(
-            self._target, self._headers + await self._bearer(refresh), body
+            self._target, self._headers + await self._bearer(refresh) + extra, body
         )
         t = self._target
         try:
@@ -288,11 +306,19 @@ class AsyncHttpTransport:
             err_body = b""
         await resp.close()
         if parsed.status == 401 and callable(self._token) and not refresh:
-            return await self._open(body, timeout_ms, refresh=True)
+            return await self._open(
+                body, timeout_ms, refresh=True, heartbeat_seconds=heartbeat_seconds
+            )
         raise _wire.status_error(self.url, parsed.status, err_body)
 
-    async def _post(self, body: bytes, timeout_ms: int, cap: int | None = None) -> bytes:
-        resp = await self._open(body, timeout_ms)
+    async def _post(
+        self,
+        body: bytes,
+        timeout_ms: int,
+        cap: int | None = None,
+        heartbeat_seconds: int | None = None,
+    ) -> bytes:
+        resp = await self._open(body, timeout_ms, heartbeat_seconds=heartbeat_seconds)
         try:
             return await resp.read_capped(self._cap if cap is None else cap)
         finally:
@@ -340,21 +366,40 @@ class AsyncHttpTransport:
         args: Sequence[str] = (),
         cwd: str | None = None,
         env: dict[str, str] | None = None,
+        heartbeat_seconds: int | None = None,
     ) -> Any:
         if env:
             await self._prove_env()
         body = _wire.request_body(command, args, cwd=cwd, timeout_ms=30_000, job=job, env=env)
         try:
-            return _wire.parse_json(self.url, await self._post(body, 30_000))
+            return _wire.parse_json(
+                self.url, await self._post(body, 30_000, heartbeat_seconds=heartbeat_seconds)
+            )
         except TooLargeError:
             raise TooLargeError("a job answer exceeded the response cap") from None
 
-    async def job_stream(self, job: dict[str, Any]) -> AsyncJobFrameStream:
+    async def job_stream(
+        self,
+        job: dict[str, Any],
+        command: str = "true",
+        args: Sequence[str] = (),
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        heartbeat_seconds: int | None = None,
+    ) -> AsyncJobFrameStream:
+        if env:
+            await self._prove_env()
         body = _wire.request_body(
-            "true", [], cwd=None, timeout_ms=_wire.STREAM_DEADLINE_MS, stream=True, job=job
+            command,
+            args,
+            cwd=cwd,
+            timeout_ms=_wire.STREAM_DEADLINE_MS,
+            stream=True,
+            job=job,
+            env=env,
         )
-        resp = await self._open(body, _wire.STREAM_DEADLINE_MS)
-        return _Frames(resp, _wire.job_decoder())
+        resp = await self._open(body, _wire.STREAM_DEADLINE_MS, heartbeat_seconds=heartbeat_seconds)
+        return _Frames(resp, _wire.job_decoder(), _wire.silence_s(heartbeat_seconds))
 
     _env_proved = False
 

@@ -1,11 +1,13 @@
 import { concat } from "./bytes.js";
-import { InvalidRequestError, ProtocolError } from "./errors.js";
-import { isJobId } from "./transport.js";
+import { InvalidRequestError, JobGoneError, ProtocolError } from "./errors.js";
+import { DEFAULT_KILL_GRACE_MS, isJobId } from "./transport.js";
 import type {
   JobChunk,
   JobFrame,
   JobInfo,
   JobSpec,
+  KeepFields,
+  ReqOptions,
   StdinWritten,
   Survivor,
   Transport,
@@ -14,14 +16,21 @@ import type {
 /** The most output one `read` returns by default. */
 export const READ_MAX = 128 * 1024;
 
-export interface JobReadOptions {
+export interface JobReadOptions extends ReqOptions {
   offset?: number;
   max?: number;
 }
 
-export interface KillOptions {
+export interface KillOptions extends ReqOptions {
   /** Also delete each job whose group is empty afterwards. */
   remove?: boolean;
+  /** Milliseconds between SIGTERM and SIGKILL (wire `grace_ms`); default 300. */
+  graceMs?: number;
+}
+
+export interface WipeOptions extends ReqOptions {
+  /** Milliseconds between SIGTERM and SIGKILL (wire `grace_ms`); default 300. */
+  graceMs?: number;
 }
 
 /** What following a job to its end collected. */
@@ -73,20 +82,48 @@ export class Jobs {
     this.transport = transport;
   }
 
-  /** Start a job the sandbox keeps from the start; returns its process group. */
-  async start(scope: string, id: string, spec: JobSpec): Promise<number> {
+  /**
+   * Start a job the sandbox keeps from the start; returns its process group. An id that exists is
+   * {@link JobExistsError}; a full disk is {@link DiskFullError}.
+   */
+  async start(
+    scope: string,
+    id: string,
+    spec: JobSpec,
+    req: ReqOptions = {},
+  ): Promise<number> {
     validScope(scope);
     validId(id);
-    return this.transport.jobs.start(scope, id, spec);
+    return this.transport.jobs.start(scope, id, spec, req);
+  }
+
+  /**
+   * Start a job held by the returned stream (wire `hold: true`): frames in order, the first
+   * `started`, the last `exit` or `signal`. If the stream stops before the last frame and the job
+   * was not {@link Jobs.keep}t, the sandbox kills its group.
+   */
+  async *startHeld(
+    scope: string,
+    id: string,
+    spec: JobSpec,
+    req: ReqOptions = {},
+  ): AsyncGenerator<JobFrame> {
+    validScope(scope);
+    validId(id);
+    yield* this.transport.jobs.startHeld(scope, id, spec, req);
   }
 
   /** Every job in the scope. */
-  async list(scope: string): Promise<JobInfo[]> {
+  async list(scope: string, req: ReqOptions = {}): Promise<JobInfo[]> {
     validScope(scope);
-    return this.transport.jobs.list(scope);
+    return this.transport.jobs.list(scope, req);
   }
 
-  /** Up to `max` bytes of output from `offset`, and the job's state. An unknown job is `gone`. */
+  /**
+   * Up to `max` bytes of output from `offset`, and the job's state. A job that does not exist or
+   * was removed (wire state `gone`) is {@link JobGoneError}; level 3 (`transport.jobs.read`) keeps
+   * the wire's `gone` state.
+   */
   async read(
     scope: string,
     id: string,
@@ -96,35 +133,50 @@ export class Jobs {
     validId(id);
     const offset = count("offset", options.offset, 0);
     const max = count("max", options.max, READ_MAX);
-    return this.transport.jobs.read(scope, id, offset, max);
+    const chunk = await this.transport.jobs.read(scope, id, offset, max, {
+      ...(options.heartbeatSeconds !== undefined
+        ? { heartbeatSeconds: options.heartbeatSeconds }
+        : {}),
+    });
+    if (chunk.state === "gone") {
+      throw new JobGoneError(
+        `job ${id} is gone: it does not exist or was removed`,
+        id,
+      );
+    }
+    return chunk;
   }
 
   /**
    * Follow a job's output from `offset` to its end: frames in order, the last one `exit` or
    * `signal`. Stopping early detaches and never kills the job. (The transport wire call is
    * {@link Transport.jobs}.attach; this surface names the stream `follow` so it is not confused
-   * with {@link Jobs.collect}.)
+   * with {@link Jobs.collect}.) A job that does not exist is {@link JobGoneError}. A stream that
+   * asked for a `heartbeatSeconds` is presumed dead only after silence longer than two beats.
    */
   async *follow(
     scope: string,
     id: string,
     offset = 0,
+    req: ReqOptions = {},
   ): AsyncGenerator<JobFrame> {
     validScope(scope);
     validId(id);
     count("offset", offset, 0);
-    yield* this.transport.jobs.attach(scope, id, offset);
+    yield* this.transport.jobs.attach(scope, id, offset, req);
   }
 
-  /**
-   * {@link Jobs.follow} to the end, collected into one {@link JobOutput}. Prefer this over
-   * {@link Jobs.attach}, which is the same call kept for older callers.
-   */
-  async collect(scope: string, id: string, offset = 0): Promise<JobOutput> {
+  /** {@link Jobs.follow} to the end, collected into one {@link JobOutput}. */
+  async collect(
+    scope: string,
+    id: string,
+    offset = 0,
+    req: ReqOptions = {},
+  ): Promise<JobOutput> {
     const chunks: Uint8Array[] = [];
     const errs: Uint8Array[] = [];
     let gap = 0;
-    for await (const f of this.follow(scope, id, offset)) {
+    for await (const f of this.follow(scope, id, offset, req)) {
       if (f.type === "output") {
         chunks.push(f.data);
         if (f.stream === "stderr") errs.push(f.data);
@@ -151,9 +203,35 @@ export class Jobs {
     );
   }
 
-  /** @deprecated Use {@link Jobs.collect}. Same as `collect`. */
-  attach(scope: string, id: string, offset = 0): Promise<JobOutput> {
-    return this.collect(scope, id, offset);
+  /**
+   * Hand a job to the sandbox for good (wire `keep`): after it, a closed {@link Jobs.startHeld}
+   * stream kills nothing. Records `num`, `kind` and `seen` for `list`. An unknown job is
+   * {@link JobGoneError}.
+   */
+  async keep(
+    scope: string,
+    id: string,
+    fields: KeepFields = {},
+    req: ReqOptions = {},
+  ): Promise<void> {
+    validScope(scope);
+    validId(id);
+    count("num", fields.num, 0);
+    count("seen", fields.seen, 0);
+    return this.transport.jobs.keep(scope, id, fields, req);
+  }
+
+  /** Record the offset of the output a person has been shown (wire `seen`). Unknown job: {@link JobGoneError}. */
+  async seen(
+    scope: string,
+    id: string,
+    offset: number,
+    req: ReqOptions = {},
+  ): Promise<void> {
+    validScope(scope);
+    validId(id);
+    count("offset", offset, 0);
+    return this.transport.jobs.seen(scope, id, offset, req);
   }
 
   /**
@@ -168,22 +246,33 @@ export class Jobs {
     validScope(scope);
     ids.forEach(validId);
     if (ids.length === 0) return [];
-    return this.transport.jobs.kill(scope, ids, options.remove ?? false);
+    const { remove, graceMs, ...req } = options;
+    return this.transport.jobs.kill(scope, ids, {
+      remove: remove ?? false,
+      graceMs: count("graceMs", graceMs, DEFAULT_KILL_GRACE_MS),
+    }, req);
   }
 
   /** Delete jobs whose process group is empty; a running job is left alone. */
-  async remove(scope: string, ids: string[]): Promise<void> {
+  async remove(
+    scope: string,
+    ids: string[],
+    req: ReqOptions = {},
+  ): Promise<void> {
     validScope(scope);
     ids.forEach(validId);
     if (ids.length === 0) return;
-    return this.transport.jobs.remove(scope, ids);
+    return this.transport.jobs.remove(scope, ids, req);
   }
 
   /**
    * Write `data` at position `at` of the job's stdin (the job must have started with `stdinOpen`);
    * `eof` closes it after. Positional: a retry (same `at`) applies nothing twice and a write ahead of
-   * the stream waits for the bytes before it. A stdin that is closed, absent or never filled is
-   * `conflict`; no such job is `not_found`; over 128 KiB is `invalid_request`.
+   * the stream waits for the bytes before it. All of these are `conflict`, told apart by class:
+   * {@link StdinClosedError} (closed, or never opened: retrying cannot succeed), {@link StdinGapError}
+   * (the bytes before it never came) and {@link StdinBusyError} (16 writes already wait: retry the
+   * same write later). No such job is {@link JobGoneError} (`not_found`); over 128 KiB is
+   * `invalid_request`.
    */
   async writeStdin(
     scope: string,
@@ -191,11 +280,12 @@ export class Jobs {
     at: number,
     data: Uint8Array,
     eof = false,
+    req: ReqOptions = {},
   ): Promise<StdinWritten> {
     validScope(scope);
     validId(id);
     count("at", at, 0);
-    return this.transport.jobs.writeStdin(scope, id, at, data, eof);
+    return this.transport.jobs.writeStdin(scope, id, at, data, eof, req);
   }
 
   /**
@@ -206,15 +296,19 @@ export class Jobs {
     scope: string,
     ids: string[],
     signal: string,
+    req: ReqOptions = {},
   ): Promise<string[]> {
     validScope(scope);
     ids.forEach(validId);
-    return this.transport.jobs.signal(scope, ids, signal);
+    return this.transport.jobs.signal(scope, ids, signal, req);
   }
 
   /** Kill every job in the scope and delete it. Returns what survived. */
-  async wipe(scope: string): Promise<Survivor[]> {
+  async wipe(scope: string, options: WipeOptions = {}): Promise<Survivor[]> {
     validScope(scope);
-    return this.transport.jobs.wipe(scope);
+    const { graceMs, ...req } = options;
+    return this.transport.jobs.wipe(scope, {
+      graceMs: count("graceMs", graceMs, DEFAULT_KILL_GRACE_MS),
+    }, req);
   }
 }

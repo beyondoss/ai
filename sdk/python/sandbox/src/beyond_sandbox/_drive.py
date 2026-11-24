@@ -21,7 +21,6 @@ from typing import (
     Awaitable,
     Callable,
     Generator,
-    Iterator,
     Sequence,
     TypeVar,
     Union,
@@ -57,13 +56,21 @@ class Call:
     args: Sequence[str] = ()
     cwd: str | None = None
     env: dict[str, str] | None = None
+    #: The request's own heartbeat, whole seconds 1 to 240 (``Keepalive-Ping-Interval``).
+    heartbeat_seconds: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class Follow:
-    """A native job stream (``attach``): its events are emitted; answered with the final status."""
+    """A native job stream (``attach``, or a held ``start`` that runs ``command``): its events are
+    emitted; answered with the final status."""
 
     job: dict[str, Any]
+    command: str = "true"
+    args: Sequence[str] = ()
+    cwd: str | None = None
+    env: dict[str, str] | None = None
+    heartbeat_seconds: int | None = None
 
 
 @dataclass(slots=True)
@@ -118,7 +125,34 @@ _DONE = object()
 _NOTHING = ExecResult(0, b"", b"")
 
 
-def drive_iter(op: Op[T], transport: Any) -> Iterator[Any]:
+def _call_extras(effect: Call) -> dict[str, Any]:
+    """What a ``Call`` passes beyond ``job, command, args, cwd``: only what is set, so a transport
+    written before ``env`` or a heartbeat existed keeps working."""
+    extras: dict[str, Any] = {}
+    if effect.env:
+        extras["env"] = effect.env
+    if effect.heartbeat_seconds is not None:
+        extras["heartbeat_seconds"] = effect.heartbeat_seconds
+    return extras
+
+
+def _follow_extras(effect: Follow) -> dict[str, Any]:
+    """What a ``Follow`` passes beyond its ``job``: only what is set (a plain ``attach`` sets none)."""
+    extras: dict[str, Any] = {}
+    if effect.command != "true":
+        extras["command"] = effect.command
+    if effect.args:
+        extras["args"] = effect.args
+    if effect.cwd is not None:
+        extras["cwd"] = effect.cwd
+    if effect.env:
+        extras["env"] = effect.env
+    if effect.heartbeat_seconds is not None:
+        extras["heartbeat_seconds"] = effect.heartbeat_seconds
+    return extras
+
+
+def drive_iter(op: Op[T], transport: Any) -> Generator[Any, None, None]:
     """Run ``op`` on a sync transport, yielding each emitted item; the last is ``(_DONE, result)``."""
     try:
         effect = next(op)
@@ -135,9 +169,8 @@ def drive_iter(op: Op[T], transport: Any) -> Iterator[Any]:
                     yield effect.item
                     answer = _NOTHING
                 elif isinstance(effect, Call):
-                    extra = (effect.env,) if effect.env else ()
                     answer = transport.job_call(
-                        effect.job, effect.command, effect.args, effect.cwd, *extra
+                        effect.job, effect.command, effect.args, effect.cwd, **_call_extras(effect)
                     )
                 elif isinstance(effect, Pipe):
                     frames = transport.stream(
@@ -151,7 +184,7 @@ def drive_iter(op: Op[T], transport: Any) -> Iterator[Any]:
                         frames.close()
                     answer = acc.result()
                 elif isinstance(effect, Follow):
-                    stream = transport.job_stream(effect.job)
+                    stream = transport.job_stream(effect.job, **_follow_extras(effect))
                     try:
                         answer = None
                         for frame in stream:
@@ -200,9 +233,8 @@ async def adrive_emit(
                         await emit(effect.item)
                     answer = _NOTHING
                 elif isinstance(effect, Call):
-                    extra = (effect.env,) if effect.env else ()
                     answer = await transport.job_call(
-                        effect.job, effect.command, effect.args, effect.cwd, *extra
+                        effect.job, effect.command, effect.args, effect.cwd, **_call_extras(effect)
                     )
                 elif isinstance(effect, Pipe):
                     aframes = await transport.stream(
@@ -216,7 +248,7 @@ async def adrive_emit(
                         await aframes.aclose()
                     answer = acc.result()
                 elif isinstance(effect, Follow):
-                    stream = await transport.job_stream(effect.job)
+                    stream = await transport.job_stream(effect.job, **_follow_extras(effect))
                     try:
                         answer = None
                         async for frame in stream:

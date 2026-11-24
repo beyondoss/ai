@@ -23,6 +23,16 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 /// end.
 pub const FRAME_SILENCE_LIMIT: Duration = Duration::from_secs(30);
 
+/// [`FRAME_SILENCE_LIMIT`] for a request that chose its heartbeat (`Keepalive-Ping-Interval`, whole
+/// seconds): two beats and ten seconds, never under the default, so a stream that asked for a 60 s
+/// beat is not killed by its own client. Pure; the TypeScript and Python SDKs have the same function.
+pub fn silence_limit(beat: Option<u32>) -> Duration {
+    match beat {
+        None => FRAME_SILENCE_LIMIT,
+        Some(s) => FRAME_SILENCE_LIMIT.max(Duration::from_secs(u64::from(s) * 2 + 10)),
+    }
+}
+
 /// The most output one frame may carry, decoded. The endpoint MUST split anything longer.
 pub const MAX_FRAME_PAYLOAD: usize = 64 * 1024;
 

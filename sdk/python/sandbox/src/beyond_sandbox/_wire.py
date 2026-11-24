@@ -11,6 +11,7 @@ from typing import Any, Callable, Generic, Sequence, TypeVar
 from .errors import (
     AuthError,
     EndpointError,
+    InvalidRequestError,
     ProtocolError,
     SandboxError,
     TooLargeError,
@@ -41,14 +42,46 @@ from .models import (
 DEFAULT_MAX_RESPONSE = 16 * 1024 * 1024
 #: Grace added to ``timeout_ms`` for the whole exchange, so the endpoint's own timeout report wins.
 GRACE_S = 30.0
-#: A stream with no frame (not even a heartbeat) for this long is a dead connection.
+#: A stream with no frame (not even a heartbeat) for this long is a dead connection, unless the
+#: request chose its own heartbeat (see :func:`silence_s`).
 SILENCE_S = 30.0
+#: The request header that names a heartbeat interval, whole seconds, and its range.
+HEARTBEAT_HEADER = "Keepalive-Ping-Interval"
+HEARTBEAT_MIN_S = 1
+HEARTBEAT_MAX_S = 240
 #: The ``timeout_ms`` of a stream with no deadline of its own: the most every endpoint can hold.
 STREAM_DEADLINE_MS = 2**31 - 1
 #: The longest NDJSON line accepted: a full 64 KiB frame is about 87 KiB of base64.
 MAX_FRAME_LINE = 1024 * 1024
 #: Room for the JSON around two base64 strings.
 ENVELOPE_SLACK = 4096
+
+
+def check_heartbeat(heartbeat_seconds: int | None) -> int | None:
+    """The heartbeat a request may ask for: whole seconds, 1 to 240, or nothing. Anything else would be
+    silently replaced by the endpoint's own, so it is refused before anything is sent."""
+    if heartbeat_seconds is None:
+        return None
+    if (
+        isinstance(heartbeat_seconds, bool)
+        or not isinstance(heartbeat_seconds, int)
+        or not HEARTBEAT_MIN_S <= heartbeat_seconds <= HEARTBEAT_MAX_S
+    ):
+        raise InvalidRequestError(
+            f"heartbeat_seconds must be a whole number from {HEARTBEAT_MIN_S} to "
+            f"{HEARTBEAT_MAX_S}, got {heartbeat_seconds!r}"
+        )
+    return heartbeat_seconds
+
+
+def silence_s(heartbeat_seconds: int | None = None) -> float:
+    """How long a stream may go without any frame before it is presumed dead, given the heartbeat the
+    request asked for (``None``: the endpoint's own, 5 s): two beats and ten seconds of slack, never
+    under :data:`SILENCE_S`, so a stream that asked for a 60 s beat is not killed by its own client.
+    A pure function of its argument: it moves into the client kernel unchanged (B1)."""
+    if heartbeat_seconds is None:
+        return SILENCE_S
+    return max(SILENCE_S, heartbeat_seconds * 2.0 + 10.0)
 
 
 def request_body(

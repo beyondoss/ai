@@ -2929,6 +2929,889 @@
           }
         }
       ]
+    },
+    {
+      "id": "jobs.errors.attach-unknown-is-job-gone",
+      "description": "Attaching to a job that does not exist is a typed error, JobGone, which is a kind of not_found.",
+      "requires": {
+        "features": [
+          "job_errors"
+        ]
+      },
+      "steps": [
+        {
+          "id": "attach",
+          "op": "job_attach",
+          "scope": "${SCOPE}",
+          "job": "ee01",
+          "offset": 0,
+          "expect": {
+            "error": {
+              "kind": "not_found",
+              "code": "job_gone"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.errors.read-of-a-removed-job-is-job-gone",
+      "description": "A read of a removed job says JobGone, as attach does. The wire's own answer is state `gone`, which a driver reports when it is not asked for the error.",
+      "requires": {
+        "features": [
+          "job_errors"
+        ]
+      },
+      "steps": [
+        {
+          "id": "start",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "ee02",
+          "command": "sh",
+          "args": [
+            "-c",
+            "exit 0"
+          ],
+          "label": "",
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              }
+            }
+          }
+        },
+        {
+          "id": "ended",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "ee02",
+          "offset": 0,
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          },
+          "expect": {
+            "ok": {
+              "state": "ended",
+              "code": 0
+            }
+          }
+        },
+        {
+          "id": "remove",
+          "op": "job_remove",
+          "scope": "${SCOPE}",
+          "jobs": [
+            "ee02"
+          ],
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "wire",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "ee02",
+          "offset": 0,
+          "expect": {
+            "ok": {
+              "state": "gone"
+            }
+          }
+        },
+        {
+          "id": "typed",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "ee02",
+          "offset": 0,
+          "gone_as_error": true,
+          "expect": {
+            "error": {
+              "kind": "not_found",
+              "code": "job_gone"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.errors.start-of-an-existing-id-is-job-exists",
+      "description": "Starting an id that exists is JobExists, a kind of conflict, and leaves the first job running.",
+      "requires": {
+        "features": [
+          "job_errors"
+        ]
+      },
+      "steps": [
+        {
+          "id": "first",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "ee03",
+          "command": "sh",
+          "args": [
+            "-c",
+            "echo first; sleep 30"
+          ],
+          "label": "",
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              }
+            }
+          }
+        },
+        {
+          "id": "second",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "ee03",
+          "command": "sh",
+          "args": [
+            "-c",
+            "echo second"
+          ],
+          "label": "",
+          "expect": {
+            "error": {
+              "kind": "conflict",
+              "code": "job_exists"
+            }
+          }
+        },
+        {
+          "id": "first-still",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "ee03",
+          "offset": 0,
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          },
+          "expect": {
+            "ok": {
+              "state": "running",
+              "data_utf8": "first\n"
+            }
+          }
+        },
+        {
+          "id": "kill",
+          "op": "job_kill",
+          "scope": "${SCOPE}",
+          "jobs": [
+            "ee03"
+          ],
+          "expect": {
+            "ok": {
+              "survivors": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.errors.stdin-never-opened",
+      "description": "A write to a job started without stdin_open is StdinClosed with reason never_opened, a kind of conflict.",
+      "requires": {
+        "features": [
+          "job_errors",
+          "job_stdin"
+        ]
+      },
+      "steps": [
+        {
+          "id": "start",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "ee04",
+          "command": "sh",
+          "args": [
+            "-c",
+            "sleep 30"
+          ],
+          "label": "",
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              }
+            }
+          }
+        },
+        {
+          "id": "write",
+          "op": "job_write",
+          "scope": "${SCOPE}",
+          "job": "ee04",
+          "at": 0,
+          "data_b64": "eA==",
+          "expect": {
+            "error": {
+              "kind": "conflict",
+              "code": "stdin_never_opened"
+            }
+          }
+        },
+        {
+          "id": "kill",
+          "op": "job_kill",
+          "scope": "${SCOPE}",
+          "jobs": [
+            "ee04"
+          ],
+          "expect": {
+            "ok": {
+              "survivors": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.errors.stdin-closed-after-eof",
+      "description": "A write after EOF is StdinClosed with reason closed: it is told apart from a stdin that never opened, and retrying cannot succeed.",
+      "requires": {
+        "features": [
+          "job_errors",
+          "job_stdin"
+        ]
+      },
+      "steps": [
+        {
+          "id": "start",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "ee05",
+          "command": "sh",
+          "args": [
+            "-c",
+            "cat"
+          ],
+          "label": "",
+          "stdin_open": true,
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              }
+            }
+          }
+        },
+        {
+          "id": "eof",
+          "op": "job_write",
+          "scope": "${SCOPE}",
+          "job": "ee05",
+          "at": 0,
+          "data_b64": "eA==",
+          "eof": true,
+          "expect": {
+            "ok": {
+              "written": 1,
+              "closed": true
+            }
+          }
+        },
+        {
+          "id": "again",
+          "op": "job_write",
+          "scope": "${SCOPE}",
+          "job": "ee05",
+          "at": 1,
+          "data_b64": "eQ==",
+          "expect": {
+            "error": {
+              "kind": "conflict",
+              "code": "stdin_closed"
+            }
+          }
+        },
+        {
+          "id": "and-again",
+          "op": "job_write",
+          "scope": "${SCOPE}",
+          "job": "ee05",
+          "at": 1,
+          "data_b64": "eQ==",
+          "expect": {
+            "error": {
+              "kind": "conflict",
+              "code": "stdin_closed"
+            }
+          }
+        },
+        {
+          "id": "kill",
+          "op": "job_kill",
+          "scope": "${SCOPE}",
+          "jobs": [
+            "ee05"
+          ],
+          "expect": {
+            "ok": {
+              "survivors": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.errors.stdin-write-to-unknown-job-is-job-gone",
+      "description": "A write to no job is JobGone, a kind of not_found.",
+      "requires": {
+        "features": [
+          "job_errors",
+          "job_stdin"
+        ]
+      },
+      "steps": [
+        {
+          "id": "write",
+          "op": "job_write",
+          "scope": "${SCOPE}",
+          "job": "ee06",
+          "at": 0,
+          "data_b64": "eA==",
+          "expect": {
+            "error": {
+              "kind": "not_found",
+              "code": "job_gone"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.options.keep-records-num-kind-and-seen",
+      "description": "keep names the job's number, kind and seen offset, and list reports them.",
+      "requires": {
+        "features": [
+          "job_options"
+        ]
+      },
+      "steps": [
+        {
+          "id": "start",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "oo01",
+          "command": "sh",
+          "args": [
+            "-c",
+            "sleep 30"
+          ],
+          "label": "",
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              }
+            }
+          }
+        },
+        {
+          "id": "keep",
+          "op": "job_keep",
+          "scope": "${SCOPE}",
+          "job": "oo01",
+          "num": 3,
+          "kind": "background",
+          "seen": 5,
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "list",
+          "op": "job_list",
+          "scope": "${SCOPE}",
+          "expect": {
+            "ok": {
+              "jobs": {
+                "$includes": [
+                  {
+                    "id": "oo01",
+                    "kept": true,
+                    "num": 3,
+                    "kind": "background",
+                    "seen": 5
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "id": "kill",
+          "op": "job_kill",
+          "scope": "${SCOPE}",
+          "jobs": [
+            "oo01"
+          ],
+          "expect": {
+            "ok": {
+              "survivors": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.options.keep-of-an-unknown-job-is-job-gone",
+      "description": "keep, and seen, of no job are JobGone.",
+      "requires": {
+        "features": [
+          "job_errors",
+          "job_options"
+        ]
+      },
+      "steps": [
+        {
+          "id": "keep",
+          "op": "job_keep",
+          "scope": "${SCOPE}",
+          "job": "oo02",
+          "num": 1,
+          "expect": {
+            "error": {
+              "kind": "not_found",
+              "code": "job_gone"
+            }
+          }
+        },
+        {
+          "id": "seen",
+          "op": "job_seen",
+          "scope": "${SCOPE}",
+          "job": "oo02",
+          "offset": 1,
+          "expect": {
+            "error": {
+              "kind": "not_found",
+              "code": "job_gone"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.options.seen-marks-the-offset-a-person-has-seen",
+      "description": "seen records the offset of the output shown, and list reports it.",
+      "requires": {
+        "features": [
+          "job_options"
+        ]
+      },
+      "steps": [
+        {
+          "id": "start",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "oo03",
+          "command": "sh",
+          "args": [
+            "-c",
+            "echo hello; sleep 30"
+          ],
+          "label": "",
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              }
+            }
+          }
+        },
+        {
+          "id": "up",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "oo03",
+          "offset": 0,
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          },
+          "expect": {
+            "ok": {
+              "data_utf8": "hello\n"
+            }
+          }
+        },
+        {
+          "id": "seen",
+          "op": "job_seen",
+          "scope": "${SCOPE}",
+          "job": "oo03",
+          "offset": 6,
+          "expect": {
+            "ok": {}
+          }
+        },
+        {
+          "id": "list",
+          "op": "job_list",
+          "scope": "${SCOPE}",
+          "expect": {
+            "ok": {
+              "jobs": {
+                "$includes": [
+                  {
+                    "id": "oo03",
+                    "seen": 6
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "id": "kill",
+          "op": "job_kill",
+          "scope": "${SCOPE}",
+          "jobs": [
+            "oo03"
+          ],
+          "expect": {
+            "ok": {
+              "survivors": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.options.a-held-job-dies-with-its-stream",
+      "description": "hold: true ties the job to the stream that started it: closing the stream before the job ends and before keep kills its group.",
+      "requires": {
+        "features": [
+          "job_options"
+        ]
+      },
+      "steps": [
+        {
+          "id": "start",
+          "op": "job_start_held",
+          "scope": "${SCOPE}",
+          "job": "oo04",
+          "command": "sh",
+          "args": [
+            "-c",
+            "echo held; sleep 60"
+          ],
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              }
+            }
+          }
+        },
+        {
+          "id": "killed",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "oo04",
+          "offset": 0,
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          },
+          "expect": {
+            "ok": {
+              "state": "ended",
+              "code": 137
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.options.a-kept-held-job-outlives-its-stream",
+      "description": "A held job that was kept before its stream closed keeps running: it is still there, and still writing, a moment after the stream is gone.",
+      "requires": {
+        "features": [
+          "job_options"
+        ]
+      },
+      "steps": [
+        {
+          "id": "start",
+          "op": "job_start_held",
+          "scope": "${SCOPE}",
+          "job": "oo05",
+          "command": "sh",
+          "args": [
+            "-c",
+            "echo up; sleep 0.8; echo alive; sleep 60"
+          ],
+          "keep": true,
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              }
+            }
+          }
+        },
+        {
+          "id": "alive",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "oo05",
+          "offset": 0,
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          },
+          "expect": {
+            "ok": {
+              "state": "running",
+              "data_utf8": "up\nalive\n"
+            }
+          }
+        },
+        {
+          "id": "kill",
+          "op": "job_kill",
+          "scope": "${SCOPE}",
+          "jobs": [
+            "oo05"
+          ],
+          "expect": {
+            "ok": {
+              "survivors": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.options.kill-grace-ms-gives-a-job-time-to-finish",
+      "description": "grace_ms is the time between SIGTERM and SIGKILL: a job that needs a second to wind down finishes cleanly with a long grace, and is killed with the default 300 ms.",
+      "requires": {
+        "features": [
+          "job_options"
+        ]
+      },
+      "steps": [
+        {
+          "id": "long",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "oo06",
+          "command": "sh",
+          "args": [
+            "-c",
+            "trap 'sleep 1; echo clean; exit 0' TERM; echo ready; while :; do sleep 0.1; done"
+          ],
+          "label": "",
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              }
+            }
+          }
+        },
+        {
+          "id": "short",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "oo07",
+          "command": "sh",
+          "args": [
+            "-c",
+            "trap 'sleep 1; echo clean; exit 0' TERM; echo ready; while :; do sleep 0.1; done"
+          ],
+          "label": "",
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              }
+            }
+          }
+        },
+        {
+          "id": "long-armed",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "oo06",
+          "offset": 0,
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          },
+          "expect": {
+            "ok": {
+              "data_utf8": "ready\n"
+            }
+          }
+        },
+        {
+          "id": "short-armed",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "oo07",
+          "offset": 0,
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          },
+          "expect": {
+            "ok": {
+              "data_utf8": "ready\n"
+            }
+          }
+        },
+        {
+          "id": "kill-long",
+          "op": "job_kill",
+          "scope": "${SCOPE}",
+          "jobs": [
+            "oo06"
+          ],
+          "grace_ms": 5000,
+          "expect": {
+            "ok": {
+              "survivors": []
+            }
+          }
+        },
+        {
+          "id": "kill-short",
+          "op": "job_kill",
+          "scope": "${SCOPE}",
+          "jobs": [
+            "oo07"
+          ],
+          "expect": {
+            "ok": {
+              "survivors": []
+            }
+          }
+        },
+        {
+          "id": "long-ended",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "oo06",
+          "offset": 0,
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          },
+          "expect": {
+            "ok": {
+              "state": "ended",
+              "code": 0,
+              "data_utf8": {
+                "$contains": "clean"
+              }
+            }
+          }
+        },
+        {
+          "id": "short-ended",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "oo07",
+          "offset": 0,
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          },
+          "expect": {
+            "ok": {
+              "state": "ended",
+              "code": 137,
+              "data_utf8": {
+                "$not": {
+                  "$contains": "clean"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.options.attach-with-a-chosen-heartbeat",
+      "description": "A request may choose its stream's heartbeat (Keepalive-Ping-Interval, whole seconds 1 to 240): the stream still delivers the job's output and end. Anything else is invalid_request, sent nowhere.",
+      "requires": {
+        "features": [
+          "job_options"
+        ]
+      },
+      "steps": [
+        {
+          "id": "start",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "oo08",
+          "command": "sh",
+          "args": [
+            "-c",
+            "sleep 2; echo done"
+          ],
+          "label": "",
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              }
+            }
+          }
+        },
+        {
+          "id": "attach",
+          "op": "job_attach",
+          "scope": "${SCOPE}",
+          "job": "oo08",
+          "offset": 0,
+          "heartbeat_seconds": 1,
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "output_utf8": "done\n"
+            }
+          }
+        },
+        {
+          "id": "zero",
+          "op": "job_attach",
+          "scope": "${SCOPE}",
+          "job": "oo08",
+          "offset": 0,
+          "heartbeat_seconds": 0,
+          "expect": {
+            "error": {
+              "kind": "invalid_request"
+            }
+          }
+        },
+        {
+          "id": "too-slow",
+          "op": "job_attach",
+          "scope": "${SCOPE}",
+          "job": "oo08",
+          "offset": 0,
+          "heartbeat_seconds": 241,
+          "expect": {
+            "error": {
+              "kind": "invalid_request"
+            }
+          }
+        }
+      ]
     }
   ]
 }
