@@ -12,10 +12,12 @@ use serde_json::{Value, json};
 
 use super::HttpExecRunner;
 use super::jobs::{
-    EventSink, JOB_SIGNALS, JobEnd, JobError, JobEvent, JobId, JobInfo, JobNotify, JobOp, JobScope,
+    EventSink, JOB_SIGNALS, JobEnd, JobError, JobId, JobInfo, JobNotify, JobOp, JobScope,
     JobSpec, JobStatus, ReadChunk, SandboxJobs, StdinWritten, Stream, WRITE_MAX,
 };
-use super::stream::{FrameReader, silence_limit};
+use job_client::step::{Mark, Mode, State};
+
+mod handle;
 
 /// A refusal as the job condition it is, when it is one; any other error is unchanged.
 fn refine(e: std::io::Error, op: JobOp) -> std::io::Error {
@@ -219,69 +221,6 @@ impl<'a> NativeJobs<'a> {
         })
     }
 
-    /// One streamed operation: frames to `events`, until the final one.
-    #[allow(clippy::too_many_arguments)] // the request's parts, each used once
-    async fn stream(
-        &self,
-        program: &str,
-        args: &[String],
-        cwd: Option<&str>,
-        env: &[(String, String)],
-        job: Value,
-        stdin_open: bool,
-        beat: Option<u32>,
-        op: JobOp,
-        events: EventSink<'_>,
-    ) -> std::io::Result<JobEnd> {
-        check_beat(beat)?;
-        let resp = self
-            .runner
-            .send_env_beat(
-                program,
-                args,
-                cwd,
-                super::STREAM_DEADLINE,
-                None,
-                true,
-                Some(&job),
-                env,
-                beat,
-            )
-            .await
-            .map_err(|e| refine(e, op))?;
-        let mut reader = FrameReader::new(resp);
-        let broken = |e: String| std::io::Error::other(format!("job stream: {e}"));
-        loop {
-            let Some(line) = reader
-                .next_line(silence_limit(beat))
-                .await
-                .map_err(broken)?
-            else {
-                return Err(broken(
-                    "the stream ended before the job's final frame".into(),
-                ));
-            };
-            match decode_job_frame(&line).map_err(broken)? {
-                JobFrame::Event(Event::Started(pgid, stdin)) => {
-                    // An endpoint that predates job stdin ignores the flag and says nothing:
-                    // the job it started would read EOF. Not a job to leave running.
-                    if stdin_open && !stdin {
-                        return Err(predates("job stdin"));
-                    }
-                    events(JobEvent::Started(pgid));
-                }
-                JobFrame::Event(Event::Output(b, s)) => events(JobEvent::Output(&b, s)),
-                JobFrame::Event(Event::Gap(n)) => events(JobEvent::Gap(n)),
-                JobFrame::Event(Event::ShellExit(c)) => events(JobEvent::ShellExit(c)),
-                JobFrame::Heartbeat => {}
-                JobFrame::End(end) => {
-                    reader.finish().await;
-                    return Ok(end);
-                }
-                JobFrame::Error(e) => return Err(broken(e)),
-            }
-        }
-    }
 }
 
 impl NativeJobs<'_> {
@@ -296,26 +235,16 @@ impl NativeJobs<'_> {
         beat: Option<u32>,
         events: EventSink<'_>,
     ) -> std::io::Result<JobEnd> {
-        let job = Self::op(
-            "start",
+        check_beat(beat)?;
+        let h = handle::Handle {
+            runner: self.runner,
             scope,
-            json!({
-                "id": id.as_str(), "hold": true, "label": spec.label,
-                "stdin_open": spec.stdin_open,
-            }),
-        );
-        self.stream(
-            &spec.program,
-            &spec.args,
-            spec.cwd.as_deref(),
-            &spec.env,
-            job,
-            spec.stdin_open,
+            id,
+            spec: Some(spec),
             beat,
-            JobOp::Start,
-            events,
-        )
-        .await
+        };
+        let state = State::for_start(1, Mode::Follow, false, beat.unwrap_or(0));
+        handle::drive(&h, state, events).await
     }
 
     /// [`SandboxJobs::follow`] with a heartbeat of the request's choosing, as [`Self::run_held_beat`].
@@ -327,23 +256,16 @@ impl NativeJobs<'_> {
         beat: Option<u32>,
         events: EventSink<'_>,
     ) -> std::io::Result<JobEnd> {
-        let job = Self::op(
-            "attach",
+        check_beat(beat)?;
+        let h = handle::Handle {
+            runner: self.runner,
             scope,
-            json!({ "id": id.as_str(), "offset": from }),
-        );
-        self.stream(
-            INERT,
-            &[],
-            None,
-            &[],
-            job,
-            false,
+            id,
+            spec: None,
             beat,
-            JobOp::Other,
-            events,
-        )
-        .await
+        };
+        let state = State::for_attach(Mark::none(), from, Mode::Follow, false, beat.unwrap_or(0));
+        handle::drive(&h, state, events).await
     }
 
     /// [`SandboxJobs::read`] for a caller that wants a removed or unknown job as an error: the wire
@@ -658,15 +580,25 @@ pub enum JobFrame {
 pub enum Event {
     /// The job's process group, and whether it was started with its stdin open (the echo of
     /// `stdin_open`).
-    Started(u32, bool),
+    Started(u32, Option<String>, bool),
+    /// An attach's answer: the job's mark and the offset the stream starts at.
+    Attached(String, u64),
     Output(Vec<u8>, Stream),
     Gap(u64),
     ShellExit(i32),
 }
 
 #[derive(Deserialize)]
+struct WireAttached {
+    mark: String,
+    from: u64,
+}
+
+#[derive(Deserialize)]
 struct WireJobFrame {
     started: Option<u64>,
+    mark: Option<String>,
+    attached: Option<WireAttached>,
     #[serde(default)]
     stdin: bool,
     stdout: Option<String>,
@@ -703,9 +635,11 @@ pub fn decode_job_frame(line: &[u8]) -> Result<JobFrame, String> {
     // (the signal sum) and never a truncated status.
     Ok(if let Some(e) = w.error {
         JobFrame::Error(e)
+    } else if let Some(a) = w.attached {
+        JobFrame::Event(Event::Attached(a.mark, a.from))
     } else if let Some(p) = w.started {
         let p = u32::try_from(p).map_err(|_| wire_out_of_range("started", p))?;
-        JobFrame::Event(Event::Started(p, w.stdin))
+        JobFrame::Event(Event::Started(p, w.mark, w.stdin))
     } else if let Some(s) = w.stdout.as_deref() {
         JobFrame::Event(Event::Output(b64(s)?, Stream::Stdout))
     } else if let Some(s) = w.stderr.as_deref() {

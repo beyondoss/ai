@@ -217,10 +217,25 @@ impl JobError {
             JobOp::Write => format!("job stdin: {body}"),
             _ => body.to_string(),
         };
+        // A start and an attach are classified by the job client kernel (`job_client::step::classify`,
+        // proven in Verus), the one table every SDK shares. A stdin write is not the kernel's: its 409
+        // is told apart by the body.
+        let kernel = |op| match job_client::step::classify(op, status) {
+            job_client::step::Class::Terminal(f) => Some(f),
+            _ => None,
+        };
+        use job_client::step::{Fault, Op};
         Some(match (op, status) {
-            (JobOp::Start, 409) => Self::Exists { text },
-            (JobOp::Start, 507) => Self::DiskFull { text },
-            (JobOp::Other | JobOp::Write, 404) => Self::Gone { text },
+            (JobOp::Start, _) => match kernel(Op::Start)? {
+                Fault::JobExists => Self::Exists { text },
+                Fault::DiskFull => Self::DiskFull { text },
+                _ => return None,
+            },
+            (JobOp::Other, _) => match kernel(Op::Attach)? {
+                Fault::JobGone => Self::Gone { text },
+                _ => return None,
+            },
+            (JobOp::Write, 404) => Self::Gone { text },
             (JobOp::Write, 409) if body.contains("has no stdin") => Self::StdinClosed {
                 reason: StdinClosedReason::NeverOpened,
                 text,

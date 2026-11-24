@@ -37,7 +37,7 @@ fn job_streams_decode_as_the_vectors_say() {
         let (mut stdin, mut streams) = (false, String::new());
         for line in case["lines"].as_array().unwrap() {
             match decode_job_frame(line.as_str().unwrap().as_bytes()).unwrap() {
-                JobFrame::Event(Event::Started(p, s)) => {
+                JobFrame::Event(Event::Started(p, _, s)) => {
                     started = Some(p);
                     stdin = s;
                 }
@@ -45,6 +45,7 @@ fn job_streams_decode_as_the_vectors_say() {
                     output.extend(b);
                     streams.push(if s == Stream::Stderr { 'e' } else { 'o' });
                 }
+                JobFrame::Event(Event::Attached(..)) => {}
                 JobFrame::Event(Event::Gap(n)) => gap += n,
                 JobFrame::Event(Event::ShellExit(c)) => shell.push(c),
                 JobFrame::Heartbeat => {}

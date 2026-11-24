@@ -944,6 +944,8 @@ fn too_large(url: &str, cap: usize) -> std::io::Error {
 pub struct EndpointStatus {
     pub status: u16,
     pub body: String,
+    /// The `Retry-After` the answer carried, in whole seconds; 0 when none (or a date).
+    pub retry_after_s: u32,
     text: String,
 }
 
@@ -953,6 +955,7 @@ impl EndpointStatus {
         Self {
             status,
             body: body.into(),
+            retry_after_s: 0,
             text: text.into(),
         }
     }
@@ -1010,6 +1013,9 @@ pub struct HttpExecRunner {
     suspect: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// An `env` was proved to be applied by this endpoint; cleared when it is suspected replaced.
     env_proved: std::sync::atomic::AtomicBool,
+    /// Test only: how many times faster than the wall clock a job handle's waits run (its
+    /// reconnect backoff). 1 in production; read in one place, `jobs_native::handle::Clock`.
+    time_divisor: u64,
 }
 
 impl HttpExecRunner {
@@ -1043,7 +1049,17 @@ impl HttpExecRunner {
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
             suspect: None,
             env_proved: std::sync::atomic::AtomicBool::new(false),
+            time_divisor: 1,
         })
+    }
+
+    /// Test only: run a job handle's waits `divisor` times faster than the wall clock, so a test of
+    /// an outage of minutes takes a fraction of a second. The kernel's decisions are unchanged; only
+    /// the clock it is given and the sleeps the shell does run fast.
+    #[doc(hidden)]
+    pub fn with_time_divisor(mut self, divisor: u64) -> Self {
+        self.time_divisor = divisor.max(1);
+        self
     }
 
     /// Raise `flag` whenever a request fails to reach the endpoint or is refused by it (a non-2xx
@@ -1303,6 +1319,11 @@ impl HttpExecRunner {
             ) {
                 self.suspect();
             }
+            let retry_after_s = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()?.trim().parse::<u32>().ok())
+                .unwrap_or(0);
             let (body, _) = self.read_capped(resp).await?;
             // A `400` refuses the request as written (notify's refused `notify` among others), which
             // a caller may answer by sending another; anything else is an error of the endpoint's.
@@ -1316,6 +1337,7 @@ impl HttpExecRunner {
                 EndpointStatus {
                     status: status.as_u16(),
                     body: String::from_utf8_lossy(&body).into_owned(),
+                    retry_after_s,
                     text: format!(
                         "exec endpoint {} returned {}: {}",
                         self.url,

@@ -183,10 +183,9 @@ pub(crate) async fn run(
     }
     match outcome {
         Some(Ok(end)) => return Ok(status_result(end.code())),
-        Some(Err(e)) if !link.kept() => return Err(e.to_string()),
-        Some(Err(e)) => {
-            tracing::info!(job = %link.id, error = %e, "a kept job's stream broke; following it by polling");
-        }
+        // The handle reconnects a cut stream itself, however long the front is down, so an error is
+        // the job's end (gone, lost) or one a retry cannot change.
+        Some(Err(e)) => return Err(e.to_string()),
         None => return steered(shared, link, &mut ctl, Phase::Released).await,
     }
     steered(shared, link, &mut ctl, Phase::Follow(FollowKind::Holding)).await
@@ -283,8 +282,6 @@ async fn steered(
     ctl: &mut Steer<'_>,
     mut phase: Phase,
 ) -> Result<ExecResult, String> {
-    // Breaks of the followed stream in a row that delivered nothing new: see [`resumes`].
-    let mut breaks = Breaks::default();
     loop {
         phase = match phase {
             Phase::Released => {
@@ -326,12 +323,6 @@ async fn steered(
                             None => Err(format!("{LOST_END} ({e})")),
                         });
                     }
-                    (Some(Err(e)), FollowKind::Holding)
-                        if resumes(shared, link, &mut breaks).await =>
-                    {
-                        tracing::info!(job = %link.id, error = %e, "a followed job's stream broke; following it again");
-                        Phase::Follow(kind)
-                    }
                     (Some(r), FollowKind::Holding) => {
                         stream_ended(shared, link);
                         return r;
@@ -344,40 +335,6 @@ async fn steered(
         };
     }
 }
-
-/// A kept job's followed stream breaks without the job having ended (the front serving it was
-/// restarted, as a rolling deploy does, and the next connection reaches the sandbox through a
-/// peer). Whether to follow again, from the offset reached: the job is still the sandbox's
-/// (running, or ended and not yet read to its end), and the breaks since the stream last delivered
-/// anything number fewer than [`MAX_BREAKS`]. Waits a moment first, so a front that is down is
-/// not spun on. `Lost` and `Gone` are the job's end, which the error reports.
-async fn resumes(shared: &JobShared, link: &SandboxLink, breaks: &mut Breaks) -> bool {
-    let at = shared.offset();
-    if breaks.at != Some(at) {
-        *breaks = Breaks { at: Some(at), n: 0 };
-    }
-    breaks.n += 1;
-    if breaks.n > MAX_BREAKS {
-        return false;
-    }
-    tokio::time::sleep(BREAK_PAUSE).await;
-    match link.store.read(&link.scope, &link.id, at, 0).await {
-        Ok(chunk) => !matches!(chunk.status, JobStatus::Lost | JobStatus::Gone),
-        // The sandbox cannot be reached this moment (a front with no replica yet): try again.
-        Err(_) => true,
-    }
-}
-
-/// The offset a followed stream last broke at, and how many times in a row.
-#[derive(Default)]
-struct Breaks {
-    at: Option<u64>,
-    n: u32,
-}
-
-/// Breaks at one offset after which a kept job is no longer followed (about a minute).
-const MAX_BREAKS: u32 = 120;
-const BREAK_PAUSE: Duration = Duration::from_millis(500);
 
 /// The stream holding a job (or the follow standing for it) delivered its final frame or broke:
 /// a proving or closing job is held as today from here (the release table's `proving, held` row).
