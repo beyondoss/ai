@@ -137,6 +137,82 @@ export class InvalidQueryError extends SandboxError {
   }
 }
 
+// ---- job conditions: finer types of the kinds above, so a `catch (e instanceof NotFoundError)` keeps working ----
+
+/**
+ * The job does not exist, or was removed: `attach` answered 404, or `read` reported state `gone`.
+ * Also a stdin `write` or a `keep`/`seen` to a job that is not there.
+ */
+export class JobGoneError extends NotFoundError {
+  readonly id: string;
+
+  constructor(detail: string, id: string, options?: { cause?: unknown }) {
+    super(detail, options);
+    this.id = id;
+  }
+}
+
+/** `start` of an id that already exists in the scope (409). The first job is left alone. */
+export class JobExistsError extends ConflictError {
+  readonly id: string;
+
+  constructor(detail: string, id: string, options?: { cause?: unknown }) {
+    super(detail, options);
+    this.id = id;
+  }
+}
+
+/** `start` refused because the sandbox's disk is full (507): there is no room for the job's output. */
+export class DiskFullError extends IoError {
+  constructor(detail: string, options?: { cause?: unknown }) {
+    super(detail, options);
+  }
+}
+
+/**
+ * A stdin `write` the job cannot take (409): its stdin was never opened (`never_opened`), or is
+ * closed, the job ended or its reader left (`closed`). Retrying cannot succeed. `written` is the
+ * stream's length applied so far, when the endpoint says.
+ */
+export class StdinClosedError extends ConflictError {
+  readonly reason: "closed" | "never_opened";
+  readonly written: number | undefined;
+
+  constructor(
+    detail: string,
+    reason: "closed" | "never_opened",
+    written?: number,
+    options?: { cause?: unknown },
+  ) {
+    super(detail, options);
+    this.reason = reason;
+    this.written = written;
+  }
+}
+
+/**
+ * A positional stdin `write` that waited for the bytes before it and they never came (409 `gap`).
+ * Writing the missing bytes first, then this one again, succeeds. `written` is the length applied.
+ */
+export class StdinGapError extends ConflictError {
+  readonly written: number | undefined;
+
+  constructor(detail: string, written?: number, options?: { cause?: unknown }) {
+    super(detail, options);
+    this.written = written;
+  }
+}
+
+/**
+ * A stdin `write` while 16 others already wait on the job (429). Retryable: the same write at the
+ * same position later applies nothing twice.
+ */
+export class StdinBusyError extends ConflictError {
+  constructor(detail: string, options?: { cause?: unknown }) {
+    super(detail, options);
+  }
+}
+
 /**
  * The exception class of `kind`, for code that has only the name (and optional HTTP status /
  * cause).

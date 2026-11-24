@@ -12,11 +12,19 @@ export type {
   JobOps,
   JobSpec,
   JobState,
+  KeepFields,
+  ReqOptions,
   RunOptions,
   RunResult,
   StdinWritten,
   Survivor,
   Transport,
+} from "./transport.js";
+export {
+  DEFAULT_KILL_GRACE_MS,
+  HEARTBEAT_MAX_S,
+  HEARTBEAT_MIN_S,
+  silenceMs,
 } from "./transport.js";
 
 export {
@@ -41,7 +49,12 @@ export type {
 } from "./files.js";
 
 export { Jobs } from "./jobs.js";
-export type { JobOutput, JobReadOptions, KillOptions } from "./jobs.js";
+export type {
+  JobOutput,
+  JobReadOptions,
+  KillOptions,
+  WipeOptions,
+} from "./jobs.js";
 
 export type {
   SearchEngine,
@@ -53,18 +66,24 @@ export type {
 export {
   AuthError,
   ConflictError,
+  DiskFullError,
   EndpointError,
   errorFor,
   InvalidQueryError,
   InvalidRequestError,
   IoError,
   IsDirectoryError,
+  JobExistsError,
+  JobGoneError,
   NotADirectoryError,
   NotFoundError,
   NotOfferedError,
   PermissionDeniedError,
   ProtocolError,
   SandboxError,
+  StdinBusyError,
+  StdinClosedError,
+  StdinGapError,
   TimeoutError,
   TooLargeError,
   TransportError,

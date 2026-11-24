@@ -83,6 +83,62 @@ class NotOfferedError(SandboxError):
     kind = "not_offered"
 
 
+# Job conditions: finer types of the kinds above, so ``except NotFoundError`` keeps working.
+class JobGoneError(NotFoundError):
+    """The job does not exist or was removed: ``attach`` answered 404, or ``read`` said ``gone``.
+    Also a stdin ``write``, ``keep`` or ``seen`` to a job that is not there."""
+
+    def __init__(self, detail: str = "", *, id: str = "", status: int | None = None) -> None:  # noqa: A002
+        super().__init__(detail, status=status)
+        self.id = id
+
+
+class JobExistsError(ConflictError):
+    """``start`` of an id that already exists in the scope (409). The first job is left alone."""
+
+    def __init__(self, detail: str = "", *, id: str = "", status: int | None = None) -> None:  # noqa: A002
+        super().__init__(detail, status=status)
+        self.id = id
+
+
+class DiskFullError(IoError):
+    """``start`` refused because the sandbox's disk is full (507): no room for the job's output."""
+
+
+class StdinClosedError(ConflictError):
+    """A stdin ``write`` the job cannot take (409): ``reason`` is ``"never_opened"`` (started without
+    ``stdin_open``) or ``"closed"`` (EOF sent, the job ended or its reader left). Retrying cannot
+    succeed. ``written`` is the stream's length applied so far, when the endpoint says."""
+
+    def __init__(
+        self,
+        detail: str = "",
+        *,
+        reason: str = "closed",
+        written: int | None = None,
+        status: int | None = None,
+    ) -> None:
+        super().__init__(detail, status=status)
+        self.reason = reason
+        self.written = written
+
+
+class StdinGapError(ConflictError):
+    """A positional stdin ``write`` waited for the bytes before it and they never came (409 ``gap``).
+    Writing the missing bytes first, then this one again, succeeds."""
+
+    def __init__(
+        self, detail: str = "", *, written: int | None = None, status: int | None = None
+    ) -> None:
+        super().__init__(detail, status=status)
+        self.written = written
+
+
+class StdinBusyError(ConflictError):
+    """A stdin ``write`` while 16 others already wait on the job (429). Retryable: the same write at
+    the same position later applies nothing twice."""
+
+
 _BY_KIND: dict[str, type[SandboxError]] = {
     cls.kind: cls
     for cls in (

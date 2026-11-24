@@ -349,9 +349,8 @@ fn parse_signal(name: &str) -> Option<Signal> {
 
 /// The most decoded bytes one `write` carries (symmetric with the client's `READ_MAX`).
 pub(crate) const WRITE_MAX: usize = 128 * 1024;
-/// The most writes waiting on one job's stdin (for the pipe, or for earlier bytes): each holds at
-/// most `WRITE_MAX` bytes plus its base64, so a job that never reads costs a bounded amount.
-pub(crate) const WAITERS_MAX: usize = 16;
+/// The most writes waiting on one job's stdin is `kernel::WAITERS_MAX`: each holds at most `WRITE_MAX`
+/// bytes plus its base64, so a job that never reads costs a bounded amount.
 /// How long a write waits for earlier bytes (a gap) when the request names no `timeout_ms`.
 const GAP_WAIT: Duration = Duration::from_secs(30);
 
@@ -406,7 +405,7 @@ async fn write_stdin(ctx: &Arc<Ctx>, req: &Request, job: &JobReq, data: Vec<u8>)
     let Some(stdin) = locked(&cell).stdin.clone() else {
         return http::error_response(409, "the job has no stdin");
     };
-    if stdin.waiters.fetch_add(1, Ordering::Relaxed) >= WAITERS_MAX {
+    if !kernel::admit_waiter(stdin.waiters.fetch_add(1, Ordering::Relaxed)) {
         stdin.waiters.fetch_sub(1, Ordering::Relaxed);
         return http::error_response(429, "too many writes waiting on this job");
     }
@@ -418,14 +417,22 @@ async fn write_stdin(ctx: &Arc<Ctx>, req: &Request, job: &JobReq, data: Vec<u8>)
         }
         b
     };
-    let end = job.at.saturating_add(data.len() as u64);
+    let len = data.len() as u64;
     let deadline = req
         .timeout_ms
         .map(|ms| tokio::time::Instant::now() + Duration::from_millis(ms));
     // Earlier bytes first: wait (without holding the pipe) until the stream reaches `at`.
     let mut rx = stdin.written.subscribe();
     let gap_by = deadline.unwrap_or_else(|| tokio::time::Instant::now() + GAP_WAIT);
-    while *rx.borrow_and_update() < job.at {
+    while kernel::stdin_plan(
+        *rx.borrow_and_update(),
+        job.at,
+        len,
+        job.eof,
+        true,
+        stdin.dead.is_cancelled(),
+    ) == kernel::Plan::Wait
+    {
         tokio::select! {
             _ = rx.changed() => {}
             () = stdin.dead.cancelled() => break,
@@ -440,30 +447,43 @@ async fn write_stdin(ctx: &Arc<Ctx>, req: &Request, job: &JobReq, data: Vec<u8>)
         p = stdin.pipe.lock() => p,
         () = stdin.dead.cancelled() => {
             // Over: bytes already applied are idempotent, anything else is refused.
-            return if end <= *stdin.written.borrow() {
-                http::json_response(200, &state(true))
-            } else {
-                closed(&state(true))
+            let plan = kernel::stdin_plan(*stdin.written.borrow(), job.at, len, job.eof, false, true);
+            return match plan {
+                kernel::Plan::Done { .. } => http::json_response(200, &state(true)),
+                _ => closed(&state(true)),
             };
         }
     };
-    // Bytes below `written` are applied: skip them.
-    let skip = usize::try_from(stdin.written.borrow().saturating_sub(job.at))
-        .unwrap_or(usize::MAX)
-        .min(data.len());
-    let mut rest = &data[skip..];
-    if *stdin.written.borrow() < job.at {
-        // The job ended while this waited for the missing bytes.
-        return closed(&state(pipe.is_none()));
-    }
-    if !rest.is_empty() && pipe.is_none() {
-        return closed(&state(true));
-    }
-    while !rest.is_empty() {
+    // The kernel decides what lands: the shell does the pipe's I/O it names.
+    let plan = kernel::stdin_plan(
+        *stdin.written.borrow(),
+        job.at,
+        len,
+        job.eof,
+        pipe.is_some(),
+        stdin.dead.is_cancelled(),
+    );
+    let (skip, take, close) = match plan {
+        // `Wait` cannot be asked here: the loop above left only with the bytes before `at`
+        // applied or the job over.
+        kernel::Plan::Wait | kernel::Plan::Refuse => return closed(&state(true)),
+        kernel::Plan::Done { close } => {
+            if close {
+                pipe.take();
+            }
+            return http::json_response(200, &state(pipe.is_none()));
+        }
+        kernel::Plan::Apply { skip, take, close } => {
+            (usize::try_from(skip).unwrap_or(usize::MAX), take, close)
+        }
+    };
+    let body = &data[skip.min(data.len())..];
+    let mut landed = 0u64;
+    while kernel::remaining(take, landed) > 0 {
         let Some(p) = pipe.as_mut() else { break };
         let step = async {
             tokio::select! {
-                r = p.write(rest) => Some(r),
+                r = p.write(&body[landed as usize..]) => Some(r),
                 () = stdin.dead.cancelled() => None,
                 () = async {
                     match deadline {
@@ -475,8 +495,10 @@ async fn write_stdin(ctx: &Arc<Ctx>, req: &Request, job: &JobReq, data: Vec<u8>)
         };
         match step.await {
             Some(Ok(n)) if n > 0 => {
-                rest = &rest[n..];
-                stdin.written.send_modify(|w| *w += n as u64);
+                landed += n as u64;
+                stdin
+                    .written
+                    .send_modify(|w| *w = kernel::advance(*w, n as u64));
             }
             // The reader is gone (EPIPE) or the pipe broke: nothing more can land.
             Some(_) => {
@@ -494,7 +516,7 @@ async fn write_stdin(ctx: &Arc<Ctx>, req: &Request, job: &JobReq, data: Vec<u8>)
             }
         }
     }
-    if job.eof {
+    if kernel::closes(close, kernel::remaining(take, landed)) {
         pipe.take();
     }
     http::json_response(200, &state(pipe.is_none()))
@@ -827,8 +849,8 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
     // and which outlive execd, read by a tail that wakes on each write.
     let mut tail = None;
     if kernel::output_sink(Kind::Job) == Dest::Spool {
-        let made = Spool::create(&spool_base(ctx), &mark).and_then(|(sp, w)| {
-            let made = Journal::create(sp.dir(), [0, 0], Vec::new(), 0)
+        let made = Spool::create(spool_base(ctx), &mark).and_then(|(sp, w)| {
+            let made = Journal::create(&sp.access(), sp.guard(), [0, 0], Vec::new(), 0)
                 .and_then(|j| Tail::open(&ctx.tails, &sp, Start::Zero).map(|t| (t, j)));
             match made {
                 Ok((t, j)) => Ok((sp, w, t, j)),
@@ -844,7 +866,9 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
                 {
                     let mut j = locked(&cell);
                     // The ring's chunks live in the spool, which a restart reads again.
-                    j.out = Ring::new(ctx.opts.job_output_retention, sp.ring_dir()).kept();
+                    j.out = Ring::new(ctx.opts.job_output_retention, sp.ring_dir())
+                        .holding(sp.guard())
+                        .kept();
                     j.spool = Some(sp);
                 }
                 tail = Some((t, journal));
@@ -942,17 +966,12 @@ fn spool_failure(e: &std::io::Error) -> (u16, &'static str) {
 }
 
 /// Where a job's spool files live (S7, `kernel::spool_root`): under the jobs directory, never the
-/// ledger's. With a ledger it is a directory that outlives this execd (a restart finds the spool
-/// by the path the ledger names), else this execd's own.
-fn spool_base(ctx: &Ctx) -> std::path::PathBuf {
+/// ledger's. The kernel chooses between the directory that outlives this execd (a ledger's spools:
+/// a restart finds one by the path the ledger names) and this execd's own.
+fn spool_base(ctx: &Ctx) -> &crate::spool::Base {
     match kernel::spool_root(ctx.jobs.ledger.enabled()) {
-        kernel::Root::Jobs if ctx.jobs.ledger.enabled() => ctx.spool.stable().to_path_buf(),
-        kernel::Root::Jobs => ctx.spool.path().to_path_buf(),
-        kernel::Root::State => ctx
-            .opts
-            .state_dir
-            .as_deref()
-            .map_or_else(|| ctx.spool.path().to_path_buf(), |d| d.join("spool")),
+        kernel::Root::Stable => ctx.spool.stable(),
+        kernel::Root::PerServer => ctx.spool.server(),
     }
 }
 
@@ -1125,7 +1144,11 @@ pub(crate) fn recover(ctx: &Arc<Ctx>) {
         };
         // The job's spool, which the old execd made and the ledger names, and which the job still
         // writes: the ring is rebuilt from it and its files are read from where execd stopped.
-        let spool = pg.and_then(|_| e.spool.as_deref().and_then(|d| Spool::at(Path::new(d))));
+        let spool = pg.and_then(|_| {
+            e.spool
+                .as_deref()
+                .and_then(|d| Spool::at(base, Path::new(d)))
+        });
         let rebuilt = spool
             .as_ref()
             .and_then(|sp| rebuild(ctx, sp).or_else(|| restart_cold(ctx, sp)));
@@ -1166,7 +1189,7 @@ pub(crate) fn recover(ctx: &Arc<Ctx>) {
     // A spool no job in the table owns (its job ended, or was removed, before the restart).
     if ctx.jobs.ledger.enabled() {
         let keep: Vec<&Path> = adopted.iter().map(std::path::PathBuf::as_path).collect();
-        Spool::retain(&base, &keep);
+        Spool::retain(base, &keep);
     }
     ctx.jobs.bump_activity();
     ctx.jobs.save();
@@ -1181,7 +1204,7 @@ pub(crate) fn recover(ctx: &Arc<Ctx>) {
 /// starts after a gap.
 fn rebuild(ctx: &Arc<Ctx>, sp: &Spool) -> Option<(Ring, Tail, Journal)> {
     let retain = ctx.opts.job_output_retention;
-    let (start, pieces) = Journal::load(sp.dir())?;
+    let (start, pieces) = Journal::load(&sp.access())?;
     let from = start[0].checked_add(start[1])?;
     let total: u64 = pieces.iter().map(|p| p.1.len() as u64).sum();
     let (jo, je) = pieces.iter().fold((0u64, 0u64), |(o, e), (err, d)| {
@@ -1195,7 +1218,7 @@ fn rebuild(ctx: &Arc<Ctx>, sp: &Spool) -> Option<(Ring, Tail, Journal)> {
     if from.checked_add(total)? > kernel::OFFSET_MAX || from % FRAME_MAX as u64 != 0 {
         return None;
     }
-    let mut ring = Ring::recover(retain, sp.ring_dir(), from);
+    let mut ring = Ring::recover(retain, sp.ring_dir(), from).holding(sp.guard());
     let chunk_end = ring.end();
     if chunk_end > from + total {
         // Chunks the journal never covered: not one this journal can continue.
@@ -1219,7 +1242,8 @@ fn rebuild(ctx: &Arc<Ctx>, sp: &Spool) -> Option<(Ring, Tail, Journal)> {
         return None;
     }
     let journal = Journal::create(
-        sp.dir(),
+        &sp.access(),
+        sp.guard(),
         [start[0] + skipped[0], start[1] + skipped[1]],
         kept,
         ring.tail_len(),
@@ -1238,8 +1262,10 @@ fn restart_cold(ctx: &Arc<Ctx>, sp: &Spool) -> Option<(Ring, Tail, Journal)> {
     );
     let _ = std::fs::remove_dir_all(sp.ring_dir());
     let tail = Tail::open(&ctx.tails, sp, Start::Data).ok()?;
-    let journal = Journal::create(sp.dir(), tail.offsets(), Vec::new(), 0).ok()?;
-    let ring = Ring::new(ctx.opts.job_output_retention, sp.ring_dir()).kept();
+    let journal = Journal::create(&sp.access(), sp.guard(), tail.offsets(), Vec::new(), 0).ok()?;
+    let ring = Ring::new(ctx.opts.job_output_retention, sp.ring_dir())
+        .holding(sp.guard())
+        .kept();
     Some((ring, tail, journal))
 }
 

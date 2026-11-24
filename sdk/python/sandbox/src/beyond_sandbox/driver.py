@@ -28,9 +28,19 @@ from typing import Any, Callable, cast
 
 from . import AsyncSandbox, Exit, Sandbox, SandboxError, Signal, Stderr, Stdout, TimedOut, _bulk
 from .atransport import AsyncHttpTransport
-from .errors import InvalidRequestError, IoError
+from .errors import (
+    DiskFullError,
+    InvalidRequestError,
+    IoError,
+    JobExistsError,
+    JobGoneError,
+    ProtocolError,
+    StdinBusyError,
+    StdinClosedError,
+    StdinGapError,
+)
 from .files import CapsOverride
-from .models import Stat
+from .models import JobRead, JobStarted, Stat
 from .transport import HttpTransport
 
 Result = dict[str, Any]
@@ -46,13 +56,13 @@ class _Unsupported(SandboxError):
 # raw stream, so it has all of them.
 FEATURES = [
     "frames", "unbounded_stream", "exit_signal", "exec_env", "job_streams", "job_stdin",
-    "job_signal_op",
+    "job_signal_op", "job_errors", "job_options",
 ]  # fmt: skip
 
 OPS = [
     "hello", "capabilities", "exec", "exec_stream",
-    "job_start", "job_list", "job_read", "job_attach", "job_kill", "job_remove", "job_wipe",
-    "job_write", "job_signal",
+    "job_start", "job_start_held", "job_keep", "job_seen", "job_list", "job_read", "job_attach",
+    "job_kill", "job_remove", "job_wipe", "job_write", "job_signal",
     "stat", "read", "write", "write_if_unchanged", "mkdir", "list", "search",
     "upload", "download", "extract",
 ]  # fmt: skip
@@ -193,6 +203,9 @@ def plan(op: str, req: dict[str, Any]) -> Plan:
         return (lambda sb: _collect_stream(sb, command, args, cwd, timeout), lambda r: r)
     if op in (
         "job_start",
+        "job_start_held",
+        "job_keep",
+        "job_seen",
         "job_list",
         "job_read",
         "job_attach",
@@ -268,7 +281,7 @@ def _job_plan(op: str, req: dict[str, Any]) -> Plan:
     if op == "job_wipe":
         # Conformance wire: wipe survivors are detail strings (see DRIVER.md / TS driver).
         return (
-            lambda sb: sb.jobs.wipe(scope),
+            lambda sb: sb.jobs.wipe(scope, **_grace(req)),
             lambda ss: {"survivors": [s.detail for s in ss]},
         )
     if op == "job_list":
@@ -295,7 +308,7 @@ def _job_plan(op: str, req: dict[str, Any]) -> Plan:
             return (lambda sb: sb.jobs.remove(scope, ids), lambda _: {})
         remove = _flag(req, "remove")
         return (
-            lambda sb: sb.jobs.kill(scope, ids, remove=remove),
+            lambda sb: sb.jobs.kill(scope, ids, remove=remove, **_grace(req)),
             lambda ss: {"survivors": [{"id": s.id, "detail": s.detail} for s in ss]},
         )
     job = _str(req, "job")
@@ -307,6 +320,24 @@ def _job_plan(op: str, req: dict[str, Any]) -> Plan:
         return (
             lambda sb: sb.jobs.write_stdin(scope, job, at, data, eof),
             lambda w: {"written": w.written, **({"closed": True} if w.closed else {})},
+        )
+    if op == "job_keep":
+        num, kind, seen = _count(req, "num"), _opt_str(req, "kind"), _count(req, "seen")
+        fields = {k: v for k, v in (("num", num), ("kind", kind), ("seen", seen)) if v is not None}
+        return (lambda sb: sb.jobs.keep(scope, job, **fields), lambda _: {})
+    if op == "job_seen":
+        at = _count(req, "offset") or 0
+        return (lambda sb: sb.jobs.seen(scope, job, at), lambda _: {})
+    if op == "job_start_held":
+        command, args = _str(req, "command"), _strings(req, "args")
+        cwd, label = _opt_str(req, "cwd"), _opt_str(req, "label") or ""
+        env, stdin_open, keep = _env(req), _flag(req, "stdin_open"), _flag(req, "keep")
+        beat = _count(req, "heartbeat_seconds")
+        return (
+            lambda sb: _start_held(
+                sb, scope, job, command, args, cwd, label, env, stdin_open, keep, beat
+            ),
+            lambda pgid: {"pgid": pgid},
         )
     if op == "job_start":
         command, args = _str(req, "command"), _strings(req, "args")
@@ -322,8 +353,9 @@ def _job_plan(op: str, req: dict[str, Any]) -> Plan:
     if op == "job_read":
         limit = _count(req, "max")
         kw: dict[str, Any] = {} if limit is None else {"max": limit}
+        gone_as_error = _flag(req, "gone_as_error")
         return (
-            lambda sb: sb.jobs.read(scope, job, offset, **kw),
+            lambda sb: _read(sb, scope, job, offset, kw, gone_as_error),
             lambda r: {
                 "state": r.state, "code": r.code, "offset": r.offset, "end": r.end,
                 "data_b64": _b64(r.data),
@@ -332,7 +364,7 @@ def _job_plan(op: str, req: dict[str, Any]) -> Plan:
             },
         )  # fmt: skip
     return (  # job_attach
-        lambda sb: sb.jobs.attach(scope, job, offset),
+        lambda sb: sb.jobs.collect(scope, job, offset, **_beat(req)),
         # As ``exec_stream`` ends: ``signal`` in place of ``exit_code`` for a death by signal.
         lambda a: {
             **({"exit_code": a.exit_code} if a.signal is None else {"signal": a.signal}),
@@ -341,6 +373,92 @@ def _job_plan(op: str, req: dict[str, Any]) -> Plan:
             "gap": a.gap,
         },
     )
+
+
+def _grace(req: dict[str, Any]) -> dict[str, Any]:
+    g = _count(req, "grace_ms")
+    return {} if g is None else {"grace_ms": g}
+
+
+def _beat(req: dict[str, Any]) -> dict[str, Any]:
+    """``heartbeat_seconds`` as the client takes it. Not a count: a wrong value (0, 241) is the
+    client's ``invalid_request``, so a non-integer is passed through for it to refuse."""
+    v = req.get("heartbeat_seconds")
+    return {} if v is None else {"heartbeat_seconds": v}
+
+
+_GONE = JobRead("gone", None, 0, 0, b"")
+
+
+def _read(
+    sb: Any, scope: str, job: str, offset: int, kw: dict[str, Any], gone_as_error: bool
+) -> Any:
+    """``job_read``: the wire answers ``gone`` for a job that is not there; the client says
+    ``JobGoneError``. ``gone_as_error`` asks for the error, as a caller of the client gets it."""
+
+    def absorb(e: BaseException) -> JobRead:
+        if isinstance(e, JobGoneError) and not gone_as_error:
+            return _GONE
+        raise e
+
+    if isinstance(sb, AsyncSandbox):
+
+        async def go() -> JobRead:
+            try:
+                return await sb.jobs.read(scope, job, offset, **kw)
+            except JobGoneError as e:
+                return absorb(e)
+
+        return go()
+    try:
+        return sb.jobs.read(scope, job, offset, **kw)
+    except JobGoneError as e:
+        return absorb(e)
+
+
+def _start_held(
+    sb: Any,
+    scope: str,
+    job: str,
+    command: str,
+    args: list[str],
+    cwd: str | None,
+    label: str,
+    env: dict[str, str] | None,
+    stdin_open: bool,
+    keep: bool,
+    beat: int | None,
+) -> Any:
+    """``job_start_held``: start held, learn the pgid from the first frame, optionally ``keep``, then
+    drop the stream: a job nobody kept dies with it (wire ``hold: true``)."""
+    kw: dict[str, Any] = {
+        "cwd": cwd, "label": label, "env": env, "stdin_open": stdin_open, "heartbeat_seconds": beat,
+    }  # fmt: skip
+    if isinstance(sb, AsyncSandbox):
+
+        async def go() -> int:
+            stream = sb.jobs.start_held(scope, job, command, args, **kw)
+            try:
+                async for f in stream:
+                    if isinstance(f, JobStarted):
+                        if keep:
+                            await sb.jobs.keep(scope, job)
+                        return f.pgid
+            finally:
+                await stream.aclose()
+            raise ProtocolError("the held start ended before `started`")
+
+        return go()
+    sync = sb.jobs.start_held(scope, job, command, args, **kw)
+    try:
+        for f in sync:
+            if isinstance(f, JobStarted):
+                if keep:
+                    sb.jobs.keep(scope, job)
+                return f.pgid
+    finally:
+        sync.close()
+    raise ProtocolError("the held start ended before `started`")
 
 
 def _collect_stream(
@@ -628,9 +746,34 @@ def _override() -> CapsOverride | None:
     return cast(CapsOverride, out)
 
 
+def _code(e: SandboxError) -> str | None:
+    """The job condition of an error, by its class (DRIVER.md, ``job_errors``)."""
+    if isinstance(e, JobGoneError):
+        return "job_gone"
+    if isinstance(e, JobExistsError):
+        return "job_exists"
+    if isinstance(e, DiskFullError):
+        return "disk_full"
+    if isinstance(e, StdinClosedError):
+        return "stdin_never_opened" if e.reason == "never_opened" else "stdin_closed"
+    if isinstance(e, StdinGapError):
+        return "stdin_gap"
+    if isinstance(e, StdinBusyError):
+        return "stdin_busy"
+    return None
+
+
 def _fail(id_: Any, e: BaseException) -> Result:
     if isinstance(e, SandboxError):
-        return {"id": id_, "error": {"kind": e.kind, "detail": e.detail}}
+        code = _code(e)
+        return {
+            "id": id_,
+            "error": {
+                "kind": e.kind,
+                "detail": e.detail,
+                **({} if code is None else {"code": code}),
+            },
+        }
     traceback.print_exception(e, file=sys.stderr)
     return {"id": id_, "error": {"kind": "io", "detail": f"driver bug: {type(e).__name__}: {e}"}}
 

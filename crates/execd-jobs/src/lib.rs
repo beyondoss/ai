@@ -795,24 +795,32 @@ pub fn output_sink(kind: Kind) -> (s: Sink)
     }
 }
 
-/// Where a job's spool files live: the jobs directory (a disk, which the operator chose), or the
-/// ledger's directory (which may be a tmpfs, where 8 MiB per job would be RAM).
+/// Where a job's spool files live. Both places are under the jobs directory (a disk the operator
+/// chose); there is no variant for the ledger's state directory (tmpfs in a sandbox, where 8 MiB per
+/// job would be RAM), so a spool cannot be put there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Root {
-    /// Under the jobs directory.
-    Jobs,
-    /// Under the ledger's state directory.
-    State,
+    /// The directory that outlives this execd, which a ledger's spools need: a restart finds a spool
+    /// there by the path the ledger names.
+    Stable,
+    /// This execd's own directory, which goes with it.
+    PerServer,
 }
 
-/// S7: where a job's spool lives. Always under the jobs directory, with a ledger or without: the
-/// ledger only names the spool by its path, so a restart finds it there, and the state directory
-/// (tmpfs in a sandbox, by design) holds the ledger and nothing else.
+/// S7: where a job's spool lives. With a ledger, the stable directory (a restart finds the spool by
+/// its recorded path); without one, this server's own (nothing could find a spool later).
 pub fn spool_root(ledger: bool) -> (r: Root)
     ensures
-        r is Jobs,
+        ledger ==> r is Stable,
+        !ledger ==> r is PerServer,
 {
-    if cfg!(feature = "mut_spool_under_state") && ledger { Root::State } else { Root::Jobs }
+    if ledger {
+        if cfg!(feature = "mut_ledger_spool_per_server") { Root::PerServer } else { Root::Stable }
+    } else if cfg!(feature = "mut_unledgered_spool_stable") {
+        Root::Stable
+    } else {
+        Root::PerServer
+    }
 }
 
 /// Why execd is stopping: `SIGTERM` or `SIGINT` (a stop: the sandbox is stopping, so nothing may be left
@@ -937,6 +945,216 @@ pub fn replay_skip(chunk_end: u64, at: u64, len: u64) -> (skip: u64)
     } else {
         len
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Positional stdin (the `write` op): `written` counts the stream's bytes applied so far.
+// ---------------------------------------------------------------------------------------------
+
+/// The most writes waiting on one job's stdin (for the pipe, or for earlier bytes).
+pub const WAITERS_MAX: usize = 16;
+
+/// W1: a write may wait only while fewer than `WAITERS_MAX` others do (the 17th is refused with
+/// 429). `waiters` is the count before this one. W1-live (completeness): once a waiter has left,
+/// a write that asks again is admitted, so a refusal never sticks.
+pub fn admit_waiter(waiters: usize) -> (r: bool)
+    ensures
+        r <==> waiters < WAITERS_MAX,
+{
+    if cfg!(feature = "mut_stdin_waiters_unbounded") {
+        true
+    } else if cfg!(feature = "mut_stdin_waiter_stuck") {
+        waiters + 1 < WAITERS_MAX
+    } else {
+        waiters < WAITERS_MAX
+    }
+}
+
+/// What a positional write does next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Plan {
+    /// Bytes are missing before `at` and the job lives: wait for `written` to reach `at`.
+    Wait,
+    /// Nothing can land: the job ended or the stdin was closed (409), or a write waited for bytes
+    /// that the end of the job cut off.
+    Refuse,
+    /// Every byte is applied already (a retry or a replay): answer with the state; close at EOF.
+    Done { close: bool },
+    /// Skip the first `skip` bytes (already applied), write the next `take`, then close at EOF.
+    Apply { skip: u64, take: u64, close: bool },
+}
+
+/// What `stdin_plan` promises (W2 to W5).
+pub open spec fn post_plan(written: u64, at: u64, len: u64, eof: bool, open: bool, ended: bool, p: Plan) -> bool {
+    // W5: a write ahead of `written` waits for the bytes before it; it never applies.
+    &&& (at > written ==> p == (if ended { Plan::Refuse } else { Plan::Wait }))
+    // W2: bytes already applied are answered, never applied again (idempotent, whatever the state).
+    &&& (at <= written && at as int + len as int <= written as int ==> p == (Plan::Done { close: eof }))
+    // W3: nothing lands on an ended job; W4: nothing lands after EOF.
+    &&& (at <= written && at as int + len as int > written as int && (ended || !open) ==> p == Plan::Refuse)
+    // W2: what is below `written` is skipped, the rest is applied, and it starts exactly at `written`.
+    &&& (at <= written && at as int + len as int > written as int && open && !ended ==> p == (Plan::Apply {
+        skip: if written - at < len { (written - at) as u64 } else { len },
+        take: (len - (if written - at < len { (written - at) as u64 } else { len })) as u64,
+        close: eof,
+    }))
+    &&& (p is Apply ==> p->Apply_take > 0 && at as int + p->Apply_skip as int == written as int
+        && p->Apply_skip as int + p->Apply_take as int == len as int && open && !ended)
+    &&& (p is Wait ==> at > written && !ended)
+}
+
+/// The definition `stdin_plan` computes (so the progress lemma reasons over the function itself:
+/// `stdin_plan` ensures `p == plan_of(..)`), with each mutation's branch in the same place.
+pub open spec fn plan_of(written: u64, at: u64, len: u64, eof: bool, open: bool, ended: bool) -> Plan {
+    if at > written {
+        if ended {
+            Plan::Refuse
+        } else if cfg!(feature = "mut_stdin_applies_ahead") {
+            Plan::Apply { skip: 0, take: len, close: eof }
+        } else {
+            Plan::Wait
+        }
+    } else if cfg!(feature = "mut_stdin_waits_at_written") && at == written && len > 0 && !ended {
+        Plan::Wait
+    } else if cfg!(feature = "mut_stdin_wait_sticks") && at < written && len > 0 && !ended {
+        Plan::Wait
+    } else {
+        let below = (written - at) as u64;
+        let skip: u64 = if cfg!(feature = "mut_stdin_replays") {
+            0
+        } else if cfg!(feature = "mut_stdin_apply_off_start") && below < len {
+            (below + 1) as u64
+        } else if below < len {
+            below
+        } else {
+            len
+        };
+        if len - skip == 0 {
+            Plan::Done { close: eof }
+        } else if (ended && !cfg!(feature = "mut_stdin_writes_ended"))
+            || (!open && !cfg!(feature = "mut_stdin_writes_after_eof")) {
+            Plan::Refuse
+        } else {
+            Plan::Apply { skip, take: (len - skip) as u64, close: eof }
+        }
+    }
+}
+
+/// W2 to W5: the decision of one positional write of `len` bytes at `at`, with `written` bytes of
+/// the stream applied, `open` (the pipe is not closed) and `ended` (the job ended or was removed).
+/// `eof` asks to close the stdin after the bytes. The shell calls it for each wait and once with
+/// the pipe held, and does only the I/O the plan names.
+pub fn stdin_plan(written: u64, at: u64, len: u64, eof: bool, open: bool, ended: bool) -> (p: Plan)
+    ensures
+        p == plan_of(written, at, len, eof, open, ended),
+        post_plan(written, at, len, eof, open, ended, p),
+        // W2a: the bytes below `written` are skipped, never applied again.
+        p is Apply && at <= written ==> p->Apply_skip as int >= (if written - at < len { (written - at) as int } else { len as int }),
+        // W2c: an apply starts exactly at `written`: no byte is skipped that was not applied.
+        p is Apply ==> at as int + p->Apply_skip as int == written as int,
+        // W5-live: nothing missing, nothing waited for.
+        at <= written ==> !(p is Wait),
+{
+    if at > written {
+        if ended {
+            Plan::Refuse
+        } else if cfg!(feature = "mut_stdin_applies_ahead") {
+            Plan::Apply { skip: 0, take: len, close: eof }
+        } else {
+            Plan::Wait
+        }
+    } else if cfg!(feature = "mut_stdin_waits_at_written") && at == written && len > 0 && !ended {
+        Plan::Wait
+    } else if cfg!(feature = "mut_stdin_wait_sticks") && at < written && len > 0 && !ended {
+        Plan::Wait
+    } else {
+        let below = written - at;
+        let skip = if cfg!(feature = "mut_stdin_replays") {
+            0
+        } else if cfg!(feature = "mut_stdin_apply_off_start") && below < len {
+            below + 1
+        } else if below < len {
+            below
+        } else {
+            len
+        };
+        if len - skip == 0 {
+            Plan::Done { close: eof }
+        } else if (ended && !cfg!(feature = "mut_stdin_writes_ended"))
+            || (!open && !cfg!(feature = "mut_stdin_writes_after_eof")) {
+            Plan::Refuse
+        } else {
+            Plan::Apply { skip, take: len - skip, close: eof }
+        }
+    }
+}
+
+/// W2: `written` after `n` bytes landed: it only grows, by exactly what landed.
+pub fn advance(written: u64, n: u64) -> (r: u64)
+    ensures
+        r >= written,
+        written as int + n as int <= u64::MAX as int ==> r as int == written as int + n as int,
+{
+    if cfg!(feature = "mut_stdin_written_shrinks") {
+        n
+    } else if written <= u64::MAX - n { written + n } else { u64::MAX }
+}
+
+/// What of a plan's `take` bytes is still to land after `landed` did (the shell's `write(2)`s).
+pub fn remaining(take: u64, landed: u64) -> (r: u64)
+    ensures
+        r as int == (if landed < take { take as int - landed as int } else { 0int }),
+{
+    if landed < take { take - landed } else { 0 }
+}
+
+/// W4: the stdin closes at EOF only once every byte of the write landed, so EOF never cuts a write
+/// short (a short write answers its exact `written` and leaves the pipe open).
+pub fn closes(close: bool, remaining: u64) -> (r: bool)
+    ensures
+        r <==> (close && remaining == 0),
+{
+    if cfg!(feature = "mut_stdin_closes_early") { close } else { close && remaining == 0 }
+}
+
+/// W1-live, progress: an admitted write is never stuck. The rank is the bytes of the write still
+/// above `written`, plus one for the answer. Under fairness F1 (what a write waits for is filled,
+/// or the job ends), F2 (the pipe takes at least one byte of a write) and F3 (the task runs); these
+/// three are the property's axioms: a
+/// `Wait` is left by any growth of `written` or by the job's end, and each `Apply` lowers the rank,
+/// so the write is answered in at most `stdin_rank` steps. A write is `Wait` only while ahead and
+/// alive, `Refuse`d only when ended or closed, and answered `Done` at rank 1.
+pub open spec fn stdin_rank(written: u64, at: u64, len: u64) -> int {
+    (if at as int + len as int > written as int { at as int + len as int - written as int } else { 0int }) + 1
+}
+
+pub proof fn lemma_stdin_progress(
+    written: u64,
+    at: u64,
+    len: u64,
+    eof: bool,
+    open: bool,
+    ended: bool,
+    written2: u64,
+)
+    requires
+        written2 > written,
+    ensures
+        ({
+            let p = plan_of(written, at, len, eof, open, ended);
+            let p2 = plan_of(written2, at, len, eof, open, ended);
+            &&& stdin_rank(written, at, len) >= 1
+            // a fair step (the gap fills, or bytes land) lowers the rank while the write is unanswered
+            &&& (stdin_rank(written, at, len) > 1 ==> stdin_rank(written2, at, len) < stdin_rank(written, at, len))
+            // F1 (the gap fills): once `written` reaches `at`, a living write is not made to wait again
+            // (and is never refused while open), so it applies or is answered
+            &&& (written2 >= at && !ended ==> !(p2 is Wait))
+            &&& (written2 >= at && !ended && open ==> !(p2 is Refuse))
+            // an apply that lands all its bytes leaves the write answered (rank 1), then it is `Done`
+            &&& (p is Apply && written2 as int == written as int + p->Apply_take as int
+                ==> stdin_rank(written2, at, len) == 1 && p2 == (Plan::Done { close: eof }))
+        }),
+{
 }
 
 // ---------------------------------------------------------------------------------------------

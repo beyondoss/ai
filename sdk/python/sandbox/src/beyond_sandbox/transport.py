@@ -84,11 +84,16 @@ class JobTransport(Transport, Protocol):
         args: Sequence[str] = (),
         cwd: str | None = None,
     ) -> Any:
-        """One job operation; its JSON answer."""
+        """One job operation; its JSON answer. A caller that chose a heartbeat also passes
+        ``heartbeat_seconds`` (the ``Keepalive-Ping-Interval`` header), and one that starts a job with
+        ``env`` passes ``env``; a transport that has no use for either may omit the parameter, and is
+        only ever passed it when it is set."""
         ...
 
     def job_stream(self, job: dict[str, Any]) -> JobFrameStream:
-        """A job operation answered by a stream (``attach``)."""
+        """A job operation answered by a stream (``attach``, or a held ``start``). When set, the
+        caller also passes ``command``, ``args``, ``cwd`` and ``env`` (a held start runs a command) and
+        ``heartbeat_seconds``; a transport is only ever passed what is set."""
         ...
 
 
@@ -168,8 +173,13 @@ class _Response:
 class _Frames:
     """Items of an NDJSON stream (command frames, or a job stream's). ``close()`` drops the connection."""
 
-    def __init__(self, resp: _Response, decoder: _wire.StreamDecoder[Any]) -> None:
-        self._resp, self._decoder = resp, decoder
+    def __init__(
+        self,
+        resp: _Response,
+        decoder: _wire.StreamDecoder[Any],
+        silence: float = _wire.SILENCE_S,
+    ) -> None:
+        self._resp, self._decoder, self._silence = resp, decoder, silence
         self._pending: deque[Any] = deque()
         self._closed = False
 
@@ -182,7 +192,7 @@ class _Frames:
                 self.close()
                 raise StopIteration
             try:
-                data = self._resp.next_chunk(_wire.SILENCE_S)
+                data = self._resp.next_chunk(self._silence)
                 if data:
                     self._pending.extend(self._decoder.feed(data))
                 else:
@@ -269,10 +279,21 @@ class HttpTransport:
         except OSError as e:
             raise TransportError(f"exec endpoint {self.url} unreachable: {e}") from None
 
-    def _open(self, body: bytes, timeout_ms: int, *, refresh: bool = False) -> _Response:
+    def _open(
+        self,
+        body: bytes,
+        timeout_ms: int,
+        *,
+        refresh: bool = False,
+        heartbeat_seconds: int | None = None,
+    ) -> _Response:
         """POST ``body``; return the response once its head is read. A non-2xx answer raises."""
         deadline = time.monotonic() + timeout_ms / 1000 + _wire.GRACE_S
-        request = _http.build_request(self._target, self._headers + self._bearer(refresh), body)
+        beat = _wire.check_heartbeat(heartbeat_seconds)
+        extra = [] if beat is None else [(_wire.HEARTBEAT_HEADER, str(beat))]
+        request = _http.build_request(
+            self._target, self._headers + self._bearer(refresh) + extra, body
+        )
         sock = self._connect(deadline)
         reader = _http.ResponseReader()
         resp = _Response(sock, reader, deadline, self.url)
@@ -298,11 +319,17 @@ class HttpTransport:
             err_body = b""
         resp.close()
         if reader.status == 401 and callable(self._token) and not refresh:
-            return self._open(body, timeout_ms, refresh=True)
+            return self._open(body, timeout_ms, refresh=True, heartbeat_seconds=heartbeat_seconds)
         raise _wire.status_error(self.url, reader.status, err_body)
 
-    def _post(self, body: bytes, timeout_ms: int, cap: int | None = None) -> bytes:
-        resp = self._open(body, timeout_ms)
+    def _post(
+        self,
+        body: bytes,
+        timeout_ms: int,
+        cap: int | None = None,
+        heartbeat_seconds: int | None = None,
+    ) -> bytes:
+        resp = self._open(body, timeout_ms, heartbeat_seconds=heartbeat_seconds)
         try:
             return resp.read_capped(self._cap if cap is None else cap)
         finally:
@@ -354,20 +381,40 @@ class HttpTransport:
         args: Sequence[str] = (),
         cwd: str | None = None,
         env: dict[str, str] | None = None,
+        heartbeat_seconds: int | None = None,
     ) -> Any:
         if env:
             self._prove_env()
         body = _wire.request_body(command, args, cwd=cwd, timeout_ms=30_000, job=job, env=env)
         try:
-            return _wire.parse_json(self.url, self._post(body, 30_000))
+            return _wire.parse_json(
+                self.url, self._post(body, 30_000, heartbeat_seconds=heartbeat_seconds)
+            )
         except TooLargeError:
             raise TooLargeError("a job answer exceeded the response cap") from None
 
-    def job_stream(self, job: dict[str, Any]) -> JobFrameStream:
+    def job_stream(
+        self,
+        job: dict[str, Any],
+        command: str = "true",
+        args: Sequence[str] = (),
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        heartbeat_seconds: int | None = None,
+    ) -> JobFrameStream:
+        if env:
+            self._prove_env()
         body = _wire.request_body(
-            "true", [], cwd=None, timeout_ms=_wire.STREAM_DEADLINE_MS, stream=True, job=job
+            command,
+            args,
+            cwd=cwd,
+            timeout_ms=_wire.STREAM_DEADLINE_MS,
+            stream=True,
+            job=job,
+            env=env,
         )
-        return _Frames(self._open(body, _wire.STREAM_DEADLINE_MS), _wire.job_decoder())
+        resp = self._open(body, _wire.STREAM_DEADLINE_MS, heartbeat_seconds=heartbeat_seconds)
+        return _Frames(resp, _wire.job_decoder(), _wire.silence_s(heartbeat_seconds))
 
     _env_proved = False
 

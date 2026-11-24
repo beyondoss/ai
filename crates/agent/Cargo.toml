@@ -283,6 +283,7 @@ mut_gate_ignores_limit = ["beyond-bash-gate/mut_gate_ignores_limit"]
 mut_quiet_never_hands_back = ["beyond-bash-gate/mut_quiet_never_hands_back"]
 mut_cwd_ignores_root = ["beyond-bash-gate/mut_cwd_ignores_root"]
 mut_command_entry_refused = ["beyond-bash-gate/mut_command_entry_refused"]
+mut_told_ignores_transcript = ["beyond-bash-gate/mut_told_ignores_transcript"]
 # Mutations of the job-table kernel (`crates/execd-jobs`), under which the notify model goes red where the table and the notifier meet.
 mut_remove_keeps_entry = ["beyond-execd-jobs/mut_remove_keeps_entry"]
 mut_remove_live = ["beyond-execd-jobs/mut_remove_live"]

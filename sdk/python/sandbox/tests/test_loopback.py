@@ -68,7 +68,7 @@ def test_jobs(execd_url: str) -> None:
     scope = f"pytest{time.monotonic_ns()}"
     try:
         sb.jobs.start(scope, "a1", "sh", ["-c", "echo one; sleep 0.2; echo two; exit 5"], label="x")
-        a = sb.jobs.attach(scope, "a1")
+        a = sb.jobs.collect(scope, "a1")
         assert (a.exit_code, a.output) == (5, b"one\ntwo\n")
         [j] = sb.jobs.list(scope)
         assert (j.id, j.state, j.code, j.label) == ("a1", "ended", 5, "x")
@@ -79,7 +79,7 @@ def test_jobs(execd_url: str) -> None:
         # A signal and an exit of 128 + S are told apart, in read and in list.
         sb.jobs.start(scope, "a3", "sh", ["-c", "kill -9 $$"])
         sb.jobs.start(scope, "a4", "sh", ["-c", "exit 137"])
-        a3, a4 = sb.jobs.attach(scope, "a3"), sb.jobs.attach(scope, "a4")
+        a3, a4 = sb.jobs.collect(scope, "a3"), sb.jobs.collect(scope, "a4")
         assert (a3.exit_code, a3.signal) == (137, 9)
         assert (a4.exit_code, a4.signal) == (137, None)
         by_id = {j.id: j for j in sb.jobs.list(scope)}
@@ -103,7 +103,7 @@ def test_async_sandbox(execd_url: str, tmp_path: Path) -> None:
             assert await sb.files.read(p) == b"async"
             scope = f"pyasync{time.monotonic_ns()}"
             await sb.jobs.start(scope, "b1", "sh", ["-c", "echo hey; exit 1"])
-            a = await sb.jobs.attach(scope, "b1")
+            a = await sb.jobs.collect(scope, "b1")
             assert (a.exit_code, a.output) == (1, b"hey\n")
             await sb.jobs.wipe(scope)
 

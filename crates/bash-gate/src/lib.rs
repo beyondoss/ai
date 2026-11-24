@@ -8,10 +8,14 @@
 //!   command keeps running as a held job: after [`IDLE_YIELD_MS`] of silence, at the call's ceiling,
 //!   or at the model's own `timeout_ms`. Returning is the whole effect: a hand-back kills nothing, and
 //!   a call that has waited past its ceiling always returns (progress).
-//! * **B3, the working directory** ([`call_cwd`], [`tool_root_source`]): a hosted session's tools are
+//! * **B5, the working directory** ([`call_cwd`], [`tool_root_source`]): a hosted session's tools are
 //!   rooted in the grant's `workspace_root`, and a call that names no `cwd` runs there.
 //! * **B4, the shape of an `.mcp.json` entry** ([`mcp_entry_shape`]): a `command` entry is a command
 //!   server, which a hosted session runs in its own sandbox.
+//! * **B3, a job's end is told once** ([`end_due`]): the session is told that a sandbox job ended
+//!   once, across a replica's death. What survives is the transcript: a notice it already holds is
+//!   told, whatever the sandbox's directory for the job still says. An ended job whose notice
+//!   nobody holds is always due (the retry after a restart tells it).
 //!
 //! Durations are in nanoseconds; this crate reads no clock.
 
@@ -186,7 +190,7 @@ pub enum Cwd {
     Inherit,
 }
 
-/// B3. Where a call runs, given whether the model named a `cwd` and whether the tool has a root.
+/// B5. Where a call runs, given whether the model named a `cwd` and whether the tool has a root.
 /// A call that names none runs in the root whenever there is one, and inherits only without one.
 pub fn call_cwd(named: bool, has_root: bool) -> (r: Cwd)
     ensures
@@ -212,7 +216,7 @@ pub enum RootSource {
     Process,
 }
 
-/// B3. A hosted (service) session's tools are rooted in the grant's `workspace_root`; only a local
+/// B5. A hosted (service) session's tools are rooted in the grant's `workspace_root`; only a local
 /// or replica process is rooted in its own cwd. With `call_cwd`, a hosted call that names no `cwd`
 /// runs in the workspace root (the root is never empty there: a grant with a relative or empty
 /// `workspace_root` is refused at open, `service.rs`).
@@ -285,6 +289,21 @@ pub fn mcp_entry_shape(kind: McpType, has_command: bool, has_url: bool) -> (r: M
     }
 }
 
+/// B3. Whether a job's end notice is due. `told_live` is this process having delivered it;
+/// `told_persisted` is the session's persisted transcript already holding it (a replica that died
+/// between persisting the report and deleting the job's directory left the job behind, ended). The
+/// iff is both halves: a held notice is never due again, and an ended job nobody holds always is.
+pub fn end_due(ended: bool, told_live: bool, told_persisted: bool) -> (r: bool)
+    ensures
+        r <==> (ended && !told_live && !told_persisted),
+{
+    if cfg!(feature = "mut_told_ignores_transcript") {
+        ended && !told_live
+    } else {
+        ended && !told_live && !told_persisted
+    }
+}
+
 } // verus!
 
 #[cfg(test)]
@@ -301,7 +320,7 @@ mod tests {
         assert_eq!(admit_start(MAX_RUNNING_JOBS + 5), Admit::Refuse);
     }
 
-    /// B3: a call that names no cwd runs in the root, and a hosted session is rooted in the workspace.
+    /// B5: a call that names no cwd runs in the root, and a hosted session is rooted in the workspace.
     /// Red under `mut_cwd_ignores_root`.
     #[test]
     fn a_call_without_cwd_runs_in_the_root() {
@@ -333,6 +352,16 @@ mod tests {
             mcp_entry_shape(McpType::Stdio, false, true),
             McpShape::Refused
         );
+    }
+
+    /// B3: a notice the transcript holds is not due again; an ended job it does not hold is. Red
+    /// under `mut_told_ignores_transcript`.
+    #[test]
+    fn a_persisted_end_is_not_told_again() {
+        assert!(!end_due(true, false, true));
+        assert!(end_due(true, false, false));
+        assert!(!end_due(true, true, false));
+        assert!(!end_due(false, false, false));
     }
 
     /// B2: 60 s of silence hands a foreground call back; 59 s does not. Red under

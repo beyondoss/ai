@@ -20,7 +20,15 @@ import {
   materialize,
   withSandboxDir,
 } from "./driver-bulk.js";
-import { SandboxError } from "./errors.js";
+import {
+  DiskFullError,
+  JobExistsError,
+  JobGoneError,
+  SandboxError,
+  StdinBusyError,
+  StdinClosedError,
+  StdinGapError,
+} from "./errors.js";
 import type { ErrorKind } from "./errors.js";
 import type { CapabilityOverrides } from "./files.js";
 import { Sandbox } from "./sandbox.js";
@@ -28,7 +36,12 @@ import type { SearchEngine } from "./search.js";
 import type { JobInfo, Survivor } from "./transport.js";
 
 type Json = Record<string, unknown>;
-type DriverError = { kind: ErrorKind | "unsupported"; detail: string };
+type DriverError = {
+  kind: ErrorKind | "unsupported";
+  detail: string;
+  /** The job condition, when the error is a finer type of its kind (DRIVER.md, `job_errors`). */
+  code?: string;
+};
 
 export const OPS = [
   "hello",
@@ -36,6 +49,9 @@ export const OPS = [
   "exec",
   "exec_stream",
   "job_start",
+  "job_start_held",
+  "job_keep",
+  "job_seen",
   "job_list",
   "job_read",
   "job_attach",
@@ -210,6 +226,8 @@ export class Driver {
               "job_streams",
               "job_stdin",
               "job_signal_op",
+              "job_errors",
+              "job_options",
             ],
           },
         };
@@ -293,13 +311,77 @@ export class Driver {
         });
         return { pgid };
       }
+      case "job_start_held": {
+        // Start held, learn the pgid from the first frame, optionally `keep`, then drop the
+        // stream: a job nobody kept dies with it (wire `hold: true`).
+        const cwd = optStr(req, "cwd");
+        const label = optStr(req, "label");
+        const env = optEnv(req);
+        const scope = str(req, "scope");
+        const job = str(req, "job");
+        const stream = jobs.startHeld(scope, job, {
+          command: str(req, "command"),
+          args: strings(req, "args"),
+          ...(cwd !== undefined ? { cwd } : {}),
+          ...(label !== undefined ? { label } : {}),
+          ...(env !== undefined ? { env } : {}),
+          ...(flag(req, "stdin_open") ? { stdinOpen: true } : {}),
+        }, heartbeat(req));
+        try {
+          for await (const f of stream) {
+            if (f.type !== "started") continue;
+            if (flag(req, "keep")) await jobs.keep(scope, job);
+            return { pgid: f.pgid };
+          }
+        } finally {
+          await stream.return(undefined);
+        }
+        throw new Reject({
+          kind: "protocol",
+          detail: "the held start ended before `started`",
+        });
+      }
+      case "job_keep": {
+        const num = optCount(req, "num");
+        const kind = optStr(req, "kind");
+        const seen = optCount(req, "seen");
+        await jobs.keep(str(req, "scope"), str(req, "job"), {
+          ...(num !== undefined ? { num } : {}),
+          ...(kind !== undefined ? { kind } : {}),
+          ...(seen !== undefined ? { seen } : {}),
+        });
+        return {};
+      }
+      case "job_seen":
+        await jobs.seen(
+          str(req, "scope"),
+          str(req, "job"),
+          optCount(req, "offset") ?? 0,
+        );
+        return {};
       case "job_list":
         return { jobs: (await jobs.list(str(req, "scope"))).map(jobJson) };
       case "job_read": {
-        const c = await jobs.read(str(req, "scope"), str(req, "job"), {
-          offset: optCount(req, "offset") ?? 0,
-          max: optCount(req, "max") ?? 128 * 1024,
-        });
+        let c;
+        try {
+          c = await jobs.read(str(req, "scope"), str(req, "job"), {
+            offset: optCount(req, "offset") ?? 0,
+            max: optCount(req, "max") ?? 128 * 1024,
+          });
+        } catch (e) {
+          // The wire answers `gone` for a job that is not there; the client says `JobGoneError`.
+          // `gone_as_error` asks for the error, as a caller of the client gets it.
+          if (e instanceof JobGoneError && !flag(req, "gone_as_error")) {
+            return {
+              state: "gone",
+              code: null,
+              offset: 0,
+              end: 0,
+              data_b64: "",
+            };
+          }
+          throw e;
+        }
         return {
           state: c.state,
           code: c.code,
@@ -315,6 +397,7 @@ export class Driver {
           str(req, "scope"),
           str(req, "job"),
           optCount(req, "offset") ?? 0,
+          heartbeat(req),
         );
         // As `exec_stream` ends: `signal` in place of `exit_code` for a death by signal.
         const end = a.signal === undefined
@@ -330,6 +413,9 @@ export class Driver {
       case "job_kill": {
         const s = await jobs.kill(str(req, "scope"), strings(req, "jobs"), {
           remove: flag(req, "remove"),
+          ...(optCount(req, "grace_ms") !== undefined
+            ? { graceMs: optCount(req, "grace_ms") as number }
+            : {}),
         });
         return {
           survivors: s.map((x: Survivor) => ({ id: x.id, detail: x.detail })),
@@ -360,7 +446,11 @@ export class Driver {
         return {};
       case "job_wipe":
         return {
-          survivors: (await jobs.wipe(str(req, "scope"))).map((x) => x.detail),
+          survivors: (await jobs.wipe(str(req, "scope"), {
+            ...(optCount(req, "grace_ms") !== undefined
+              ? { graceMs: optCount(req, "grace_ms") as number }
+              : {}),
+          })).map((x) => x.detail),
         };
       case "stat": {
         const s = await files.stat(str(req, "path"));
@@ -507,11 +597,41 @@ function tokenFromCommand(cmd: string): () => Promise<string> {
     });
 }
 
+/** `heartbeat_seconds`: the request's own heartbeat (the `Keepalive-Ping-Interval` header). */
+function heartbeat(req: Json): { heartbeatSeconds?: number } {
+  const v = req.heartbeat_seconds;
+  if (v === undefined || v === null) return {};
+  if (typeof v !== "number") {
+    throw invalid("`heartbeat_seconds` must be a number");
+  }
+  return { heartbeatSeconds: v };
+}
+
+/** The job condition of an error, by its class (DRIVER.md, `job_errors`). */
+function codeOf(e: SandboxError): string | undefined {
+  if (e instanceof JobGoneError) return "job_gone";
+  if (e instanceof JobExistsError) return "job_exists";
+  if (e instanceof DiskFullError) return "disk_full";
+  if (e instanceof StdinClosedError) {
+    return e.reason === "never_opened" ? "stdin_never_opened" : "stdin_closed";
+  }
+  if (e instanceof StdinGapError) return "stdin_gap";
+  if (e instanceof StdinBusyError) return "stdin_busy";
+  return undefined;
+}
+
 function toError(e: unknown): DriverError {
   if (e instanceof BulkReject) {
     return { kind: e.kind as ErrorKind, detail: e.detail };
   }
-  if (e instanceof SandboxError) return { kind: e.kind, detail: e.detail };
+  if (e instanceof SandboxError) {
+    const code = codeOf(e);
+    return {
+      kind: e.kind,
+      detail: e.detail,
+      ...(code === undefined ? {} : { code }),
+    };
+  }
   return { kind: "io", detail: e instanceof Error ? e.message : String(e) };
 }
 

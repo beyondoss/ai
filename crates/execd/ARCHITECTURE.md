@@ -159,7 +159,7 @@ never span a change of stream. Arrival order between the two files is the order 
 the answer echoes `stdin: true`. The job holds a `JobStdin`: the pipe behind an async (FIFO) mutex, `written` (a `watch`), a
 cancel token and a waiter count. `write` is positional (`at`): bytes below `written` are skipped, a write ahead waits on the
 `watch` without holding the pipe (so the write that fills the gap can run), then applies under the mutex, advancing `written`
-after every `write(2)`. So writes are ordered, idempotent and exact when cut off. There is no queue and no polling: a full pipe
+after every `write(2)`. So writes are ordered, idempotent and exact when cut off. Every decision of the write is the job kernel's (`execd_jobs::stdin_plan`: wait, refuse, already applied, or apply from `written`; `admit_waiter`; `advance`), proven in Verus: bytes below `written` are never applied again (W2a), `written` only grows (W2b) and an apply starts exactly at `written` (W2c); EOF closes only after every byte landed (`remaining`, `closes`), nothing lands on an ended job (W3) or after EOF (W4), a write ahead waits rather than applies (W5), the 17th waiter is refused (W1), and a refused or waiting write is always answered within `stdin_rank` steps (W1-live, `lemma_stdin_progress`). The shell only does the pipe's I/O, the `watch` and the mutex. There is no queue and no polling: a full pipe
 parks the request on the reactor, `timeout_ms` bounds the wait (short write), a dropped connection cancels it. `WRITE_MAX`
 128 KiB, `WAITERS_MAX` 16 per job (429). The token cancels and the pipe is dropped when the job ends or is removed, so no fd
 outlives the job. The std `Mutex<Job>` is never held across an await.
@@ -235,21 +235,32 @@ cargo test -p beyond-execd --test job_model faithful          # both bounds, all
 cargo test -p beyond-execd --features <mut> --test job_model the_mutation   # each MUST pass only if its property is red
 ```
 
-| mutation                     | property it turns red                              |
-| ---------------------------- | -------------------------------------------------- |
-| `mut_start_overwrites`       | J1                                                 |
-| `mut_scope_ignored`          | J2                                                 |
-| `mut_remove_keeps_entry`     | J3                                                 |
-| `mut_end_rewritten`          | J4 (`ended_is_final`, over every phase and event)  |
-| `mut_disconnect_kills_kept`  | J6                                                 |
-| `mut_remove_live`            | J7                                                 |
-| `mut_signal_ended`           | J8                                                 |
-| `mut_ended_not_removable`    | L1                                                 |
-| `mut_stream_follows_key`     | J9                                                 |
-| `mut_take_by_key`            | J10                                                |
-| `mut_follow_waits_after_end` | L2                                                 |
-| `mut_signal_after_reap`      | J11 (`os_model`, and Verus on `may_deliver`)       |
-| `mut_held_forgets`           | J11-live (`os_model`, and Verus on `Held::insert`) |
+| mutation                      | property it turns red                              |
+| ----------------------------- | -------------------------------------------------- |
+| `mut_start_overwrites`        | J1                                                 |
+| `mut_scope_ignored`           | J2                                                 |
+| `mut_remove_keeps_entry`      | J3                                                 |
+| `mut_end_rewritten`           | J4 (`ended_is_final`, over every phase and event)  |
+| `mut_disconnect_kills_kept`   | J6                                                 |
+| `mut_remove_live`             | J7                                                 |
+| `mut_signal_ended`            | J8                                                 |
+| `mut_ended_not_removable`     | L1                                                 |
+| `mut_stream_follows_key`      | J9                                                 |
+| `mut_take_by_key`             | J10                                                |
+| `mut_follow_waits_after_end`  | L2                                                 |
+| `mut_signal_after_reap`       | J11 (`os_model`, and Verus on `may_deliver`)       |
+| `mut_held_forgets`            | J11-live (`os_model`, and Verus on `Held::insert`) |
+| `mut_stdin_replays`           | W2 (Verus on `stdin_plan`)                         |
+| `mut_stdin_written_shrinks`   | W2b (Verus on `advance`)                           |
+| `mut_stdin_apply_off_start`   | W2c (Verus on `stdin_plan`)                        |
+| `mut_stdin_wait_sticks`       | W5-live (progress lemma)                           |
+| `mut_stdin_closes_early`      | W4 (Verus on `closes`)                             |
+| `mut_stdin_applies_ahead`     | W5 (Verus on `stdin_plan`)                         |
+| `mut_stdin_writes_ended`      | W3 (Verus on `stdin_plan`)                         |
+| `mut_stdin_writes_after_eof`  | W4 (Verus on `stdin_plan`)                         |
+| `mut_stdin_waiters_unbounded` | W1 (Verus on `admit_waiter`)                       |
+| `mut_stdin_waiter_stuck`      | W1-live (Verus on `admit_waiter`)                  |
+| `mut_stdin_waits_at_written`  | W5-live (Verus on `stdin_plan`)                    |
 
 ### The OS boundary (J11)
 
@@ -306,13 +317,15 @@ through a restart. A file has no reader to lose. `job_kernel::output_sink` decid
 pipe; S2: a command's is a pipe, which ends with its client), and `exec::command_for` and `start_job` call it.
 
 The files are always under the jobs directory (`EXECD_JOBS_DIR`, a disk), never the state directory (S7: `job_kernel::spool_root`,
-which `spool_base` calls). With `EXECD_STATE_DIR` they are in `<jobs>/execd-spool-<tag>/<mark>/` (`<tag>` hashes the state directory's path, so two ledgers in one jobs directory never clean up each other; `0700`, files `0600`, `O_EXCL`,
+which `spool_base` calls: with a ledger the stable directory, else the server's own, and there is no variant for the state directory). With `EXECD_STATE_DIR` they are in `<jobs>/execd-spool-<tag>/<mark>/` (`<tag>` hashes the state directory's path, so two ledgers in one jobs directory never clean up each other; `0700`, files `0600`, `O_EXCL`,
 `O_NOFOLLOW`), a directory no execd removes when it stops, which survives the process: the ledger names each job's spool by its
 path, so a restart finds it there. That name does not match `execd-jobs-<uid>-<pid>-<random>`, so the stale-directory cleanup at
 start never reads it. Without a state directory they are in this execd's own `execd-jobs-...` directory and die with it, as the
 jobs' ledger would not have kept them anyway. The state directory holds the ledger and nothing else: in a sandbox it is a tmpfs,
 where 8 MiB per job would be RAM and part of every memory snapshot. The spool's directory goes when the job is removed, and at a
 restart for every spool no recovered job names (`Spool::retain` over `<jobs>/execd-spool-<tag>`).
+
+**The stable directory is a trust boundary.** Its name is predictable and the jobs directory is shared (`/var/tmp` is world-writable), while execd (root) deletes inside it. `JobsDir::open` makes it non-recursively with mode `0700` and, every start, `lstat`s it: a real directory (never a link), owned by execd's uid, mode `0700`; anything else is refused and execd does not start (fail closed, logged). The directory is opened once (`O_DIRECTORY|O_NOFOLLOW`) and checked with `fstat` on the descriptor, and that descriptor is the only handle used afterwards: `Spool::create` makes a job's directory and files with `mkdirat` and `openat(O_NOFOLLOW|O_CREAT|O_EXCL)`, `Spool::at` and `Spool::retain` open and remove by name relative to it, and the opens that remain path-based (the tail, the journal, the ring) go through `/proc/self/fd/<n>` of the job's own held directory. A link swapped in at the stable directory's name after start is never followed (`a_link_swapped_in_after_start_is_not_followed`). The ledger still records the real name. A process that plants a link or a directory there gets a refusal, and nothing outside is touched.
 
 **The tail.** One task per job reads each file from its own offset into the job's ring (offsets, stderr labels and retention
 are still `crates/execd-ring`'s, R1-R6), a buffer from each file in turn, and yields to the runtime after each round. A file gives
@@ -364,8 +377,8 @@ disconnect (R2 above). Who restarts execd and keeps its process group out of the
 (`KillMode=process`, or its own).
 
 Proven in Verus (`execd-jobs`, `output_sink`, `spool_root` and `shutdown_of`): each of these `mut_*` features each turn one clause red
-(`mut_job_output_pipe`, `mut_command_output_spool`, `mut_spool_under_state`, `mut_shutdown_signals_jobs`, `mut_shutdown_orphans_unrecorded`,
-`mut_shutdown_forgets_jobs`, `mut_shutdown_spares_commands`), and `tests/restart.rs` drives the binary through S1, S7 (`a_ledgers_spools_are_in_the_jobs_directory_and_survive_a_restart`), S3 (a `SIGHUP`), S4 and S6 (a `SIGTERM`).
+(`mut_job_output_pipe`, `mut_command_output_spool`, `mut_ledger_spool_per_server`, `mut_unledgered_spool_stable`, `mut_shutdown_signals_jobs`, `mut_shutdown_orphans_unrecorded`,
+`mut_shutdown_forgets_jobs`, `mut_shutdown_spares_commands`), and `tests/restart.rs` drives the binary through S1, S7 (`a_ledgers_spools_are_in_the_jobs_directory_and_survive_a_restart`, `a_forked_disks_stale_spools_are_removed_before_serving`), S3 (a `SIGHUP`), S4 and S6 (a `SIGTERM`).
 
 **Measured** (`benches/jobs_first_byte.py`, n=40 per run, three runs each, release builds, this 2-CPU ext4/tmpfs host), before
 the pipe and after the file:
@@ -385,7 +398,7 @@ one thread for a pipe's worth of data per wake, and the tail reads 64 KiB per fi
 ```sh
 cargo test -p beyond-execd --test restart
 cargo test -p beyond-execd --features mut_job_output_pipe --test restart      # red
-cargo test -p beyond-execd --features mut_spool_under_state --test restart     # red
+cargo test -p beyond-execd --features mut_ledger_spool_per_server --test restart # red
 cargo test -p beyond-execd --features mut_shutdown_signals_jobs --test restart # red
 mise run verify:kernels -- --features mut_shutdown_signals_jobs               # red
 ```

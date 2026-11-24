@@ -1,19 +1,26 @@
 import { concat, fromBase64, text, toBase64 } from "./bytes.js";
 import {
   AuthError,
-  ConflictError,
+  DiskFullError,
   EndpointError,
   InvalidRequestError,
-  NotFoundError,
+  JobExistsError,
+  JobGoneError,
   NotOfferedError,
   ProtocolError,
   SandboxError,
+  StdinBusyError,
+  StdinClosedError,
+  StdinGapError,
   TimeoutError,
   TooLargeError,
   TransportError,
 } from "./errors.js";
 import {
+  DEFAULT_KILL_GRACE_MS,
   type Frame,
+  HEARTBEAT_MAX_S,
+  HEARTBEAT_MIN_S,
   isJobId,
   JOB_SIGNALS,
   type JobChunk,
@@ -22,8 +29,11 @@ import {
   type JobOps,
   type JobSpec,
   type JobState,
+  type KeepFields,
+  type ReqOptions,
   type RunOptions,
   type RunResult,
+  silenceMs,
   type StdinWritten,
   type Survivor,
   type Transport,
@@ -36,8 +46,6 @@ export const DEFAULT_MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 120_000;
 /** The client's deadline is the command's `timeout_ms` plus this, so the endpoint's verdict wins. */
 const DEADLINE_GRACE_MS = 30_000;
-/** A stream that goes this long without any frame (a heartbeat is a frame) is presumed dead. */
-const FRAME_SILENCE_MS = 30_000;
 /** The most a frame line may hold before a newline. */
 const MAX_LINE = 1024 * 1024;
 /** What a streamed command sends as `timeout_ms`: the connection is its lifetime. */
@@ -45,7 +53,6 @@ const STREAM_DEADLINE_MS = 2_147_483_647;
 /** The most a timer can hold. */
 const MAX_TIMER_MS = 2_147_483_647;
 const JOB_OP_TIMEOUT_MS = 30_000;
-const KILL_GRACE_MS = 300;
 /** Room for the JSON around two base64 strings. */
 const ENVELOPE_SLACK = 4096;
 
@@ -89,6 +96,8 @@ interface Body {
   stream?: boolean | undefined;
   job?: Record<string, unknown> | undefined;
   env?: Record<string, string> | undefined;
+  /** Sent as `Keepalive-Ping-Interval` (whole seconds, 1 to 240). */
+  heartbeatSeconds?: number | undefined;
 }
 
 /** The default transport: the exec protocol over HTTP `POST`. */
@@ -252,6 +261,7 @@ export class HttpTransport implements Transport {
 
   /** POST one request. Resolves once the status is known to be a success. */
   async post(body: Body, signal?: AbortSignal): Promise<Exchange> {
+    checkHeartbeat(body.heartbeatSeconds);
     const payload: Record<string, unknown> = {
       command: body.command,
       args: body.args,
@@ -269,7 +279,13 @@ export class HttpTransport implements Transport {
 
     let refreshed = false;
     for (;;) {
-      const ex = await this.send(json, deadline, refreshed, signal);
+      const ex = await this.send(
+        json,
+        deadline,
+        refreshed,
+        signal,
+        body.heartbeatSeconds,
+      );
       if (ex.res.ok) return ex;
       const status = ex.res.status;
       let detail: string;
@@ -304,11 +320,15 @@ export class HttpTransport implements Transport {
     deadlineMs: number,
     refresh: boolean,
     signal?: AbortSignal,
+    heartbeatSeconds?: number,
   ): Promise<Exchange> {
     if (signal?.aborted) {
       throw new TransportError(`exec endpoint ${this.url}: aborted`);
     }
     const headers = await this.requestHeaders(refresh);
+    if (heartbeatSeconds !== undefined) {
+      headers["keepalive-ping-interval"] = String(heartbeatSeconds);
+    }
     // Abort during token mint / header build never reaches the listener below: re-check.
     if (signal?.aborted) {
       throw new TransportError(`exec endpoint ${this.url}: aborted`);
@@ -443,8 +463,15 @@ export class HttpTransport implements Transport {
     return v;
   }
 
-  /** The lines of a streamed body, each without its newline. Presumes a dead connection after 30 s of silence. */
-  async *lines(ex: Exchange): AsyncGenerator<Uint8Array> {
+  /**
+   * The lines of a streamed body, each without its newline. Presumes a dead connection after
+   * {@link silenceMs} of silence: 30 s, or longer when the request chose a slower heartbeat.
+   */
+  async *lines(
+    ex: Exchange,
+    heartbeatSeconds?: number,
+  ): AsyncGenerator<Uint8Array> {
+    const silenceLimit = silenceMs(heartbeatSeconds);
     const reader = ex.res.body?.getReader();
     if (!reader) return;
     // `start` is the first unread byte: we copy each line once and only compact
@@ -479,11 +506,11 @@ export class HttpTransport implements Transport {
                   reject(
                     new TransportError(
                       `exec endpoint ${this.url}: no frame for ${
-                        FRAME_SILENCE_MS / 1000
+                        silenceLimit / 1000
                       } s; the endpoint stopped sending heartbeats, so the connection is presumed dead`,
                     ),
                   ),
-                FRAME_SILENCE_MS,
+                silenceLimit,
               );
               unref(silence);
             }),
@@ -523,12 +550,14 @@ export class HttpTransport implements Transport {
   /** One job operation that is not a stream: its JSON answer. */
   async jobCall(
     job: Record<string, unknown>,
+    req: ReqOptions = {},
   ): Promise<Record<string, unknown>> {
     const ex = await this.post({
       command: "true",
       args: [],
       timeoutMs: JOB_OP_TIMEOUT_MS,
       job,
+      heartbeatSeconds: req.heartbeatSeconds,
     });
     try {
       const { body, over } = await this.readCapped(ex);
@@ -746,6 +775,81 @@ function parseSurvivors(v: Record<string, unknown>): Survivor[] {
   });
 }
 
+/** A request's heartbeat is whole seconds, 1 to 240 (the endpoint would otherwise silently use its own). */
+function checkHeartbeat(seconds: number | undefined): void {
+  if (seconds === undefined) return;
+  if (
+    !Number.isInteger(seconds) || seconds < HEARTBEAT_MIN_S
+    || seconds > HEARTBEAT_MAX_S
+  ) {
+    throw new InvalidRequestError(
+      `heartbeatSeconds must be a whole number from ${HEARTBEAT_MIN_S} to ${HEARTBEAT_MAX_S}, got ${seconds}`,
+    );
+  }
+}
+
+/** The `written` an endpoint's 409 body carries, when its excerpt still has it. */
+function writtenIn(detail: string): number | undefined {
+  const m = /"written"\s*:\s*(\d+)/.exec(detail);
+  return m ? Number(m[1]) : undefined;
+}
+
+/**
+ * A job op's refusal, as the typed error of its status. Matches the reference client
+ * (`crates/sandbox/src/exec_endpoint/jobs_native.rs`, `write_stdin`): 404 no such job; stdin 409
+ * `has no stdin` (never opened), 409 `gap` (a write ahead of the stream), any other 409 (closed);
+ * 429 too many waiting writes. Each is a subclass of what this client threw before, so a catch of
+ * `NotFoundError`, `ConflictError` or `IoError` keeps working.
+ */
+function jobFailure(
+  e: unknown,
+  id: string,
+  op: "start" | "attach" | "write" | "other",
+): unknown {
+  if (!(e instanceof EndpointError)) return e;
+  const { status, detail } = e;
+  const cause = { cause: e };
+  if (status === 404 && op !== "start") {
+    return new JobGoneError(`job ${id}: ${detail}`, id, cause);
+  }
+  if (op === "start" && status === 409) {
+    return new JobExistsError(`job ${id} exists: ${detail}`, id, cause);
+  }
+  if (op === "start" && status === 507) {
+    return new DiskFullError(detail, cause);
+  }
+  if (op === "write") {
+    if (status === 409 && detail.includes("has no stdin")) {
+      return new StdinClosedError(
+        `job stdin: ${detail}`,
+        "never_opened",
+        undefined,
+        cause,
+      );
+    }
+    if (status === 409 && detail.includes("\"gap\"")) {
+      return new StdinGapError(
+        `job stdin: ${detail}`,
+        writtenIn(detail),
+        cause,
+      );
+    }
+    if (status === 409) {
+      return new StdinClosedError(
+        `job stdin: ${detail}`,
+        "closed",
+        writtenIn(detail),
+        cause,
+      );
+    }
+    if (status === 429) {
+      return new StdinBusyError(`job stdin: ${detail}`, cause);
+    }
+    if (status === 413) return new InvalidRequestError(detail, cause);
+  }
+  return e;
+}
+
 class HttpJobs implements JobOps {
   private readonly t: HttpTransport;
 
@@ -757,22 +861,57 @@ class HttpJobs implements JobOps {
     return { op, scope, ...extra };
   }
 
-  async start(scope: string, id: string, spec: JobSpec): Promise<number> {
-    const job = this.job("start", scope, {
-      id,
-      hold: false,
-      label: spec.label ?? "",
-      stdin_open: spec.stdinOpen === true,
-    });
-    await this.t.proveEnv(spec.env);
-    const ex = await this.t.post({
+  /** One non-stream job op: its JSON answer, a refusal typed. */
+  private async call(
+    id: string,
+    kind: "attach" | "write" | "other",
+    job: Record<string, unknown>,
+    req?: ReqOptions,
+  ): Promise<Record<string, unknown>> {
+    try {
+      return await this.t.jobCall(job, req);
+    } catch (e) {
+      throw jobFailure(e, id, kind);
+    }
+  }
+
+  private startBody(
+    scope: string,
+    id: string,
+    spec: JobSpec,
+    hold: boolean,
+    req: ReqOptions,
+  ): Body {
+    return {
       command: spec.command,
       args: spec.args ?? [],
       cwd: spec.cwd,
-      timeoutMs: JOB_OP_TIMEOUT_MS,
-      job,
+      timeoutMs: hold ? STREAM_DEADLINE_MS : JOB_OP_TIMEOUT_MS,
+      ...(hold ? { stream: true } : {}),
+      job: this.job("start", scope, {
+        id,
+        hold,
+        label: spec.label ?? "",
+        stdin_open: spec.stdinOpen === true,
+      }),
       env: spec.env,
-    });
+      heartbeatSeconds: req.heartbeatSeconds,
+    };
+  }
+
+  async start(
+    scope: string,
+    id: string,
+    spec: JobSpec,
+    req: ReqOptions = {},
+  ): Promise<number> {
+    await this.t.proveEnv(spec.env);
+    let ex: Exchange;
+    try {
+      ex = await this.t.post(this.startBody(scope, id, spec, false, req));
+    } catch (e) {
+      throw jobFailure(e, id, "start");
+    }
     try {
       const { body, over } = await this.t.readCapped(ex);
       if (over) {
@@ -789,7 +928,10 @@ class HttpJobs implements JobOps {
       }
       if (spec.stdinOpen === true && !echoed) {
         // Started without its stdin: stop it, so nothing is left running that reads EOF.
-        await this.kill(scope, [id], true).catch(() => {});
+        await this.kill(scope, [id], {
+          remove: true,
+          graceMs: DEFAULT_KILL_GRACE_MS,
+        }).catch(() => {});
         throw new NotOfferedError(
           "the endpoint predates job stdin: it ran the job without it",
         );
@@ -805,8 +947,56 @@ class HttpJobs implements JobOps {
     }
   }
 
-  async list(scope: string): Promise<JobInfo[]> {
-    const v = await this.t.jobCall(this.job("list", scope));
+  async *startHeld(
+    scope: string,
+    id: string,
+    spec: JobSpec,
+    req: ReqOptions = {},
+  ): AsyncGenerator<JobFrame> {
+    await this.t.proveEnv(spec.env);
+    let ex: Exchange;
+    try {
+      ex = await this.t.post(this.startBody(scope, id, spec, true, req));
+    } catch (e) {
+      throw jobFailure(e, id, "start");
+    }
+    try {
+      if (!isNdjson(ex.res)) {
+        throw new ProtocolError(
+          `exec endpoint ${this.t.url} answered a job stream with something that is not a stream`,
+        );
+      }
+      let first = true;
+      for await (const line of this.t.lines(ex, req.heartbeatSeconds)) {
+        const f = decodeJobFrame(line);
+        if (f === "heartbeat") continue;
+        if (first) {
+          first = false;
+          if (f.type !== "started") {
+            throw new ProtocolError(
+              "the endpoint's held start did not begin with `started`",
+            );
+          }
+          if (spec.stdinOpen === true && f.stdin !== true) {
+            // Closing the stream kills the held job (nothing was kept).
+            throw new NotOfferedError(
+              "the endpoint predates job stdin: it ran the job without it",
+            );
+          }
+        }
+        yield f;
+        if (f.type === "exit" || f.type === "signal") return;
+      }
+      throw new TransportError(
+        "job stream: the stream ended before the job's final frame",
+      );
+    } finally {
+      ex.close();
+    }
+  }
+
+  async list(scope: string, req?: ReqOptions): Promise<JobInfo[]> {
+    const v = await this.t.jobCall(this.job("list", scope), req);
     if (!Array.isArray(v.jobs)) throw badJob("list", v);
     const out: JobInfo[] = [];
     for (const j of v.jobs) {
@@ -835,9 +1025,11 @@ class HttpJobs implements JobOps {
     id: string,
     offset: number,
     max: number,
+    req?: ReqOptions,
   ): Promise<JobChunk> {
     const v = await this.t.jobCall(
       this.job("read", scope, { id, offset, max }),
+      req,
     );
     const st = jobState(v.state, v.code);
     const data = typeof v.data === "string" ? fromBase64(v.data) : null;
@@ -870,21 +1062,28 @@ class HttpJobs implements JobOps {
     scope: string,
     id: string,
     offset: number,
+    req: ReqOptions = {},
   ): AsyncGenerator<JobFrame> {
-    const ex = await this.t.post({
-      command: "true",
-      args: [],
-      timeoutMs: STREAM_DEADLINE_MS,
-      stream: true,
-      job: this.job("attach", scope, { id, offset }),
-    });
+    let ex: Exchange;
+    try {
+      ex = await this.t.post({
+        command: "true",
+        args: [],
+        timeoutMs: STREAM_DEADLINE_MS,
+        stream: true,
+        job: this.job("attach", scope, { id, offset }),
+        heartbeatSeconds: req.heartbeatSeconds,
+      });
+    } catch (e) {
+      throw jobFailure(e, id, "attach");
+    }
     try {
       if (!isNdjson(ex.res)) {
         throw new ProtocolError(
           `exec endpoint ${this.t.url} answered a job stream with something that is not a stream`,
         );
       }
-      for await (const line of this.t.lines(ex)) {
+      for await (const line of this.t.lines(ex, req.heartbeatSeconds)) {
         const f = decodeJobFrame(line);
         if (f === "heartbeat") continue;
         yield f;
@@ -898,21 +1097,59 @@ class HttpJobs implements JobOps {
     }
   }
 
+  async keep(
+    scope: string,
+    id: string,
+    fields: KeepFields,
+    req?: ReqOptions,
+  ): Promise<void> {
+    await this.call(
+      id,
+      "other",
+      this.job("keep", scope, {
+        id,
+        ...(fields.num !== undefined ? { num: fields.num } : {}),
+        ...(fields.kind !== undefined ? { kind: fields.kind } : {}),
+        ...(fields.seen !== undefined ? { seen: fields.seen } : {}),
+      }),
+      req,
+    );
+  }
+
+  async seen(
+    scope: string,
+    id: string,
+    offset: number,
+    req?: ReqOptions,
+  ): Promise<void> {
+    await this.call(id, "other", this.job("seen", scope, { id, offset }), req);
+  }
+
   async kill(
     scope: string,
     ids: string[],
-    remove: boolean,
+    fields: { remove: boolean; graceMs: number },
+    req?: ReqOptions,
   ): Promise<Survivor[]> {
     if (ids.length === 0) return [];
     const v = await this.t.jobCall(
-      this.job("kill", scope, { ids, remove, grace_ms: KILL_GRACE_MS }),
+      this.job("kill", scope, {
+        ids,
+        remove: fields.remove,
+        grace_ms: fields.graceMs,
+      }),
+      req,
     );
     return parseSurvivors(v);
   }
 
-  async remove(scope: string, ids: string[]): Promise<void> {
+  async remove(
+    scope: string,
+    ids: string[],
+    req?: ReqOptions,
+  ): Promise<void> {
     if (ids.length === 0) return;
-    await this.t.jobCall(this.job("remove", scope, { ids }));
+    await this.t.jobCall(this.job("remove", scope, { ids }), req);
   }
 
   async writeStdin(
@@ -921,29 +1158,19 @@ class HttpJobs implements JobOps {
     at: number,
     data: Uint8Array,
     eof: boolean,
+    req?: ReqOptions,
   ): Promise<StdinWritten> {
     if (data.length > WRITE_MAX) {
       throw new InvalidRequestError(
         `a write is at most ${WRITE_MAX} bytes, got ${data.length}`,
       );
     }
-    let v: Record<string, unknown>;
-    try {
-      v = await this.t.jobCall(
-        this.job("write", scope, { id, at, eof, data: toBase64(data) }),
-      );
-    } catch (e) {
-      if (e instanceof EndpointError) {
-        if (e.status === 404) throw new NotFoundError(e.detail, { cause: e });
-        if (e.status === 409 || e.status === 429) {
-          throw new ConflictError(`job stdin: ${e.detail}`, { cause: e });
-        }
-        if (e.status === 413) {
-          throw new InvalidRequestError(e.detail, { cause: e });
-        }
-      }
-      throw e;
-    }
+    const v = await this.call(
+      id,
+      "write",
+      this.job("write", scope, { id, at, eof, data: toBase64(data) }),
+      req,
+    );
     if (typeof v.written !== "number") throw badJob("write", v);
     return { written: v.written, closed: v.closed === true };
   }
@@ -952,6 +1179,7 @@ class HttpJobs implements JobOps {
     scope: string,
     ids: string[],
     signal: string,
+    req?: ReqOptions,
   ): Promise<string[]> {
     if (!JOB_SIGNALS.includes(signal)) {
       throw new InvalidRequestError(
@@ -961,15 +1189,23 @@ class HttpJobs implements JobOps {
       );
     }
     if (ids.length === 0) return [];
-    const v = await this.t.jobCall(this.job("signal", scope, { ids, signal }));
+    const v = await this.t.jobCall(
+      this.job("signal", scope, { ids, signal }),
+      req,
+    );
     if (!Array.isArray(v.sent)) throw badJob("signal", v);
     return v.sent.filter((i): i is string => typeof i === "string");
   }
 
-  async wipe(scope: string): Promise<Survivor[]> {
+  async wipe(
+    scope: string,
+    fields: { graceMs: number },
+    req?: ReqOptions,
+  ): Promise<Survivor[]> {
     return parseSurvivors(
       await this.t.jobCall(
-        this.job("wipe", scope, { grace_ms: KILL_GRACE_MS }),
+        this.job("wipe", scope, { grace_ms: fields.graceMs }),
+        req,
       ),
     );
   }

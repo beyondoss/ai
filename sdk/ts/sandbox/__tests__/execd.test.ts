@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { describe, expect, inject, it } from "vitest";
 import { Sandbox } from "../src/index.js";
 import type { Frame } from "../src/index.js";
-import { HttpTransport } from "../src/index.js";
+import { HttpTransport, JobGoneError } from "../src/index.js";
 
 const execd = inject("execd");
 /** Writes every byte value, 0x00 to 0xFF, to stdout. */
@@ -251,11 +251,6 @@ d("against a loopback execd", () => {
           const att = await sb.jobs.collect(scope, "job1");
           expect(att).toMatchObject({ exitCode: 5, gap: 0 });
           expect(dec(att.output)).toBe("one\ntwo\n");
-          // deprecated alias still works
-          expect(await sb.jobs.attach(scope, "job1")).toMatchObject({
-            exitCode: 5,
-            gap: 0,
-          });
           const c = await sb.jobs.read(scope, "job1", { offset: 4 });
           expect(c).toMatchObject({
             state: "ended",
@@ -273,7 +268,16 @@ d("against a loopback execd", () => {
           });
           await sb.jobs.remove(scope, ["job1"]);
           expect(await sb.jobs.list(scope)).toEqual([]);
-          expect((await sb.jobs.read(scope, "job1")).state).toBe("gone");
+          // The wire says `gone`; layer 2 says JobGoneError, and so does attaching to the id.
+          await expect(sb.jobs.read(scope, "job1")).rejects.toBeInstanceOf(
+            JobGoneError,
+          );
+          await expect(sb.jobs.collect(scope, "job1")).rejects.toBeInstanceOf(
+            JobGoneError,
+          );
+          expect(
+            (await sb.transport.jobs.read(scope, "job1", 0, 10)).state,
+          ).toBe("gone");
         } finally {
           await sb.jobs.wipe(scope);
         }

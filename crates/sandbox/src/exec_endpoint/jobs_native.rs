@@ -12,10 +12,29 @@ use serde_json::{Value, json};
 
 use super::HttpExecRunner;
 use super::jobs::{
-    EventSink, JOB_SIGNALS, JobEnd, JobEvent, JobId, JobInfo, JobNotify, JobScope, JobSpec,
-    JobStatus, ReadChunk, SandboxJobs, StdinWritten, Stream, WRITE_MAX,
+    EventSink, JOB_SIGNALS, JobEnd, JobError, JobEvent, JobId, JobInfo, JobNotify, JobOp, JobScope,
+    JobSpec, JobStatus, ReadChunk, SandboxJobs, StdinWritten, Stream, WRITE_MAX,
 };
-use super::stream::{FRAME_SILENCE_LIMIT, FrameReader};
+use super::stream::{FrameReader, silence_limit};
+
+/// A refusal as the job condition it is, when it is one; any other error is unchanged.
+fn refine(e: std::io::Error, op: JobOp) -> std::io::Error {
+    match super::endpoint_status(&e).and_then(|s| JobError::classify(op, s.status, &s.body)) {
+        Some(j) => j.into_io(),
+        None => e,
+    }
+}
+
+/// A heartbeat the request may ask for: whole seconds, 1 to 240 (`Keepalive-Ping-Interval`).
+fn check_beat(beat: Option<u32>) -> std::io::Result<()> {
+    match beat {
+        Some(s) if !(1..=240).contains(&s) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("heartbeat_seconds must be a whole number from 1 to 240, got {s}"),
+        )),
+        _ => Ok(()),
+    }
+}
 
 /// How long a job operation other than a stream may take.
 const OP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -210,11 +229,14 @@ impl<'a> NativeJobs<'a> {
         env: &[(String, String)],
         job: Value,
         stdin_open: bool,
+        beat: Option<u32>,
+        op: JobOp,
         events: EventSink<'_>,
     ) -> std::io::Result<JobEnd> {
+        check_beat(beat)?;
         let resp = self
             .runner
-            .send_env(
+            .send_env_beat(
                 program,
                 args,
                 cwd,
@@ -223,13 +245,15 @@ impl<'a> NativeJobs<'a> {
                 true,
                 Some(&job),
                 env,
+                beat,
             )
-            .await?;
+            .await
+            .map_err(|e| refine(e, op))?;
         let mut reader = FrameReader::new(resp);
         let broken = |e: String| std::io::Error::other(format!("job stream: {e}"));
         loop {
             let Some(line) = reader
-                .next_line(FRAME_SILENCE_LIMIT)
+                .next_line(silence_limit(beat))
                 .await
                 .map_err(broken)?
             else {
@@ -260,13 +284,16 @@ impl<'a> NativeJobs<'a> {
     }
 }
 
-#[async_trait]
-impl SandboxJobs for NativeJobs<'_> {
-    async fn run_held(
+impl NativeJobs<'_> {
+    /// [`SandboxJobs::run_held`] with a heartbeat of the request's choosing (whole seconds, 1 to
+    /// 240: the `Keepalive-Ping-Interval` header). The stream is presumed dead after two beats and
+    /// ten seconds of silence, never under 30 s.
+    pub async fn run_held_beat(
         &self,
         scope: &JobScope,
         id: &JobId,
         spec: &JobSpec,
+        beat: Option<u32>,
         events: EventSink<'_>,
     ) -> std::io::Result<JobEnd> {
         let job = Self::op(
@@ -284,9 +311,106 @@ impl SandboxJobs for NativeJobs<'_> {
             &spec.env,
             job,
             spec.stdin_open,
+            beat,
+            JobOp::Start,
             events,
         )
         .await
+    }
+
+    /// [`SandboxJobs::follow`] with a heartbeat of the request's choosing, as [`Self::run_held_beat`].
+    pub async fn follow_beat(
+        &self,
+        scope: &JobScope,
+        id: &JobId,
+        from: u64,
+        beat: Option<u32>,
+        events: EventSink<'_>,
+    ) -> std::io::Result<JobEnd> {
+        let job = Self::op(
+            "attach",
+            scope,
+            json!({ "id": id.as_str(), "offset": from }),
+        );
+        self.stream(
+            INERT,
+            &[],
+            None,
+            &[],
+            job,
+            false,
+            beat,
+            JobOp::Other,
+            events,
+        )
+        .await
+    }
+
+    /// [`SandboxJobs::read`] for a caller that wants a removed or unknown job as an error: the wire
+    /// answers state `gone`, this says [`JobError::Gone`] (as `Jobs.read` does in the TypeScript and
+    /// Python SDKs). [`SandboxJobs::read`] keeps the wire's `Gone` status.
+    pub async fn read_or_gone(
+        &self,
+        scope: &JobScope,
+        id: &JobId,
+        offset: u64,
+        max: usize,
+    ) -> std::io::Result<ReadChunk> {
+        let chunk = self.read(scope, id, offset, max).await?;
+        if chunk.status == JobStatus::Gone {
+            return Err(JobError::gone("the job does not exist or was removed").into_io());
+        }
+        Ok(chunk)
+    }
+
+    /// [`SandboxJobs::kill`] with the SIGTERM grace the caller names (wire `grace_ms`).
+    pub async fn kill_grace(
+        &self,
+        scope: &JobScope,
+        ids: &[JobId],
+        remove: bool,
+        grace_ms: u64,
+    ) -> std::io::Result<Vec<(JobId, String)>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<&str> = ids.iter().map(JobId::as_str).collect();
+        let v = self
+            .call(Self::op(
+                "kill",
+                scope,
+                json!({ "ids": ids, "remove": remove, "grace_ms": grace_ms }),
+            ))
+            .await?;
+        Ok(parse_survivors(&v)
+            .into_iter()
+            .filter_map(|(id, d)| Some((JobId::parse(&id?)?, d)))
+            .collect())
+    }
+
+    /// [`SandboxJobs::wipe`] with the SIGTERM grace the caller names (wire `grace_ms`).
+    pub async fn wipe_grace(
+        &self,
+        scope: &JobScope,
+        grace_ms: u64,
+    ) -> std::io::Result<Vec<String>> {
+        let v = self
+            .call(Self::op("wipe", scope, json!({ "grace_ms": grace_ms })))
+            .await?;
+        Ok(parse_survivors(&v).into_iter().map(|(_, d)| d).collect())
+    }
+}
+
+#[async_trait]
+impl SandboxJobs for NativeJobs<'_> {
+    async fn run_held(
+        &self,
+        scope: &JobScope,
+        id: &JobId,
+        spec: &JobSpec,
+        events: EventSink<'_>,
+    ) -> std::io::Result<JobEnd> {
+        self.run_held_beat(scope, id, spec, None, events).await
     }
 
     async fn start_kept(
@@ -315,7 +439,8 @@ impl SandboxJobs for NativeJobs<'_> {
                 Some(&job),
                 &spec.env,
             )
-            .await?;
+            .await
+            .map_err(|e| refine(e, JobOp::Start))?;
         let (body, _) = self.runner.read_capped(resp).await?;
         let answer = serde_json::from_slice::<Value>(&body).ok();
         if spec.stdin_open && answer.as_ref().and_then(|v| v.get("stdin")?.as_bool()) != Some(true)
@@ -346,12 +471,7 @@ impl SandboxJobs for NativeJobs<'_> {
         from: u64,
         events: EventSink<'_>,
     ) -> std::io::Result<JobEnd> {
-        let job = Self::op(
-            "attach",
-            scope,
-            json!({ "id": id.as_str(), "offset": from }),
-        );
-        self.stream(INERT, &[], None, &[], job, false, events).await
+        self.follow_beat(scope, id, from, None, events).await
     }
 
     async fn read(
@@ -386,6 +506,7 @@ impl SandboxJobs for NativeJobs<'_> {
         ))
         .await
         .map(drop)
+        .map_err(|e| refine(e, JobOp::Other))
     }
 
     async fn keep_notify(
@@ -407,6 +528,7 @@ impl SandboxJobs for NativeJobs<'_> {
         ))
         .await
         .map(drop)
+        .map_err(|e| refine(e, JobOp::Other))
     }
 
     async fn seen(&self, scope: &JobScope, id: &JobId, offset: u64) -> std::io::Result<()> {
@@ -417,6 +539,7 @@ impl SandboxJobs for NativeJobs<'_> {
         ))
         .await
         .map(drop)
+        .map_err(|e| refine(e, JobOp::Other))
     }
 
     async fn kill(
@@ -425,21 +548,7 @@ impl SandboxJobs for NativeJobs<'_> {
         ids: &[JobId],
         remove: bool,
     ) -> std::io::Result<Vec<(JobId, String)>> {
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let ids: Vec<&str> = ids.iter().map(JobId::as_str).collect();
-        let v = self
-            .call(Self::op(
-                "kill",
-                scope,
-                json!({ "ids": ids, "remove": remove, "grace_ms": KILL_GRACE_MS }),
-            ))
-            .await?;
-        Ok(parse_survivors(&v)
-            .into_iter()
-            .filter_map(|(id, d)| Some((JobId::parse(&id?)?, d)))
-            .collect())
+        self.kill_grace(scope, ids, remove, KILL_GRACE_MS).await
     }
 
     async fn list(&self, scope: &JobScope) -> std::io::Result<Vec<JobInfo>> {
@@ -455,7 +564,7 @@ impl SandboxJobs for NativeJobs<'_> {
         data: &[u8],
         eof: bool,
     ) -> std::io::Result<StdinWritten> {
-        use std::io::ErrorKind::{BrokenPipe, InvalidInput, NotFound};
+        use std::io::ErrorKind::InvalidInput;
         if data.len() > WRITE_MAX {
             return Err(std::io::Error::new(
                 InvalidInput,
@@ -473,20 +582,14 @@ impl SandboxJobs for NativeJobs<'_> {
         match self.call(job).await {
             Ok(v) => parse_written(&v),
             Err(e) => {
-                let Some(st) = super::endpoint_status(&e) else {
-                    return Err(e);
-                };
-                let kind = match st.status {
-                    404 => NotFound,
-                    409 if st.body.contains("has no stdin") => InvalidInput,
-                    409 if st.body.contains("\"gap\"") => std::io::ErrorKind::TimedOut,
-                    409 | 429 => BrokenPipe,
-                    413 => InvalidInput,
-                    _ => return Err(e),
-                };
-                // The 409 for a gap that never filled and the one for a closed stdin both carry
-                // `written`; the message says which.
-                Err(std::io::Error::new(kind, format!("job stdin: {}", st.body)))
+                // 413 is the endpoint's own answer for a write over the cap.
+                if let Some(st) = super::endpoint_status(&e).filter(|st| st.status == 413) {
+                    return Err(std::io::Error::new(
+                        InvalidInput,
+                        format!("job stdin: {}", st.body),
+                    ));
+                }
+                Err(refine(e, JobOp::Write))
             }
         }
     }
@@ -535,14 +638,7 @@ impl SandboxJobs for NativeJobs<'_> {
     }
 
     async fn wipe(&self, scope: &JobScope) -> std::io::Result<Vec<String>> {
-        let v = self
-            .call(Self::op(
-                "wipe",
-                scope,
-                json!({ "grace_ms": KILL_GRACE_MS }),
-            ))
-            .await?;
-        Ok(parse_survivors(&v).into_iter().map(|(_, d)| d).collect())
+        self.wipe_grace(scope, KILL_GRACE_MS).await
     }
 }
 
@@ -874,5 +970,70 @@ mod tests {
     fn a_wide_code_in_a_list_is_an_error() {
         let wide = json!({"jobs": [{"id": "j1", "state": "ended", "code": 4294967297_u64}]});
         assert!(parse_list(&wide).is_err());
+    }
+
+    #[test]
+    fn a_refusal_is_the_job_condition_of_its_status_and_operation() {
+        use super::super::jobs::StdinClosedReason::{Closed, NeverOpened};
+        let c = JobError::classify;
+        let code = |op, st, body| c(op, st, body).map(|j| j.code());
+        assert_eq!(
+            code(JobOp::Start, 409, "the job exists"),
+            Some("job_exists")
+        );
+        assert_eq!(code(JobOp::Start, 507, "disk full"), Some("disk_full"));
+        assert_eq!(code(JobOp::Other, 404, "no such job"), Some("job_gone"));
+        assert_eq!(code(JobOp::Write, 404, "no such job"), Some("job_gone"));
+        assert_eq!(
+            code(JobOp::Write, 409, r#"{"error":"the job has no stdin"}"#),
+            Some("stdin_never_opened")
+        );
+        assert_eq!(
+            code(JobOp::Write, 409, r#"{"error":"gap","written":2}"#),
+            Some("stdin_gap")
+        );
+        assert_eq!(
+            code(
+                JobOp::Write,
+                409,
+                r#"{"error":"stdin is closed","written":7}"#
+            ),
+            Some("stdin_closed")
+        );
+        assert_eq!(code(JobOp::Write, 429, "busy"), Some("stdin_busy"));
+        // The same status means nothing for another operation, and 5xx is no condition.
+        assert_eq!(code(JobOp::Other, 409, "x"), None);
+        assert_eq!(code(JobOp::Start, 404, "x"), None);
+        assert_eq!(code(JobOp::Start, 503, "x"), None);
+        // Each keeps the ErrorKind this client has always reported.
+        use std::io::ErrorKind::{BrokenPipe, InvalidInput, NotFound, TimedOut};
+        let kind = |st, body| c(JobOp::Write, st, body).unwrap().io_kind();
+        assert_eq!(kind(404, ""), NotFound);
+        assert_eq!(kind(409, "has no stdin"), InvalidInput);
+        assert_eq!(kind(409, r#""gap""#), TimedOut);
+        assert_eq!(kind(409, "closed"), BrokenPipe);
+        assert_eq!(kind(429, ""), BrokenPipe);
+        assert!(matches!(
+            c(JobOp::Write, 409, "has no stdin"),
+            Some(JobError::StdinClosed {
+                reason: NeverOpened,
+                ..
+            })
+        ));
+        assert!(matches!(
+            c(JobOp::Write, 409, "closed"),
+            Some(JobError::StdinClosed { reason: Closed, .. })
+        ));
+    }
+
+    #[test]
+    fn the_silence_limit_follows_the_heartbeat() {
+        use super::super::stream::silence_limit;
+        assert_eq!(silence_limit(None), Duration::from_secs(30));
+        assert_eq!(silence_limit(Some(1)), Duration::from_secs(30));
+        assert_eq!(silence_limit(Some(60)), Duration::from_secs(130));
+        assert_eq!(silence_limit(Some(240)), Duration::from_secs(490));
+        assert!(check_beat(Some(0)).is_err() && check_beat(Some(241)).is_err());
+        assert!(check_beat(Some(240)).is_ok() && check_beat(None).is_ok());
     }
 }

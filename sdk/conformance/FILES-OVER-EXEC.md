@@ -921,6 +921,11 @@ The driver ops are in DRIVER.md. Behaviours the scenarios pin:
   or unknown job, and with `remove` deletes jobs whose group is empty;
   `remove` never deletes a running job; `wipe` kills and deletes the scope;
 - scopes are separate namespaces; at least the last 8 MiB of output is kept;
+- a job refusal has a kind and, in a client that types it, a finer type of that kind (`code` in DRIVER.md):
+  `attach`, `keep`, `seen` or a stdin `write` of no job is `404` (`not_found`, JobGone); `start` of an id that exists is
+  `409` (`conflict`, JobExists); `start` on a full disk is `507` (`io`, DiskFull); a stdin `write` is `409` (`conflict`)
+  when the job has no stdin or it is closed (retrying cannot succeed) or when a gap never filled, and `429` (`conflict`,
+  retryable) when 16 writes already wait. A typed client turns the wire's `gone` into JobGone too (a `read` of a removed job);
 - when the shell exits leaving its group alive the job is `exited` with the
   shell's code until the group is empty (`ended`); `attach` ends only then.
 

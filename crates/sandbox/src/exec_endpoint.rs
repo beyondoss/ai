@@ -1149,6 +1149,26 @@ impl HttpExecRunner {
         job: Option<&serde_json::Value>,
         env: &[(String, String)],
     ) -> std::io::Result<reqwest::Response> {
+        self.send_env_beat(program, args, cwd, timeout, stdin, stream, job, env, None)
+            .await
+    }
+
+    /// [`Self::send_env`] with a heartbeat of the request's choosing: whole seconds, sent as the
+    /// `Keepalive-Ping-Interval` header (the endpoint takes 1 to 240 and uses its own otherwise).
+    #[allow(clippy::too_many_arguments)]
+    #[doc(hidden)]
+    pub async fn send_env_beat(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: Option<&str>,
+        timeout: Duration,
+        stdin: Option<&[u8]>,
+        stream: bool,
+        job: Option<&serde_json::Value>,
+        env: &[(String, String)],
+        beat: Option<u32>,
+    ) -> std::io::Result<reqwest::Response> {
         if !env.is_empty() && !self.env_proved.load(std::sync::atomic::Ordering::Relaxed) {
             self.prove_env().await?;
         }
@@ -1166,7 +1186,7 @@ impl HttpExecRunner {
                     .collect()
             }),
         };
-        self.send_request(timeout, &body).await
+        self.send_request(timeout, &body, beat).await
     }
 
     /// The behavioural proof [`Self::send_env`] runs once per endpoint identity.
@@ -1192,7 +1212,9 @@ impl HttpExecRunner {
                 .collect(),
             ),
         };
-        let resp = self.send_request(Duration::from_secs(10), &body).await?;
+        let resp = self
+            .send_request(Duration::from_secs(10), &body, None)
+            .await?;
         let answer = self.envelope(resp).await?;
         if answer.exit_code != 0 || answer.stdout != "MQ==" {
             return Err(std::io::Error::new(
@@ -1214,6 +1236,7 @@ impl HttpExecRunner {
         &self,
         timeout: Duration,
         body: &ExecRequest<'_>,
+        beat: Option<u32>,
     ) -> std::io::Result<reqwest::Response> {
         let mut token = match &self.auth {
             Some(auth) => Some(auth.token().await?),
@@ -1224,6 +1247,9 @@ impl HttpExecRunner {
             let mut req = self.client.post(&self.url).json(body);
             for (name, value) in &self.headers {
                 req = req.header(name.as_str(), value.as_str());
+            }
+            if let Some(s) = beat {
+                req = req.header("Keepalive-Ping-Interval", s.to_string());
             }
             if let Some(t) = &token {
                 req = req.bearer_auth(t);

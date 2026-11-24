@@ -25,6 +25,9 @@ class LocalTransport implements Transport {
   calls = 0;
   readonly jobs: JobOps = {
     start: refuse("jobs"),
+    startHeld: refuse("jobs"),
+    keep: refuse("jobs"),
+    seen: refuse("jobs"),
     list: refuse("jobs"),
     read: refuse("jobs"),
     attach: refuse("jobs"),
