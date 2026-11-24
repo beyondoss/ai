@@ -372,9 +372,11 @@ impl Mode {
     /// What [`tools::ToolConfig::root`](crate::tools::ToolConfig::root) reads: the grant's
     /// `workspace_root`, or empty for "the process cwd".
     pub(crate) fn tool_root(&self) -> PathBuf {
-        match self {
-            Mode::Service(service) => PathBuf::from(service.workspace_root()),
-            Mode::Local | Mode::Replica => PathBuf::new(),
+        match (bash_gate::tool_root_source(matches!(self, Mode::Service(_))), self) {
+            (bash_gate::RootSource::Workspace, Mode::Service(service)) => {
+                PathBuf::from(service.workspace_root())
+            }
+            _ => PathBuf::new(),
         }
     }
 

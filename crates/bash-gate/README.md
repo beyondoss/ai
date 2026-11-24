@@ -7,6 +7,8 @@ The agent's `bash` decisions as pure functions, written inside `verus!` and chec
 | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------- |
 | B1 a start is admitted below 20 running commands and refused at 20; the decision has no arm that stops a running one                                                     | `admit_start`, `lemma_a_start_stops_nothing`                                            |
 | B2 a foreground call hands back to the model after 60 s of silence, at its ceiling or at the model's `timeout_ms`, and always by its ceiling; handing back kills nothing | `yield_reason`, `lemma_sixty_seconds_hands_back`, `lemma_a_call_returns_by_its_ceiling` |
+| B4 an `.mcp.json` entry with a `command` (and no `"type"`, or `stdio`) is a command server, which a hosted session runs in its own sandbox; a `url` entry is a url server; the rest are refused | `mcp_entry_shape` |
+| B3 a hosted session's tools are rooted in the grant's `workspace_root`, and a call that names no `cwd` runs there (inherits the process cwd only without a root) | `tool_root_source`, `call_cwd` |
 
 ## Mutations
 
@@ -14,3 +16,5 @@ The agent's `bash` decisions as pure functions, written inside `verus!` and chec
 | ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `mut_gate_ignores_limit`     | `the_limit_gates_a_start` (this crate); `bash_background_tests::the_limit_counts_every_running_job_and_refuses_before_starting`, `bash_jobs_tests::a_command_at_the_limit_is_refused_with_the_list` (`beyond-agent`)                    |
 | `mut_quiet_never_hands_back` | `sixty_quiet_seconds_hand_a_call_back` (this crate); `bash_idle_yield_tests::a_quiet_command_returns_early_and_keeps_running_until_killed` (`beyond-agent`; the command outlasts the 60 s, so it fails by the call not returning early) |
+| `mut_cwd_ignores_root` | `a_call_without_cwd_runs_in_the_root` (this crate) |
+| `mut_command_entry_refused` | `a_command_entry_is_a_command_server` (this crate); `mcp_json` tests (`beyond-agent`) |
