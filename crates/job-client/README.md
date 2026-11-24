@@ -49,17 +49,24 @@ In `src/lib.rs`. `accepts(s)` says `s` is the encoding of some cursor whose fiel
 property has one `mut_*` feature that removes the guard it rests on and turns the proof red
 (`mise run verify:kernels -- --features <mut>`).
 
-| Property                                                                                                                                                                                     | Where                                                        | Mutant                                         |
-| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------ | ---------------------------------------------- |
-| C1 `decode(encode(c)) == Ok(c)` for every cursor: nothing valid is refused (the completeness partner of C3). `decode` is `Ok` exactly for the strings `encode` writes, and there is one each | `decode_bytes`'s ensures, `encode_fields`, `lemma_enc_facts` | `mut_rejects_max_offset`                       |
-| C2 the offset is exact: all 64 bits survive, `u64::MAX` included                                                                                                                             | `lemma_offset_hex_round_trip`, `lemma_hex_roundtrip`         | `mut_offset_truncated`                         |
-| C3a changing any one byte of an accepted string leaves a string that is refused                                                                                                              | `lemma_single_byte_change_refused`, `lemma_sum_one_diff`     | `mut_check_skipped`, `mut_check_skips_a_byte`  |
-| C3b a strict prefix of an accepted string is refused (a cursor cut short)                                                                                                                    | `lemma_prefix_refused`                                       | `mut_trailing_accepted` (the extension mirror) |
-| C3c an accepted string with bytes after it is refused                                                                                                                                        | `lemma_extension_refused`, `decode_bytes`'s `Ok ==> accepts` | `mut_trailing_accepted`                        |
-| C4 a decoded or constructed cursor has a scope of 1 to 64 `[0-9a-z-]`, an id of 1 to 32 `[0-9a-z]` and a mark of 1 to 32 `[0-9a-f]`: the type invariant, whoever made the value              | `Cursor::inv`, `Cursor::scope`, `Cursor::id`, `Cursor::mark` | `mut_scope_unchecked`, `mut_id_unchecked`      |
+| Property                                                                                                                                                                                                       | Where                                                                                     | Mutant                                                                          |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| C1 `decode(encode(c)) == Ok(c)` for every cursor: nothing valid is refused. `decode` is `Ok` exactly for the strings `encode` writes, and there is one each. This is the liveness (completeness) partner of C3 | `decode_bytes`'s ensures, `encode_fields`, `lemma_enc_facts`                              | `mut_rejects_max_offset`                                                        |
+| C2 the offset is exact: all 64 bits survive, `u64::MAX` included                                                                                                                                               | `lemma_offset_hex_round_trip`, `lemma_hex_roundtrip`                                      | `mut_offset_truncated`                                                          |
+| C3a changing any one byte of an accepted string leaves a string that is refused                                                                                                                                | `lemma_single_byte_change_refused`, `lemma_sum_one_diff`, `decode_bytes`'s C3a ensures    | `mut_check_skips_a_byte`                                                        |
+| C3b a strict prefix of an accepted string is refused (a cursor cut short)                                                                                                                                      | `lemma_prefix_refused`, `decode_bytes`'s C3b ensures                                      | `mut_prefix_accepted`                                                           |
+| C3c an accepted string with bytes after it is refused                                                                                                                                                          | `lemma_extension_refused`, `decode_bytes`'s C3c ensures                                   | `mut_trailing_accepted`                                                         |
+| C4 a decoded or constructed cursor has a scope of 1 to 64 `[0-9a-z-]`, an id of 1 to 32 `[0-9a-z]` and a mark of 1 to 32 `[0-9a-f]`: the type invariant, whoever made the value                                | `Cursor::inv`, `Cursor::scope`, `Cursor::id`, `Cursor::mark`, `decode_bytes`'s C4 ensures | `mut_scope_unchecked`, `mut_id_unchecked`, `mut_mark_unchecked` (one per field) |
 
-C1 is also the liveness partner of the refusals (C3): a valid cursor is always accepted, so a retry with the
-cursor a handle held never fails on the cursor. `decode` and `encode` are total and take no step.
+The mutants are the guards, not the lemmas: a mutant that makes `decode` accept what it must not breaks
+`decode_bytes`'s own ensures (`Ok` iff `accepts`), and with it every C3 clause, which rests on that. Run
+`mise run verify:kernels -- --features <mut> -- --multiple-errors 50` to see each failing clause named.
+`mut_check_skipped` (decode takes any check) is red at the `accepts` link and also covers C1 and C3a.
+
+C1 is the liveness (completeness) partner of the refusals (C3): a valid cursor is always accepted, so a retry
+with the cursor a handle held never fails on the cursor. It is stated in `decode_bytes`'s ensures and needs no fairness assumption.
+The properties are registered in Beyond's `proof/properties.toml` (C1 as `kind = "liveness"`, partner C3, `proof` the
+`decode_bytes` completeness ensures) when Beyond consumes this crate; this crate carries no registry. `decode` and `encode` are total and take no step.
 
 No `assume`, `admit` or `external_body`.
 

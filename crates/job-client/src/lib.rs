@@ -759,17 +759,9 @@ fn byte_ok(kind: u8, b: u8) -> (r: bool)
 {
     let digit = 48 <= b && b <= 57;
     if kind == 0 {
-        if cfg!(feature = "mut_scope_unchecked") {
-            true
-        } else {
-            digit || (97 <= b && b <= 122) || b == 45
-        }
+        digit || (97 <= b && b <= 122) || b == 45
     } else if kind == 1 {
-        if cfg!(feature = "mut_id_unchecked") {
-            true
-        } else {
-            digit || (97 <= b && b <= 122)
-        }
+        digit || (97 <= b && b <= 122)
     } else {
         digit || (97 <= b && b <= 102)
     }
@@ -1046,11 +1038,11 @@ pub fn encode_bytes(c: &Cursor) -> (v: Vec<u8>)
     encode_fields(c.scope.as_slice(), c.id.as_slice(), c.mark.as_slice(), c.offset)
 }
 
-/// Whether `s` is a cursor, and which. The refusals say which part is wrong; the proof says that the answer
-/// is `Ok` exactly for the strings [`encode_bytes`] writes (`accepts`), and that what it returns is the
-/// cursor that was written: C1 to C5.
+/// The decision: whether `input` is exactly the encoding of a cursor, and which. The refusals say which part
+/// is wrong; the proof says the answer is `Ok` exactly for the strings [`encode_bytes`] writes (`accepts`),
+/// and that what it returns is the cursor that was written.
 #[verifier::rlimit(100)]
-pub fn decode_bytes(input: &[u8]) -> (r: Result<Cursor, CursorError>)
+fn decode_core(input: &[u8]) -> (r: Result<Cursor, CursorError>)
     ensures
         (r is Ok) == accepts(input@),
         r matches Ok(c) ==> input@ == spec_enc(c.scope_v(), c.id_v(), c.mark_v(), c.offset_v()),
@@ -1058,14 +1050,9 @@ pub fn decode_bytes(input: &[u8]) -> (r: Result<Cursor, CursorError>)
             fields_ok(sc, id, mark) && input@ == #[trigger] spec_enc(sc, id, mark, off)
                 ==> (r is Ok && r->Ok_0.scope_v() == sc && r->Ok_0.id_v() == id && r->Ok_0.mark_v() == mark
                 && r->Ok_0.offset_v() == off),
+        r is Ok ==> fields_ok(r->Ok_0.scope_v(), r->Ok_0.id_v(), r->Ok_0.mark_v()),
 {
-    let s: &[u8] = if cfg!(feature = "mut_trailing_accepted") && input.len() > 0
-        && input[input.len() - 1] == 10
-    {
-        vstd::slice::slice_subrange(input, 0, input.len() - 1)
-    } else {
-        input
-    };
+    let s: &[u8] = input;
     proof {
         assert forall|sc: Seq<u8>, id: Seq<u8>, mark: Seq<u8>, off: u64|
             fields_ok(sc, id, mark) && s@ == #[trigger] spec_enc(sc, id, mark, off)
@@ -1090,13 +1077,13 @@ pub fn decode_bytes(input: &[u8]) -> (r: Result<Cursor, CursorError>)
     let Some(p2) = find_dot(s, p1 + 1, end) else {
         return Err(CursorError::BadField(Field::Separator));
     };
-    if p1 < 4 || p1 > 67 || !all_ok(s, 3, p1, 0) {
+    if p1 < 4 || p1 > 67 || (!cfg!(feature = "mut_scope_unchecked") && !all_ok(s, 3, p1, 0)) {
         return Err(CursorError::BadField(Field::Scope));
     }
-    if p2 < p1 + 2 || p2 > p1 + 33 || !all_ok(s, p1 + 1, p2, 1) {
+    if p2 < p1 + 2 || p2 > p1 + 33 || (!cfg!(feature = "mut_id_unchecked") && !all_ok(s, p1 + 1, p2, 1)) {
         return Err(CursorError::BadField(Field::Id));
     }
-    if end < p2 + 2 || end > p2 + 33 || !all_ok(s, p2 + 1, end, 2) {
+    if end < p2 + 2 || end > p2 + 33 || (!cfg!(feature = "mut_mark_unchecked") && !all_ok(s, p2 + 1, end, 2)) {
         return Err(CursorError::BadField(Field::Mark));
     }
     if !all_ok(s, n - 21, n - 5, 2) {
@@ -1106,9 +1093,6 @@ pub fn decode_bytes(input: &[u8]) -> (r: Result<Cursor, CursorError>)
         return Err(CursorError::BadField(Field::Check));
     }
     let offset = parse_hex(s, n - 21, 16);
-    if cfg!(feature = "mut_rejects_max_offset") && offset == u64::MAX {
-        return Err(CursorError::BadField(Field::Offset));
-    }
     let check = parse_hex(s, n - 4, 4);
     let computed = sum_of(s, n - 5);
     proof {
@@ -1155,6 +1139,72 @@ pub fn decode_bytes(input: &[u8]) -> (r: Result<Cursor, CursorError>)
         }
     }
     Ok(c)
+}
+
+/// Whether `input` is a cursor, and which: [`decode_core`] under the rules of the cursor's refusals. The
+/// proof says the answer is `Ok` exactly for the strings [`encode_bytes`] writes (C1), that what it returns
+/// is the cursor that was written (C1), that nothing altered by one byte (C3a), cut short (C3b) or with
+/// bytes after it (C3c) from a valid cursor is accepted, and that a decoded cursor obeys the field rules (C4).
+pub fn decode_bytes(input: &[u8]) -> (r: Result<Cursor, CursorError>)
+    ensures
+        (r is Ok) == accepts(input@),
+        r matches Ok(c) ==> input@ == spec_enc(c.scope_v(), c.id_v(), c.mark_v(), c.offset_v()),
+        forall|sc: Seq<u8>, id: Seq<u8>, mark: Seq<u8>, off: u64|
+            fields_ok(sc, id, mark) && input@ == #[trigger] spec_enc(sc, id, mark, off)
+                ==> (r is Ok && r->Ok_0.scope_v() == sc && r->Ok_0.id_v() == id && r->Ok_0.mark_v() == mark
+                && r->Ok_0.offset_v() == off),
+        // C3a: one byte changed in a valid cursor
+        forall|orig: Seq<u8>, i: int, b: u8|
+            accepts(orig) && 0 <= i < orig.len() && b != orig[i] && input@ == #[trigger] orig.update(i, b)
+                ==> r is Err,
+        // C3b: a valid cursor cut short
+        forall|orig: Seq<u8>, k: int|
+            accepts(orig) && 0 <= k < orig.len() && input@ == #[trigger] orig.subrange(0, k) ==> r is Err,
+        // C3c: a valid cursor with bytes after it
+        forall|orig: Seq<u8>, extra: Seq<u8>|
+            accepts(orig) && extra.len() > 0 && input@ == #[trigger] (orig + extra) ==> r is Err,
+        // C4: the fields of a decoded cursor obey the rules
+        r is Ok ==> fields_ok(r->Ok_0.scope_v(), r->Ok_0.id_v(), r->Ok_0.mark_v()),
+{
+    let r = decode_core(input);
+    if cfg!(feature = "mut_rejects_max_offset") {
+        if let Ok(c) = &r {
+            if c.offset() == u64::MAX {
+                return Err(CursorError::BadField(Field::Offset));
+            }
+        }
+    }
+    if cfg!(feature = "mut_prefix_accepted") && r.is_err() {
+        // A cursor missing its last byte is read as if the byte were `0`.
+        let mut padded: Vec<u8> = Vec::new();
+        append(&mut padded, input);
+        padded.push(48);
+        return decode_core(padded.as_slice());
+    }
+    if cfg!(feature = "mut_trailing_accepted") && r.is_err() && input.len() > 0
+        && input[input.len() - 1] == 10
+    {
+        // A trailing newline is dropped.
+        return decode_core(vstd::slice::slice_subrange(input, 0, input.len() - 1));
+    }
+    proof {
+        assert forall|orig: Seq<u8>, i: int, b: u8|
+            accepts(orig) && 0 <= i < orig.len() && b != orig[i] && input@ == #[trigger] orig.update(i, b)
+            implies r is Err by {
+            lemma_single_byte_change_refused(orig, i, b);
+        }
+        assert forall|orig: Seq<u8>, k: int|
+            accepts(orig) && 0 <= k < orig.len() && input@ == #[trigger] orig.subrange(0, k)
+            implies r is Err by {
+            lemma_prefix_refused(orig, k);
+        }
+        assert forall|orig: Seq<u8>, extra: Seq<u8>|
+            accepts(orig) && extra.len() > 0 && input@ == #[trigger] (orig + extra)
+            implies r is Err by {
+            lemma_extension_refused(orig, extra);
+        }
+    }
+    r
 }
 
 } // verus!

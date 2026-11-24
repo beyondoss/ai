@@ -26,10 +26,12 @@ verify = true
 [features]
 # Mutations of the cursor's decisions, each removing one guard. The proof
 # (`mise run verify:kernels -- --features <mut>`, which runs here) goes red under each.
-mut_offset_truncated = [] # encode writes only the low 32 bits of the offset (C2, C5)
-mut_check_skipped = [] # decode accepts any check value (C3)
-mut_check_skips_a_byte = [] # the check leaves out the last body byte, so a change there goes unseen (C3)
-mut_trailing_accepted = [] # decode ignores bytes after a cursor's end, so an extension decodes (C3)
+mut_offset_truncated = [] # encode writes only the low 32 bits of the offset (C2)
+mut_check_skipped = [] # decode accepts any check value (C1, C3a)
+mut_check_skips_a_byte = [] # the check leaves out the last body byte, so a change there goes unseen (C3a)
+mut_trailing_accepted = [] # decode drops one trailing newline, so a cursor with a byte glued on decodes (C3c)
+mut_prefix_accepted = [] # decode pads a missing last byte, so a cursor cut short decodes (C3b)
 mut_scope_unchecked = [] # decode takes any byte in a scope (C4)
+mut_mark_unchecked = [] # decode takes any byte in a mark (C4)
 mut_id_unchecked = [] # decode takes any byte in an id (C4)
 mut_rejects_max_offset = [] # decode refuses the offset u64::MAX, a valid cursor (C1, C2)
