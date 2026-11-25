@@ -612,6 +612,14 @@ async fn execd_restarts_with_its_keeper_already_dead_and_the_terminal_ends_clean
 /// the sandbox runs.
 #[tokio::test]
 async fn the_shell_holds_no_descriptor_of_execd_or_the_keeper() {
+    // What this process was handed from outside (a test runner's pipes): not execd's own, and not
+    // execd's to close. Anything else past 0, 1 and 2 would be execd's or the keeper's.
+    let inherited: Vec<String> = std::fs::read_dir("/proc/self/fd")
+        .unwrap()
+        .flatten()
+        .filter_map(|d| std::fs::read_link(d.path()).ok())
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
     let (e, _jobs) = start_execd(&[]);
     let a = SocketAddr::V4(e.addr);
     term(a, "f", "echo pid=$$; exec sleep 300", 80, 24).await;
@@ -635,12 +643,21 @@ async fn the_shell_holds_no_descriptor_of_execd_or_the_keeper() {
         })
         .collect();
     open.sort();
-    let names: Vec<&str> = open.iter().map(|(n, _)| n.as_str()).collect();
-    assert_eq!(names, ["0", "1", "2"], "the shell's descriptors: {open:?}");
+    let ours: Vec<&(String, String)> = open
+        .iter()
+        .filter(|(n, t)| !(["0", "1", "2"].contains(&n.as_str()) || inherited.contains(t)))
+        .collect();
     assert!(
-        open.iter().all(|(_, t)| t.starts_with("/dev/pts/")),
-        "a standard descriptor is not the terminal: {open:?}"
+        ours.is_empty(),
+        "the shell holds execd's or the keeper's: {open:?}"
     );
+    for std in ["0", "1", "2"] {
+        assert!(
+            open.iter()
+                .any(|(n, t)| n == std && t.starts_with("/dev/pts/")),
+            "descriptor {std} is not the terminal: {open:?}"
+        );
+    }
     job(
         a,
         json!({"op":"kill","scope":"s","ids":["f"],"grace_ms":100}),

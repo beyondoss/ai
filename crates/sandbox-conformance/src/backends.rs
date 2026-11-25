@@ -248,7 +248,6 @@ impl LocalHost {
         let mut c = Command::new(execd);
         c.env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
-            // port-0: execd binds it, keeps it, and announces the port it got (read by `listening`).
             .env("EXECD_LISTEN", listen)
             .env("EXECD_ROOT", root)
             .env("EXECD_JOBS_DIR", jobs)
@@ -358,8 +357,15 @@ async fn local(
     let jobs = jobs_dir.path().canonicalize().map_err(|e| e.to_string())?;
     let state_dir = tempfile::tempdir().map_err(|e| e.to_string())?;
     let state = state_dir.path().canonicalize().map_err(|e| e.to_string())?;
-    let (child, leader, addr) =
-        LocalHost::spawn(&execd, &work, (&jobs, &state), bearer, "127.0.0.1:0").await?;
+    let (child, leader, addr) = LocalHost::spawn(
+        &execd,
+        &work,
+        (&jobs, &state),
+        bearer,
+        // port-0: execd binds it, keeps it, and announces the port it got (read by `listening`).
+        "127.0.0.1:0",
+    )
+    .await?;
     let host = std::sync::Arc::new(LocalHost {
         execd,
         root: work.clone(),
