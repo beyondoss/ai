@@ -147,8 +147,7 @@ impl Jobs {
                         .and_then(|s| s.term.as_ref())
                         .map(|t| t.keeper_pid);
                     Entry::of(
-                        &scope,
-                        &id,
+                        (&scope, &id),
                         &j.label,
                         &j.argv,
                         &j.mark,

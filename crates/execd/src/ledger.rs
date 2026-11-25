@@ -99,8 +99,7 @@ struct File {
 impl Entry {
     /// What to save of a job, or `None` for one not worth saving: no group yet, or removed.
     pub fn of(
-        scope: &str,
-        id: &str,
+        (scope, id): (&str, &str),
         label: &str,
         argv: &crate::jobs::Argv,
         mark: &str,
