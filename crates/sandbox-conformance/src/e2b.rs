@@ -433,7 +433,10 @@ sudo chmod 700 @HOME@/bin/execd-restart"#
         vars: BTreeMap::from([
             ("SPOOL_STATE".into(), STATE_DIR.into()),
             ("SPOOL_JOBS".into(), JOBS_DIR.into()),
-            ("EXECD_RESTART".into(), format!("sudo {HOME}/bin/execd-restart")),
+            (
+                "EXECD_RESTART".into(),
+                format!("sudo {HOME}/bin/execd-restart"),
+            ),
         ]),
         lease: Some(Arc::new({
             let vm = vm.clone();
