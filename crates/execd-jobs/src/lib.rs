@@ -45,6 +45,7 @@
     clippy::single_match,
     clippy::collapsible_if,
     clippy::nonminimal_bool,
+    clippy::ptr_arg,
     non_shorthand_field_patterns
 )]
 
