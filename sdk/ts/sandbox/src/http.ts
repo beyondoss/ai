@@ -1021,9 +1021,9 @@ class HttpJobs implements JobOps {
       if (!st) continue;
       // An endpoint that predates marks names none of these: its list is not trusted.
       if (
-        typeof j.mark !== "string" ||
-        typeof j.command !== "string" ||
-        !Array.isArray(j.args)
+        typeof j.mark !== "string"
+        || typeof j.command !== "string"
+        || !Array.isArray(j.args)
       ) {
         throw new NotOfferedError(
           "the endpoint predates job marks: its list did not name the job's incarnation",
