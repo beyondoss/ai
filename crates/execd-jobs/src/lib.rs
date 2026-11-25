@@ -1297,16 +1297,14 @@ pub enum Attach {
 }
 
 /// Where a stream stands once it takes `output` into account: an output stream stays at `sent`; a
-/// status-only one (`output: false`) skips everything held and everything still to come, to the
-/// ring's `end` (M7).
+/// status-only one (`output: false`) is at the ring's `end`, whatever it was asked to start at: it
+/// skips everything held and everything still to come (M6).
 pub fn quiet_from(output: bool, sent: u64, end: u64) -> (r: u64)
     ensures
         output ==> r == sent,
-        !output ==> (r >= end && r >= sent),
+        !output ==> r == end,
 {
     if output || cfg!(feature = "mut_status_only_streams") {
-        sent
-    } else if sent > end {
         sent
     } else {
         end
@@ -1320,36 +1318,36 @@ pub fn attach_plan(mark_ok: bool, output: bool, offset: u64, end: u64) -> (r: At
     ensures
         !mark_ok ==> r is Refuse,
         mark_ok ==> r is Stream,
-        mark_ok && output ==> r == (Attach::Stream { from: offset }),
-        mark_ok && !output ==> (r->Stream_from >= end && r->Stream_from >= offset),
+        (r is Stream && output) ==> r->Stream_from == offset,
+        (r is Stream && !output) ==> r->Stream_from == end,
 {
     if !mark_ok && !cfg!(feature = "mut_attach_ignores_mark") {
         Attach::Refuse
     } else if cfg!(feature = "mut_attach_refuses") {
         Attach::Refuse
+    } else if output && cfg!(feature = "mut_attach_offset_shifted") {
+        Attach::Stream { from: end }
     } else {
         Attach::Stream { from: quiet_from(output, offset, end) }
     }
 }
 
-/// M7: a status-only stream (its `sent` is at least the ring's `end`, which `quiet_from` makes it)
-/// sends neither bytes nor a gap: its next frame is the shell's exit, the end, or a wait.
-pub proof fn lemma_status_only_is_silent(
-    s: State,
-    sent: u64,
-    base: u64,
-    end: u64,
-    told: bool,
-    f: Follow,
-)
-    requires
-        base <= end,
-        sent >= end,
-        post_follow(s, sent, base, end, told, f),
+/// M7: what a stream sends next, from where `quiet_from` puts it. A status-only stream (`output:
+/// false`) of a ring `[base, end)` sends neither bytes nor a gap: its next frame is the shell's
+/// exit, the end, or a wait. Returns the stream's position and that frame.
+pub fn stream_next(output: bool, s: &State, sent: u64, base: u64, end: u64, shell_told: bool) -> (r: (u64, Follow))
     ensures
-        !(f is Data),
-        !(f is Gap),
+        post_follow(*s, r.0, base, end, shell_told, r.1),
+        (!output && base <= end) ==> !(r.1 is Data),
+        (!output && base <= end) ==> !(r.1 is Gap),
 {
+    let at = if !output && cfg!(feature = "mut_status_only_sends") {
+        sent
+    } else {
+        quiet_from(output, sent, end)
+    };
+    let f = follow(s, at, base, end, shell_told);
+    (at, f)
 }
 
 // ---------------------------------------------------------------------------------------------

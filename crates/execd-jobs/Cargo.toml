@@ -78,4 +78,6 @@ mut_remove_never_takes = [] # a remove of a job that may go reports it running (
 mut_running_unreported = [] # a remove skips a running job and reports it as a mismatch (M3)
 mut_attach_ignores_mark = [] # an attach naming another incarnation streams anyway (M4)
 mut_attach_refuses = [] # an attach refuses the incarnation it names (M4-live)
-mut_status_only_streams = [] # a status-only attach starts at its offset, so it streams bytes (M5, M6, M7)
+mut_status_only_streams = [] # a status-only attach starts at its offset, not the end (M6)
+mut_status_only_sends = [] # a status-only stream is not moved to the end before it follows, so it sends bytes (M7)
+mut_attach_offset_shifted = [] # an attach with output starts at the end, not at the offset it asked for (M5)

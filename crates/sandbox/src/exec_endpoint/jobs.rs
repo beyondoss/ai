@@ -513,6 +513,19 @@ pub trait SandboxJobs: Send + Sync {
         events: EventSink<'_>,
     ) -> std::io::Result<JobEnd>;
 
+    /// [`Self::follow`] naming the incarnation it means (`mark`: a job of another mark is a not-found
+    /// error and nothing is streamed) and whether to carry output (`false`: a status-only attach, which
+    /// starts at the job's current end). The first event is [`JobEvent::Attached`].
+    async fn follow_marked(
+        &self,
+        scope: &JobScope,
+        id: &JobId,
+        from: u64,
+        mark: Option<&str>,
+        output: bool,
+        events: EventSink<'_>,
+    ) -> std::io::Result<JobEnd>;
+
     /// Up to `max` bytes of output from `offset`, and the job's status.
     async fn read(
         &self,

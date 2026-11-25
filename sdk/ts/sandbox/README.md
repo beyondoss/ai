@@ -109,7 +109,7 @@ The sandbox is not trusted on download: a member with `..` or an absolute name, 
 `stdinOpen: true` at start), `signal(scope, ids, "SIGINT")` (one of `SIGHUP SIGINT SIGQUIT SIGUSR1 SIGUSR2 SIGTERM SIGKILL`,
 sent at once with no grace; `kill` is the TERM, grace, KILL escalation). A job is owned by the sandbox: it keeps
 running when you disconnect, and its last 8 MiB of output is readable from any offset. The sandbox keeps them; the client
-validates and forwards. `scope` is 1 to 64 of `[0-9a-z-]`, an id 1 to 32 of `[0-9a-z]`.
+validates and forwards. `scope` is 1 to 64 of `[0-9a-z-]`, an id 1 to 64 of `[0-9a-z_-]`.
 
 The wire's other options are there under the wire's names: `startHeld` (`hold: true`: the job lives only as long as its
 stream unless you `keep` it), `keep(scope, id, { num, kind, seen })`, `seen(scope, id, offset)`, `graceMs` (the SIGTERM grace

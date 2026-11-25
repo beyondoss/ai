@@ -1469,8 +1469,10 @@ async fn follow(
                 let j = locked(&cell);
                 let total = j.out.end();
                 // A status-only stream is never behind: it sends no bytes and no gap (M7).
-                sent = kernel::quiet_from(output, sent, total);
-                match kernel::follow(&j.k, sent, j.out.base, total, shell_told) {
+                let (at, frame) =
+                    kernel::stream_next(output, &j.k, sent, j.out.base, total, shell_told);
+                sent = at;
+                match frame {
                     Follow::Gap(n) => {
                         sent = j.out.base;
                         Next::Frame(frame::json(&json!({ "gap": n })))

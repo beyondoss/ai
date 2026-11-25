@@ -392,10 +392,10 @@ impl St {
             Some(h) => {
                 let sim = &self.sims[h];
                 // A status-only stream is never behind the ring's end (M7).
-                let sent = kernel::quiet_from(cl.output, u64::from(cl.sent), u64::from(sim.end));
-                let f = kernel::follow(
+                let (_, f) = kernel::stream_next(
+                    cl.output,
                     &sim.k,
-                    sent,
+                    u64::from(cl.sent),
                     u64::from(sim.base),
                     u64::from(sim.end),
                     cl.told,
@@ -1150,7 +1150,8 @@ fn ended_is_final() {
     feature = "mut_remove_ignores_mark",
     feature = "mut_attach_ignores_mark",
     feature = "mut_running_unreported",
-    feature = "mut_status_only_streams"
+    feature = "mut_status_only_streams",
+    feature = "mut_status_only_sends"
 ))]
 #[test]
 fn the_mutation_turns_its_property_red() {
@@ -1186,7 +1187,10 @@ fn the_mutation_turns_its_property_red() {
         "M1: "
     } else if cfg!(feature = "mut_running_unreported") {
         "M3: "
-    } else if cfg!(feature = "mut_status_only_streams") {
+    } else if cfg!(any(
+        feature = "mut_status_only_streams",
+        feature = "mut_status_only_sends"
+    )) {
         "M7: "
     } else {
         "L2: "
@@ -1254,11 +1258,10 @@ fn production_calls_the_kernel() {
         "kernel::Root::Stable => ctx.spool.stable()",
         "kernel::Root::PerServer => ctx.spool.server()",
         "kernel::bound(",
-        "kernel::follow(",
+        "kernel::stream_next(",
         "kernel::mark_ok(",
         "kernel::removal(",
         "kernel::attach_plan(",
-        "kernel::quiet_from(",
         "kernel::id_ok(",
         "kernel::stdin_plan(",
         "kernel::admit_waiter(",
