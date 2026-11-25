@@ -18,6 +18,8 @@ export interface Script {
   reattachEcho?: string;
   /** Bytes of the front of the output the server no longer keeps. */
   base?: number;
+  /** End with `{signal}` (a kill) instead of `{exit_code: 0}`. */
+  signal?: number;
   /** The shell's exit, sent before the final frame. */
   shellExit?: number;
   /** A held start's answer. */
@@ -94,7 +96,13 @@ export async function markServer(script: Script) {
     if (script.shellExit !== undefined) {
       res.write(JSON.stringify({ shell_exit: script.shellExit }) + "\n");
     }
-    res.end(JSON.stringify({ exit_code: 0 }) + "\n");
+    res.end(
+      JSON.stringify(
+        script.signal === undefined
+          ? { exit_code: 0 }
+          : { signal: script.signal },
+      ) + "\n",
+    );
   }
   return { ...e, attaches, starts };
 }

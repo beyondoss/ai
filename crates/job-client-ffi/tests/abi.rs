@@ -29,5 +29,5 @@ fn a_long_cursor_within_the_bound_is_a_bad_cursor_not_a_crash() {
 
 #[test]
 fn the_abi_version_is_the_one_the_codecs_speak() {
-    assert_eq!(jc_abi_version(), 3);
+    assert_eq!(jc_abi_version(), 4);
 }

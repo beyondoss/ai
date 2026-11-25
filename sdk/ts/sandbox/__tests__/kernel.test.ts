@@ -56,6 +56,12 @@ describe("the kernel's ABI from TypeScript", () => {
     });
     expect(k.classify("attach", 401)).toEqual({ t: "terminal", fault: "auth" });
     expect(k.classify("remove", 404)).toEqual({ t: "ok" });
+    // Any other op on one job: its 404 is the same JobGone.
+    expect(k.classify("other", 404)).toEqual({
+      t: "terminal",
+      fault: "job_gone",
+    });
+    expect(k.classify("other", 200)).toEqual({ t: "ok" });
   });
 
   it("the silence limit follows the heartbeat", async () => {

@@ -168,7 +168,7 @@ impl Cfg {
     fn init(&self) -> St {
         let (c, slot, held, incs) = match self.flow {
             Flow::Start => (
-                State::for_start(KEY, self.mode, self.remove_on_exit, 0, false),
+                State::for_start(KEY, self.mode, self.remove_on_exit, 0, false, false),
                 None,
                 None,
                 0,
@@ -294,6 +294,8 @@ impl Cfg {
                 | Action::Started { .. }
                 | Action::Attached { .. }
                 | Action::ShellExit { .. } => {}
+                // A kept start's refused echo: the model starts held jobs and kept ones alike and never refuses one.
+                Action::Kill => {}
                 Action::Remove { mark } => {
                     if !s.exit_taken || Some(mark) != s.held.map(mark_of) {
                         s.bad |= B_REMOVE;

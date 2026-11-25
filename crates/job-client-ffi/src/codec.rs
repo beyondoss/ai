@@ -3,8 +3,8 @@
 //! `tests/no_decision.rs` fails on a branch, a loop or a comparison in this file.
 //!
 //! Layout. All integers little-endian. A mark is 33 bytes: its length, then 32 bytes. A state is the
-//! 87 bytes `[phase, flow, mode, remove_on_exit, stdin_open, announced, key u64, mark, offset u64, pending u64, misses u32,
-//! since_ms u64, until_ms u64, beat_s u32]`. Tags are the order the variants are declared in `job_client::step`, except the actions `Reconnecting` (10), `Started` (11), `Attached` (12) and `ShellExit` (13).
+//! 88 bytes `[phase, flow, mode, remove_on_exit, stdin_open, kept, announced, key u64, mark, offset u64, pending u64, misses u32,
+//! since_ms u64, until_ms u64, beat_s u32]`. Tags are the order the variants are declared in `job_client::step`, except the actions `Reconnecting` (10), `Started` (11), `Attached` (12), `ShellExit` (13) and `Kill` (14).
 
 use job_client::step::{
     Action, Class, Event, Flow, Frame, Mark, Mode, Op, Phase, State, classify as k_classify,
@@ -93,6 +93,7 @@ impl Rd<'_> {
             mode: self.mode()?,
             remove_on_exit: self.flag()?,
             stdin_open: self.flag()?,
+            kept: self.flag()?,
             announced: self.flag()?,
             key: self.u64()?,
             mark: self.mark()?,
@@ -155,6 +156,7 @@ fn put_state(v: &mut Vec<u8>, s: &State) {
     v.push(s.mode as u8);
     v.push(u8::from(s.remove_on_exit));
     v.push(u8::from(s.stdin_open));
+    v.push(u8::from(s.kept));
     v.push(u8::from(s.announced));
     v.extend_from_slice(&s.key.to_le_bytes());
     put_mark(v, &s.mark);
@@ -194,11 +196,13 @@ fn put_action(v: &mut Vec<u8>, a: &Action) {
             code,
             signal,
             dropped,
+            killed,
         } => {
             v.push(4);
             v.extend_from_slice(&code.to_le_bytes());
             v.extend_from_slice(&signal.to_le_bytes());
             v.extend_from_slice(&dropped.to_le_bytes());
+            v.push(u8::from(*killed));
         }
         Action::Sleep { until_ms } => {
             v.push(5);
@@ -220,6 +224,7 @@ fn put_action(v: &mut Vec<u8>, a: &Action) {
         }
         Action::Finish => v.push(8),
         Action::Detached => v.push(9),
+        Action::Kill => v.push(14),
         Action::Started { mark, stdin } => {
             v.push(11);
             put_mark(v, mark);
@@ -250,10 +255,17 @@ fn finish(out: &mut [u8], answer: &[u8]) -> R<usize> {
     Ok(answer.len())
 }
 
-/// `State::for_start`: `[key u64, mode, remove_on_exit, beat_s u32, stdin_open]` -> a state.
+/// `State::for_start`: `[key u64, mode, remove_on_exit, beat_s u32, stdin_open, kept]` -> a state.
 pub fn state_for_start(input: &[u8], out: &mut [u8]) -> R<usize> {
     let mut r = Rd(input);
-    let s = State::for_start(r.u64()?, r.mode()?, r.flag()?, r.u32()?, r.flag()?);
+    let s = State::for_start(
+        r.u64()?,
+        r.mode()?,
+        r.flag()?,
+        r.u32()?,
+        r.flag()?,
+        r.flag()?,
+    );
     let mut v = Vec::new();
     put_state(&mut v, &s);
     finish(out, &v)
@@ -298,6 +310,7 @@ pub fn classify(input: &[u8], out: &mut [u8]) -> R<usize> {
         0 => Op::Start,
         1 => Op::Attach,
         2 => Op::Remove,
+        3 => Op::Other,
         _ => return Err(BAD_INPUT),
     };
     let v = match k_classify(op, r.u16()?) {

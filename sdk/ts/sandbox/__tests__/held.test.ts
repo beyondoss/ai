@@ -97,6 +97,29 @@ describe("a followed job survives cuts", () => {
     expect(started[0]).toEqual({ type: "started", pgid: 42, mark: MARK });
   });
 
+  it("a death by signal ends with a signal frame and an exit with an exit frame, as the kernel says", async () => {
+    const killed = await rig({ output: "x", signal: 9 });
+    expect((await drain(killed.jobs.follow("s", "aa", 0))).at(-1)).toEqual({
+      type: "signal",
+      signal: 9,
+    });
+    const exited = await rig({ output: "x" });
+    expect((await drain(exited.jobs.follow("s", "aa", 0))).at(-1)).toEqual({
+      type: "exit",
+      code: 0,
+    });
+  });
+
+  it("a held start whose stdin was not opened is refused and nothing is killed (the stream's close ends it)", async () => {
+    const { s, jobs } = await rig({ output: "x" });
+    const err = await drain(
+      jobs.startHeld("s", "aa", { command: "cat", stdinOpen: true }),
+    ).then(() => null, (e: unknown) => e);
+    expect(err).toBeInstanceOf(NotOfferedError);
+    expect(s.starts).toHaveLength(1);
+    expect(s.attaches).toHaveLength(0);
+  });
+
   it("waits out a busy answer and tries again (429 with Retry-After)", async () => {
     const { s, jobs } = await rig({
       output: "abc",
