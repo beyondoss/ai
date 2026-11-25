@@ -1,5 +1,6 @@
 import {
   AuthError,
+  ConnectError,
   DiskFullError,
   EndpointError,
   InvalidRequestError,
@@ -80,6 +81,8 @@ function faultError(
         : new EndpointError(said, status);
     case "auth":
       return new AuthError(said);
+    case "transport":
+      return new ConnectError(`job ${id}: ${said}`);
   }
 }
 
@@ -125,6 +128,10 @@ export async function* held(
     try {
       conn = await ops.open(open);
     } catch (e) {
+      if (e instanceof ConnectError) {
+        refused = e.detail;
+        return { t: "unreached" };
+      }
       if (e instanceof TransportError || e instanceof TimeoutError) {
         return { t: "broke" };
       }

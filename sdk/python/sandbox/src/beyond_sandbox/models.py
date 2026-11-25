@@ -246,6 +246,20 @@ class JobEnd:
     code: int
     signal: int | None = None
 
+    @classmethod
+    def of(cls, code: int, signal: int, killed: bool) -> JobEnd:
+        """The end the kernel delivered: an exit with ``code``, or (``killed``) ``signal`` killed the shell."""
+        return cls(128 + signal, signal) if killed else cls(code)
+
+
+@dataclass(frozen=True, slots=True)
+class Reconnecting:
+    """The handle cannot reach the endpoint and keeps trying: ``attempts`` failed opens in a row, the
+    first ``since_ms`` milliseconds ago. A status, never an end."""
+
+    attempts: int
+    since_ms: int
+
 
 JobEvent = Union[JobOutput, JobGap, JobShellExit, JobStarted, JobAttached]
 JobFrame = Union[JobOutput, JobGap, JobShellExit, JobStarted, JobAttached, JobEnd]

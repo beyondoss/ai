@@ -124,7 +124,7 @@ done
 description = "The step model (crates/job-client/tests/step_model.rs) under each step mutation it can reach: every run must go red. Under it the model (M10, M11) also goes red for mut_gone_ignored and mut_gone_on_silence. The mutations no model state reaches (an offset near u64::MAX, the classification rows, the wait cap, the silence limit) are Verus's alone. Pairs with `verify:job-client-mutants`."
 run = '''
 set -u
-for m in mut_reattach_from_zero mut_gap_not_counted mut_trailing_gap_dropped mut_echo_mark_unchecked mut_echo_skipped mut_reattach_after_exit mut_remove_on_exit_frame mut_remove_unscoped mut_exit_taken_stalls mut_backoff_never_reopens mut_start_fresh_key mut_start_lost_gives_up mut_heartbeat_ends mut_watch_delivers mut_close_removes mut_gives_up_on_budget mut_gone_ignored mut_gone_on_silence; do
+for m in mut_reattach_from_zero mut_gap_not_counted mut_trailing_gap_dropped mut_echo_mark_unchecked mut_echo_skipped mut_reattach_after_exit mut_remove_on_exit_frame mut_remove_unscoped mut_exit_taken_stalls mut_backoff_never_reopens mut_start_fresh_key mut_start_lost_gives_up mut_unanswered_start_retries mut_heartbeat_ends mut_watch_delivers mut_close_removes mut_gives_up_on_budget mut_gone_ignored mut_gone_on_silence; do
   if cargo test -p beyond-job-client --locked --features "$m" --test step_model >/dev/null 2>&1; then
     echo "model stayed green under $m" >&2; exit 1
   fi
@@ -377,6 +377,10 @@ dir = "sdk/ts"
 description = "Rebuild the job client kernel as WASM and inline it into the TypeScript SDK (sdk/ts/sandbox/src/kernel/). `-- --check` rebuilds and fails if the committed bytes differ."
 run = "crates/job-client-ffi/build.sh"
 
+[tasks."build:py-kernel"]
+description = "Build the job client kernel as a native library into the Python SDK's package (sdk/python/sandbox/src/beyond_sandbox/_native/, untracked): the library beyond_sandbox loads with ctypes. Same sources and pinned compiler as build:job-client-wasm; a wheel build runs the same script."
+run = "crates/job-client-ffi/build-native.sh"
+
 [tasks."build:ts"]
 description = "Build the TypeScript SDK (tsdown): sandbox + @beyond.dev/tools dist."
 run = "npm run build"
@@ -474,7 +478,8 @@ cargo test -q -p beyond-sandbox-conformance --test differential -- --include-ign
 # ---- python client: beyond-sandbox (sdk/python/sandbox) ---------------------------------------------
 
 [tasks."install:py"]
-description = "Install beyond-sandbox and its dev tools into sdk/python/sandbox/.venv (uv when present, else venv + pip)."
+description = "Install beyond-sandbox and its dev tools into sdk/python/sandbox/.venv (uv when present, else venv + pip), and build its native kernel (build:py-kernel)."
+depends = ["build:py-kernel"]
 run = """
 set -e
 cd sdk/python/sandbox
@@ -496,6 +501,14 @@ cd sdk/python/sandbox
 .venv/bin/ruff format --check .
 .venv/bin/ruff check .
 .venv/bin/mypy
+"""
+
+[tasks."test:py-broken-kernel"]
+description = "beyond-sandbox's behaviour comes from the kernel library: build it with 429 changed to 428 in a scratch copy of the repository, and run a test against it. It must go red there (and be green with the package's own library)."
+depends = ["install:py"]
+run = """
+set -e
+PATH="$PWD/sdk/python/sandbox/.venv/bin:$PATH" sdk/python/sandbox/scripts/broken_kernel.sh
 """
 
 [tasks."test:py"]

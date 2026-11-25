@@ -2,6 +2,7 @@ import { concat, fromBase64, text, toBase64 } from "./bytes.js";
 import {
   AuthError,
   ConflictError,
+  ConnectError,
   EndpointError,
   InvalidRequestError,
   JobGoneError,
@@ -388,10 +389,10 @@ export class HttpTransport implements Transport {
           cause: e,
         });
       }
-      throw new TransportError(
-        `exec endpoint ${this.url} unreachable: ${errorText(e)}`,
-        { cause: e },
-      );
+      const detail = `exec endpoint ${this.url} unreachable: ${errorText(e)}`;
+      throw neverConnected(e)
+        ? new ConnectError(detail, { cause: e })
+        : new TransportError(detail, { cause: e });
     }
     const response = res;
     return {
@@ -1271,6 +1272,35 @@ const wireCount = (v: unknown): v is number =>
 /** A 32-bit signed integer of the wire. */
 const int32 = (v: unknown): v is number =>
   typeof v === "number" && (v | 0) === v;
+
+/** The codes of a connection that was never made: refused, no route, a name that does not resolve. */
+const NEVER_CONNECTED = new Set([
+  "ECONNREFUSED",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "ENETUNREACH",
+  "EHOSTUNREACH",
+]);
+
+function neverConnected(e: unknown, depth = 0): boolean {
+  if (typeof e !== "object" || e === null || depth > 4) return false;
+  const { code, cause, errors, message } = e as {
+    code?: unknown;
+    cause?: unknown;
+    errors?: unknown;
+    message?: unknown;
+  };
+  if (typeof code === "string" && NEVER_CONNECTED.has(code)) return true;
+  // A runtime that names the code only in its message; `bad port` is fetch refusing a port it will not
+  // connect to (1, among others): nothing was sent.
+  if (
+    typeof message === "string"
+    && [...NEVER_CONNECTED, "bad port"].some((c) => message.includes(c))
+  ) return true;
+  if (neverConnected(cause, depth + 1)) return true;
+  return Array.isArray(errors)
+    && errors.some((x) => neverConnected(x, depth + 1));
+}
 
 /** One line of a job stream, read for the facts the kernel decides on. Never throws. */
 export function decodeJobLine(line: Uint8Array): JobLine {

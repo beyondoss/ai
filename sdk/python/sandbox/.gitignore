@@ -4,3 +4,4 @@
 .pytest_cache/
 dist/
 *.egg-info/
+_native/

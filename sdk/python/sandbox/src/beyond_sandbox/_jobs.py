@@ -1,37 +1,46 @@
 """Sandbox jobs: the operations, as sans-IO generators (see :mod:`beyond_sandbox._drive`).
 
-A job is kept by the sandbox
-from the start (``hold: false``), so closing a connection never kills
-it. Every operation asks the transport for a ``Call`` (one JSON answer) or a ``Follow`` (a stream).
+A job is kept by the sandbox from the start (``hold: false``), so closing a connection never kills it.
+Every operation asks the transport for a ``Call`` (one JSON answer); the three that open a stream
+(``start``, ``start_held``, ``follow``) run the job handle (:mod:`beyond_sandbox._held`), which the client
+kernel steers.
 """
 
 from __future__ import annotations
 
-import contextlib
 import re
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
-from . import _wire
-from ._drive import Call, Follow, Op
+from . import _kernel, _wire
+from ._drive import Call, Emit, Op
+from ._held import Attach, Start, held
 from .errors import (
     ConflictError,
-    DiskFullError,
     InvalidRequestError,
     IoError,
-    JobExistsError,
     JobGoneError,
-    NotOfferedError,
+    ProtocolError,
     SandboxError,
     StdinBusyError,
     StdinClosedError,
     StdinGapError,
 )
-from .models import JobEnd, JobInfo, JobRead, JobRemoved, JobStart, Pty, StdinWritten, Survivor
+from .models import (
+    JobInfo,
+    JobRead,
+    JobRemoved,
+    JobStart,
+    JobStarted,
+    Pty,
+    Reconnecting,
+    StdinWritten,
+    Survivor,
+)
 
 #: The most one ``read`` returns by default: its base64 fits the smallest answer a runner keeps whole.
 READ_MAX = 128 * 1024
 #: The SIGTERM grace a kill gives a job before SIGKILL.
-KILL_GRACE_MS = 300
+KILL_GRACE_MS = _wire.KILL_GRACE_MS
 #: The most decoded bytes one ``write`` carries.
 WRITE_MAX = 128 * 1024
 #: The signals ``signal`` sends: names only.
@@ -45,6 +54,14 @@ def check_id(job: str) -> str:
     if not _JOB_ID.fullmatch(job):
         raise InvalidRequestError(f"bad job id {job!r}: 1 to 64 characters of [0-9a-z_-]")
     return job
+
+
+def check_timeout(timeout: float | None) -> float | None:
+    if timeout is not None and (
+        isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout < 0
+    ):
+        raise InvalidRequestError("`timeout` must be a non-negative number of seconds")
+    return timeout
 
 
 def check_scope(scope: str) -> str:
@@ -62,19 +79,17 @@ def _written_in(detail: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
-def _start_failure(e: SandboxError, job: str) -> SandboxError:
-    """A refused ``start``: 409 is an id that exists, 507 a full disk (execd's ``spool_failure``)."""
-    if e.status == 409:
-        return JobExistsError(f"job {job} exists: {e.detail}", id=job, status=409)
-    if e.status == 507:
-        return DiskFullError(e.detail, status=507)
-    return e
+def _is_gone(e: SandboxError) -> bool:
+    """What an op on one job's refusal means is the client kernel's table: gone, or not."""
+    return e.status is not None and _kernel.load().classify("other", e.status) == _kernel.Class(
+        "terminal", "job_gone"
+    )
 
 
 def _gone_failure(e: SandboxError, job: str) -> SandboxError:
-    """404 from an op on a job: it does not exist, or was removed."""
-    if e.status == 404:
-        return JobGoneError(f"job {job}: {e.detail}", id=job, status=404)
+    """An op on a job that does not exist, or was removed."""
+    if _is_gone(e):
+        return JobGoneError(f"job {job}: {e.detail}", id=job, status=e.status)
     return e
 
 
@@ -85,8 +100,8 @@ def _stdin_failure(e: SandboxError, job: str) -> SandboxError:
     (closed); 429 too many waiting writes; 413 too large."""
     d = e.detail
     detail = f"job stdin: {d}"
-    if e.status == 404:
-        return JobGoneError(detail, id=job, status=404)
+    if _is_gone(e):
+        return JobGoneError(detail, id=job, status=e.status)
     if e.status == 409 and "has no stdin" in d:
         return StdinClosedError(detail, reason="never_opened", status=409)
     if e.status == 409 and '"gap"' in d:
@@ -107,27 +122,11 @@ def _resize_failure(e: SandboxError, job: str) -> SandboxError:
     hung up."""
     if e.status == 400:
         return InvalidRequestError(e.detail, status=400)
-    if e.status == 404:
-        return JobGoneError(f"job {job}: {e.detail}", id=job, status=404)
+    if _is_gone(e):
+        return JobGoneError(f"job {job}: {e.detail}", id=job, status=e.status)
     if e.status == 409:
         return ConflictError(f"job {job}: {e.detail}", status=409)
     return e
-
-
-def check_pty(pty: Pty) -> dict[str, int]:
-    """The wire's ``pty`` member; ``cols`` and ``rows`` are integers from 1 to 1024."""
-    if not (_wire._pty_dim(pty.cols) and _wire._pty_dim(pty.rows)):
-        raise InvalidRequestError("pty: cols and rows are integers from 1 to 1024")
-    return {"cols": pty.cols, "rows": pty.rows}
-
-
-def _job_start_op(
-    scope: str, job: str, hold: bool, label: str, stdin_open: bool, pty: Pty | None
-) -> dict[str, Any]:
-    extra: dict[str, Any] = {} if pty is None else {"pty": check_pty(pty)}
-    return _wire.job_op(
-        "start", scope, id=job, hold=hold, label=label, stdin_open=stdin_open, **extra
-    )
 
 
 def start(
@@ -140,38 +139,37 @@ def start(
     env: dict[str, str] | None = None,
     stdin_open: bool = False,
     heartbeat_seconds: int | None = None,
+    timeout: float | None = None,
     pty: Pty | None = None,
 ) -> Op[JobStart]:
+    """Start a job the sandbox keeps from the start (wire ``hold: false``): its process group and mark.
+    The handle (``_held.py``) does the request and the checks of its answer; an endpoint that lacks the
+    mark or the stdin echo is ``NotOfferedError``, and the kernel has the job it started stopped."""
     check_scope(scope)
     check_id(job)
+    check_timeout(timeout)
+    what = Start(command, args, cwd, label, env, stdin_open, hold=False, pty=pty)
+    started = yield from _first_started(held(scope, job, what, heartbeat_seconds, timeout=timeout))
+    return JobStart(started.pgid, started.mark)
+
+
+def _first_started(inner: Op[None]) -> Op[JobStarted]:
+    """Run a handle until it reports the job's start, then let go of it."""
     try:
-        v = yield Call(
-            _job_start_op(scope, job, False, label, stdin_open, pty),
-            command,
-            args,
-            cwd,
-            env,
-            heartbeat_seconds,
-        )
-    except SandboxError as e:
-        raise _start_failure(e, job) from None
-    pgid = v.get("started") if isinstance(v, dict) else None
-    if not isinstance(pgid, int) or isinstance(pgid, bool):
-        raise IoError(f"the endpoint did not report the job's start: {str(v)[:200]}")
-    if stdin_open and not (isinstance(v, dict) and v.get("stdin") is True):
-        # Started without its stdin: stop it, so nothing is left running that reads EOF.
-        with contextlib.suppress(SandboxError):
-            yield Call(_wire.job_op("kill", scope, ids=[job], remove=True, grace_ms=KILL_GRACE_MS))
-        raise NotOfferedError("the endpoint predates job stdin: it ran the job without it")
-    if pty is not None and _wire.parse_pty(v.get("pty")) is None:
-        # Started without its terminal: stop it, so no program runs that expects one.
-        with contextlib.suppress(SandboxError):
-            yield Call(_wire.job_op("kill", scope, ids=[job], remove=True, grace_ms=KILL_GRACE_MS))
-        raise NotOfferedError(NO_PTY)
-    mark = v.get("mark")
-    if not isinstance(mark, str) or not mark:
-        raise NotOfferedError("the endpoint predates the job mark: its start did not name one")
-    return JobStart(pgid, mark)
+        effect = next(inner)
+        while True:
+            if isinstance(effect, Emit) and isinstance(effect.item, JobStarted):
+                return effect.item
+            try:
+                answer = yield effect
+            except SandboxError as e:
+                effect = inner.throw(e)
+            else:
+                effect = inner.send(answer)
+    except StopIteration:
+        raise ProtocolError("the endpoint did not report the job's start") from None
+    finally:
+        inner.close()
 
 
 def start_held(
@@ -184,25 +182,18 @@ def start_held(
     env: dict[str, str] | None = None,
     stdin_open: bool = False,
     heartbeat_seconds: int | None = None,
+    on_reconnecting: Callable[[Reconnecting], None] | None = None,
+    timeout: float | None = None,
     pty: Pty | None = None,
-) -> Op[JobEnd]:
+) -> Op[None]:
     """Start a job held by this stream (wire ``hold: true``). Emits the job's events, the first a
-    :class:`~beyond_sandbox.JobStarted`; returns how it ended. If the stream stops before the end and
-    the job was not kept (:func:`keep`), the sandbox kills its group."""
+    :class:`~beyond_sandbox.JobStarted` and the last a :class:`~beyond_sandbox.JobEnd`. If the stream
+    stops before the end and the job was not kept (:func:`keep`), the sandbox kills its group."""
     check_scope(scope)
     check_id(job)
-    try:
-        end: JobEnd = yield Follow(
-            _job_start_op(scope, job, True, label, stdin_open, pty),
-            command,
-            args,
-            cwd,
-            env,
-            heartbeat_seconds,
-        )
-    except SandboxError as e:
-        raise _start_failure(e, job) from None
-    return end
+    check_timeout(timeout)
+    what = Start(command, args, cwd, label, env, stdin_open, hold=True, pty=pty)
+    return held(scope, job, what, heartbeat_seconds, on_reconnecting, timeout)
 
 
 def read(scope: str, job: str, offset: int = 0, max_bytes: int = READ_MAX) -> Op[JobRead]:
@@ -224,31 +215,22 @@ def follow(
     heartbeat_seconds: int | None = None,
     mark: str | None = None,
     output: bool = True,
-) -> Op[JobEnd]:
-    """Emits the job's events, the first a :class:`~beyond_sandbox.JobAttached`; returns how it
-    ended. A job that does not exist, or whose mark is not ``mark``, is
-    :class:`~beyond_sandbox.JobGoneError`. ``output=False`` follows to the end without any output."""
+    on_reconnecting: Callable[[Reconnecting], None] | None = None,
+    timeout: float | None = None,
+) -> Op[None]:
+    """Emits the job's events, the first a :class:`~beyond_sandbox.JobAttached` and the last a
+    :class:`~beyond_sandbox.JobEnd`. A job that does not exist, or whose mark is not ``mark``, is
+    :class:`~beyond_sandbox.JobGoneError`. ``output=False`` follows to the end without any output. A cut
+    or silent stream is reopened at the offset reached, by the kernel."""
     check_scope(scope)
     check_id(job)
-    try:
-        end: JobEnd = yield Follow(
-            _wire.job_op("attach", scope, id=job, offset=offset, **_attach_fields(mark, output)),
-            heartbeat_seconds=heartbeat_seconds,
-        )
-    except SandboxError as e:
-        raise _gone_failure(e, job) from None
-    return end
-
-
-def _attach_fields(mark: str | None, output: bool) -> dict[str, Any]:
-    fields: dict[str, Any] = {}
-    if mark is not None:
-        if not isinstance(mark, str) or not mark:
-            raise InvalidRequestError("`mark` must be a non-empty string")
-        fields["mark"] = mark
-    if not output:
-        fields["output"] = False
-    return fields
+    if mark is not None and (not isinstance(mark, str) or not mark):
+        raise InvalidRequestError("`mark` must be a non-empty string")
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise InvalidRequestError("`offset` must be a non-negative integer")
+    check_timeout(timeout)
+    what = Attach(offset, mark or "", output)
+    return held(scope, job, what, heartbeat_seconds, on_reconnecting, timeout)
 
 
 def keep(
@@ -384,7 +366,7 @@ def resize(scope: str, job: str, cols: int, rows: int) -> Op[Pty]:
     a job with no terminal, an ended one or one whose terminal hung up is ``ConflictError``."""
     check_scope(scope)
     check_id(job)
-    check_pty(Pty(cols, rows))
+    _wire.check_pty(Pty(cols, rows))
     try:
         v = yield Call(_wire.job_op("resize", scope, id=job, cols=cols, rows=rows))
     except SandboxError as e:

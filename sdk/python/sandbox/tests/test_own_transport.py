@@ -17,15 +17,15 @@ import pytest
 from beyond_sandbox import (
     AsyncFiles,
     AsyncFrameStream,
+    AsyncJobOpened,
     ConflictError,
     ExecResult,
     Files,
     FrameStream,
+    JobOpened,
     NotFoundError,
     Sandbox,
 )
-from beyond_sandbox.atransport import AsyncJobFrameStream
-from beyond_sandbox.transport import JobFrameStream
 
 
 class LocalTransport:
@@ -74,7 +74,7 @@ class LocalTransport:
     ) -> Any:
         raise NotImplementedError("this transport only runs commands")
 
-    def job_stream(self, job: dict[str, Any]) -> JobFrameStream:
+    def job_open(self, job: dict[str, Any], silence_ms: int) -> JobOpened:
         raise NotImplementedError("this transport only runs commands")
 
 
@@ -115,7 +115,7 @@ class AsyncLocalTransport:
     ) -> Any:
         raise NotImplementedError("this transport only runs commands")
 
-    async def job_stream(self, job: dict[str, Any]) -> AsyncJobFrameStream:
+    async def job_open(self, job: dict[str, Any], silence_ms: int) -> AsyncJobOpened:
         raise NotImplementedError("this transport only runs commands")
 
 

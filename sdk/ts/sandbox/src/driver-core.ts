@@ -31,6 +31,7 @@ import {
 } from "./errors.js";
 import type { ErrorKind } from "./errors.js";
 import type { CapabilityOverrides } from "./files.js";
+import { HttpTransport } from "./http.js";
 import { Sandbox } from "./sandbox.js";
 import type { SearchEngine } from "./search.js";
 import type { JobInfo, Survivor } from "./transport.js";
@@ -217,17 +218,21 @@ export class Driver {
   }
 
   /**
-   * Connect (and probe) on the first request that needs it; a failure is that op's answer. The
-   * driver goes through `Sandbox`, so its wiring is under test too.
+   * The sandbox for the first request that needs it. No probe: an endpoint that cannot be reached is
+   * that op's answer, found by the op's own path (a job's start is judged by the client kernel).
    */
   private connect(): Promise<Sandbox> {
-    this.connected ??= Sandbox.connect({
-      url: this.cfg.url,
-      token: this.cfg.tokenCmd
-        ? tokenFromCommand(this.cfg.tokenCmd)
-        : this.cfg.bearer || undefined,
-      files: { overrides: this.cfg.caps },
-    });
+    this.connected ??= Promise.resolve(
+      new Sandbox(
+        new HttpTransport({
+          url: this.cfg.url,
+          token: this.cfg.tokenCmd
+            ? tokenFromCommand(this.cfg.tokenCmd)
+            : this.cfg.bearer || undefined,
+        }),
+        { files: { overrides: this.cfg.caps } },
+      ),
+    );
     return this.connected;
   }
 

@@ -27,6 +27,8 @@
 //! - M7 an endpoint that does not echo marks is never streamed: the handle fails closed.
 //! - M9 reconnecting never ends the handle: a cut, a tick or a busy answer is never followed by an end,
 //!   however many failed opens came before.
+//! - M12 a failure to connect (`Unreached`) ends a handle only when it is a start nothing answered, with
+//!   `Transport`; it ends nothing else (folded into M9).
 //! - M10 an answer the backend itself gave (`Authority::SandboxGone`, `Authority::SessionEnded`) ends the
 //!   handle in that one step, with that fault.
 //! - M11 nothing else ends the handle as `SandboxGone` or `SessionEnded`: not a cut, a tick, a busy
@@ -107,6 +109,8 @@ struct St {
     starts: u8,
     peak: u32,
     start_lost: bool,
+    /// A request of the handle reached the server (it was answered, or its answer was lost).
+    reached: bool,
     saw_gap_chunk: bool,
     saw_gap_exit: bool,
     reattached: bool,
@@ -145,6 +149,8 @@ enum A {
     Frame,
     /// The stream breaks; or, with the request in flight, its answer is lost.
     Cut,
+    /// The request in flight never reaches a server: the connection is refused.
+    Refuse,
     /// The wake time comes.
     Tick,
     /// The consumer takes the exit.
@@ -212,6 +218,7 @@ impl Cfg {
             starts: 0,
             peak: 0,
             start_lost: false,
+            reached: false,
             saw_gap_chunk: false,
             saw_gap_exit: false,
             reattached: false,
@@ -359,6 +366,19 @@ impl Cfg {
         if busy && s.ended.is_some() {
             s.bad |= B_GIVEUP;
         }
+        // T: a failure to connect ends a handle only for a start nothing answered, with `Transport`; and
+        // `Transport` is never the end of anything else.
+        let unanswered_start =
+            matches!(req_before, Req::Start { .. }) && !s.reached && s.created_key.is_none();
+        if matches!(ev, Event::Unreached)
+            && let Some(e) = s.ended
+            && !(e == Ended::Fault(Fault::Transport) && unanswered_start)
+        {
+            s.bad |= B_GIVEUP;
+        }
+        if s.ended == Some(Ended::Fault(Fault::Transport)) && !matches!(ev, Event::Unreached) {
+            s.bad |= B_GIVEUP;
+        }
     }
 }
 
@@ -407,6 +427,7 @@ impl Model for Cfg {
                 out.push(A::Answer(st));
             }
             out.push(A::Cut);
+            out.push(A::Refuse);
             out.push(A::AnswerGone);
             out.push(A::AnswerEnded);
         }
@@ -476,6 +497,7 @@ impl Model for Cfg {
             }
             A::Cut => {
                 if n.in_flight && n.conn.is_none() {
+                    n.reached = true;
                     // The answer is lost; a start has reached the server all the same.
                     if let Req::Start { key } = n.req {
                         self.server_creates(&mut n, key);
@@ -487,8 +509,13 @@ impl Model for Cfg {
                 }
                 self.feed(&mut n, Event::Broke, 0, u32::MAX);
             }
+            A::Refuse => {
+                n.in_flight = false;
+                self.feed(&mut n, Event::Unreached, 0, 0);
+            }
             A::Answer(status) => {
                 n.in_flight = false;
+                n.reached = true;
                 let req = n.req.clone();
                 let mut status = status;
                 match &req {
@@ -639,6 +666,12 @@ impl Model for Cfg {
                     && s.c.phase == Phase::Streaming
             },
         ));
+        if self.flow == Flow::Start {
+            p.push(Property::<Self>::sometimes(
+                "W11 a start nothing answered ends with Transport",
+                |_, s| s.ended == Some(Ended::Fault(Fault::Transport)),
+            ));
+        }
         p.push(Property::<Self>::sometimes(
             "W11 the sandbox is gone: SandboxGone",
             |_, s| s.ended == Some(Ended::Fault(Fault::SandboxGone)),

@@ -66,6 +66,7 @@ export type {
 export {
   AuthError,
   ConflictError,
+  ConnectError,
   DiskFullError,
   EndpointError,
   errorFor,

@@ -32,7 +32,9 @@ from beyond_sandbox import (
     StdinBusyError,
     StdinClosedError,
     StdinGapError,
-    _wire,
+)
+from beyond_sandbox import (
+    _kernel as K,
 )
 from beyond_sandbox.jobs import AsyncJobs
 
@@ -134,12 +136,11 @@ def test_the_heartbeat_is_1_to_240_whole_seconds_and_checked_before_anything_is_
 
 
 def test_the_silence_limit_follows_the_heartbeat_the_request_chose() -> None:
-    assert _wire.silence_s() == 30.0
-    assert _wire.silence_s(1) == 30.0
-    assert _wire.silence_s(5) == 30.0
-    # A 60 s beat would be killed by a 30 s limit; two beats and slack hold.
-    assert _wire.silence_s(60) == 130.0
-    assert _wire.silence_s(240) == 490.0
+    """The kernel's limit: two beats and ten seconds, never under 30 s (a 60 s beat is not killed by 30 s)."""
+    k = K.load()
+    assert [k.silence_ms(b) for b in (0, 1, 10, 11, 60, 240)] == [
+        30_000, 30_000, 30_000, 32_000, 130_000, 490_000,
+    ]  # fmt: skip
 
 
 def test_async_jobs_carry_the_same_options() -> None:
@@ -163,10 +164,10 @@ def test_async_jobs_carry_the_same_options() -> None:
 def test_pty_goes_out_on_start_and_its_echo_is_required() -> None:
     sb, e = jobs_over(
         lambda h, b: reply(
-            h, 200, {"started": 5, "mark": "m", "stdin": True, "pty": b["job"].get("pty")}
+            h, 200, {"started": 5, "mark": "0a", "stdin": True, "pty": b["job"].get("pty")}
         )
     )
-    assert sb.start("s", "aa", "sh", pty=Pty(80, 24)) == JobStart(5, "m")
+    assert sb.start("s", "aa", "sh", pty=Pty(80, 24)) == JobStart(5, "0a")
     assert e.requests[0]["job"]["pty"] == {"cols": 80, "rows": 24}
     sb.start("s", "bb", "true")
     assert "pty" not in e.requests[1]["job"]
@@ -175,7 +176,7 @@ def test_pty_goes_out_on_start_and_its_echo_is_required() -> None:
 def test_an_endpoint_that_does_not_echo_pty_is_not_offered_and_the_job_is_stopped() -> None:
     def answer(h: Any, b: Any) -> None:
         reply(
-            h, 200, {"started": 5, "mark": "m"} if b["job"]["op"] == "start" else {"survivors": []}
+            h, 200, {"started": 5, "mark": "0a"} if b["job"]["op"] == "start" else {"survivors": []}
         )
 
     sb, e = jobs_over(answer)
@@ -187,12 +188,12 @@ def test_an_endpoint_that_does_not_echo_pty_is_not_offered_and_the_job_is_stoppe
 def test_a_held_terminal_start_needs_the_echo_in_its_first_frame() -> None:
     sb, _ = jobs_over(
         lambda h, b: reply(
-            h, 200, b'{"started":42,"mark":"m","stdin":true}\n{"exit_code":0}\n', NDJSON
+            h, 200, b'{"started":42,"mark": "0a","stdin":true}\n{"exit_code":0}\n', NDJSON
         )
     )
     with pytest.raises(NotOfferedError):
         list(sb.start_held("s", "aa", "sh", pty=Pty(80, 24)))
-    ok = b'{"started":42,"mark":"m","stdin":true,"pty":{"cols":80,"rows":24}}\n{"exit_code":0}\n'
+    ok = b'{"started":42,"mark": "0a","stdin":true,"pty":{"cols":80,"rows":24}}\n{"exit_code":0}\n'
     sb, _ = jobs_over(lambda h, b: reply(h, 200, ok, NDJSON))
     first = next(iter(sb.start_held("s", "aa", "sh", pty=Pty(80, 24))))
     assert isinstance(first, JobStarted) and first.pty == Pty(80, 24)
@@ -242,7 +243,7 @@ def test_a_terminal_write_refuses_eof_and_a_hangup_is_stdin_closed_with_written(
 
 
 def test_list_and_read_carry_pty_on_terminals_only() -> None:
-    base = {"mark": "m", "command": "sh", "args": [], "outputStart": 0, "outputEnd": 0}
+    base = {"mark": "0a", "command": "sh", "args": [], "outputStart": 0, "outputEnd": 0}
     listing = {
         "jobs": [
             {
@@ -275,12 +276,12 @@ def test_async_resize_and_start() -> None:
         200,
         {"cols": 9, "rows": 8}
         if b["job"]["op"] == "resize"
-        else {"started": 3, "mark": "m", "stdin": True, "pty": b["job"]["pty"]},
+        else {"started": 3, "mark": "0a", "stdin": True, "pty": b["job"]["pty"]},
     )
 
     async def go() -> None:
         sb = AsyncJobs(AsyncHttpTransport(e.url))
-        assert await sb.start("s", "aa", "sh", pty=Pty(80, 24)) == JobStart(3, "m")
+        assert await sb.start("s", "aa", "sh", pty=Pty(80, 24)) == JobStart(3, "0a")
         assert await sb.resize("s", "aa", 9, 8) == Pty(9, 8)
 
     asyncio.run(go())

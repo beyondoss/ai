@@ -3,7 +3,8 @@
 **Connect to any sandbox that speaks the exec protocol.** This package does **not** create, pause, or
 destroy VMs — lifecycle stays with the platform that gave you the URL (Beyond, E2B with
 [`execd`](../../../crates/execd) installed, Docker, …). Here you run commands, read, write and search
-files, and keep background jobs. Pure Python, no dependencies, sync and asyncio, fully typed.
+files, and keep background jobs. No dependencies, sync and asyncio, fully typed. One platform wheel carries the
+job client's kernel as a native library (see [A job survives a cut stream](#a-job-survives-a-cut-stream)).
 
 ```python
 from beyond_sandbox import Sandbox
@@ -92,12 +93,45 @@ Job failures are typed, each a subclass of the kind it was before (`except NotFo
 `write_stdin`: `StdinClosedError` (`.reason` is `"never_opened"` or `"closed"`; retrying cannot succeed), `StdinGapError`
 (the bytes before it never came) and `StdinBusyError` (16 writes already wait: the same write, later, is safe).
 
+## A job survives a cut stream
+
+`jobs.follow`, `jobs.collect`, `jobs.start_held` and `jobs.start` run the **job client kernel**
+([`crates/job-client`](../../../crates/job-client), every decision proven in Verus), the same function the Rust
+and TypeScript SDKs run. A cut or silent stream is reopened at the offset reached, with the job's mark, so each
+byte arrives once and a reopen can never read another job that reused the id; a busy endpoint (`429`, `502`, `503`,
+`504`, `Retry-After`) is waited out; a refusal that will not change (`404`, `409`, `507`, `401`, `403`, `500`, a bad
+frame) is one typed error. When the endpoint stays unreachable the handle keeps trying and says so through
+`on_reconnecting(Reconnecting(attempts, since_ms))`; it ends only when the job does, the endpoint refuses for
+good, or you stop iterating, or your `timeout=` (seconds, on `start`, `start_held`, `follow` and `collect`) passes:
+the kernel's `Deadline`, which raises `TimeoutError`; it is checked between frames and waits, so a quiet stream notices it at its
+next heartbeat. One start is the exception: a `start` whose first request cannot connect at all (refused, unreachable, the name
+does not resolve) while nothing of it was ever answered ends with `ConnectError` (a `TransportError`): nothing was started and
+nobody answered. Once any request of it was answered or lost, a failure to connect keeps trying like every other. An endpoint that does not name the job's mark is `NotOfferedError`, before any byte.
+
+Python holds none of that. `_held.py` makes the request the kernel names, reads the answer, and does what the
+kernel's actions say; `tests/test_no_decision.py` fails if it grows a status code, an offset sum, a retry counter
+or a time constant. The kernel is a native library (`crates/job-client-ffi`, built as a `cdylib`) loaded with
+`ctypes` (`_kernel.py`): there is no pure-Python copy of the decisions to fall back on.
+
+**Wheels.** The package ships as one `py3-none-<platform>` wheel per platform (the library needs no CPython ABI):
+linux x86_64 and aarch64 (manylinux and musllinux), macOS x86_64 and arm64, windows x86_64, built and
+smoke-tested on each platform by `.github/workflows/sdk-python-wheels.yml`. There is no sdist: a platform
+without a wheel does not install, rather than run decisions that are not the proven ones.
+
+**From a checkout**, `mise run install:py` builds the library into `src/beyond_sandbox/_native/` (untracked) with the
+compiler pinned in `crates/job-client-ffi/toolchain`. A library older than its sources fails
+`tests/test_kernel.py`; rebuild with `mise run build:py-kernel`.
+
 ### Breaking
 
 - `Jobs.attach` / `AsyncJobs.attach` are renamed `collect` (follow to the end, collected); `follow` is unchanged.
 - `Jobs.read` of a removed or unknown job raises `JobGoneError` (a `NotFoundError`) instead of returning state `gone`.
 - A start of an existing id is `JobExistsError`, a full disk `DiskFullError`, and a stdin write's 409 and 429 are `StdinClosedError`, `StdinGapError` and `StdinBusyError` (all still `ConflictError`s).
-- A custom `job_call` / `job_stream` is passed `heartbeat_seconds`, `env`, `command`, `args` and `cwd` only when set.
+- A custom `job_call` is passed `heartbeat_seconds` only when set. `job_stream` is replaced by `job_open(job, silence_ms, *, command, args, cwd, env, heartbeat_seconds)`: one request, answered with its status (a `JobOpened`: `status`, `retry_after_s`, `detail`, `lines`, `close`), never retried and never an exception for a refusal. The kernel decides what the status means. `AsyncJobTransport.job_open` is the awaited twin (`AsyncJobOpened`).
+- A cut or silent job stream is reopened by the kernel instead of ending as `TransportError`. A held job's frames are the same; a stream that ends in an error frame is `EndpointError` or `ProtocolError`, no longer `TransportError`.
+- A `start` that cannot connect at all ends with `ConnectError`; a started job's handle, or any follow, keeps trying until its `timeout=` passes.
+- A job mark is 1 to 32 hex digits: `follow(mark=...)` refuses anything else with `InvalidRequestError`, before anything is sent.
+- The wheel is platform-specific and there is no sdist.
 
 ## Authentication
 
@@ -112,7 +146,7 @@ await AsyncSandbox.connect(url, token=fetch_token_async)    # a coroutine functi
 
 ## Bring your own transport
 
-A transport is anything with `run` (and `stream`, `job_call`, `job_stream` for the rest): an SSH
+A transport is anything with `run` (and `stream`, `job_call`, `job_open` for the rest): an SSH
 session, `docker exec`, a vendor SDK, a test double. `Files` needs only `run`. This one runs commands
 locally:
 
@@ -131,7 +165,7 @@ files.write("/tmp/x", "hello")      # the same atomic write and search, with no 
 ```
 
 `HttpTransport` is the default implementation, not the definition. `Sandbox` and `Jobs` also need
-`stream`, `job_call` and `job_stream` (see `JobTransport`).
+`stream`, `job_call` and `job_open` (see `JobTransport`).
 
 ## Your own helper on raw exec
 
@@ -205,15 +239,18 @@ Both return a `Transfer(files, dirs, links, bytes)`; `AsyncSandbox` has the same
 `_wire.py` and `_http.py` are the protocol and an HTTP/1.1 framing with no I/O; `transport.py` moves
 bytes with `socket`, `atransport.py` with `asyncio` streams. The helpers (`_fs.py`, `_jobs.py`) are
 generators that _ask_ for commands and are driven by `transport.run` or `await transport.run`
-(`_drive.py`), so each helper exists once, for sync and async. The shell scripts
+(`_drive.py`), so each helper exists once, for sync and async. The job handle (`_held.py`) is the same kind of
+generator: it asks for a request (`Open`), a line (`NextLine`) or a wait (`Sleep`), whichever the kernel
+(`_kernel.py`, the native library) says next, and the two drivers do it. The shell scripts
 in `_scripts.py` are generated from the reference (`scripts/gen_scripts.py`, checked by a test).
 
 ## Develop
 
 ```sh
-mise run install:py    # .venv with the dev tools (uv if present, else venv + pip)
+mise run install:py    # .venv with the dev tools (uv if present, else venv + pip), and the native kernel
 mise run check:py      # ruff format + lint, mypy --strict
 mise run test:py       # pytest; loopback tests run a real execd
+mise run test:py-broken-kernel  # the handle against a kernel with 429 changed to 428: red, as it must be
 mise run test:clients  # the shared conformance matrix, every client
 ```
 

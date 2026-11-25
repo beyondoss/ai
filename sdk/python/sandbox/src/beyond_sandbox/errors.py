@@ -69,6 +69,11 @@ class TransportError(SandboxError):
     kind = "transport"
 
 
+class ConnectError(TransportError):
+    """The connection was never made: refused, no route, or the name did not resolve. Nothing was sent, so
+    nothing happened. (A ``TransportError``: a caller that catches that keeps working.)"""
+
+
 class ProtocolError(SandboxError):
     kind = "protocol"
 
