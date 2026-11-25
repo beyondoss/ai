@@ -3613,7 +3613,7 @@ async fn connect_sandbox_stdio(
     command: &crate::grant::SandboxCommand,
 ) -> Result<McpClient, String> {
     // A cold sandbox is still being made when the front's wake budget runs out and it answers 503:
-    // wait it out (bounded) rather than leaving the server out of the session for good.
+    // wait it out (no timer ends the wait) rather than leaving the server out of the session for good.
     let (read, write) = crate::tools::mcp_sandbox_stdio::start_waiting(
         || {
             crate::tools::mcp_sandbox_stdio::connect(

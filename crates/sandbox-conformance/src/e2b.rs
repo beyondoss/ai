@@ -97,6 +97,11 @@ impl Drop for Vm {
     }
 }
 
+/// Delete a sandbox by id now (what a test does to a sandbox it wants gone mid-run).
+pub fn delete_sandbox(key: &str, id: &str) {
+    delete(key, id);
+}
+
 /// Synchronous so it runs from `Drop`. Idempotent: a VM already gone answers 404.
 fn delete(key: &str, id: &str) {
     let Ok(mut c) = std::process::Command::new("curl")

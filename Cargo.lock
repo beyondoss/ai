@@ -359,6 +359,7 @@ dependencies = [
  "beyond-bash-gate",
  "beyond-exec-notify",
  "beyond-execd-jobs",
+ "beyond-job-client",
  "beyond-providers",
  "beyond-sandbox",
  "beyond-test-support",

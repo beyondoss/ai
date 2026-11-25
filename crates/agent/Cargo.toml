@@ -28,6 +28,7 @@ beyond-bash-gate = { path = "../bash-gate" }
 # The exec protocol v1.4 notification kernel (`exec_endpoint::notify_kernel`): zero dependencies,
 # shared with every endpoint that calls back, the reference mock included.
 beyond-exec-notify = { path = "../exec-notify" }
+beyond-job-client = { path = "../job-client" }
 # The exec client, FsBackend and ShellFs, shared with every other way to use a sandbox.
 beyond-sandbox = { path = "../sandbox" }
 # `serve`'s `OutFrame::Raw` payload: a serialized event line shared — by refcount bump, not deep copy —

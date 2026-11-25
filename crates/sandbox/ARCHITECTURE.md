@@ -5,24 +5,25 @@ depends on it; it depends on neither `beyond-agent` nor `beyond-agent-core`.
 
 ## Modules
 
-| file                               | what                                                                                                                         |
-| ---------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| `src/lib.rs`                       | the public names: `Exec`, `HttpExec`, `Files`, `Jobs`, `Sandbox`, `TokenSource`, `SandboxError`                              |
-| `src/error.rs`                     | `SandboxError` / `ErrorKind`: FILES-OVER-EXEC §3 vocabulary, classify from `io` / `FsError` / `BulkError`                    |
-| `src/exec.rs`                      | `CommandRunner` (`Exec`), `ExecResult`, `ExecOutput` (code and bytes), `Kill`/`LocalKill`/`kill_all`, bounded output capture |
-| `src/exec_endpoint.rs`             | the protocol spec (module doc), `HttpExecRunner`                                                                             |
-| `src/exec_endpoint/stream.rs`      | stream frames and the frame reader                                                                                           |
-| `src/exec_endpoint/jobs.rs`        | `SandboxJobs`, scopes (`JobScope::named` / `for_session`), ids                                                               |
-| `src/exec_endpoint/jobs_native.rs` | the endpoint's jobs: `NativeJobs`, `HttpJobs`                                                                                |
-| `src/fs.rs`                        | `FsBackend`, its types, and the result policy every backend shares                                                           |
-| `src/fs/shell.rs`                  | `ShellFs` (`Files`): file operations as commands, the one lazy environment probe, parsers, `__fuzz`                          |
-| `src/bulk.rs`                      | `upload`/`download`/`extract`: tar over exec, the three scripts, the staged upload, `Sources`, `Transfer`, `BulkError`       |
-| `src/bulk/extract.rs`              | the policy layer over the `tar` crate for untrusted archives: never writes through a link, directory modes last              |
-| `src/procgroup.rs`                 | process-group identity and kill guards for local children                                                                    |
-| `src/sandbox.rs`                   | `Jobs` (with ergonomic `start`), `Sandbox`, the `Command` / `StartJob` builders                                              |
-| `src/token.rs`                     | `TokenSource` and the one-renewal bearer                                                                                     |
-| `src/tls.rs`                       | installs the `ring` rustls provider before a client is built                                                                 |
-| `src/testing.rs`                   | a plain local runner for unit tests                                                                                          |
+| file                                      | what                                                                                                                         |
+| ----------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `src/lib.rs`                              | the public names: `Exec`, `HttpExec`, `Files`, `Jobs`, `Sandbox`, `TokenSource`, `SandboxError`                              |
+| `src/error.rs`                            | `SandboxError` / `ErrorKind`: FILES-OVER-EXEC §3 vocabulary, classify from `io` / `FsError` / `BulkError`                    |
+| `src/exec.rs`                             | `CommandRunner` (`Exec`), `ExecResult`, `ExecOutput` (code and bytes), `Kill`/`LocalKill`/`kill_all`, bounded output capture |
+| `src/exec_endpoint.rs`                    | the protocol spec (module doc), `HttpExecRunner`                                                                             |
+| `src/exec_endpoint/stream.rs`             | stream frames and the frame reader                                                                                           |
+| `src/exec_endpoint/jobs.rs`               | `SandboxJobs`, scopes (`JobScope::named` / `for_session`), ids                                                               |
+| `src/exec_endpoint/jobs_native.rs`        | the endpoint's jobs: `NativeJobs`, `HttpJobs`                                                                                |
+| `src/exec_endpoint/jobs_native/handle.rs` | the job handle: the shell that drives the client kernel (`step`) for `run_held` and `follow`                                 |
+| `src/fs.rs`                               | `FsBackend`, its types, and the result policy every backend shares                                                           |
+| `src/fs/shell.rs`                         | `ShellFs` (`Files`): file operations as commands, the one lazy environment probe, parsers, `__fuzz`                          |
+| `src/bulk.rs`                             | `upload`/`download`/`extract`: tar over exec, the three scripts, the staged upload, `Sources`, `Transfer`, `BulkError`       |
+| `src/bulk/extract.rs`                     | the policy layer over the `tar` crate for untrusted archives: never writes through a link, directory modes last              |
+| `src/procgroup.rs`                        | process-group identity and kill guards for local children                                                                    |
+| `src/sandbox.rs`                          | `Jobs` (with ergonomic `start`), `Sandbox`, the `Command` / `StartJob` builders                                              |
+| `src/token.rs`                            | `TokenSource` and the one-renewal bearer                                                                                     |
+| `src/tls.rs`                              | installs the `ring` rustls provider before a client is built                                                                 |
+| `src/testing.rs`                          | a plain local runner for unit tests                                                                                          |
 
 ## Layers
 
@@ -114,6 +115,18 @@ the processes, the output and the notify sender (`execd` is the reference); the 
 `JobScope::named` takes an opaque `[0-9a-z-]{1,64}` scope string (what the TypeScript and Python clients take).
 `JobScope::for_session` remains the Beyond agent helper that digests tenant + session. `Jobs::start` builds a kept
 job from program/args with optional cwd/label — the short path; `start_kept` still takes a full `JobSpec`.
+
+**The handle (`exec_endpoint/jobs_native/handle.rs`).** `run_held` and `follow` are one handle driven by the client
+kernel (`job_client::step`, proven in Verus): the shell sends the request the kernel names, turns what comes back into a
+kernel event (a status, a frame, a cut, a tick) and does the actions it returns. It keeps no reconnect counter, offset,
+gap or status table of its own. A cut stream is reopened at the offset the consumer has reached, asking for the mark the
+first frame named; a start is sent again with the same `idempotency_key`; a gap is told to the sink before the next
+output; and the handle ends only on the job's end, a terminal answer (`JobGone`, a refused credential, ...) or the
+caller dropping the future. A front that is down for any length of time is a `Reconnecting` log line, never an end. Only the backend's own exact answer that the sandbox is gone ends it (`says_sandbox_gone`: E2B's `502` with `{"sandboxId", "message": "The sandbox was not found", "code": 502}` naming a sandbox in the endpoint's URL; Beyond's `401` with code `session_ended`); any other 502 is a busy front. `crates/sandbox-conformance/tests/e2b_sandbox_gone.rs` deletes a real E2B VM mid-follow and shows it (opt-in, billed).
+An endpoint that does not echo a mark (`started{mark}`, `attached{mark,from}`) is refused as `Unsupported` (the kernel's
+`NotOffered`): there is no version check and no capabilities op. `JobError::classify` takes a start's and an attach's
+statuses from the kernel's `classify`. `HttpExecRunner::with_time_divisor` is test-only: it runs the handle's clock and
+sleeps faster so a test of a minutes-long outage takes a fraction of a second; the default is the wall clock.
 
 ## Errors (`error.rs`)
 

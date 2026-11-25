@@ -12,11 +12,13 @@ use serde_json::{Value, json};
 
 use super::HttpExecRunner;
 use super::jobs::{
-    EventSink, JOB_SIGNALS, JobEnd, JobError, JobEvent, JobId, JobInfo, JobNotify, JobOp, JobScope,
-    JobSpec, JobStatus, PtyInfo, PtySize, ReadChunk, Removal, SandboxJobs, Started, StdinWritten,
-    Stream, WRITE_MAX,
+    EventSink, JOB_SIGNALS, JobEnd, JobError, JobId, JobInfo, JobNotify, JobOp, JobScope, JobSpec,
+    JobStatus, PtyInfo, PtySize, ReadChunk, Removal, SandboxJobs, Started, StdinWritten, Stream,
+    WRITE_MAX,
 };
-use super::stream::{FrameReader, silence_limit};
+use job_client::step::{Mark, Mode, State};
+
+mod handle;
 
 /// A refusal as the job condition it is, when it is one; any other error is unchanged.
 fn refine(e: std::io::Error, op: JobOp) -> std::io::Error {
@@ -257,95 +259,6 @@ impl<'a> NativeJobs<'a> {
             ))
         })
     }
-
-    /// One streamed operation: frames to `events`, until the final one.
-    #[allow(clippy::too_many_arguments)] // the request's parts, each used once
-    async fn stream(
-        &self,
-        program: &str,
-        args: &[String],
-        cwd: Option<&str>,
-        env: &[(String, String)],
-        job: Value,
-        (stdin_open, pty): (bool, bool),
-        beat: Option<u32>,
-        op: JobOp,
-        attach: bool,
-        events: EventSink<'_>,
-    ) -> std::io::Result<JobEnd> {
-        check_beat(beat)?;
-        let mut first = true;
-        let resp = self
-            .runner
-            .send_env_beat(
-                program,
-                args,
-                cwd,
-                super::STREAM_DEADLINE,
-                None,
-                true,
-                Some(&job),
-                env,
-                beat,
-            )
-            .await
-            .map_err(|e| refine(e, op))?;
-        let mut reader = FrameReader::new(resp);
-        let broken = |e: String| std::io::Error::other(format!("job stream: {e}"));
-        loop {
-            let Some(line) = reader
-                .next_line(silence_limit(beat))
-                .await
-                .map_err(broken)?
-            else {
-                return Err(broken(
-                    "the stream ended before the job's final frame".into(),
-                ));
-            };
-            let frame = decode_job_frame(&line).map_err(broken)?;
-            if attach && first && frame != JobFrame::Heartbeat {
-                first = false;
-                // An attach is answered `attached` first; an endpoint that predates marks streams.
-                if !matches!(
-                    frame,
-                    JobFrame::Event(Event::Attached(..)) | JobFrame::Error(_)
-                ) {
-                    return Err(predates("job marks"));
-                }
-            }
-            match frame {
-                JobFrame::Event(Event::Started(pgid, mark, stdin, echoed)) => {
-                    // An endpoint that predates job stdin ignores the flag and says nothing:
-                    // the job it started would read EOF. Not a job to leave running.
-                    if stdin_open && !stdin {
-                        return Err(predates("job stdin"));
-                    }
-                    // The same for a terminal: dropping the stream kills the held job.
-                    if pty && echoed.is_none() {
-                        return Err(predates("job terminals"));
-                    }
-                    // The first frame of a held start names the incarnation; an endpoint that
-                    // predates marks says nothing.
-                    let Some(mark) = mark else {
-                        return Err(predates("job marks"));
-                    };
-                    events(JobEvent::Started(pgid, &mark));
-                }
-                JobFrame::Event(Event::Attached(mark, from)) => {
-                    events(JobEvent::Attached { mark: &mark, from });
-                }
-                JobFrame::Event(Event::Output(b, s)) => events(JobEvent::Output(&b, s)),
-                JobFrame::Event(Event::Gap(n)) => events(JobEvent::Gap(n)),
-                JobFrame::Event(Event::ShellExit(c)) => events(JobEvent::ShellExit(c)),
-                JobFrame::Heartbeat => {}
-                JobFrame::End(end) => {
-                    reader.finish().await;
-                    return Ok(end);
-                }
-                JobFrame::Error(e) => return Err(broken(e)),
-            }
-        }
-    }
 }
 
 impl NativeJobs<'_> {
@@ -360,20 +273,25 @@ impl NativeJobs<'_> {
         beat: Option<u32>,
         events: EventSink<'_>,
     ) -> std::io::Result<JobEnd> {
-        let job = Self::start_op(scope, id, true, spec);
-        self.stream(
-            &spec.program,
-            &spec.args,
-            spec.cwd.as_deref(),
-            &spec.env,
-            job,
-            (spec.stdin_open, spec.pty.is_some()),
+        check_beat(beat)?;
+        let h = handle::Handle {
+            runner: self.runner,
+            scope,
+            id,
+            spec: Some(spec),
             beat,
-            JobOp::Start,
+            output: true,
+        };
+        let state = State::for_start(
+            1,
+            Mode::Follow,
             false,
-            events,
-        )
-        .await
+            beat.unwrap_or(0),
+            spec.stdin_open,
+            spec.pty.is_some(),
+            false,
+        );
+        handle::drive(&h, state, events).await
     }
 
     /// [`SandboxJobs::follow`] with a heartbeat of the request's choosing, as [`Self::run_held_beat`].
@@ -404,24 +322,28 @@ impl NativeJobs<'_> {
         beat: Option<u32>,
         events: EventSink<'_>,
     ) -> std::io::Result<JobEnd> {
-        let mut extra = json!({ "id": id.as_str(), "offset": from, "output": output });
-        if let Some(m) = mark {
-            extra["mark"] = json!(m);
-        }
-        let job = Self::op("attach", scope, extra);
-        self.stream(
-            INERT,
-            &[],
-            None,
-            &[],
-            job,
-            (false, false),
+        check_beat(beat)?;
+        let mark = match mark {
+            None => Mark::none(),
+            Some(m) => Mark::from_bytes(m.as_bytes()).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("a mark is 1 to 32 characters of [0-9a-f], got {m:?}"),
+                )
+            })?,
+        };
+        let h = handle::Handle {
+            runner: self.runner,
+            scope,
+            id,
+            spec: None,
             beat,
-            JobOp::Other,
-            true,
-            events,
-        )
-        .await
+            output,
+        };
+        // A status-only attach carries no output: the kernel counts it and delivers only the exit.
+        let mode = if output { Mode::Follow } else { Mode::Watch };
+        let state = State::for_attach(mark, from, mode, false, beat.unwrap_or(0));
+        handle::drive(&h, state, events).await
     }
 
     /// [`SandboxJobs::read`] for a caller that wants a removed or unknown job as an error: the wire

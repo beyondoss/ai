@@ -378,6 +378,7 @@ fn only_the_kernel_is_called_and_it_is_the_only_dependency() {
         .collect();
     let known = [
         "Action",
+        "Authority",
         "Class",
         "Event",
         "Flow",
