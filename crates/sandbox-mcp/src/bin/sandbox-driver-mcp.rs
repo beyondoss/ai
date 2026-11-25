@@ -79,7 +79,8 @@ fn missing_features() -> Value {
         "frames": "an MCP tool result arrives whole, so there are no frames or heartbeats to see",
         "unbounded_stream": "exec_stream is job_output over a job's log, which keeps the last 8 MiB of output (a bound of the job protocol): a longer stream loses its head",
         "job_errors": "an MCP tool result carries an error message, not the typed job errors of the TypeScript and Python SDKs",
-                "job_options": "the MCP tools have no held start, keep, seen, grace_ms or heartbeat_seconds",
+        "job_options": "the MCP tools have no held start, keep, seen, grace_ms or heartbeat_seconds",
+        "job_pty": "the MCP tools have no terminal: no `pty` on a job start and no resize tool",
     })
 }
 
@@ -1010,7 +1011,8 @@ async fn main() {
                 let result = if op == "hello" {
                     Ok(json!({
                         "driver": DRIVER, "protocol": 1, "ops": OPS,
-                        "features": ["exit_signal", "exec_env", "job_streams", "job_stdin", "job_signal_op", "job_marks", "job_start_key"], "missing": missing_features(),
+                        "features": ["exit_signal", "exec_env", "job_streams", "job_stdin", "job_signal_op", "job_marks"], "missing": missing_features(),
+                        "features": ["exit_signal", "exec_env", "job_streams", "job_stdin", "job_signal_op", "job_start_key"], "missing": missing_features(),
                     }))
                 } else if !OPS.contains(&op.as_str()) {
                     Err(err("unsupported", "no such op"))

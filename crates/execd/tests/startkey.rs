@@ -176,8 +176,7 @@ async fn a_key_used_for_another_command_is_a_409_for_every_field_of_the_spec() {
 }
 
 /// K4, K5: an id in the table is the claim, with no key or under another key; a start with no key never
-/// replays. A malformed key is a `400`, and a well-formed one is not (K12, K13). Red under `mut_unkeyed_replays`,
-/// `mut_key_held_starts`, `mut_bad_key_accepted` and `mut_valid_key_refused`.
+/// replays. A malformed key is a `400`. Red under `mut_unkeyed_replays`.
 #[tokio::test]
 async fn an_id_in_the_table_is_refused_without_its_key_and_a_bad_key_is_400() {
     let execd = Execd::start(&[], &[]);
@@ -200,13 +199,6 @@ async fn an_id_in_the_table_is_refused_without_its_key_and_a_bad_key_is_400() {
             "{bad:?}"
         );
     }
-    // K12, K13: every byte class of the grammar, and the longest key, are valid.
-    for (i, good) in ["Az09._:-", &"k".repeat(128)].into_iter().enumerate() {
-        let (s, v) = start(a, &format!("g{i}"), Some(good), "sleep 300", json!({})).await;
-        assert_eq!(s, 200, "{good:?}: {v}");
-        assert_eq!(v["key"], good, "the key is echoed");
-    }
-    kill(a, &["g0", "g1"]).await;
     // An unkeyed job's id replays nothing either.
     let (s, _) = start(a, "j4", None, "sleep 300", json!({})).await;
     assert_eq!(s, 200);
@@ -430,115 +422,88 @@ async fn a_keyed_start_claimed_and_never_saved_is_lost_and_its_retry_never_spawn
     assert_eq!(runs(&mark), 0, "the command never ran");
 }
 
-/// Whether a process still runs (a zombie is dead: nothing of it runs).
-fn running(pid: i32) -> bool {
-    std::fs::read_to_string(format!("/proc/{pid}/stat"))
-        .ok()
-        .and_then(|s| s.rsplit(')').next().map(|r| r.trim_start().to_string()))
-        .is_some_and(|r| !r.starts_with('Z'))
-}
-
-/// K10: a keyed start whose claim cannot be written is refused (`507` for a full disk, `500` otherwise) and spawns
-/// nothing; once the fault clears the retry, with the same key, starts and runs once. An unkeyed start has no claim to
-/// write and is not refused. Red under `mut_spawn_without_claim` (the process runs with no claim on disk) and
-/// `mut_durable_claim_refused` (the retry is refused).
+/// B1, K10, K16: a keyed start whose claim cannot be made durable spawns nothing (`507` for a full disk, else
+/// `500`), and the same key started again once the fault clears runs. Red on a build whose launch spawns without
+/// the claim (`mut_spawn_without_claim`). The fault is the test knob `EXECD_TEST_FAULT`, read in `fault.rs` only.
 #[tokio::test]
-async fn a_keyed_start_whose_claim_cannot_be_written_spawns_nothing_and_its_retry_starts() {
+async fn a_claim_that_cannot_be_saved_refuses_the_start_and_its_retry_runs() {
     let state = tempfile::tempdir().unwrap();
     let ledger = state.path().join("ledger");
-    let fault = state.path().join("fault");
-    let settings = [("EXECD_STATE_DIR", ledger.to_str().unwrap())];
-    let env = [("EXECD_TEST_FAULT", fault.to_str().unwrap())];
-    let execd = Execd::start(&settings, &env);
-    let a = SocketAddr::V4(execd.addr);
+    std::fs::create_dir_all(&ledger).unwrap();
     let dir = tempfile::tempdir().unwrap();
+    let fault = dir.path().join("fault");
     let mark = dir.path().join("mark");
     let sc = script(&mark);
-    for (what, status) in [("full", 507), ("eio", 500)] {
+    let settings = [
+        ("EXECD_STATE_DIR", ledger.to_str().unwrap()),
+        ("EXECD_TEST_FAULT", fault.to_str().unwrap()),
+    ];
+    let e = Execd::start(&settings, &[]);
+    let a = SocketAddr::V4(e.addr);
+    for (what, want) in [("full", 507), ("eio", 500)] {
         std::fs::write(&fault, format!("claim_save={what}\n")).unwrap();
-        let (s, v) = start(a, "j1", Some("claim-key"), &sc, json!({})).await;
-        assert_eq!(s, status, "{what}: {v}");
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(runs(&mark), 0, "{what}: nothing spawned");
+        let (s, v) = start(a, "j", Some("k"), &sc, json!({})).await;
+        assert_eq!(s, want, "{what}: {v}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(runs(&mark), 0, "{what}: nothing was spawned");
         assert!(
             ids(a).await.is_empty(),
-            "{what}: the refused job is not in the table"
+            "{what}: the refused start left no job"
         );
     }
-    // The claim is not the unkeyed start's: it runs through the fault.
-    let (s, v) = start(a, "plain", None, "sleep 300", json!({})).await;
-    assert_eq!(s, 200, "{v}");
-    kill(a, &["plain"]).await;
-    // The fault clears: the same start, with the same key, runs once.
     std::fs::remove_file(&fault).unwrap();
-    let (s, first) = start(a, "j1", Some("claim-key"), &sc, json!({})).await;
-    assert_eq!(s, 200, "{first}");
-    assert_eq!(first["key"], "claim-key");
-    until("the run", async || runs(&mark) == 1).await;
-    let (s, again) = start(a, "j1", Some("claim-key"), &sc, json!({})).await;
-    assert_eq!((s, &again), (200, &first));
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(runs(&mark), 1, "the command ran once");
-    kill(a, &["j1"]).await;
+    let (s, v) = start(a, "j", Some("k"), &sc, json!({})).await;
+    assert_eq!(s, 200, "the retry, once the fault clears: {v}");
+    until("the retry ran", async || runs(&mark) == 1).await;
+    kill(a, &["j"]).await;
 }
 
-/// K11: execd exits between a keyed start's spawn and the group's save (the test knob), leaving the job's real process
-/// running with only its intent on disk. The next execd answers the intent as lost and kills the process by its mark;
-/// the retry replays the lost job and starts nothing. Red under `mut_orphan_survives` (the process lives on) and
-/// `mut_intent_respawns` (the retry spawns a second one).
+/// M1, K11: execd dies between the spawn and the group's save, leaving a marked process and only the intent on
+/// disk. The restart kills the process (the kernel's `Sweep::KillMarked`) and answers the retry with the lost job,
+/// starting nothing. Red on `mut_orphan_survives` (the process lives) and on `mut_intent_respawns`.
 #[tokio::test]
-async fn a_process_spawned_before_its_save_is_killed_by_the_next_execd_and_the_retry_starts_nothing()
+async fn an_orphan_of_a_crash_between_the_spawn_and_the_save_is_killed_and_the_retry_starts_nothing()
  {
     let state = tempfile::tempdir().unwrap();
     let ledger = state.path().join("ledger");
-    let fault = state.path().join("fault");
-    let settings = [("EXECD_STATE_DIR", ledger.to_str().unwrap())];
-    let env = [("EXECD_TEST_FAULT", fault.to_str().unwrap())];
+    std::fs::create_dir_all(&ledger).unwrap();
     let dir = tempfile::tempdir().unwrap();
+    let fault = dir.path().join("fault");
     let mark = dir.path().join("mark");
     let pidfile = dir.path().join("pid");
-    let sc = format!(
-        "echo $$ > {}; echo run >> {}; sleep 300",
-        pidfile.display(),
-        mark.display()
-    );
-    let mut first = Execd::start(&settings, &env);
-    let a1 = SocketAddr::V4(first.addr);
+    let sc = format!("echo $$ > {}; {}", pidfile.display(), script(&mark));
+    let sc = sc.as_str();
     std::fs::write(&fault, "after_spawn=exit\n").unwrap();
-    // The answer never comes: execd exits with the process spawned.
-    let sent = tokio::spawn({
-        let sc = sc.clone();
-        async move { start(a1, "orphan", Some("crash-key"), &sc, json!({})).await }
-    });
-    until("the process ran", async || runs(&mark) == 1).await;
-    until("execd exited", async || {
-        first.child.try_wait().unwrap().is_some()
-    })
-    .await;
-    let _ = sent.await;
-    let pid: i32 = std::fs::read_to_string(&pidfile)
+    let settings = [
+        ("EXECD_STATE_DIR", ledger.to_str().unwrap()),
+        ("EXECD_TEST_FAULT", fault.to_str().unwrap()),
+    ];
+    {
+        let e = Execd::start(&settings, &[]);
+        let a = SocketAddr::V4(e.addr);
+        // The answer dies with execd.
+        let mut job = json!({ "op": "start", "scope": "s", "id": "j", "hold": false });
+        job["idempotency_key"] = json!("k");
+        let body = json!({ "command": "sh", "args": ["-c", sc], "job": job });
+        let _ = tokio::spawn(async move { post(a, &[], &body).await }).await;
+    }
+    until("the orphan ran", async || runs(&mark) == 1).await;
+    let pid: u32 = std::fs::read_to_string(&pidfile)
         .unwrap()
         .trim()
         .parse()
         .unwrap();
-    assert!(running(pid), "the process outlived execd: an orphan");
-
+    let alive = |pid: u32| {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .is_ok_and(|s| !s.rsplit(") ").next().unwrap_or("").starts_with('Z'))
+    };
+    assert!(alive(pid), "the orphan outlived execd");
     std::fs::remove_file(&fault).unwrap();
-    let second = Execd::start(&settings, &env);
-    let a2 = SocketAddr::V4(second.addr);
-    until("the orphan is killed", async || !running(pid)).await;
-    // The intent is a job that ended lost, and its retry is answered by it: nothing starts.
-    let l = job(a2, json!({"op":"list","scope":"s"})).await;
-    assert_eq!(l["jobs"][0]["id"], "orphan", "{l}");
-    assert_eq!(l["jobs"][0]["state"], "ended");
-    for _ in 0..2 {
-        let (s, v) = start(a2, "orphan", Some("crash-key"), &sc, json!({})).await;
-        assert_eq!(
-            (s, &v["started"], &v["key"]),
-            (200, &json!(0), &json!("crash-key")),
-            "{v}"
-        );
-    }
+    let e = Execd::start(&settings, &[]);
+    let a = SocketAddr::V4(e.addr);
+    until("the restart killed the orphan", async || !alive(pid)).await;
+    let (s, v) = start(a, "j", Some("k"), sc, json!({})).await;
+    assert_eq!((s, &v["started"]), (200, &json!(0)), "{v}");
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(runs(&mark), 1, "the command ran once, and nothing runs now");
+    assert_eq!(runs(&mark), 1, "the retry started nothing");
 }

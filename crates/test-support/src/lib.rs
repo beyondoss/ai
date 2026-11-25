@@ -18,6 +18,7 @@
 pub mod bundle;
 pub mod exec_mock;
 pub mod grant;
+pub mod job_front;
 pub mod ports;
 
 use std::io::{Read, Write};

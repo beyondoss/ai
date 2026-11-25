@@ -109,7 +109,7 @@ impl Model for Os {
 
     fn init_states(&self) -> Vec<St> {
         vec![St {
-            jobs: (0..self.jobs).map(|_| State::new(0, false)).collect(),
+            jobs: (0..self.jobs).map(|_| State::new(0, false, None)).collect(),
             held: Held::new(),
             owner: Owner::Free,
             pending: Vec::new(),

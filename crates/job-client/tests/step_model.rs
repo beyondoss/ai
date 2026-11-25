@@ -27,6 +27,12 @@
 //! - M7 an endpoint that does not echo marks is never streamed: the handle fails closed.
 //! - M9 reconnecting never ends the handle: a cut, a tick or a busy answer is never followed by an end,
 //!   however many failed opens came before.
+//! - M12 a failure to connect (`Unreached`) ends a handle only when it is a start nothing answered, with
+//!   `Transport`; it ends nothing else (folded into M9).
+//! - M10 an answer the backend itself gave (`Authority::SandboxGone`, `Authority::SessionEnded`) ends the
+//!   handle in that one step, with that fault.
+//! - M11 nothing else ends the handle as `SandboxGone` or `SessionEnded`: not a cut, a tick, a busy
+//!   answer, silence, or any answer that is not authoritative.
 //! - Witnesses (`sometimes`): the handle finishes after delivering the exit and removing the job; the front
 //!   stays down past the notice threshold and the handle still streams again; the caller's deadline ends it;
 //!   it ends `JobGone` when the id was reused; a gap is delivered in a chunk and with the exit; it reattaches
@@ -38,7 +44,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use job_client::step::{
-    self, Action, Event, Fault, Flow, Frame, Mark, Mode, Phase, State, step as kernel_step,
+    self, Action, Authority, Event, Fault, Flow, Frame, Mark, Mode, Phase, State,
+    step as kernel_step,
 };
 use stateright::{Checker, Model, Property};
 
@@ -102,6 +109,8 @@ struct St {
     starts: u8,
     peak: u32,
     start_lost: bool,
+    /// A request of the handle reached the server (it was answered, or its answer was lost).
+    reached: bool,
     saw_gap_chunk: bool,
     saw_gap_exit: bool,
     reattached: bool,
@@ -125,15 +134,23 @@ const B_KEY: u32 = 1 << 5;
 const B_ECHO: u32 = 1 << 6;
 const B_FRESH: u32 = 1 << 7;
 const B_GIVEUP: u32 = 1 << 8;
+const B_AUTH_ONE: u32 = 1 << 9;
+const B_AUTH_ONLY: u32 = 1 << 10;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum A {
     /// The server answers the request with this status.
     Answer(u16),
+    /// The backend answers the request with its own "the sandbox was not found".
+    AnswerGone,
+    /// The front answers the request with "the session has ended".
+    AnswerEnded,
     /// The server sends its next frame on the open connection.
     Frame,
     /// The stream breaks; or, with the request in flight, its answer is lost.
     Cut,
+    /// The request in flight never reaches a server: the connection is refused.
+    Refuse,
     /// The wake time comes.
     Tick,
     /// The consumer takes the exit.
@@ -168,7 +185,7 @@ impl Cfg {
     fn init(&self) -> St {
         let (c, slot, held, incs) = match self.flow {
             Flow::Start => (
-                State::for_start(KEY, self.mode, self.remove_on_exit, 0),
+                State::for_start(KEY, self.mode, self.remove_on_exit, 0, false, false, false),
                 None,
                 None,
                 0,
@@ -201,6 +218,7 @@ impl Cfg {
             starts: 0,
             peak: 0,
             start_lost: false,
+            reached: false,
             saw_gap_chunk: false,
             saw_gap_exit: false,
             reattached: false,
@@ -214,6 +232,7 @@ impl Cfg {
         let before = s.c;
         let conn_before = s.conn.clone();
         let req_before = s.req.clone();
+        let ended_before = s.ended;
         let (c2, acts) = kernel_step(s.c, ev, now, draw);
         s.c = c2;
         if before.phase != Phase::Streaming && c2.phase == Phase::Streaming && s.held.is_none() {
@@ -289,7 +308,13 @@ impl Cfg {
                     s.cover = end;
                 }
                 Action::Sleep { until_ms } => s.wake = Some(until_ms),
-                Action::Reconnecting { .. } => {}
+                // Told to the consumer only: the model has no consumer-side state to change.
+                Action::Reconnecting { .. }
+                | Action::Started { .. }
+                | Action::Attached { .. }
+                | Action::ShellExit { .. } => {}
+                // A kept start's refused echo: the model starts held jobs and kept ones alike and never refuses one.
+                Action::Kill => {}
                 Action::Remove { mark } => {
                     if !s.exit_taken || Some(mark) != s.held.map(mark_of) {
                         s.bad |= B_REMOVE;
@@ -305,19 +330,53 @@ impl Cfg {
             }
         }
         s.peak = s.peak.max(s.c.misses);
+        // M10: the backend's own answer ends the handle in this one step, with its fault.
+        let authority = match ev {
+            Event::Answered { authority, .. } => authority,
+            _ => Authority::NotAuthoritative,
+        };
+        let expected = match authority {
+            Authority::SandboxGone => Some(Fault::SandboxGone),
+            Authority::SessionEnded => Some(Fault::SessionEnded),
+            Authority::NotAuthoritative => None,
+        };
+        if let Some(f) = expected
+            && s.ended != Some(Ended::Fault(f))
+        {
+            s.bad |= B_AUTH_ONE;
+        }
+        // M11: those two faults end the handle only through that answer.
+        if ended_before.is_none()
+            && let Some(Ended::Fault(f @ (Fault::SandboxGone | Fault::SessionEnded))) = s.ended
+            && expected != Some(f)
+        {
+            s.bad |= B_AUTH_ONLY;
+        }
         // Reconnecting is a status: a cut, a tick or a busy answer never ends the handle, however
         // many came before.
         let busy = matches!(ev, Event::Broke | Event::Tick)
-            || matches!(
-                ev,
-                Event::Answered {
-                    status: 429 | 502 | 504,
-                    ..
-                }
-            )
-            || (matches!(ev, Event::Answered { status: 503, .. })
-                && !matches!(req_before, Req::Start { .. }));
+            || (expected.is_none()
+                && match ev {
+                    Event::Answered { status, .. } => {
+                        matches!(status, 429 | 502 | 504)
+                            || (status == 503 && !matches!(req_before, Req::Start { .. }))
+                    }
+                    _ => false,
+                });
         if busy && s.ended.is_some() {
+            s.bad |= B_GIVEUP;
+        }
+        // T: a failure to connect ends a handle only for a start nothing answered, with `Transport`; and
+        // `Transport` is never the end of anything else.
+        let unanswered_start =
+            matches!(req_before, Req::Start { .. }) && !s.reached && s.created_key.is_none();
+        if matches!(ev, Event::Unreached)
+            && let Some(e) = s.ended
+            && !(e == Ended::Fault(Fault::Transport) && unanswered_start)
+        {
+            s.bad |= B_GIVEUP;
+        }
+        if s.ended == Some(Ended::Fault(Fault::Transport)) && !matches!(ev, Event::Unreached) {
             s.bad |= B_GIVEUP;
         }
     }
@@ -368,6 +427,9 @@ impl Model for Cfg {
                 out.push(A::Answer(st));
             }
             out.push(A::Cut);
+            out.push(A::Refuse);
+            out.push(A::AnswerGone);
+            out.push(A::AnswerEnded);
         }
         // A break reported late, after the exit: the handle must let it pass.
         if s.conn.is_none() && !s.in_flight && matches!(s.c.phase, Phase::ExitHeld) {
@@ -435,6 +497,7 @@ impl Model for Cfg {
             }
             A::Cut => {
                 if n.in_flight && n.conn.is_none() {
+                    n.reached = true;
                     // The answer is lost; a start has reached the server all the same.
                     if let Req::Start { key } = n.req {
                         self.server_creates(&mut n, key);
@@ -446,8 +509,13 @@ impl Model for Cfg {
                 }
                 self.feed(&mut n, Event::Broke, 0, u32::MAX);
             }
+            A::Refuse => {
+                n.in_flight = false;
+                self.feed(&mut n, Event::Unreached, 0, 0);
+            }
             A::Answer(status) => {
                 n.in_flight = false;
+                n.reached = true;
                 let req = n.req.clone();
                 let mut status = status;
                 match &req {
@@ -495,6 +563,27 @@ impl Model for Cfg {
                     Event::Answered {
                         status,
                         retry_after_s: if status == 503 { 1 } else { 0 },
+                        authority: Authority::NotAuthoritative,
+                    },
+                    0,
+                    0,
+                );
+            }
+            A::AnswerGone | A::AnswerEnded => {
+                if !(n.in_flight && n.conn.is_none()) {
+                    return None;
+                }
+                let (status, authority) = if a == A::AnswerGone {
+                    (502, Authority::SandboxGone)
+                } else {
+                    (401, Authority::SessionEnded)
+                };
+                self.feed(
+                    &mut n,
+                    Event::Answered {
+                        status,
+                        retry_after_s: 0,
+                        authority,
                     },
                     0,
                     0,
@@ -542,6 +631,14 @@ impl Model for Cfg {
             always!("M7 no echo, no stream", B_ECHO),
             always!("M8 a job is never created twice for one handle", B_FRESH),
             always!("M9 reconnecting never ends the handle", B_GIVEUP),
+            always!(
+                "M10 the backend's own answer ends the handle in one step",
+                B_AUTH_ONE
+            ),
+            always!(
+                "M11 nothing but that answer ends it as SandboxGone or SessionEnded",
+                B_AUTH_ONLY
+            ),
         ];
         if self.legacy {
             p.push(Property::<Self>::sometimes(
@@ -568,6 +665,20 @@ impl Model for Cfg {
                     && s.reattached
                     && s.c.phase == Phase::Streaming
             },
+        ));
+        if self.flow == Flow::Start {
+            p.push(Property::<Self>::sometimes(
+                "W11 a start nothing answered ends with Transport",
+                |_, s| s.ended == Some(Ended::Fault(Fault::Transport)),
+            ));
+        }
+        p.push(Property::<Self>::sometimes(
+            "W11 the sandbox is gone: SandboxGone",
+            |_, s| s.ended == Some(Ended::Fault(Fault::SandboxGone)),
+        ));
+        p.push(Property::<Self>::sometimes(
+            "W12 the session has ended: SessionEnded",
+            |_, s| s.ended == Some(Ended::Fault(Fault::SessionEnded)),
         ));
         p.push(Property::<Self>::sometimes(
             "W10 the caller's deadline ends it",
@@ -648,6 +759,8 @@ impl Cfg {
             return Some(match n.req {
                 Req::Start { .. } => Event::Frame(Frame::Started {
                     mark: mark_of(k.inc),
+                    stdin: false,
+                    pty: false,
                 }),
                 _ => Event::Frame(Frame::Attached {
                     mark: mark_of(k.inc),

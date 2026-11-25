@@ -17,7 +17,7 @@ use beyond_sandbox::Sandbox;
 use beyond_sandbox::exec::CommandRunner;
 use beyond_sandbox::exec_endpoint::HttpExecRunner;
 use beyond_sandbox::exec_endpoint::jobs::{
-    JobEnd, JobError, JobEvent, JobId, JobScope, JobSpec, JobStatus, Stream,
+    JobEnd, JobError, JobEvent, JobId, JobScope, JobSpec, JobStatus, PtyInfo, PtySize, Stream,
 };
 use beyond_sandbox::exec_endpoint::jobs_native::NativeJobs;
 use beyond_sandbox::fs::shell::{Capabilities, SearchEngine};
@@ -75,12 +75,62 @@ fn io_err(e: &std::io::Error) -> Value {
 /// a heartbeat out of range is `invalid_request`; anything else is as [`io_err`].
 fn job_err(e: &std::io::Error) -> Value {
     if let Some(j) = JobError::of(e) {
-        return json!({ "kind": j.kind(), "detail": j.to_string(), "code": j.code() });
+        let mut v = json!({ "kind": j.kind(), "detail": j.to_string() });
+        // A resize conflict has no code of its own (DRIVER.md): only the conditions of `job_errors`.
+        if !matches!(j, JobError::Conflict { .. }) {
+            v["code"] = json!(j.code());
+        }
+        // A refused stdin write says how much of the stream was applied (`job_pty`).
+        if let Some(n) = written_in(&j.to_string()) {
+            v["written"] = json!(n);
+        }
+        return v;
     }
     if e.kind() == std::io::ErrorKind::InvalidInput && e.to_string().contains("heartbeat_seconds") {
         return err("invalid_request", e.to_string());
     }
     io_err(e)
+}
+
+/// The `written` an endpoint's 409 body carries, when the error text still has it.
+fn written_in(text: &str) -> Option<u64> {
+    let rest = &text[text.find("\"written\"")? + "\"written\"".len()..];
+    let rest = rest.trim_start().strip_prefix(':')?.trim_start();
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
+/// `pty`: `{cols, rows}` or nothing; a size out of range is `invalid_request`.
+fn pty_arg(req: &Value) -> Result<Option<PtySize>, Value> {
+    let Some(p) = req.get("pty").filter(|p| !p.is_null()) else {
+        return Ok(None);
+    };
+    let dim = |k: &str| {
+        p.get(k)
+            .and_then(Value::as_u64)
+            .ok_or_else(|| err("invalid_request", format!("`pty.{k}` must be a count")))
+    };
+    PtySize::new(dim("cols")?, dim("rows")?)
+        .map(Some)
+        .ok_or_else(|| {
+            err(
+                "invalid_request",
+                "pty: cols and rows are integers from 1 to 1024",
+            )
+        })
+}
+
+fn pty_echo(mut v: Value, pty: Option<PtySize>) -> Value {
+    if let Some(p) = pty {
+        v["pty"] = json!({ "cols": p.cols, "rows": p.rows });
+    }
+    v
+}
+
+fn pty_json(p: PtyInfo) -> Value {
+    json!({ "cols": p.size.cols, "rows": p.size.rows, "open": p.open })
 }
 
 fn fs_err(e: &FsError) -> Value {
@@ -358,6 +408,7 @@ impl Driver {
                 "job_wipe",
                 "job_write",
                 "job_signal",
+                "job_resize",
             ]);
         }
         ops.extend([
@@ -402,7 +453,8 @@ impl Driver {
                 "ops": self.ops(),
                 "features": [
                     "frames", "unbounded_stream", "exit_signal", "exec_env", "job_streams",
-                    "job_stdin", "job_signal_op", "job_errors", "job_options", "job_marks", "job_start_key"
+                    "job_stdin", "job_signal_op", "job_errors", "job_options", "job_marks", "job_pty",
+                    "job_start_key"
                 ],
             }));
         }
@@ -443,6 +495,7 @@ impl Driver {
             "job_wipe" => self.job_wipe(req).await,
             "job_write" => self.job_write(req).await,
             "job_signal" => self.job_signal(req).await,
+            "job_resize" => self.job_resize(req).await,
             "stat" => self.stat(req).await,
             "read" => self.read(req).await,
             "write" => self.write(req).await,
@@ -545,6 +598,7 @@ impl Driver {
             label: opt_str(req, "label")?.unwrap_or("").to_string(),
             env: env_arg(req)?,
             stdin_open: flag(req, "stdin_open")?,
+            pty: pty_arg(req)?,
             idempotency_key: opt_str(req, "idempotency_key")?.map(str::to_string),
         };
         let started = self
@@ -552,7 +606,12 @@ impl Driver {
             .start_kept(&scope, &id, &spec)
             .await
             .map_err(|e| job_err(&e))?;
-        Ok(json!({ "pgid": started.pgid, "mark": started.mark }))
+        // The client refused (`not_offered`) an endpoint that did not echo `pty`, so a start that
+        // came back echoed it.
+        Ok(pty_echo(
+            json!({ "pgid": started.pgid, "mark": started.mark }),
+            spec.pty,
+        ))
     }
 
     /// Start held, learn the pgid from the first frame, optionally `keep`, then drop the stream: a
@@ -567,6 +626,7 @@ impl Driver {
             label: opt_str(req, "label")?.unwrap_or("").to_string(),
             env: env_arg(req)?,
             stdin_open: flag(req, "stdin_open")?,
+            pty: pty_arg(req)?,
             idempotency_key: None,
         };
         let keep = flag(req, "keep")?;
@@ -597,7 +657,7 @@ impl Driver {
                 .map_err(|e| job_err(&e))?;
         }
         // Dropping the future closes the stream.
-        Ok(json!({ "pgid": pgid, "mark": mark }))
+        Ok(pty_echo(json!({ "pgid": pgid, "mark": mark }), spec.pty))
     }
 
     async fn job_keep(&self, req: &Value) -> Out {
@@ -651,6 +711,9 @@ impl Driver {
                 if let Some(s) = j.signal {
                     entry["signal"] = json!(s);
                 }
+                if let Some(p) = j.pty {
+                    entry["pty"] = pty_json(p);
+                }
                 entry
             })
             .collect();
@@ -680,6 +743,9 @@ impl Driver {
         }
         if let Some(s) = c.signal {
             out["signal"] = json!(s);
+        }
+        if let Some(p) = c.pty {
+            out["pty"] = pty_json(p);
         }
         Ok(out)
     }
@@ -790,10 +856,34 @@ impl Driver {
                 Err(match e.kind() {
                     _ if JobError::of(&e).is_some() => job_err(&e),
                     NotFound => err("not_found", e.to_string()),
-                    BrokenPipe | TimedOut | InvalidInput => err("conflict", e.to_string()),
+                    // 413 and a terminal's refusal of `eof` (400).
+                    InvalidInput => err("invalid_request", e.to_string()),
+                    BrokenPipe | TimedOut => err("conflict", e.to_string()),
                     _ => io_err(&e),
                 })
             }
+        }
+    }
+
+    async fn job_resize(&self, req: &Value) -> Out {
+        let scope = self.scope(req)?;
+        let id = Self::job_id(req, "job")?;
+        let dim = |k: &str| {
+            u64_arg(req, k)?.ok_or_else(|| err("invalid_request", format!("`{k}` must be a count")))
+        };
+        // Out of range is `invalid_request` and nothing is sent.
+        let size = PtySize::new(dim("cols")?, dim("rows")?).ok_or_else(|| {
+            err(
+                "invalid_request",
+                "pty: cols and rows are integers from 1 to 1024",
+            )
+        })?;
+        match self.jobs()?.resize(&scope, &id, size).await {
+            Ok(p) => Ok(json!({ "cols": p.cols, "rows": p.rows })),
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+                Err(err("invalid_request", e.to_string()))
+            }
+            Err(e) => Err(job_err(&e)),
         }
     }
 

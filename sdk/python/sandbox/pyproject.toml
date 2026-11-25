@@ -13,7 +13,9 @@ dependencies = []
 classifiers = [
   "Typing :: Typed",
   "Programming Language :: Python :: 3",
-  "Operating System :: OS Independent",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
 ]
 
 [project.urls]
@@ -24,6 +26,11 @@ dev = ["pytest>=8", "mypy>=1.10", "ruff>=0.5"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/beyond_sandbox"]
+
+# The wheel carries the job client's kernel as a native library (hatch_build.py), so it is platform-tagged.
+# There is no sdist: a platform without a wheel does not install (see hatch_build.py).
+[tool.hatch.build.targets.wheel.hooks.custom]
+path = "hatch_build.py"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -53,9 +60,11 @@ ignore = [
 "src/beyond_sandbox/errors.py" = ["A001"]
 "src/beyond_sandbox/__init__.py" = ["A004"]
 "src/beyond_sandbox/_fs.py" = ["A004"]
+"src/beyond_sandbox/_held.py" = ["A004"]
 "src/beyond_sandbox/atransport.py" = ["A004"]
 "src/beyond_sandbox/transport.py" = ["A004"]
 "tests/test_bulk.py" = ["A004"]
+"tests/test_held.py" = ["A004"]
 "tests/test_transport.py" = ["A004"]
 
 [tool.ruff.format]

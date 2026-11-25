@@ -191,6 +191,45 @@ mut_stdin_written_shrinks = [
 mut_stdin_apply_off_start = [
   "beyond-execd-jobs/mut_stdin_apply_off_start",
 ] # an apply skips one byte more than was applied, so it starts past `written` (W2c)
+mut_resize_ended = ["beyond-execd-jobs/mut_resize_ended"] # T1
+mut_resize_lost_while_spawning = [
+  "beyond-execd-jobs/mut_resize_lost_while_spawning",
+] # T1-live
+mut_size_unbounded = ["beyond-execd-jobs/mut_size_unbounded"] # T3
+mut_size_off_by_one = ["beyond-execd-jobs/mut_size_off_by_one"] # T4
+mut_pty_err_sink = ["beyond-execd-jobs/mut_pty_err_sink"] # T5
+mut_pty_kill_group_only = ["beyond-execd-jobs/mut_pty_kill_group_only"] # T9
+mut_pty_eof_closes = ["beyond-execd-jobs/mut_pty_eof_closes"] # T10
+mut_gate_refuses_open = ["beyond-execd-jobs/mut_gate_refuses_open"] # T11
+mut_write_after_hangup = ["beyond-execd-jobs/mut_write_after_hangup"] # T12
+mut_end_keeps_terminal = ["beyond-execd-jobs/mut_end_keeps_terminal"] # T8
+mut_recover_hangs_up_live_terminal = [
+  "beyond-execd-jobs/mut_recover_hangs_up_live_terminal",
+] # T6
+mut_recover_opens_silent_terminal = [
+  "beyond-execd-jobs/mut_recover_opens_silent_terminal",
+] # T7
+mut_recover_drops_status = ["beyond-execd-jobs/mut_recover_drops_status"] # T7b
+mut_exit_before_drain = ["beyond-execd-jobs/mut_exit_before_drain"] # K1
+mut_keeper_waits_forever = ["beyond-execd-jobs/mut_keeper_waits_forever"] # K2
+mut_keeper_reconnect_resets_written = [
+  "beyond-execd-jobs/mut_keeper_reconnect_resets_written",
+] # T5b
+mut_keeper_exits_unasked = ["beyond-execd-jobs/mut_keeper_exits_unasked"] # K2b
+mut_hangup_keeps_terminal = ["beyond-execd-jobs/mut_hangup_keeps_terminal"] # T7
+mut_admit_any_peer = ["beyond-execd-jobs/mut_admit_any_peer"] # P1
+mut_pty_cap_ignored = ["beyond-execd-jobs/mut_pty_cap_ignored"] # Q1
+mut_keeper_no_pty_is_500 = ["beyond-execd-jobs/mut_keeper_no_pty_is_500"] # Q1
+mut_keeper_answer_unchecked = [
+  "beyond-execd-jobs/mut_keeper_answer_unchecked",
+] # T6a
+mut_resize_not_idempotent = [
+  "beyond-execd-jobs/mut_resize_not_idempotent",
+] # T14
+mut_spool_failure_silent = ["beyond-execd-jobs/mut_spool_failure_silent"] # Q6
+mut_spool_failure_keeps_code = [
+  "beyond-execd-jobs/mut_spool_failure_keeps_code",
+] # Q6
 mut_stdin_closes_early = [
   "beyond-execd-jobs/mut_stdin_closes_early",
 ] # EOF closes the stdin before every byte of the write landed (W4)
@@ -303,7 +342,7 @@ openssl-probe = "0.1"
 # client is built (`rustls-no-provider` has no default).
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 # `FIONREAD`: how many bytes a pipe holds, as a safe call.
-rustix = { version = "1", default-features = false, features = ["std"] }
+rustix = { version = "1", default-features = false, features = ["std", "pty", "termios", "process", "event", "stdio", "net", "fs"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde.workspace = true
 serde_json.workspace = true

@@ -221,17 +221,18 @@
 //!
 //! | op | `job` fields | answer |
 //! |---|---|---|
-//! | `start` | `id`, `hold`, `label`, `stdin_open`, `idempotency_key` — the command is the request's `command`/`args`/`cwd`/`env` | `hold: true` (with `"stream": true`): a job stream; `hold: false`: `{"started": pgid, "mark"}`; both name the job's `mark` (this incarnation of the id), say `"stdin": true` when `stdin_open` was honoured, and echo the start's `"key"` when it carried an `idempotency_key` |
+//! | `start` | `id`, `hold`, `label`, `stdin_open`, `pty`, `idempotency_key` — the command is the request's `command`/`args`/`cwd`/`env` | `hold: true` (with `"stream": true`): a job stream; `hold: false`: `{"started": pgid, "mark"}`; A start whose key (1 to 128 characters of `[0-9A-Za-z._:-]`) an earlier start of the same command, args, cwd, env, `stdin_open` and `hold` used answers that job as the first answer did and runs nothing, echoing the `key` beside the `mark`; the key of another command is `409`; a key an endpoint does not know is ignored and not echoed. Both name the job's `mark` (this incarnation of the id), say `"stdin": true` when `stdin_open` was honoured, and `"pty": {"cols", "rows"}` when `pty` was ("Job terminals") |
 //! | `attach` | `id`, `offset`, `mark`?, `output`? (default true) (with `"stream": true`) | a job stream from `offset`, `{"attached": {"mark", "from"}}` first; a `mark` that is not the job's is 404; `output: false` streams no output and no gap, only the end, and `from` is the output's end |
-//! | `read` | `id`, `offset`, `max` | `{"state", "code", "signal"?, "offset", "end", "data", "stderr_ranges"?}` |
+//! | `read` | `id`, `offset`, `max` | `{"state", "code", "signal"?, "offset", "end", "data", "stderr_ranges"?, "pty"?}` |
 //! | `keep` | `id`, `num`, `kind`, `seen` | `{}` |
 //! | `seen` | `id`, `offset` | `{}` |
 //! | `kill` | `ids`, `remove`, `grace_ms` | `{"survivors": [{"id", "pids": [..]}]}` |
-//! | `list` | | `{"jobs": [{"id", "mark", "command", "args", "outputStart", "outputEnd", "state", "code", "signal"?, "kept", "num", "kind", "seen", "started", "ended", "label"}]}` |
+//! | `list` | | `{"jobs": [{"id", "mark", "command", "args", "outputStart", "outputEnd", "state", "code", "signal"?, "kept", "num", "kind", "seen", "started", "ended", "label", "pty"?}]}` |
 //! | `remove` | `ids`, `marks`? (`{id: mark}`) | `{"running": [ids], "mismatch": [ids]}`: a job whose group is not empty, or whose mark is not the one named, is left |
 //! | `wipe` | `grace_ms` | `{"survivors": [{"pids": [..]}]}` |
 //! | `write` | `id`, `at`, `data`, `eof` | `{"written": N, "closed"?: true}` |
 //! | `signal` | `ids`, `signal` | `{"sent": [id, ..]}` |
+//! | `resize` | `id`, `cols`, `rows` | `{"cols", "rows"}` |
 //!
 //! - **A job** runs in a process group (or cgroup) of its own, its stdin empty unless it was
 //!   started with `stdin_open` ("Job stdin"), its stdout and stderr one combined **output**, of
@@ -318,6 +319,41 @@
 //! job read them: a job that does not read blocks the write, and `timeout_ms` bounds the wait (a
 //! `200` with `written` short of the request's end is a short write, as POSIX). Dropping the
 //! connection cancels the write. The pipe is closed when the job ends or is removed.
+//!
+//! ## Job terminals
+//!
+//! `start` with `"pty": {"cols": C, "rows": R}` (integers from 1 to 1024; anything else is
+//! `400 "pty: cols and rows are integers from 1 to 1024"` and nothing runs) makes the job a
+//! **terminal**: its stdin, stdout and stderr are one pseudo-terminal of that size, the command is
+//! the leader of a session of its own with the terminal as its controlling terminal, and
+//! `TERM=xterm-256color` is set unless the request's `env` sets `TERM`. The answer echoes
+//! `"pty": {"cols", "rows"}` (a held start's first frame too), and says `"stdin": true`; a client that
+//! asked for a terminal and was not told it got one stops the job and fails, because the endpoint
+//! predates it. If no pseudo-terminal is free the start is `503 "no pseudo-terminal is free"`, which
+//! is final for that start.
+//!
+//! - **A terminal is a job.** Offsets, gaps, retention, `attach`, `read`, `keep`, `hold`, `signal`,
+//!   `kill`, `remove`, `notify` and the positional `write` are unchanged. It outlives its client
+//!   when kept, and a restart of the endpoint (a process that holds the terminal's master, the
+//!   **keeper**, outlives it): the restarted endpoint finds it with its size, its offsets and its
+//!   count of what was written, and the shell's own exit code is reported when it ends. A terminal
+//!   whose keeper died is **hung up**: it is still a job, and ends when its processes do, but
+//!   input and resize are refused.
+//! - **One stream.** Everything a terminal prints is output on `stdout`: no `stderr_ranges`, no
+//!   `stderr` frame. `\n` is `\r\n` as on any terminal.
+//! - **Input.** `write` carries bytes into the terminal's input, positional as for any stdin. A
+//!   terminal has no end of input: `eof: true` is `400` and writes nothing (write `0x04`, Ctrl-D,
+//!   as `0x03` is Ctrl-C: they are data). A write to a hung-up terminal or an ended job is
+//!   `409 {"error": "the terminal hung up", "written": N}`.
+//! - **`resize`.** `{"op":"resize","scope","id","cols","rows"}` sets the terminal's size (the
+//!   foreground group gets `SIGWINCH`) and answers `{"cols", "rows"}`. It is absolute, so a retry is
+//!   idempotent, and a size asked for while the job is still starting is applied when it starts.
+//!   `400` outside 1 to 1024; `404` no such job; `409` with `"the job has no terminal"`, `"the job has
+//!   ended"` or `"the terminal hung up"`.
+//! - **`list` and `read`** carry `"pty": {"cols", "rows", "open"}` on a terminal (`open` is false
+//!   once it hung up or its job ended), and no `pty` member on any other job.
+//! - **A held terminal nobody kept** dies with its client's connection, every process of its session
+//!   included.
 //!
 //! ## Job signal
 //!
@@ -944,6 +980,8 @@ fn too_large(url: &str, cap: usize) -> std::io::Error {
 pub struct EndpointStatus {
     pub status: u16,
     pub body: String,
+    /// The `Retry-After` the answer carried, in whole seconds; 0 when none (or a date).
+    pub retry_after_s: u32,
     text: String,
 }
 
@@ -953,6 +991,7 @@ impl EndpointStatus {
         Self {
             status,
             body: body.into(),
+            retry_after_s: 0,
             text: text.into(),
         }
     }
@@ -1010,6 +1049,29 @@ pub struct HttpExecRunner {
     suspect: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// An `env` was proved to be applied by this endpoint; cleared when it is suspected replaced.
     env_proved: std::sync::atomic::AtomicBool,
+    /// Test only: how many times faster than the wall clock a job handle's waits run (its
+    /// reconnect backoff). 1 in production; read in one place, `jobs_native::handle::Clock`.
+    time_divisor: u64,
+    /// The sandbox this endpoint is configured for, when the endpoint names one: what an answer that
+    /// "the sandbox was not found" must name to be about this sandbox (`job_client::step::authority`).
+    /// Derived from an E2B URL's host by [`e2b_sandbox_id`]; [`Self::with_sandbox_id`] sets it for any other
+    /// endpoint. None: no answer can say this sandbox is gone.
+    sandbox_id: Option<String>,
+}
+
+/// The sandbox id an E2B endpoint URL names: its host is exactly `<port>-<id>.e2b.app`, the port digits and
+/// the id lowercase letters and digits. Any other host names none.
+pub fn e2b_sandbox_id(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let label = parsed.host_str()?.strip_suffix(".e2b.app")?;
+    let (port, id) = label.split_once('-')?;
+    let ok = !port.is_empty()
+        && port.bytes().all(|b| b.is_ascii_digit())
+        && !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase());
+    ok.then(|| id.to_string())
 }
 
 impl HttpExecRunner {
@@ -1026,6 +1088,7 @@ impl HttpExecRunner {
                 parsed.scheme()
             ));
         }
+        let sandbox_id = e2b_sandbox_id(&url);
         Ok(Self {
             url,
             client: {
@@ -1043,7 +1106,30 @@ impl HttpExecRunner {
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
             suspect: None,
             env_proved: std::sync::atomic::AtomicBool::new(false),
+            time_divisor: 1,
+            sandbox_id,
         })
+    }
+
+    /// The sandbox this endpoint is for, for an endpoint whose URL does not name it: the id an answer that
+    /// the sandbox was not found must carry (see the field).
+    pub fn with_sandbox_id(mut self, id: impl Into<String>) -> Self {
+        self.sandbox_id = Some(id.into());
+        self
+    }
+
+    /// The sandbox id this endpoint is configured for, if any.
+    pub fn sandbox_id(&self) -> Option<&str> {
+        self.sandbox_id.as_deref()
+    }
+
+    /// Test only: run a job handle's waits `divisor` times faster than the wall clock, so a test of
+    /// an outage of minutes takes a fraction of a second. The kernel's decisions are unchanged; only
+    /// the clock it is given and the sleeps the shell does run fast.
+    #[doc(hidden)]
+    pub fn with_time_divisor(mut self, divisor: u64) -> Self {
+        self.time_divisor = divisor.max(1);
+        self
     }
 
     /// Raise `flag` whenever a request fails to reach the endpoint or is refused by it (a non-2xx
@@ -1303,6 +1389,11 @@ impl HttpExecRunner {
             ) {
                 self.suspect();
             }
+            let retry_after_s = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()?.trim().parse::<u32>().ok())
+                .unwrap_or(0);
             let (body, _) = self.read_capped(resp).await?;
             // A `400` refuses the request as written (notify's refused `notify` among others), which
             // a caller may answer by sending another; anything else is an error of the endpoint's.
@@ -1316,6 +1407,7 @@ impl HttpExecRunner {
                 EndpointStatus {
                     status: status.as_u16(),
                     body: String::from_utf8_lossy(&body).into_owned(),
+                    retry_after_s,
                     text: format!(
                         "exec endpoint {} returned {}: {}",
                         self.url,

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import re
 from typing import Any
 
@@ -10,26 +9,24 @@ import pytest
 from test_transport import Endpoint, reply
 
 from beyond_sandbox import (
-    AsyncHttpTransport,
     HttpTransport,
     InvalidRequestError,
     Jobs,
+    KeyConflictError,
     NotOfferedError,
 )
-from beyond_sandbox.jobs import AsyncJobs
 
 
-def jobs_over() -> tuple[Jobs, Endpoint]:
-    e = Endpoint()
-    e.handler = lambda h, b: reply(h, 200, {"started": 7, "key": b["job"]["idempotency_key"]})
-    return Jobs(HttpTransport(e.url)), e
-
-
-def ignoring_keys() -> tuple[Jobs, Endpoint]:
-    """An endpoint that predates start keys: it starts the job and says nothing of the key."""
+def jobs_over(echo: bool = True) -> tuple[Jobs, Endpoint]:
+    """An endpoint that keeps start keys (it echoes the one it was sent), or one that ignores them."""
     e = Endpoint()
     e.handler = lambda h, b: reply(
-        h, 200, {"started": 7} if b["job"]["op"] == "start" else {"survivors": []}
+        h,
+        200,
+        {"started": 7, "mark": "ab"}
+        | ({"key": b["job"]["idempotency_key"]} if echo and b["job"]["op"] == "start" else {})
+        if b["job"]["op"] == "start"
+        else {"survivors": []},
     )
     return Jobs(HttpTransport(e.url)), e
 
@@ -63,39 +60,26 @@ def test_a_bad_key_is_refused_before_anything_is_sent(bad: str) -> None:
     assert e.requests == []
 
 
-def test_an_endpoint_that_ignores_the_key_is_not_offered_and_what_it_started_is_stopped() -> None:
-    sb, e = ignoring_keys()
+def test_an_endpoint_that_ignores_keys_is_not_offered_and_the_job_is_stopped() -> None:
+    sb, e = jobs_over(echo=False)
     with pytest.raises(NotOfferedError):
         sb.start("s", "aa", "true")
     assert [r["job"]["op"] for r in e.requests] == ["start", "kill"]
 
 
-def test_a_held_start_whose_first_frame_does_not_echo_the_key_is_not_offered() -> None:
+def test_a_held_start_of_an_endpoint_that_ignores_keys_is_not_offered() -> None:
     e = Endpoint()
     e.handler = lambda h, b: reply(
-        h, 200, b'{"started":42}\n{"exit_code":0}\n', "application/x-ndjson"
+        h, 200, b'{"started":42,"mark":"ab"}\n{"exit_code":0}\n', "application/x-ndjson"
     )
-    sb = Jobs(HttpTransport(e.url))
     with pytest.raises(NotOfferedError):
-        list(sb.start_held("s", "aa", "true"))
+        list(Jobs(HttpTransport(e.url)).start_held("s", "aa", "true"))
 
 
-def test_async_jobs_fail_closed_on_a_missing_echo_too() -> None:
+def test_a_409_key_conflict_is_its_own_error() -> None:
     e = Endpoint()
     e.handler = lambda h, b: reply(
-        h, 200, {"started": 7} if b["job"]["op"] == "start" else {"survivors": []}
+        h, 409, {"error": "the key was used for a different command or id", "code": "key_conflict"}
     )
-    held = Endpoint()
-    held.handler = lambda h, b: reply(
-        h, 200, b'{"started":42}\n{"exit_code":0}\n', "application/x-ndjson"
-    )
-
-    async def go() -> None:
-        with pytest.raises(NotOfferedError):
-            await AsyncJobs(AsyncHttpTransport(e.url)).start("s", "aa", "true")
-        with pytest.raises(NotOfferedError):
-            async for _ in AsyncJobs(AsyncHttpTransport(held.url)).start_held("s", "aa", "true"):
-                pass
-
-    asyncio.run(go())
-    assert [r["job"]["op"] for r in e.requests] == ["start", "kill"]
+    with pytest.raises(KeyConflictError):
+        Jobs(HttpTransport(e.url)).start("s", "aa", "true")

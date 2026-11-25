@@ -89,16 +89,20 @@ run = '''
 set -u
 for m in $(grep -oE '^mut_[a-z0-9_]+' crates/job-client/Cargo.toml); do
   out=$(KERNEL_CRATES=crates/job-client .github/scripts/verify-kernels.sh --features "$m" 2>&1) && { echo "proof stayed green under $m" >&2; exit 1; }
-  line=$(grep -E "verification results:: .* [1-9][0-9]* errors" <<<"$out") || { echo "$m: failed without a Verus verification result (build error?)" >&2; exit 1; }
+  line=$(printf "%s\n" "$out" | grep -E "verification results:: .* [1-9][0-9]* errors") || { echo "$m: failed without a Verus verification result (build error?)" >&2; exit 1; }
   echo "red under $m: $line"
 done
 '''
 
-[tasks."verify:start-key-mutants"]
-description = "crates/execd-jobs under each of the start key's mut_* features (K1-K16): every proof must go red (a Verus verification failure, not a build error). The execd tests (crates/execd/tests/startkey.rs) go red under the same features. Pairs with `verify:kernels`, which must be green without a feature."
+[tasks."test:execd-keeper-release"]
+description = "A terminal's keeper in a release build: 30 idle keepers, each under 1 MiB of Pss (crates/execd/tests/keeper_size.rs, compiled only without debug assertions)."
+run = "cargo test --release -p beyond-execd --locked --test keeper_size -- --nocapture"
+
+[tasks."verify:execd-jobs-term-mutants"]
+description = "crates/execd-jobs under each terminal and keeper mut_* feature (T1 to T14, P1, Q1, K1, K2, Q6): every proof must go red (a Verus verification failure, not a build error). Pairs with `verify:kernels`, which must be green without a feature."
 run = '''
 set -u
-for m in mut_key_replay_starts mut_key_digest_ignored mut_key_fresh_refused mut_unkeyed_replays mut_key_forgotten_on_restart mut_key_record_clears mut_key_take_forgets_none mut_intent_respawns mut_key_id_ignored mut_key_held_starts mut_spawn_without_claim mut_durable_claim_refused mut_orphan_survives mut_bad_key_accepted mut_valid_key_refused mut_replay_refuses_started mut_replay_waits_forever; do
+for m in mut_resize_ended mut_resize_lost_while_spawning mut_size_unbounded mut_size_off_by_one mut_pty_err_sink mut_pty_kill_group_only mut_pty_eof_closes mut_gate_refuses_open mut_write_after_hangup mut_end_keeps_terminal mut_recover_hangs_up_live_terminal mut_recover_opens_silent_terminal mut_recover_drops_status mut_exit_before_drain mut_keeper_waits_forever mut_keeper_exits_unasked mut_keeper_reconnect_resets_written mut_admit_any_peer mut_pty_cap_ignored mut_keeper_no_pty_is_500 mut_keeper_answer_unchecked mut_resize_not_idempotent mut_spool_failure_silent mut_spool_failure_keeps_code mut_hangup_keeps_terminal; do
   out=$(KERNEL_CRATES=crates/execd-jobs .github/scripts/verify-kernels.sh --features "$m" 2>&1) && { echo "proof stayed green under $m" >&2; exit 1; }
   line=$(grep -E "verification results:: .* [1-9][0-9]* errors" <<<"$out") || { echo "$m: failed without a Verus verification result (build error?)" >&2; exit 1; }
   echo "red under $m: $line"
@@ -116,11 +120,22 @@ for m in mut_id_length_unbounded mut_id_any_byte mut_id_rejects_dash mut_mark_ig
 done
 '''
 
-[tasks."test:job-client-model-mutants"]
-description = "The step model (crates/job-client/tests/step_model.rs) under each step mutation it can reach: every run must go red. The mutations no model state reaches (an offset near u64::MAX, the classification rows, the wait cap, the silence limit) are Verus's alone. Pairs with `verify:job-client-mutants`."
+[tasks."verify:start-key-mutants"]
+description = "crates/execd-jobs under each of the start key's seventeen mut_* features (K1-K16): every proof must go red (a Verus verification failure, not a build error). The execd tests (crates/execd/tests/startkey.rs) go red under the same features. Pairs with `verify:kernels`, which must be green without a feature."
 run = '''
 set -u
-for m in mut_reattach_from_zero mut_gap_not_counted mut_trailing_gap_dropped mut_echo_mark_unchecked mut_echo_skipped mut_reattach_after_exit mut_remove_on_exit_frame mut_remove_unscoped mut_exit_taken_stalls mut_backoff_never_reopens mut_start_fresh_key mut_start_lost_gives_up mut_heartbeat_ends mut_watch_delivers mut_close_removes mut_gives_up_on_budget; do
+for m in mut_key_replay_starts mut_key_digest_ignored mut_key_fresh_refused mut_unkeyed_replays mut_key_forgotten_on_restart mut_key_record_clears mut_key_take_forgets_none mut_intent_respawns mut_key_id_ignored mut_key_held_starts mut_spawn_without_claim mut_durable_claim_refused mut_orphan_survives mut_bad_key_accepted mut_valid_key_refused mut_replay_refuses_started mut_replay_waits_forever; do
+  out=$(KERNEL_CRATES=crates/execd-jobs .github/scripts/verify-kernels.sh --features "$m" 2>&1) && { echo "proof stayed green under $m" >&2; exit 1; }
+  line=$(grep -E "verification results:: .* [1-9][0-9]* errors" <<<"$out") || { echo "$m: failed without a Verus verification result (build error?)" >&2; exit 1; }
+  echo "red under $m: $line"
+done
+'''
+
+[tasks."test:job-client-model-mutants"]
+description = "The step model (crates/job-client/tests/step_model.rs) under each step mutation it can reach: every run must go red. Under it the model (M10, M11) also goes red for mut_gone_ignored and mut_gone_on_silence. The mutations no model state reaches (an offset near u64::MAX, the classification rows, the wait cap, the silence limit) are Verus's alone. Pairs with `verify:job-client-mutants`."
+run = '''
+set -u
+for m in mut_reattach_from_zero mut_gap_not_counted mut_trailing_gap_dropped mut_echo_mark_unchecked mut_echo_skipped mut_reattach_after_exit mut_remove_on_exit_frame mut_remove_unscoped mut_exit_taken_stalls mut_backoff_never_reopens mut_start_fresh_key mut_start_lost_gives_up mut_unanswered_start_retries mut_heartbeat_ends mut_watch_delivers mut_close_removes mut_gives_up_on_budget mut_gone_ignored mut_gone_on_silence; do
   if cargo test -p beyond-job-client --locked --features "$m" --test step_model >/dev/null 2>&1; then
     echo "model stayed green under $m" >&2; exit 1
   fi
@@ -369,6 +384,14 @@ description = "Install the TypeScript SDK's dependencies (npm ci in sdk/ts)."
 run = "npm ci"
 dir = "sdk/ts"
 
+[tasks."build:job-client-wasm"]
+description = "Rebuild the job client kernel as WASM and inline it into the TypeScript SDK (sdk/ts/sandbox/src/kernel/). `-- --check` rebuilds and fails if the committed bytes differ."
+run = "crates/job-client-ffi/build.sh"
+
+[tasks."build:py-kernel"]
+description = "Build the job client kernel as a native library into the Python SDK's package (sdk/python/sandbox/src/beyond_sandbox/_native/, untracked): the library beyond_sandbox loads with ctypes. Same sources and pinned compiler as build:job-client-wasm; a wheel build runs the same script."
+run = "crates/job-client-ffi/build-native.sh"
+
 [tasks."build:ts"]
 description = "Build the TypeScript SDK (tsdown): sandbox + @beyond.dev/tools dist."
 run = "npm run build"
@@ -466,7 +489,8 @@ cargo test -q -p beyond-sandbox-conformance --test differential -- --include-ign
 # ---- python client: beyond-sandbox (sdk/python/sandbox) ---------------------------------------------
 
 [tasks."install:py"]
-description = "Install beyond-sandbox and its dev tools into sdk/python/sandbox/.venv (uv when present, else venv + pip)."
+description = "Install beyond-sandbox and its dev tools into sdk/python/sandbox/.venv (uv when present, else venv + pip), and build its native kernel (build:py-kernel)."
+depends = ["build:py-kernel"]
 run = """
 set -e
 cd sdk/python/sandbox
@@ -488,6 +512,14 @@ cd sdk/python/sandbox
 .venv/bin/ruff format --check .
 .venv/bin/ruff check .
 .venv/bin/mypy
+"""
+
+[tasks."test:py-broken-kernel"]
+description = "beyond-sandbox's behaviour comes from the kernel library: build it with 429 changed to 428 in a scratch copy of the repository, and run a test against it. It must go red there (and be green with the package's own library)."
+depends = ["install:py"]
+run = """
+set -e
+PATH="$PWD/sdk/python/sandbox/.venv/bin:$PATH" sdk/python/sandbox/scripts/broken_kernel.sh
 """
 
 [tasks."test:py"]

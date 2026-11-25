@@ -277,6 +277,7 @@ impl Verifier {
             let scope = self.scope("stdin");
             let id = JobId::fresh();
             let mut cat = JobSpec {
+                pty: None,
                 program: "cat".into(),
                 args: Vec::new(),
                 ..Self::spec("")
@@ -354,6 +355,7 @@ impl Verifier {
                 &scope,
                 &plain,
                 &JobSpec {
+                    pty: None,
                     program: "cat".into(),
                     args: Vec::new(),
                     ..Self::spec("")

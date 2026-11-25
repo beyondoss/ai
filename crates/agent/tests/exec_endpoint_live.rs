@@ -462,6 +462,7 @@ async fn a_sandbox_job_lives_in_the_target_and_outlives_its_hold_once_kept() {
         label: cmd.into(),
         env: Vec::new(),
         stdin_open: false,
+        pty: None,
         idempotency_key: None,
     };
     let started = Mutex::new(None::<u32>);

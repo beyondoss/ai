@@ -38,9 +38,6 @@ const STATE_DIR: &str = "/run/execd-state";
 const JOBS_DIR: &str = "/var/tmp";
 /// The release installed: its `execd-<tag>-linux-<arch>.tar.gz`, checked against its `.sha256`.
 const DEFAULT_TAG: &str = "v0.1.16";
-/// The release that stands for an execd that ignores start keys (it predates them): the `jobs-key` suite's scenario
-/// that expects `not_offered` connects to it, on the port after [`PORT`], beside the execd under test.
-const PRIOR_TAG: &str = "v0.1.16";
 const READY_WITHIN: Duration = Duration::from_secs(90);
 
 pub fn key() -> Option<String> {
@@ -98,6 +95,11 @@ impl Drop for Vm {
         delete(&self.key, &self.id);
         crate::reaper::forget_sandbox(&self.id);
     }
+}
+
+/// Delete a sandbox by id now (what a test does to a sandbox it wants gone mid-run).
+pub fn delete_sandbox(key: &str, id: &str) {
+    delete(key, id);
 }
 
 /// Synchronous so it runs from `Drop`. Idempotent: a VM already gone answers 404.
@@ -425,61 +427,16 @@ sudo chmod 700 @HOME@/bin/execd-restart"#
     if let Ok((_, log, _)) = vm.run("grep -m1 listening /tmp/execd.log", json!({})).await {
         eprintln!("e2b: {}", log.trim());
     }
-    // The prior release beside it, on the next port: the endpoint that ignores start keys.
-    let prior_port = PORT + 1;
-    let prior = format!(
-        "set -e; mkdir -p {HOME}/prior\n\
-         curl -fsSL --retry 3 https://github.com/beyondoss/ai/releases/download/{PRIOR_TAG}/install-execd.sh \
-           | EXECD_VERSION={PRIOR_TAG} EXECD_INSTALL_DIR={HOME}/prior sh\n\
-         sudo env -u SUDO_COMMAND -u SUDO_USER -u SUDO_UID -u SUDO_GID EXECD_LISTEN=0.0.0.0:{prior_port} \
-           EXECD_ROOT={HOME}/work EXECD_HOME={HOME} EXECD_RUN_AS=user EXECD_BEARER=\"$BEARER\" \
-           setsid nohup {HOME}/prior/execd >/tmp/execd-prior.log 2>&1 < /dev/null &\nsleep 1"
-    );
-    let prior_url = format!("https://{prior_port}-{}.e2b.app/exec", vm.id);
-    let mut prior_up = false;
-    if vm
-        .run(&prior, json!({"BEARER": bearer}))
-        .await
-        .is_ok_and(|r| r.0 == 0)
-    {
-        let t = Instant::now();
-        while t.elapsed() < READY_WITHIN {
-            let code = curl(
-                &[],
-                &[
-                    "-o",
-                    "/dev/null",
-                    "-w",
-                    "%{http_code}",
-                    "-m",
-                    "5",
-                    "-X",
-                    "POST",
-                    &prior_url,
-                    "-d",
-                    "{}",
-                ],
-                None,
-            )
-            .await
-            .unwrap_or_default();
-            if code == b"401" {
-                prior_up = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-    }
-    if !prior_up {
-        eprintln!(
-            "e2b: the prior execd ({PRIOR_TAG}) did not come up: the scenarios that need it are skipped"
-        );
-    }
     eprintln!("e2b: ready in {:.1}s", t0.elapsed().as_secs_f64());
+    let host = Arc::new(E2bHost {
+        vm: vm.clone(),
+        launch,
+        bearer: Arc::new(bearer.clone()),
+    });
     Ok(Started {
         name: name.into(),
         url,
-        bearer: Some(bearer.clone()),
+        bearer: Some(bearer),
         work: format!("{HOME}/work"),
         caps: None,
         suites: None,
@@ -490,11 +447,7 @@ sudo chmod 700 @HOME@/bin/execd-restart"#
                 "EXECD_RESTART".into(),
                 format!("sudo {HOME}/bin/execd-restart"),
             ),
-        ])
-        .into_iter()
-        .chain(prior_up.then(|| ("EXECD_PRIOR_URL".to_string(), prior_url.clone())))
-        .chain(prior_up.then(|| ("EXECD_PRIOR_BEARER".to_string(), bearer.clone())))
-        .collect(),
+        ]),
         lease: Some(Arc::new({
             let vm = vm.clone();
             move || {
@@ -502,6 +455,68 @@ sudo chmod 700 @HOME@/bin/execd-restart"#
                 Box::pin(async move { vm.lease().await })
             }
         })),
+        host: Some(host),
         _guard: Box::new(vm),
     })
+}
+
+/// What a `host` step does inside the VM: the execd there is a root process (started by the install
+/// above), so it is signalled with `sudo`, and a new one is started with the very command that started
+/// the first (same port, root, state and jobs directories and bearer), so the URL holds and the
+/// ledger on the VM's tmpfs finds the jobs. Terminal keepers are execd's own binary in keeper mode.
+struct E2bHost {
+    vm: Arc<Vm>,
+    launch: String,
+    bearer: Arc<String>,
+}
+
+impl E2bHost {
+    /// The server's pid is the process whose command line is exactly the binary (a keeper has
+    /// arguments); its signal and a new launch, then wait for the port to answer in the VM.
+    async fn restart(&self, signal: &str) -> Result<Value, String> {
+        let script = format!(
+            "pid=$(pgrep -fx {HOME}/bin/execd | head -1)\n\
+             [ -n \"$pid\" ] || {{ echo 'no execd' >&2; exit 1; }}\n\
+             sudo kill {signal} \"$pid\"\n\
+             for i in $(seq 100); do kill -0 \"$pid\" 2>/dev/null || break; sleep 0.1; done\n\
+             if kill -0 \"$pid\" 2>/dev/null; then echo 'execd did not exit' >&2; exit 1; fi\n\
+             {launch}\n\
+             for i in $(seq 100); do curl -s -o /dev/null -m 1 -X POST http://127.0.0.1:{PORT}/exec -d '{{}}' && break; sleep 0.1; done",
+            launch = self.launch
+        );
+        let (c, o, e) = self
+            .vm
+            .run(&script, json!({"BEARER": &*self.bearer}))
+            .await?;
+        if c != 0 {
+            return Err(format!("e2b host: exited {c}: {o}{e}"));
+        }
+        Ok(json!({}))
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::run::Host for E2bHost {
+    fn actions(&self) -> &'static [&'static str] {
+        &["restart_execd", "crash_execd", "kill_keepers"]
+    }
+
+    async fn act(&self, action: &str) -> Result<Value, String> {
+        match action {
+            "restart_execd" => self.restart("-HUP").await,
+            "crash_execd" => self.restart("-KILL").await,
+            "kill_keepers" => {
+                let (_, out, _) = self
+                    .vm
+                    .run(
+                        "pids=$(pgrep -f -- '--execd-run-as-helper keep '); \
+                         for p in $pids; do sudo kill -KILL $p; done; echo $pids | wc -w",
+                        json!({}),
+                    )
+                    .await?;
+                Ok(json!({ "killed": out.trim().parse::<u64>().unwrap_or(0) }))
+            }
+            other => Err(format!("no host action {other:?}")),
+        }
+    }
 }

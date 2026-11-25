@@ -183,6 +183,14 @@ pub enum Fault {
     Protocol,
     /// The credential is refused.
     Auth,
+    /// A start that nothing ever answered: the connection was refused or the name did not resolve on the
+    /// first try, so no request of it reached any server.
+    Transport,
+    /// The sandbox no longer exists, and the answer that said so was the backend's ([`Authority::SandboxGone`]).
+    /// The only way an unreachable endpoint ends a handle.
+    SandboxGone,
+    /// The session has ended, and the front said so ([`Authority::SessionEnded`]).
+    SessionEnded,
 }
 
 /// What a request is, for classifying its answer.
@@ -191,6 +199,9 @@ pub enum Op {
     Start,
     Attach,
     Remove,
+    /// Any other op addressed to one job by its id (`keep`, `seen`, `kill`, a stdin `write`, `read`): no handle,
+    /// one request, its answer classified by the same table.
+    Other,
 }
 
 /// What an HTTP answer means.
@@ -215,6 +226,18 @@ pub struct State {
     pub remove_on_exit: bool,
     /// The idempotency key's handle (the shell holds the key itself). Never changes.
     pub key: u64,
+    /// The job is started with its stdin open: the `started` echo must say it was honoured. Never changes.
+    pub stdin_open: bool,
+    /// The job is started on a terminal: the `started` echo must say so. Never changes.
+    pub pty_open: bool,
+    /// The start is a kept job's (`hold: false`): no stream's close ends it, so a refused echo stops it.
+    pub kept: bool,
+    /// The consumer has been told the echo (`Started` or the first `Attached`): a reattach's is not told again.
+    pub announced: bool,
+    /// A request of this handle may have reached a server: it was answered, or its answer was lost. Until
+    /// then a start that cannot connect ends with `Transport`; after it, only the job's end or a terminal
+    /// answer does.
+    pub reached: bool,
     /// The incarnation this handle holds; length 0 until the echo names it (a start, or a `get`).
     pub mark: Mark,
     /// The next output byte the consumer has not been given.
@@ -238,17 +261,34 @@ pub enum Frame {
     /// `{"attached": {"mark", "from"}}`: the first frame of an attach.
     Attached { mark: Mark, from: u64 },
     /// `{"started": {"mark"}}`: the first frame of a start.
-    Started { mark: Mark },
+    /// `stdin` is whether the endpoint says the job's stdin was opened.
+    /// `pty` is whether it says a terminal was opened.
+    Started { mark: Mark, stdin: bool, pty: bool },
     /// An output frame of `len` decoded bytes.
     Output { len: u64 },
     /// `{"gap": n}`: `n` bytes are no longer kept.
     Gap { n: u64 },
     /// A heartbeat.
     Heartbeat,
+    /// The job's shell exited with `code`; the job is not over (its group runs on). Not final.
+    ShellExit { code: i32 },
     /// The final frame.
     Exit { code: i32, signal: i32 },
     /// An error frame, an unparseable line, a frame out of range.
     Bad,
+}
+
+/// Whether a refusal is the backend's own authoritative answer about the sandbox or the session, as
+/// [`authority`] decides from what the shell parsed out of the answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Authority {
+    /// Anything else: a busy front, a proxy's 502, a refused credential. The handle waits or the class
+    /// table decides.
+    NotAuthoritative,
+    /// The backend says the sandbox does not exist (E2B's `502` naming ours).
+    SandboxGone,
+    /// The front says the session has ended (Beyond's `401` with code `session_ended`).
+    SessionEnded,
 }
 
 /// What the shell observed.
@@ -257,11 +297,16 @@ pub enum Event {
     /// Send the first request.
     Go,
     /// The request was answered with this status (and `Retry-After` in whole seconds, 0 if none).
-    Answered { status: u16, retry_after_s: u32 },
+    /// `authority`: what [`authority`] made of the answer. Silence, a refused connect and a timeout are never
+    /// authoritative: they are `Broke`.
+    Answered { status: u16, retry_after_s: u32, authority: Authority },
     /// A frame arrived.
     Frame(Frame),
     /// The stream broke: reset, silence for the limit, EOF or a truncated line before the final frame.
     Broke,
+    /// The request never reached a server: the connection was refused, the host was unreachable or its name
+    /// did not resolve. Nothing was sent, so nothing was started.
+    Unreached,
     /// A sleep the kernel asked for ended.
     Tick,
     /// The consumer received the exit.
@@ -281,13 +326,21 @@ pub enum Action {
     OpenAttach { offset: u64, mark: Mark, silence_ms: u64 },
     /// Release the connection, if one is open.
     CloseStream,
+    /// Tell the consumer the job started (the `started` echo was accepted): `mark` names the incarnation.
+    Started { mark: Mark, stdin: bool, pty: bool },
+    /// Tell the consumer, once, where an attach began: the first accepted `attached` echo.
+    Attached { mark: Mark, from: u64 },
+    /// Tell the consumer the job's shell exited with `code` (not final).
+    ShellExit { code: i32 },
+    /// Stop the job and remove it: a kept start whose echo was refused leaves a job nothing can name.
+    Kill,
     /// Status, not an end: `attempts` failed opens in a row since `since_ms`, and the handle keeps trying.
     Reconnecting { attempts: u32, since_ms: u64 },
     /// Hand the consumer `len` bytes (the frame just decoded) at offset `at`, with `dropped` bytes lost
     /// just before them, at `[at - dropped, at)`.
     Deliver { at: u64, len: u64, dropped: u64 },
     /// Hand the consumer the exit, with the `dropped` bytes of output lost just before it.
-    DeliverExit { code: i32, signal: i32, dropped: u64 },
+    DeliverExit { code: i32, signal: i32, dropped: u64, killed: bool },
     /// Feed [`Event::Tick`] at this time.
     Sleep { until_ms: u64 },
     /// Send the remove, scoped to `mark`.
@@ -359,8 +412,12 @@ pub open spec fn op_of(p: Phase) -> Op {
 }
 
 /// The table of answers, as a spec.
-pub open spec fn class_of(op: Op, status: int) -> Class {
-    if 200 <= status && status <= 299 {
+pub open spec fn class_of(op: Op, status: int, auth: Authority) -> Class {
+    if auth is SandboxGone {
+        Class::Terminal(Fault::SandboxGone)
+    } else if auth is SessionEnded {
+        Class::Terminal(Fault::SessionEnded)
+    } else if 200 <= status && status <= 299 {
         Class::Ok
     } else if op is Remove && status == 404 {
         Class::Ok
@@ -370,7 +427,7 @@ pub open spec fn class_of(op: Op, status: int) -> Class {
         if op is Start { Class::Terminal(Fault::NoPty) } else { Class::Retry }
     } else if status == 401 || status == 403 {
         Class::Terminal(Fault::Auth)
-    } else if status == 404 && op is Attach {
+    } else if status == 404 && (op is Attach || op is Other) {
         Class::Terminal(Fault::JobGone)
     } else if status == 409 && op is Start {
         Class::Terminal(Fault::JobExists)
@@ -385,6 +442,13 @@ pub open spec fn ev_status(ev: Event) -> int {
     match ev {
         Event::Answered { status, .. } => status as int,
         _ => -1,
+    }
+}
+
+pub open spec fn ev_authority(ev: Event) -> Authority {
+    match ev {
+        Event::Answered { authority, .. } => authority,
+        _ => Authority::NotAuthoritative,
     }
 }
 
@@ -411,7 +475,7 @@ pub open spec fn no_mark() -> Mark {
 pub open spec fn echo_mark(ev: Event) -> Mark {
     match ev {
         Event::Frame(Frame::Attached { mark, .. }) => mark,
-        Event::Frame(Frame::Started { mark }) => mark,
+        Event::Frame(Frame::Started { mark, .. }) => mark,
         _ => no_mark(),
     }
 }
@@ -461,7 +525,7 @@ pub open spec fn is_exit_frame(ev: Event) -> bool {
 pub open spec fn exit_frame_ok(ev: Event, out: Seq<Action>, dropped: int) -> bool {
     match ev {
         Event::Frame(Frame::Exit { code, signal }) => out.len() >= 2
-            && out[1] == (Action::DeliverExit { code, signal, dropped: dropped as u64 }),
+            && out[1] == (Action::DeliverExit { code, signal, dropped: dropped as u64, killed: signal != 0 }),
         _ => false,
     }
 }
@@ -522,6 +586,8 @@ pub open spec fn good_echo(s: State, ev: Event) -> bool {
     &&& (s.flow is Start) == (ev is Frame && ev->Frame_0 is Started)
     &&& (s.flow is Attach) == (ev is Frame && ev->Frame_0 is Attached)
     &&& echo_from(ev) >= s.offset as int
+    &&& (s.flow is Start && s.stdin_open) ==> echo_stdin(ev)
+    &&& (s.flow is Start && s.pty_open) ==> echo_pty(ev)
 }
 
 /// Fairness: the server is reachable and answers as it should. A step under it is a fair step.
@@ -529,10 +595,10 @@ pub open spec fn fair(s: State, ev: Event, now: u64) -> bool {
     match s.phase {
         Phase::Idle => ev is Go,
         Phase::Backoff => ev is Tick && now >= s.until_ms,
-        Phase::Starting => 200 <= ev_status(ev) && ev_status(ev) <= 299,
-        Phase::Opening => 200 <= ev_status(ev) && ev_status(ev) <= 299,
+        Phase::Starting => 200 <= ev_status(ev) && ev_status(ev) <= 299 && ev_authority(ev) is NotAuthoritative,
+        Phase::Opening => 200 <= ev_status(ev) && ev_status(ev) <= 299 && ev_authority(ev) is NotAuthoritative,
         Phase::Confirming => good_echo(s, ev),
-        Phase::Removing => 200 <= ev_status(ev) && ev_status(ev) <= 299,
+        Phase::Removing => 200 <= ev_status(ev) && ev_status(ev) <= 299 && ev_authority(ev) is NotAuthoritative,
         Phase::ExitHeld => ev is ExitTaken,
         _ => false,
     }
@@ -647,6 +713,86 @@ pub open spec fn post_incarnation(s: State, ev: Event, s2: State, out: Seq<Actio
     }
 }
 
+pub open spec fn echo_stdin(ev: Event) -> bool {
+    match ev {
+        Event::Frame(Frame::Started { stdin, .. }) => stdin,
+        _ => false,
+    }
+}
+
+pub open spec fn echo_pty(ev: Event) -> bool {
+    match ev {
+        Event::Frame(Frame::Started { pty, .. }) => pty,
+        _ => false,
+    }
+}
+
+pub open spec fn is_started_frame(ev: Event) -> bool {
+    match ev {
+        Event::Frame(Frame::Started { .. }) => true,
+        _ => false,
+    }
+}
+
+pub open spec fn is_attached_frame(ev: Event) -> bool {
+    match ev {
+        Event::Frame(Frame::Attached { .. }) => true,
+        _ => false,
+    }
+}
+
+pub open spec fn is_shell_exit_frame(ev: Event) -> bool {
+    match ev {
+        Event::Frame(Frame::ShellExit { .. }) => true,
+        _ => false,
+    }
+}
+
+/// U: what the consumer is told. The accepted `started` echo is told, with whether the job's stdin was
+/// opened, and a start that asked for stdin is refused (`NotOffered`) when the echo says it was not; the
+/// first accepted `attached` echo is told, once, and a reattach's never; the shell's exit is told when it
+/// arrives and changes nothing else. Each telling comes from exactly the step it names.
+pub open spec fn post_surface(s: State, ev: Event, s2: State, out: Seq<Action>) -> bool {
+    &&& forall|i: int| 0 <= i < out.len() ==> match #[trigger] out[i] {
+        Action::Started { mark, stdin, pty } => {
+            &&& s.phase is Confirming && s.flow is Start
+            &&& ev == Event::Frame(Frame::Started { mark, stdin, pty })
+            &&& s2.phase is Streaming
+            &&& s.stdin_open ==> stdin
+            &&& s.pty_open ==> pty
+        },
+        Action::Attached { mark, from } => {
+            &&& s.phase is Confirming && s.flow is Attach && !s.announced
+            &&& ev == Event::Frame(Frame::Attached { mark, from })
+            &&& s2.phase is Streaming
+        },
+        Action::ShellExit { code } => {
+            &&& s.phase is Streaming
+            &&& ev == Event::Frame(Frame::ShellExit { code })
+        },
+        Action::Kill => {
+            &&& s.kept && s.flow is Start && s.phase is Confirming
+            &&& fails_with(out, Fault::NotOffered)
+        },
+        _ => true,
+    }
+    &&& (s.phase is Confirming && s.flow is Start && s2.phase is Streaming) ==> (out.len() == 1 && out[0] is Started)
+    &&& (s.phase is Confirming && s.flow is Attach && s2.phase is Streaming) ==> {
+        &&& s.announced ==> out.len() == 0
+        &&& !s.announced ==> (out.len() == 1 && out[0] is Attached)
+    }
+    &&& (s.phase is Confirming && s.flow is Start && s.stdin_open && is_started_frame(ev) && !echo_stdin(ev)
+        && echo_mark(ev).len > 0 && (s.mark.len == 0 || echo_mark(ev) == s.mark)) ==> fails_with(out, Fault::NotOffered)
+    &&& (s.phase is Confirming && s.flow is Start && s.pty_open && is_started_frame(ev) && !echo_pty(ev)
+        && echo_mark(ev).len > 0 && (s.mark.len == 0 || echo_mark(ev) == s.mark)) ==> fails_with(out, Fault::NotOffered)
+    &&& (s.phase is Confirming && s.kept && s.flow is Start && s2.phase is Done && fails_with(out, Fault::NotOffered))
+        ==> (out.len() == 3 && out[1] is Kill)
+    &&& (s.phase is Streaming && is_shell_exit_frame(ev)) ==> {
+        &&& s2 == s
+        &&& out.len() == 1 && out[0] is ShellExit
+    }
+}
+
 /// X: exit. The exit is delivered once, by the stream's final frame, and nothing after it reopens the
 /// stream or delivers anything.
 pub open spec fn post_exit(s: State, ev: Event, s2: State, out: Seq<Action>) -> bool {
@@ -685,7 +831,7 @@ pub open spec fn post_remove(s: State, ev: Event, now: u64, s2: State, out: Seq<
 /// goes on.
 pub open spec fn post_classify(s: State, ev: Event, s2: State, out: Seq<Action>) -> bool {
     (s.phase is Starting || s.phase is Opening || s.phase is Removing) && ev is Answered ==> {
-        match class_of(op_of(s.phase), ev_status(ev)) {
+        match class_of(op_of(s.phase), ev_status(ev), ev_authority(ev)) {
             Class::Ok => {
                 &&& s2.misses == s.misses
                 &&& s.phase is Removing ==> (s2.phase is Done && out == seq![Action::Finish])
@@ -714,7 +860,7 @@ pub open spec fn post_backoff(s: State, ev: Event, now: u64, s2: State, out: Seq
         _ => true,
     }
     &&& ((s.phase is Starting || s.phase is Opening || s.phase is Removing) && ev is Answered
-        && class_of(op_of(s.phase), ev_status(ev)) is Retry) ==> {
+        && class_of(op_of(s.phase), ev_status(ev), ev_authority(ev)) is Retry) ==> {
         &&& s2.phase is Backoff
         &&& s2.until_ms as int >= min_int(
             now as int + min_int(ev_retry_after_ms(ev), BACKOFF_CAP_MS as int),
@@ -780,6 +926,29 @@ pub open spec fn post_key(s: State, ev: Event, s2: State, out: Seq<Action>) -> b
     }
 }
 
+/// T: a start nothing answered. A start whose first request could not even connect (`Unreached`: refused,
+/// unreachable, the name did not resolve) before any request of it may have reached a server ends with
+/// `Transport`: nothing was started and nobody answered, so there is nothing to keep trying for. From the
+/// moment any request of the handle was answered, or its answer was lost (`reached`), the handle never ends on
+/// a failure to connect: it backs off and reopens, however many fail in a row. Only that one case ends with
+/// `Transport`, and each failure to connect after it is the retry that a retry-class answer gets (the handle
+/// is not done, so the caller's retry is the next `Tick`).
+pub open spec fn post_unreached(s: State, ev: Event, s2: State, out: Seq<Action>) -> bool {
+    &&& s2.reached == (s.reached || (s.phase is Starting && (ev is Answered || ev is Broke)))
+    &&& (ev is Unreached && s.phase is Starting && !s.reached) ==> {
+        &&& s2.phase is Done
+        &&& out == seq![Action::Fail { fault: Fault::Transport, status: 0, offset: s.offset }]
+    }
+    &&& (ev is Unreached && !(s.phase is Done) && !(s.phase is Starting && !s.reached)) ==> !(s2.phase is Done)
+    &&& (ev is Unreached && ((s.phase is Starting && s.reached) || s.phase is Opening || s.phase is Removing))
+        ==> s2.phase is Backoff
+    &&& forall|i: int| 0 <= i < out.len() ==> match #[trigger] out[i] {
+        Action::Fail { fault, .. } => (fault is Transport) ==> (ev is Unreached && s.phase is Starting
+            && !s.reached),
+        _ => true,
+    }
+}
+
 /// V: watch. A watching handle counts output and delivers none of it.
 pub open spec fn post_watch(s: State, s2: State, out: Seq<Action>) -> bool {
     &&& s2.mode == s.mode
@@ -823,17 +992,18 @@ pub open spec fn post_only_these_end(s: State, ev: Event, s2: State, out: Seq<Ac
         ||| ev is ExitTaken
         ||| ev is Answered
         ||| ev is Frame
+        ||| ev is Unreached
     }
     &&& (ev is ExitTaken && s2.phase is Done && !(s.phase is Done)) ==> (s.phase is ExitHeld
         && !s.remove_on_exit)
     &&& (ev is Answered && s2.phase is Done && !(s.phase is Done)) ==> {
         &&& s.phase is Starting || s.phase is Opening || s.phase is Removing
-        &&& (class_of(op_of(s.phase), ev_status(ev)) is Terminal || (s.phase is Removing
-            && class_of(op_of(s.phase), ev_status(ev)) is Ok))
+        &&& (class_of(op_of(s.phase), ev_status(ev), ev_authority(ev)) is Terminal || (s.phase is Removing
+            && class_of(op_of(s.phase), ev_status(ev), ev_authority(ev)) is Ok))
     }
     &&& ((s.phase is Starting || s.phase is Opening || s.phase is Removing) && ev is Answered
-        && !(class_of(op_of(s.phase), ev_status(ev)) is Terminal)
-        && !(s.phase is Removing && class_of(op_of(s.phase), ev_status(ev)) is Ok)) ==> !(s2.phase is Done)
+        && !(class_of(op_of(s.phase), ev_status(ev), ev_authority(ev)) is Terminal)
+        && !(s.phase is Removing && class_of(op_of(s.phase), ev_status(ev), ev_authority(ev)) is Ok)) ==> !(s2.phase is Done)
     &&& (s.phase is Streaming && ev is Frame && ev->Frame_0 is Heartbeat) ==> !(s2.phase is Done)
     &&& (s.phase is Streaming && is_output(ev) && s.offset as int + s.pending as int + output_len(ev)
         <= u64::MAX as int) ==> !(s2.phase is Done)
@@ -844,7 +1014,12 @@ pub open spec fn post_only_these_end(s: State, ev: Event, s2: State, out: Seq<Ac
     &&& (s.phase is Confirming && good_echo(s, ev)) ==> !(s2.phase is Done)
     &&& ((ev is Broke || ev is Tick) && !(s.phase is Done)) ==> !(s2.phase is Done)
     &&& forall|i: int| 0 <= i < out.len() ==> match #[trigger] out[i] {
-        Action::Fail { fault, .. } => (fault is Deadline) == (ev is Deadline),
+        Action::Fail { fault, .. } => {
+            &&& (fault is Deadline) == (ev is Deadline)
+            // SG: an unreachable endpoint ends nothing; only an authoritative answer does.
+            &&& (fault is SandboxGone) ==> (ev is Answered && ev_authority(ev) is SandboxGone)
+            &&& (fault is SessionEnded) ==> (ev is Answered && ev_authority(ev) is SessionEnded)
+        },
         _ => true,
     }
 }
@@ -866,6 +1041,7 @@ pub open spec fn step_post(s: State, ev: Event, now: u64, s2: State, out: Seq<Ac
     &&& post_watch(s, s2, out)
     &&& post_end(s, ev, s2, out)
     &&& post_only_these_end(s, ev, s2, out)
+    &&& post_unreached(s, ev, s2, out)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -897,31 +1073,41 @@ pub fn silence_ms(beat_s: u32) -> (r: u64)
 }
 
 /// What an answer to `op` with `status` means.
-pub fn classify(op: Op, status: u16) -> (c: Class)
+pub fn classify(op: Op, status: u16, auth: Authority) -> (c: Class)
     ensures
+        // (j) an authoritative answer is its own terminal class, whatever the status (E2B says it with a
+        // 502), and nothing else is: `SandboxGone` and `SessionEnded` come from `auth` alone.
+        auth is SandboxGone ==> c == Class::Terminal(Fault::SandboxGone),
+        auth is SessionEnded ==> c == Class::Terminal(Fault::SessionEnded),
+        c == Class::Terminal(Fault::SandboxGone) ==> auth is SandboxGone,
+        c == Class::Terminal(Fault::SessionEnded) ==> auth is SessionEnded,
         // (a) any 2xx goes on.
-        200 <= status <= 299 ==> c == Class::Ok,
+        ((auth is NotAuthoritative) && 200 <= status <= 299) ==> c == Class::Ok,
         // (b) 500 is terminal, whatever the request: a retry would not change it.
-        status == 500 ==> c == Class::Terminal(Fault::Protocol),
+        ((auth is NotAuthoritative) && status == 500) ==> c == Class::Terminal(Fault::Protocol),
         // (c) 503 on a start means no pseudo-terminal is free: terminal.
-        (matches!(op, Op::Start) && status == 503) ==> c == Class::Terminal(Fault::NoPty),
+        ((auth is NotAuthoritative) && matches!(op, Op::Start) && status == 503) ==> c == Class::Terminal(Fault::NoPty),
         // (d) the busy answers are retried (completeness: a retry class is never terminal).
-        (status == 429 || status == 502 || status == 504 || (status == 503 && !(matches!(op, Op::Start))))
+        ((auth is NotAuthoritative) && (status == 429 || status == 502 || status == 504 || (status == 503 && !(matches!(op, Op::Start)))))
             ==> c == Class::Retry,
         // (e) an attach of a job that is gone is `JobGone`.
-        (matches!(op, Op::Attach) && status == 404) ==> c == Class::Terminal(Fault::JobGone),
+        ((auth is NotAuthoritative) && (matches!(op, Op::Attach) || matches!(op, Op::Other)) && status == 404) ==> c == Class::Terminal(Fault::JobGone),
         // (f) the start answers that name a cause.
-        (matches!(op, Op::Start) && status == 409) ==> c == Class::Terminal(Fault::JobExists),
-        (matches!(op, Op::Start) && status == 507) ==> c == Class::Terminal(Fault::DiskFull),
+        ((auth is NotAuthoritative) && matches!(op, Op::Start) && status == 409) ==> c == Class::Terminal(Fault::JobExists),
+        ((auth is NotAuthoritative) && matches!(op, Op::Start) && status == 507) ==> c == Class::Terminal(Fault::DiskFull),
         // (g) the credential is refused.
-        (status == 401 || status == 403) ==> c == Class::Terminal(Fault::Auth),
+        ((auth is NotAuthoritative) && (status == 401 || status == 403)) ==> c == Class::Terminal(Fault::Auth),
         // (h) a remove of a job already gone is done.
-        (matches!(op, Op::Remove) && status == 404) ==> c == Class::Ok,
+        ((auth is NotAuthoritative) && matches!(op, Op::Remove) && status == 404) ==> c == Class::Ok,
         // (i) nothing else is retried: only the four busy statuses are.
         c is Retry ==> (status == 429 || status == 502 || status == 503 || status == 504),
-        c == class_of(op, status as int),
+        c == class_of(op, status as int, auth),
 {
-    if 200 <= status && status <= 299 {
+    if matches!(auth, Authority::SandboxGone) && !cfg!(feature = "mut_gone_ignored") {
+        Class::Terminal(Fault::SandboxGone)
+    } else if matches!(auth, Authority::SessionEnded) && !cfg!(feature = "mut_gone_ignored") {
+        Class::Terminal(Fault::SessionEnded)
+    } else if 200 <= status && status <= 299 {
         Class::Ok
     } else if matches!(op, Op::Remove) && status == 404 {
         Class::Ok
@@ -943,7 +1129,9 @@ pub fn classify(op: Op, status: u16) -> (c: Class)
         } else {
             Class::Terminal(Fault::Auth)
         }
-    } else if status == 404 && matches!(op, Op::Attach) {
+    } else if status == 404 && matches!(op, Op::Other) && cfg!(feature = "mut_other_404_unclassified") {
+        Class::Terminal(Fault::Protocol)
+    } else if status == 404 && (matches!(op, Op::Attach) || matches!(op, Op::Other)) {
         if cfg!(feature = "mut_404_retried") { Class::Retry } else { Class::Terminal(Fault::JobGone) }
     } else if status == 409 && matches!(op, Op::Start) {
         Class::Terminal(Fault::JobExists)
@@ -955,6 +1143,73 @@ pub fn classify(op: Op, status: u16) -> (c: Class)
         Class::Retry
     } else {
         Class::Terminal(Fault::Protocol)
+    }
+}
+
+/// The body of E2B's answer for a sandbox it no longer has: `{"sandboxId": ours, "message": <this>, "code": 502}`.
+pub open spec fn gone_message() -> Seq<u8> {
+    seq![84u8, 104u8, 101u8, 32u8, 115u8, 97u8, 110u8, 100u8, 98u8, 111u8, 120u8, 32u8, 119u8, 97u8, 115u8, 32u8, 110u8, 111u8, 116u8, 32u8, 102u8, 111u8, 117u8, 110u8, 100u8]
+}
+
+/// The `code` of Beyond's answer for a session that has ended: status 401, `{"code": <this>, ...}`.
+pub open spec fn session_ended_code() -> Seq<u8> {
+    seq![115u8, 101u8, 115u8, 115u8, 105u8, 111u8, 110u8, 95u8, 101u8, 110u8, 100u8, 101u8, 100u8]
+}
+
+/// What a refusal is, from the fields the shell parsed out of its JSON body (all empty or `None` for a field the
+/// body lacks, or for a body that is not JSON). `ours` is the sandbox id the endpoint is configured for
+/// (empty when it has none): an answer about any other sandbox is not about this one.
+pub open spec fn authority_of(
+    status: int,
+    message: Seq<u8>,
+    code_num: Option<u64>,
+    code_text: Seq<u8>,
+    sandbox_id: Seq<u8>,
+    ours: Seq<u8>,
+) -> Authority {
+    if status == 502 && message == gone_message() && code_num == Some(502u64) && ours.len() > 0
+        && sandbox_id == ours {
+        Authority::SandboxGone
+    } else if status == 401 && code_text == session_ended_code() {
+        Authority::SessionEnded
+    } else {
+        Authority::NotAuthoritative
+    }
+}
+
+/// Whether a refusal is the backend's own authoritative answer: `SandboxGone` exactly when it is a `502` whose
+/// message is exactly "The sandbox was not found", whose code is the number 502 and whose `sandboxId` is
+/// `ours` (not empty); `SessionEnded` exactly when it is a `401` whose code is exactly "session_ended";
+/// `NotAuthoritative` for everything else, a proxy's 502 and a refused credential included. A wrong
+/// `SandboxGone` abandons a live job, so this is the one place that decides it, and the shell only parses.
+pub fn authority(
+    status: u16,
+    message: &[u8],
+    code_num: Option<u64>,
+    code_text: &[u8],
+    sandbox_id: &[u8],
+    ours: &[u8],
+) -> (a: Authority)
+    ensures
+        a == authority_of(status as int, message@, code_num, code_text@, sandbox_id@, ours@),
+{
+    let gone: [u8; 25] = [84, 104, 101, 32, 115, 97, 110, 100, 98, 111, 120, 32, 119, 97, 115, 32, 110, 111, 116, 32, 102, 111, 117, 110, 100];
+    let ended: [u8; 13] = [115, 101, 115, 115, 105, 111, 110, 95, 101, 110, 100, 101, 100];
+    proof {
+        assert(gone@ =~= gone_message());
+        assert(ended@ =~= session_ended_code());
+    }
+    let is502_code = match code_num {
+        Some(c) => c == 502,
+        None => false,
+    };
+    let ours_ok = cfg!(feature = "mut_gone_any_502") || (ours.len() > 0 && crate::same(sandbox_id, ours));
+    if status == 502 && crate::same(message, &gone) && is502_code && ours_ok {
+        Authority::SandboxGone
+    } else if status == 401 && (cfg!(feature = "mut_gone_any_401") || crate::same(code_text, &ended)) {
+        Authority::SessionEnded
+    } else {
+        Authority::NotAuthoritative
     }
 }
 
@@ -1045,6 +1300,39 @@ fn fail(s: State, fault: Fault, status: u16, close: bool) -> (r: (State, Vec<Act
     (t, out)
 }
 
+/// Finish `NotOffered` on a refused echo. A kept start also stops the job first: no stream's close ends it,
+/// and nothing else can name it.
+fn unoffered(s: State) -> (r: (State, Vec<Action>))
+    ensures
+        r.0 == (State { phase: Phase::Done, pending: 0, ..s }),
+        (s.kept && s.flow is Start) ==> r.1@ == seq![
+            Action::CloseStream,
+            Action::Kill,
+            Action::Fail { fault: Fault::NotOffered, status: 0, offset: s.offset },
+        ],
+        !(s.kept && s.flow is Start) ==> r.1@ == seq![
+            Action::CloseStream,
+            Action::Fail { fault: Fault::NotOffered, status: 0, offset: s.offset },
+        ],
+{
+    let (t, mut out) = fail(s, Fault::NotOffered, 0, true);
+    let kill = if cfg!(feature = "mut_kill_skipped") {
+        false
+    } else if cfg!(feature = "mut_kill_when_held") {
+        true
+    } else {
+        s.kept && matches!(s.flow, Flow::Start)
+    };
+    if kill {
+        let fail_action = out.pop();
+        out.push(Action::Kill);
+        if let Some(a) = fail_action {
+            out.push(a);
+        }
+    }
+    (t, out)
+}
+
 /// Finish: the consumer stopped.
 fn detach(s: State, close: bool) -> (r: (State, Vec<Action>))
     ensures
@@ -1131,6 +1419,7 @@ fn streaming(s: State, echo: Mark, gap: u64) -> (r: State)
             mark: echo,
             pending: gap,
             misses: 0,
+            announced: true,
             ..s
         }),
 {
@@ -1139,6 +1428,7 @@ fn streaming(s: State, echo: Mark, gap: u64) -> (r: State)
     t.flow = Flow::Attach;
     t.mark = echo;
     t.pending = gap;
+    t.announced = true;
     if !cfg!(feature = "mut_budget_not_reset_on_echo") {
         t.misses = 0;
     }
@@ -1215,6 +1505,8 @@ fn step_close(s: State, ev: Event, now: u64) -> (r: (State, Vec<Action>))
         post_watch(s, r.0, r.1@),
         post_end(s, ev, r.0, r.1@),
         post_only_these_end(s, ev, r.0, r.1@),
+        post_unreached(s, ev, r.0, r.1@),
+        post_surface(s, ev, r.0, r.1@),
 {
     let open = matches!(s.phase, Phase::Starting) || matches!(s.phase, Phase::Opening)
         || matches!(s.phase, Phase::Confirming) || matches!(s.phase, Phase::Streaming)
@@ -1254,6 +1546,8 @@ fn step_idle(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<Action
         post_watch(s, r.0, r.1@),
         post_end(s, ev, r.0, r.1@),
         post_only_these_end(s, ev, r.0, r.1@),
+        post_unreached(s, ev, r.0, r.1@),
+        post_surface(s, ev, r.0, r.1@),
 {
     if matches!(ev, Event::Go) {
         return open_action(s, draw as u64);
@@ -1284,6 +1578,8 @@ fn step_backoff(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<Act
         post_watch(s, r.0, r.1@),
         post_end(s, ev, r.0, r.1@),
         post_only_these_end(s, ev, r.0, r.1@),
+        post_unreached(s, ev, r.0, r.1@),
+        post_surface(s, ev, r.0, r.1@),
 {
     if matches!(ev, Event::Tick) {
         if now >= s.until_ms {
@@ -1297,6 +1593,19 @@ fn step_backoff(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<Act
         return (s, out);
     }
     (s, Vec::new())
+}
+
+/// The handle after an event, as to `reached`: an answer or a lost answer of a start means a request of it may
+/// have reached a server.
+fn mark_reached(s: State, ev: Event) -> (r: State)
+    ensures
+        r == (State { reached: s.reached || (s.phase is Starting && (ev is Answered || ev is Broke)), ..s }),
+{
+    let mut t = s;
+    if matches!(s.phase, Phase::Starting) && (matches!(ev, Event::Answered { .. }) || matches!(ev, Event::Broke)) {
+        t.reached = true;
+    }
+    t
 }
 
 /// A request is in flight (start, attach or remove) and the answer, or the cut, came.
@@ -1323,9 +1632,12 @@ fn step_request(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<Act
         post_watch(s, r.0, r.1@),
         post_end(s, ev, r.0, r.1@),
         post_only_these_end(s, ev, r.0, r.1@),
+        post_unreached(s, ev, r.0, r.1@),
+        post_surface(s, ev, r.0, r.1@),
 {
+    let s = mark_reached(s, ev);
     match ev {
-        Event::Answered { status, retry_after_s } => {
+        Event::Answered { status, retry_after_s, authority } => {
             let op = if matches!(s.phase, Phase::Starting) {
                 Op::Start
             } else if matches!(s.phase, Phase::Removing) {
@@ -1333,7 +1645,7 @@ fn step_request(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<Act
             } else {
                 Op::Attach
             };
-            match classify(op, status) {
+            match classify(op, status, authority) {
                 Class::Ok => {
                     if matches!(s.phase, Phase::Removing) {
                         let mut t = s;
@@ -1359,10 +1671,19 @@ fn step_request(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<Act
             }
         },
         Event::Broke => {
+            if cfg!(feature = "mut_gone_on_silence") {
+                return fail(s, Fault::SandboxGone, 0, true);
+            }
             if cfg!(feature = "mut_start_lost_gives_up") && matches!(s.phase, Phase::Starting) {
                 return fail(s, Fault::Protocol, 0, true);
             }
             backoff(s, 0, now, draw, true)
+        },
+        Event::Unreached => {
+            if matches!(s.phase, Phase::Starting) && !s.reached && !cfg!(feature = "mut_unanswered_start_retries") {
+                return fail(s, Fault::Transport, 0, false);
+            }
+            backoff(s, 0, now, draw, false)
         },
         _ => (s, Vec::new()),
     }
@@ -1392,37 +1713,51 @@ fn step_confirming(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<
         post_watch(s, r.0, r.1@),
         post_end(s, ev, r.0, r.1@),
         post_only_these_end(s, ev, r.0, r.1@),
+        post_unreached(s, ev, r.0, r.1@),
+        post_surface(s, ev, r.0, r.1@),
 {
     match ev {
         Event::Frame(f) => match f {
             Frame::Attached { mark, from } => {
                 if mark.len == 0 {
-                    fail(s, Fault::NotOffered, 0, true)
+                    unoffered(s)
                 } else if s.mark.len > 0 && !mark_eq(&mark, &s.mark) && !cfg!(feature = "mut_echo_mark_unchecked") {
                     fail(s, Fault::JobGone, 0, true)
                 } else if matches!(s.flow, Flow::Start) {
-                    fail(s, Fault::NotOffered, 0, true)
+                    unoffered(s)
                 } else if from < s.offset {
                     fail(s, Fault::Protocol, 0, true)
                 } else {
                     let t = streaming(s, mark, from - s.offset);
-                    (t, Vec::new())
+                    let mut out = Vec::new();
+                    if !s.announced || cfg!(feature = "mut_attached_repeated") {
+                        if !cfg!(feature = "mut_attached_not_told") {
+                            out.push(Action::Attached { mark, from });
+                        }
+                    }
+                    (t, out)
                 }
             },
-            Frame::Started { mark } => {
+            Frame::Started { mark, stdin, pty } => {
                 if mark.len == 0 {
-                    fail(s, Fault::NotOffered, 0, true)
+                    unoffered(s)
                 } else if s.mark.len > 0 && !mark_eq(&mark, &s.mark) && !cfg!(feature = "mut_echo_mark_unchecked") {
                     fail(s, Fault::JobGone, 0, true)
                 } else if matches!(s.flow, Flow::Attach) {
-                    fail(s, Fault::NotOffered, 0, true)
+                    unoffered(s)
+                } else if s.stdin_open && !stdin && !cfg!(feature = "mut_stdin_unchecked") {
+                    unoffered(s)
+                } else if s.pty_open && !pty && !cfg!(feature = "mut_pty_unchecked") {
+                    unoffered(s)
                 } else {
                     let t = streaming(s, mark, 0);
-                    (t, Vec::new())
+                    let mut out = Vec::new();
+                    out.push(Action::Started { mark, stdin, pty });
+                    (t, out)
                 }
             },
             Frame::Bad => fail(s, Fault::Protocol, 0, true),
-            _ => fail(s, Fault::NotOffered, 0, true),
+            _ => unoffered(s),
         },
         Event::Broke => backoff(s, 0, now, draw, true),
         _ => (s, Vec::new()),
@@ -1453,6 +1788,8 @@ fn step_streaming(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<A
         post_watch(s, r.0, r.1@),
         post_end(s, ev, r.0, r.1@),
         post_only_these_end(s, ev, r.0, r.1@),
+        post_unreached(s, ev, r.0, r.1@),
+        post_surface(s, ev, r.0, r.1@),
 {
     match ev {
         Event::Frame(f) => match f {
@@ -1490,6 +1827,13 @@ fn step_streaming(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<A
                 (t, Vec::new())
             },
             Frame::Heartbeat => (s, Vec::new()),
+            Frame::ShellExit { code } => {
+                let mut out = Vec::new();
+                if !cfg!(feature = "mut_shell_exit_not_told") {
+                    out.push(Action::ShellExit { code });
+                }
+                (s, out)
+            },
             Frame::Exit { code, signal } => {
                 if s.pending > u64::MAX - s.offset {
                     return fail(s, Fault::Protocol, 0, true);
@@ -1505,7 +1849,8 @@ fn step_streaming(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<A
                 };
                 let mut out = Vec::new();
                 out.push(Action::CloseStream);
-                out.push(Action::DeliverExit { code, signal, dropped });
+                let killed = if cfg!(feature = "mut_signal_zero_kills") { signal == 0 } else { signal != 0 };
+                out.push(Action::DeliverExit { code, signal, dropped, killed });
                 if cfg!(feature = "mut_remove_on_exit_frame") {
                     out.push(Action::Remove { mark: s.mark });
                 }
@@ -1518,7 +1863,7 @@ fn step_streaming(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<A
                     fail(s, Fault::Protocol, 0, true)
                 }
             },
-            Frame::Started { mark } => {
+            Frame::Started { mark, .. } => {
                 if mark.len > 0 && !mark_eq(&mark, &s.mark) {
                     fail(s, Fault::JobGone, 0, true)
                 } else {
@@ -1556,6 +1901,8 @@ fn step_exit_held(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<A
         post_watch(s, r.0, r.1@),
         post_end(s, ev, r.0, r.1@),
         post_only_these_end(s, ev, r.0, r.1@),
+        post_unreached(s, ev, r.0, r.1@),
+        post_surface(s, ev, r.0, r.1@),
 {
     match ev {
         Event::ExitTaken => {
@@ -1612,6 +1959,8 @@ pub fn step(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<Action>
         post_watch(s, r.0, r.1@),
         post_end(s, ev, r.0, r.1@),
         post_only_these_end(s, ev, r.0, r.1@),
+        post_unreached(s, ev, r.0, r.1@),
+        post_surface(s, ev, r.0, r.1@),
 {
     if matches!(s.phase, Phase::Done) {
         return (s, Vec::new());
@@ -1693,6 +2042,55 @@ pub proof fn lemma_exit_progress(s: State, ev: Event, now: u64, s2: State, out: 
 {
 }
 
+/// SG-live (the liveness partner of the refusals that end a handle on an answer): the first authoritative
+/// answer ends the handle in that one step, with its own fault, whatever the status. The fairness
+/// assumption: the backend answers (the authority is what `authority` made of that answer).
+pub proof fn lemma_gone_ends_in_one_step(s: State, ev: Event, now: u64, s2: State, out: Seq<Action>)
+    requires
+        wf(s),
+        s.phase is Starting || s.phase is Opening || s.phase is Removing,
+        ev is Answered,
+        !(ev_authority(ev) is NotAuthoritative),
+        step_post(s, ev, now, s2, out),
+    ensures
+        s2.phase is Done,
+        ev_authority(ev) is SandboxGone ==> fails_with(out, Fault::SandboxGone),
+        ev_authority(ev) is SessionEnded ==> fails_with(out, Fault::SessionEnded),
+{
+}
+
+/// SG-complete (the completeness partner of `authority`'s refusals): the backend's exact answer is always
+/// recognised, so a retry with the same answer never ends in `NotAuthoritative`.
+pub proof fn lemma_authority_complete(
+    message: Seq<u8>,
+    sandbox_id: Seq<u8>,
+    ours: Seq<u8>,
+    code_text: Seq<u8>,
+)
+    requires
+        message == gone_message(),
+        ours.len() > 0,
+        sandbox_id == ours,
+    ensures
+        authority_of(502, message, Some(502u64), code_text, sandbox_id, ours) is SandboxGone,
+        authority_of(401, Seq::empty(), None, session_ended_code(), sandbox_id, ours) is SessionEnded,
+{
+}
+
+/// SG-silent: an endpoint that cannot be reached ends nothing. A cut, a refused connect and a timeout are
+/// `Broke`, and a tick is the wait ending: neither ever finishes a handle, however many came before.
+pub proof fn lemma_unreachable_never_ends(s: State, ev: Event, now: u64, s2: State, out: Seq<Action>)
+    requires
+        wf(s),
+        !(s.phase is Done),
+        ev is Broke || ev is Tick,
+        step_post(s, ev, now, s2, out),
+    ensures
+        !(s2.phase is Done),
+        forall|i: int| 0 <= i < out.len() ==> !is_fail(#[trigger] out[i]),
+{
+}
+
 } // verus!
 
 impl Mark {
@@ -1704,12 +2102,25 @@ impl Mark {
 
 impl State {
     /// A handle that starts a job. `key` is the shell's handle for the idempotency key it holds.
-    pub fn for_start(key: u64, mode: Mode, remove_on_exit: bool, beat_s: u32) -> State {
+    pub fn for_start(
+        key: u64,
+        mode: Mode,
+        remove_on_exit: bool,
+        beat_s: u32,
+        stdin_open: bool,
+        pty_open: bool,
+        kept: bool,
+    ) -> State {
         State {
             phase: Phase::Idle,
             flow: Flow::Start,
             mode,
             remove_on_exit,
+            stdin_open,
+            pty_open,
+            kept,
+            announced: false,
+            reached: false,
             key,
             mark: Mark { len: 0, b: [0; 32] },
             offset: 0,
@@ -1734,6 +2145,11 @@ impl State {
             flow: Flow::Attach,
             mode,
             remove_on_exit,
+            stdin_open: false,
+            pty_open: false,
+            kept: false,
+            announced: false,
+            reached: false,
             key: 0,
             mark,
             offset,
@@ -1770,6 +2186,93 @@ mod tests {
         assert_eq!(silence_limit_ms(Some(11)), 32_000);
         assert_eq!(silence_limit_ms(Some(60)), 130_000);
         assert_eq!(silence_limit_ms(Some(240)), 490_000);
+    }
+
+    /// The answers that are authoritative and the ones that are not. The first is E2B's real answer for a
+    /// deleted sandbox, captured over HTTP/2 (`content-type: application/json; charset=utf-8`).
+    #[test]
+    fn an_answer_is_authoritative_only_in_the_exact_shapes_the_backends_send() {
+        let msg = b"The sandbox was not found";
+        let ours = b"imot0yzwbvc4a43fuehu9";
+        let a = |st, m: &[u8], cn, ct: &[u8], id: &[u8], o: &[u8]| authority(st, m, cn, ct, id, o);
+        assert_eq!(
+            a(502, msg, Some(502), b"", ours, ours),
+            Authority::SandboxGone
+        );
+        // About another sandbox, no id, or an endpoint with none configured.
+        assert_eq!(
+            a(502, msg, Some(502), b"", b"zzz", ours),
+            Authority::NotAuthoritative
+        );
+        assert_eq!(
+            a(502, msg, Some(502), b"", b"", ours),
+            Authority::NotAuthoritative
+        );
+        assert_eq!(
+            a(502, msg, Some(502), b"", b"", b""),
+            Authority::NotAuthoritative
+        );
+        assert_eq!(
+            a(502, msg, Some(502), b"", ours, b""),
+            Authority::NotAuthoritative
+        );
+        // Not the status, message or code E2B sends.
+        for st in [404, 410, 503, 504, 200] {
+            assert_eq!(
+                a(st, msg, Some(502), b"", ours, ours),
+                Authority::NotAuthoritative
+            );
+        }
+        assert_eq!(
+            a(502, b"The sandbox is starting", Some(502), b"", ours, ours),
+            Authority::NotAuthoritative
+        );
+        assert_eq!(
+            a(502, b"", Some(502), b"", ours, ours),
+            Authority::NotAuthoritative
+        );
+        assert_eq!(
+            a(502, msg, Some(503), b"", ours, ours),
+            Authority::NotAuthoritative
+        );
+        assert_eq!(
+            a(502, msg, None, b"502", ours, ours),
+            Authority::NotAuthoritative
+        );
+        // Beyond's execfront: a session that has ended is a 401 whose code says so; any other 401 is a refused credential.
+        assert_eq!(
+            a(401, b"session ended", None, b"session_ended", b"", b""),
+            Authority::SessionEnded
+        );
+        assert_eq!(
+            a(401, b"", None, b"try_again", b"", b""),
+            Authority::NotAuthoritative
+        );
+        assert_eq!(
+            a(401, b"", None, b"", b"", b""),
+            Authority::NotAuthoritative
+        );
+        assert_eq!(
+            a(503, b"", None, b"session_ended", b"", b""),
+            Authority::NotAuthoritative
+        );
+        // Its classes: each ends a handle as its own fault, whatever the status.
+        assert_eq!(
+            classify(Op::Attach, 502, Authority::SandboxGone),
+            Class::Terminal(Fault::SandboxGone)
+        );
+        assert_eq!(
+            classify(Op::Attach, 401, Authority::SessionEnded),
+            Class::Terminal(Fault::SessionEnded)
+        );
+        assert_eq!(
+            classify(Op::Attach, 502, Authority::NotAuthoritative),
+            Class::Retry
+        );
+        assert_eq!(
+            classify(Op::Attach, 401, Authority::NotAuthoritative),
+            Class::Terminal(Fault::Auth)
+        );
     }
 
     #[test]

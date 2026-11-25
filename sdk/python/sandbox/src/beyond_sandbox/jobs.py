@@ -7,12 +7,11 @@ started it, and its output can be read from any offset.
 from __future__ import annotations
 
 import builtins
-from typing import AsyncGenerator, AsyncIterator, Generator, Iterator, Sequence
+from typing import AsyncGenerator, AsyncIterator, Callable, Generator, Iterator, Sequence
 
 from . import _jobs
-from ._drive import _DONE, adrive, adrive_emit, aiter_events, drive, drive_iter
+from ._drive import adrive, adrive_emit, aiter_items, drive, iter_items
 from .atransport import AsyncJobTransport
-from .errors import NotOfferedError
 from .models import (
     Attached,
     JobAttached,
@@ -25,34 +24,14 @@ from .models import (
     JobRemoved,
     JobShellExit,
     JobStart,
-    JobStarted,
+    Pty,
+    Reconnecting,
     StdinWritten,
     Survivor,
 )
 from .transport import JobTransport
 
 READ_MAX = _jobs.READ_MAX
-
-
-def _held_refusal(ev: JobFrame, stdin_open: bool, key: str) -> str | None:
-    """Why a held start's first frame shows an endpoint that lacks a feature asked for, if it does:
-    no stdin echo for ``stdin_open``, no echo of the start's idempotency ``key``, or no mark."""
-    if not isinstance(ev, JobStarted):
-        return None
-    if stdin_open and not ev.stdin:
-        return "the endpoint predates job stdin: it ran the job without it"
-    if ev.key != key:
-        return _jobs.NO_START_KEY
-    if not ev.mark:
-        return "the endpoint predates the job mark: its started frame did not name one"
-    return None
-
-
-def _attach_refusal(first: bool, ev: JobFrame) -> str | None:
-    """An attach stream opens with ``attached``; one that does not is an endpoint that predates it."""
-    if first and not isinstance(ev, JobAttached):
-        return "the endpoint predates the job mark: its attach did not answer with `attached`"
-    return None
 
 
 def _collect(a: Attached, ev: JobFrame) -> None:
@@ -87,17 +66,22 @@ class Jobs:
         env: dict[str, str] | None = None,
         stdin_open: bool = False,
         heartbeat_seconds: int | None = None,
+        timeout: float | None = None,
+        pty: Pty | None = None,
         idempotency_key: str | None = None,
     ) -> JobStart:
         """Start a job the sandbox keeps from the start; returns its process group and mark. ``env`` is the
         command's own environment; ``stdin_open`` keeps its stdin open for :meth:`write_stdin`
-        (an endpoint that predates it is a ``NotOfferedError`` and the job is stopped). An id that
+        (an endpoint that predates it is a ``NotOfferedError`` and the job is stopped); ``pty``
+        runs it on a terminal of that size (:class:`~beyond_sandbox.Pty`; the same ``NotOfferedError``
+        when the endpoint does not echo it; ``stdin_open`` is implied, and ``write_stdin`` takes no
+        ``eof``). An id that
         exists is :class:`~beyond_sandbox.JobExistsError`; a full disk is
         :class:`~beyond_sandbox.DiskFullError`. The start carries an idempotency key
         (``idempotency_key``, 1 to 128 characters of ``[0-9A-Za-z._:-]``; omitted, one is generated for this
         call): sent again, it answers the same job and runs nothing, and the key of another command is
-        :class:`~beyond_sandbox.JobExistsError` too (``409``). Pass your own to make a re-run of a whole
-        program return its job."""
+        :class:`~beyond_sandbox.KeyConflictError` (``409``). An endpoint that ignores keys is a
+        ``NotOfferedError``. Pass your own to make a re-run of a whole program return its job."""
         op = _jobs.start(
             scope,
             job,
@@ -108,6 +92,8 @@ class Jobs:
             env,
             stdin_open,
             heartbeat_seconds,
+            timeout,
+            pty,
             idempotency_key,
         )
         return drive(op, self._t)
@@ -124,12 +110,16 @@ class Jobs:
         env: dict[str, str] | None = None,
         stdin_open: bool = False,
         heartbeat_seconds: int | None = None,
+        on_reconnecting: Callable[[Reconnecting], None] | None = None,
+        timeout: float | None = None,
+        pty: Pty | None = None,
         idempotency_key: str | None = None,
     ) -> Generator[JobFrame, None, None]:
         """Start a job held by the returned stream (wire ``hold: true``): events, the first a
         :class:`JobStarted`, ending with a :class:`JobEnd`. If you stop before the end and did not
-        :meth:`keep` the job, the sandbox kills its group."""
-        key = _jobs.start_key(idempotency_key)
+        :meth:`keep` the job, the sandbox kills its group. A cut or silent stream is reopened at the
+        offset reached, by the client kernel; a handle that cannot reopen says so through
+        ``on_reconnecting`` and keeps trying."""
         op = _jobs.start_held(
             scope,
             job,
@@ -140,19 +130,12 @@ class Jobs:
             env,
             stdin_open,
             heartbeat_seconds,
-            key,
+            on_reconnecting,
+            timeout,
+            pty,
+            idempotency_key,
         )
-        items = drive_iter(op, self._t)
-        try:
-            for item in items:
-                if isinstance(item, tuple) and item and item[0] is _DONE:
-                    yield item[1]
-                else:
-                    if (why := _held_refusal(item, stdin_open, key)) is not None:
-                        raise NotOfferedError(why)
-                    yield item
-        finally:
-            items.close()
+        yield from iter_items(op, self._t)
 
     def keep(
         self,
@@ -177,6 +160,12 @@ class Jobs:
         """Write ``data`` at position ``at`` of the job's stdin; ``eof`` closes it after."""
         return drive(_jobs.write_stdin(scope, job, at, data, eof), self._t)
 
+    def resize(self, scope: str, job: str, cols: int, rows: int) -> Pty:
+        """Set a terminal job's size (wire ``resize``), absolute and idempotent. A size outside 1 to
+        1024 is ``InvalidRequestError`` (nothing is sent); no such job is ``JobGoneError``; a job with
+        no terminal, an ended one or one whose terminal hung up is ``ConflictError``."""
+        return drive(_jobs.resize(scope, job, cols, rows), self._t)
+
     def signal(self, scope: str, jobs: Sequence[str], signal: str) -> builtins.list[str]:
         """Send a named signal to the running jobs' groups; the ids that were running."""
         return drive(_jobs.signal(scope, jobs, signal), self._t)
@@ -198,25 +187,24 @@ class Jobs:
         heartbeat_seconds: int | None = None,
         mark: str | None = None,
         output: bool = True,
+        on_reconnecting: Callable[[Reconnecting], None] | None = None,
+        timeout: float | None = None,
     ) -> Iterator[JobFrame]:
         """Events, the first a :class:`JobAttached` (the job's mark and where the stream starts), then
         (:class:`JobOutput`, :class:`JobGap`, :class:`JobShellExit`, …), ending with a
         :class:`JobEnd` once the job's group is empty. Stopping early leaves the job running. A job
-        that does not exist is :class:`~beyond_sandbox.JobGoneError`. ``heartbeat_seconds`` (1 to 240,
-        the ``Keepalive-Ping-Interval`` header) sets the stream's beat; it is presumed dead only after
-        two beats and ten seconds of silence, never under 30 s. ``mark`` names the incarnation of the
-        id to follow: another is a ``JobGoneError`` and nothing is streamed. ``output=False`` sends no
-        output and no gap, only the end."""
-        op = _jobs.follow(scope, job, offset, heartbeat_seconds, mark, output)
-        first = True
-        for item in drive_iter(op, self._t):
-            if isinstance(item, tuple) and item and item[0] is _DONE:
-                yield item[1]
-            else:
-                if (why := _attach_refusal(first, item)) is not None:
-                    raise NotOfferedError(why)
-                first = False
-                yield item
+        that does not exist is :class:`~beyond_sandbox.JobGoneError`. A cut or silent stream is
+        reopened at the offset reached, by the client kernel (``crates/job-client``); a handle that
+        cannot reopen says so through ``on_reconnecting`` and keeps trying. ``heartbeat_seconds`` (1 to
+        240, the ``Keepalive-Ping-Interval`` header) sets the stream's beat; the stream is presumed
+        dead after two beats and ten seconds of silence, never under 30 s. ``mark`` names the
+        incarnation of the id to follow: another is a ``JobGoneError`` and nothing is streamed.
+        ``output=False`` sends no output and no gap, only the end. An endpoint that does not name the
+        mark is :class:`~beyond_sandbox.NotOfferedError`, before any byte."""
+        op = _jobs.follow(
+            scope, job, offset, heartbeat_seconds, mark, output, on_reconnecting, timeout
+        )
+        yield from iter_items(op, self._t)
 
     def collect(
         self,
@@ -227,11 +215,20 @@ class Jobs:
         heartbeat_seconds: int | None = None,
         mark: str | None = None,
         output: bool = True,
+        on_reconnecting: Callable[[Reconnecting], None] | None = None,
+        timeout: float | None = None,
     ) -> Attached:
         """Follow the job to its end and collect everything."""
         result = Attached(-1)
         for ev in self.follow(
-            scope, job, offset, heartbeat_seconds=heartbeat_seconds, mark=mark, output=output
+            scope,
+            job,
+            offset,
+            heartbeat_seconds=heartbeat_seconds,
+            mark=mark,
+            output=output,
+            on_reconnecting=on_reconnecting,
+            timeout=timeout,
         ):
             if isinstance(ev, JobEnd):
                 result.exit_code, result.signal = ev.code, ev.signal
@@ -280,6 +277,8 @@ class AsyncJobs:
         env: dict[str, str] | None = None,
         stdin_open: bool = False,
         heartbeat_seconds: int | None = None,
+        timeout: float | None = None,
+        pty: Pty | None = None,
         idempotency_key: str | None = None,
     ) -> JobStart:
         op = _jobs.start(
@@ -292,6 +291,8 @@ class AsyncJobs:
             env,
             stdin_open,
             heartbeat_seconds,
+            timeout,
+            pty,
             idempotency_key,
         )
         return await adrive(op, self._t)
@@ -308,10 +309,12 @@ class AsyncJobs:
         env: dict[str, str] | None = None,
         stdin_open: bool = False,
         heartbeat_seconds: int | None = None,
+        on_reconnecting: Callable[[Reconnecting], None] | None = None,
+        timeout: float | None = None,
+        pty: Pty | None = None,
         idempotency_key: str | None = None,
     ) -> AsyncGenerator[JobFrame, None]:
         """As :meth:`Jobs.start_held`."""
-        key = _jobs.start_key(idempotency_key)
         op = _jobs.start_held(
             scope,
             job,
@@ -322,19 +325,13 @@ class AsyncJobs:
             env,
             stdin_open,
             heartbeat_seconds,
-            key,
+            on_reconnecting,
+            timeout,
+            pty,
+            idempotency_key,
         )
-        events = aiter_events(op, self._t)
-        try:
-            async for item in events:
-                if isinstance(item, tuple) and item and item[0] is _DONE:
-                    yield item[1]
-                else:
-                    if (why := _held_refusal(item, stdin_open, key)) is not None:
-                        raise NotOfferedError(why)
-                    yield item
-        finally:
-            await events.aclose()
+        async for item in aiter_items(op, self._t):
+            yield item
 
     async def keep(
         self,
@@ -355,6 +352,9 @@ class AsyncJobs:
     ) -> StdinWritten:
         return await adrive(_jobs.write_stdin(scope, job, at, data, eof), self._t)
 
+    async def resize(self, scope: str, job: str, cols: int, rows: int) -> Pty:
+        return await adrive(_jobs.resize(scope, job, cols, rows), self._t)
+
     async def signal(self, scope: str, jobs: Sequence[str], signal: str) -> builtins.list[str]:
         return await adrive(_jobs.signal(scope, jobs, signal), self._t)
 
@@ -373,22 +373,15 @@ class AsyncJobs:
         heartbeat_seconds: int | None = None,
         mark: str | None = None,
         output: bool = True,
+        on_reconnecting: Callable[[Reconnecting], None] | None = None,
+        timeout: float | None = None,
     ) -> AsyncIterator[JobFrame]:
         """As :meth:`Jobs.follow`."""
-        op = _jobs.follow(scope, job, offset, heartbeat_seconds, mark, output)
-        events = aiter_events(op, self._t)
-        first = True
-        try:
-            async for item in events:
-                if isinstance(item, tuple) and item and item[0] is _DONE:
-                    yield item[1]
-                else:
-                    if (why := _attach_refusal(first, item)) is not None:
-                        raise NotOfferedError(why)
-                    first = False
-                    yield item
-        finally:
-            await events.aclose()
+        op = _jobs.follow(
+            scope, job, offset, heartbeat_seconds, mark, output, on_reconnecting, timeout
+        )
+        async for item in aiter_items(op, self._t):
+            yield item
 
     async def collect(
         self,
@@ -399,20 +392,21 @@ class AsyncJobs:
         heartbeat_seconds: int | None = None,
         mark: str | None = None,
         output: bool = True,
+        on_reconnecting: Callable[[Reconnecting], None] | None = None,
+        timeout: float | None = None,
     ) -> Attached:
         result = Attached(-1)
-        op = _jobs.follow(scope, job, offset, heartbeat_seconds, mark, output)
-        first = True
+        op = _jobs.follow(
+            scope, job, offset, heartbeat_seconds, mark, output, on_reconnecting, timeout
+        )
 
         async def collect(ev: JobFrame) -> None:
-            nonlocal first
-            if (why := _attach_refusal(first, ev)) is not None:
-                raise NotOfferedError(why)
-            first = False
-            _collect(result, ev)
+            if isinstance(ev, JobEnd):
+                result.exit_code, result.signal = ev.code, ev.signal
+            else:
+                _collect(result, ev)
 
-        end = await adrive_emit(op, self._t, collect)
-        result.exit_code, result.signal = end.code, end.signal
+        await adrive_emit(op, self._t, collect)
         return result
 
     async def kill(

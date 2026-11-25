@@ -359,6 +359,7 @@ dependencies = [
  "beyond-bash-gate",
  "beyond-exec-notify",
  "beyond-execd-jobs",
+ "beyond-job-client",
  "beyond-providers",
  "beyond-sandbox",
  "beyond-test-support",
@@ -612,6 +613,13 @@ version = "0.1.0"
 dependencies = [
  "stateright",
  "vstd",
+]
+
+[[package]]
+name = "beyond-job-client-ffi"
+version = "0.1.0"
+dependencies = [
+ "beyond-job-client",
 ]
 
 [[package]]

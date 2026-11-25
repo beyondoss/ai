@@ -12,10 +12,13 @@ use serde_json::{Value, json};
 
 use super::HttpExecRunner;
 use super::jobs::{
-    EventSink, JOB_SIGNALS, JobEnd, JobError, JobEvent, JobId, JobInfo, JobNotify, JobOp, JobScope,
-    JobSpec, JobStatus, ReadChunk, Removal, SandboxJobs, Started, StdinWritten, Stream, WRITE_MAX,
+    EventSink, JOB_SIGNALS, JobEnd, JobError, JobId, JobInfo, JobNotify, JobOp, JobScope, JobSpec,
+    JobStatus, PtyInfo, PtySize, ReadChunk, Removal, SandboxJobs, Started, StdinWritten, Stream,
+    WRITE_MAX,
 };
-use super::stream::{FrameReader, silence_limit};
+use job_client::step::{Mark, Mode, State};
+
+mod handle;
 
 /// A refusal as the job condition it is, when it is one; any other error is unchanged.
 fn refine(e: std::io::Error, op: JobOp) -> std::io::Error {
@@ -173,6 +176,15 @@ impl SandboxJobs for HttpJobs {
         dispatch!(self, write_stdin(scope, id, at, data, eof))
     }
 
+    async fn resize(
+        &self,
+        scope: &JobScope,
+        id: &JobId,
+        size: PtySize,
+    ) -> std::io::Result<PtySize> {
+        dispatch!(self, resize(scope, id, size))
+    }
+
     async fn signal(
         &self,
         scope: &JobScope,
@@ -215,6 +227,18 @@ impl<'a> NativeJobs<'a> {
         job
     }
 
+    /// The `start` request's members: `pty` only when a terminal is asked for.
+    fn start_op(scope: &JobScope, id: &JobId, hold: bool, spec: &JobSpec, key: &str) -> Value {
+        let mut extra = json!({
+            "id": id.as_str(), "hold": hold, "label": spec.label,
+            "stdin_open": spec.stdin_open, "idempotency_key": key,
+        });
+        if let Some(p) = spec.pty {
+            extra["pty"] = json!({ "cols": p.cols, "rows": p.rows });
+        }
+        Self::op("start", scope, extra)
+    }
+
     /// One non-streamed operation; its JSON answer.
     #[doc(hidden)]
     pub async fn call(&self, job: Value) -> std::io::Result<Value> {
@@ -235,101 +259,11 @@ impl<'a> NativeJobs<'a> {
             ))
         })
     }
-
-    /// One streamed operation: frames to `events`, until the final one.
-    #[allow(clippy::too_many_arguments)] // the request's parts, each used once
-    async fn stream(
-        &self,
-        program: &str,
-        args: &[String],
-        cwd: Option<&str>,
-        env: &[(String, String)],
-        job: Value,
-        stdin_open: bool,
-        key: Option<&str>,
-        beat: Option<u32>,
-        op: JobOp,
-        attach: bool,
-        events: EventSink<'_>,
-    ) -> std::io::Result<JobEnd> {
-        check_beat(beat)?;
-        let mut first = true;
-        let resp = self
-            .runner
-            .send_env_beat(
-                program,
-                args,
-                cwd,
-                super::STREAM_DEADLINE,
-                None,
-                true,
-                Some(&job),
-                env,
-                beat,
-            )
-            .await
-            .map_err(|e| refine(e, op))?;
-        let mut reader = FrameReader::new(resp);
-        let broken = |e: String| std::io::Error::other(format!("job stream: {e}"));
-        loop {
-            let Some(line) = reader
-                .next_line(silence_limit(beat))
-                .await
-                .map_err(broken)?
-            else {
-                return Err(broken(
-                    "the stream ended before the job's final frame".into(),
-                ));
-            };
-            let frame = decode_job_frame(&line).map_err(broken)?;
-            if attach && first && frame != JobFrame::Heartbeat {
-                first = false;
-                // An attach is answered `attached` first; an endpoint that predates marks streams.
-                if !matches!(
-                    frame,
-                    JobFrame::Event(Event::Attached(..)) | JobFrame::Error(_)
-                ) {
-                    return Err(predates("job marks"));
-                }
-            }
-            match frame {
-                JobFrame::Event(Event::Started(pgid, mark, stdin, echoed)) => {
-                    // An endpoint that predates job stdin ignores the flag and says nothing:
-                    // the job it started would read EOF. Not a job to leave running.
-                    if stdin_open && !stdin {
-                        return Err(predates("job stdin"));
-                    }
-                    // Nor one that ignores the start's key: a start sent again for a lost answer would run twice.
-                    if key.is_some() && echoed.as_deref() != key {
-                        return Err(predates("start keys"));
-                    }
-                    // The first frame of a held start names the incarnation; an endpoint that
-                    // predates marks says nothing.
-                    let Some(mark) = mark else {
-                        return Err(predates("job marks"));
-                    };
-                    events(JobEvent::Started(pgid, &mark));
-                }
-                JobFrame::Event(Event::Attached(mark, from)) => {
-                    events(JobEvent::Attached { mark: &mark, from });
-                }
-                JobFrame::Event(Event::Output(b, s)) => events(JobEvent::Output(&b, s)),
-                JobFrame::Event(Event::Gap(n)) => events(JobEvent::Gap(n)),
-                JobFrame::Event(Event::ShellExit(c)) => events(JobEvent::ShellExit(c)),
-                JobFrame::Heartbeat => {}
-                JobFrame::End(end) => {
-                    reader.finish().await;
-                    return Ok(end);
-                }
-                JobFrame::Error(e) => return Err(broken(e)),
-            }
-        }
-    }
 }
 
 /// The start's idempotency key: the caller's, checked, else a fresh one (128 random bits). Taken once per start
 /// call, before the first send.
-fn start_key(spec: &JobSpec) -> std::io::Result<String> {
+pub(super) fn start_key(spec: &JobSpec) -> std::io::Result<String> {
     if let Some(k) = &spec.idempotency_key {
         let ok = (1..=128).contains(&k.len())
             && k.bytes()
@@ -361,30 +295,25 @@ impl NativeJobs<'_> {
         beat: Option<u32>,
         events: EventSink<'_>,
     ) -> std::io::Result<JobEnd> {
-        let key = start_key(spec)?;
-        let job = Self::op(
-            "start",
+        check_beat(beat)?;
+        let h = handle::Handle {
+            runner: self.runner,
             scope,
-            json!({
-                "id": id.as_str(), "hold": true, "label": spec.label,
-                "stdin_open": spec.stdin_open,
-                "idempotency_key": key,
-            }),
-        );
-        self.stream(
-            &spec.program,
-            &spec.args,
-            spec.cwd.as_deref(),
-            &spec.env,
-            job,
-            spec.stdin_open,
-            Some(&key),
+            id,
+            spec: Some(spec),
             beat,
-            JobOp::Start,
+            output: true,
+        };
+        let state = State::for_start(
+            1,
+            Mode::Follow,
             false,
-            events,
-        )
-        .await
+            beat.unwrap_or(0),
+            spec.stdin_open,
+            spec.pty.is_some(),
+            false,
+        );
+        handle::drive(&h, state, events).await
     }
 
     /// [`SandboxJobs::follow`] with a heartbeat of the request's choosing, as [`Self::run_held_beat`].
@@ -415,25 +344,28 @@ impl NativeJobs<'_> {
         beat: Option<u32>,
         events: EventSink<'_>,
     ) -> std::io::Result<JobEnd> {
-        let mut extra = json!({ "id": id.as_str(), "offset": from, "output": output });
-        if let Some(m) = mark {
-            extra["mark"] = json!(m);
-        }
-        let job = Self::op("attach", scope, extra);
-        self.stream(
-            INERT,
-            &[],
-            None,
-            &[],
-            job,
-            false,
-            None,
+        check_beat(beat)?;
+        let mark = match mark {
+            None => Mark::none(),
+            Some(m) => Mark::from_bytes(m.as_bytes()).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("a mark is 1 to 32 characters of [0-9a-f], got {m:?}"),
+                )
+            })?,
+        };
+        let h = handle::Handle {
+            runner: self.runner,
+            scope,
+            id,
+            spec: None,
             beat,
-            JobOp::Other,
-            true,
-            events,
-        )
-        .await
+            output,
+        };
+        // A status-only attach carries no output: the kernel counts it and delivers only the exit.
+        let mode = if output { Mode::Follow } else { Mode::Watch };
+        let state = State::for_attach(mark, from, mode, false, beat.unwrap_or(0));
+        handle::drive(&h, state, events).await
     }
 
     /// [`SandboxJobs::read`] for a caller that wants a removed or unknown job as an error: the wire
@@ -510,15 +442,7 @@ impl SandboxJobs for NativeJobs<'_> {
         spec: &JobSpec,
     ) -> std::io::Result<Started> {
         let key = start_key(spec)?;
-        let job = Self::op(
-            "start",
-            scope,
-            json!({
-                "id": id.as_str(), "hold": false, "label": spec.label,
-                "stdin_open": spec.stdin_open,
-                "idempotency_key": key,
-            }),
-        );
+        let job = Self::start_op(scope, id, false, spec, &key);
         let resp = self
             .runner
             .send_env(
@@ -540,6 +464,16 @@ impl SandboxJobs for NativeJobs<'_> {
             // Started without its stdin: stop it, so nothing is left running that reads EOF.
             let _ = self.kill(scope, std::slice::from_ref(id), true).await;
             return Err(predates("job stdin"));
+        }
+        if spec.pty.is_some()
+            && answer
+                .as_ref()
+                .and_then(|v| parse_pty(v.get("pty")?))
+                .is_none()
+        {
+            // Started without its terminal: stop it, so no program runs that expects one.
+            let _ = self.kill(scope, std::slice::from_ref(id), true).await;
+            return Err(predates("job terminals"));
         }
         if answer.as_ref().and_then(|v| v.get("key")?.as_str()) != Some(key.as_str()) {
             // The endpoint ignored the key: stop what it started, as for a stdin it ignored.
@@ -698,8 +632,11 @@ impl SandboxJobs for NativeJobs<'_> {
         match self.call(job).await {
             Ok(v) => parse_written(&v),
             Err(e) => {
-                // 413 is the endpoint's own answer for a write over the cap.
-                if let Some(st) = super::endpoint_status(&e).filter(|st| st.status == 413) {
+                // 413 is the endpoint's own answer for a write over the cap, 400 a terminal's
+                // refusal of `eof`.
+                if let Some(st) =
+                    super::endpoint_status(&e).filter(|st| matches!(st.status, 400 | 413))
+                {
                     return Err(std::io::Error::new(
                         InvalidInput,
                         format!("job stdin: {}", st.body),
@@ -708,6 +645,28 @@ impl SandboxJobs for NativeJobs<'_> {
                 Err(refine(e, JobOp::Write))
             }
         }
+    }
+
+    async fn resize(
+        &self,
+        scope: &JobScope,
+        id: &JobId,
+        size: PtySize,
+    ) -> std::io::Result<PtySize> {
+        let v = self
+            .call(Self::op(
+                "resize",
+                scope,
+                json!({ "id": id.as_str(), "cols": size.cols, "rows": size.rows }),
+            ))
+            .await
+            .map_err(|e| match super::endpoint_status(&e) {
+                Some(st) if st.status == 400 => {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, st.body.clone())
+                }
+                _ => refine(e, JobOp::Resize),
+            })?;
+        parse_pty(&v).ok_or_else(|| bad("resize", &v))
     }
 
     async fn signal(
@@ -797,10 +756,9 @@ pub enum JobFrame {
 /// A job stream's non-final news, owned.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Event {
-    /// The job's process group, the incarnation's mark (`None` from an endpoint that predates marks), whether it was
-    /// started with its stdin open (the echo of `stdin_open`), and the start's idempotency key as the endpoint echoed
-    /// it (`None` from an endpoint that ignores keys).
-    Started(u32, Option<String>, bool, Option<String>),
+    /// The job's process group, its mark, whether it was started with its stdin open (the echo of
+    /// `stdin_open`), the terminal's size (the echo of `pty`) and the start's idempotency key (its echo).
+    Started(u32, Option<String>, bool, Option<PtySize>, Option<String>),
     /// An attach's answer: the job's mark and the offset the stream starts at.
     Attached(String, u64),
     Output(Vec<u8>, Stream),
@@ -821,6 +779,7 @@ struct WireJobFrame {
     attached: Option<WireAttached>,
     #[serde(default)]
     stdin: bool,
+    pty: Option<Value>,
     key: Option<String>,
     stdout: Option<String>,
     stderr: Option<String>,
@@ -860,7 +819,8 @@ pub fn decode_job_frame(line: &[u8]) -> Result<JobFrame, String> {
         JobFrame::Event(Event::Attached(a.mark, a.from))
     } else if let Some(p) = w.started {
         let p = u32::try_from(p).map_err(|_| wire_out_of_range("started", p))?;
-        JobFrame::Event(Event::Started(p, w.mark, w.stdin, w.key))
+        let pty = w.pty.as_ref().and_then(parse_pty);
+        JobFrame::Event(Event::Started(p, w.mark, w.stdin, pty, w.key))
     } else if let Some(s) = w.stdout.as_deref() {
         JobFrame::Event(Event::Output(b64(s)?, Stream::Stdout))
     } else if let Some(s) = w.stderr.as_deref() {
@@ -977,6 +937,21 @@ pub fn parse_read(v: &Value) -> std::io::Result<ReadChunk> {
         end: num("end"),
         data,
         stderr,
+        pty: pty_info(v),
+    })
+}
+
+/// A terminal's size as the wire echoes it; `None` when absent or not two integers from 1 to 1024.
+pub fn parse_pty(v: &Value) -> Option<PtySize> {
+    PtySize::new(v.get("cols")?.as_u64()?, v.get("rows")?.as_u64()?)
+}
+
+/// The `pty` member of a `list` entry or `read` answer: terminals only.
+fn pty_info(v: &Value) -> Option<PtyInfo> {
+    let p = v.get("pty")?;
+    Some(PtyInfo {
+        size: parse_pty(p)?,
+        open: p.get("open").and_then(Value::as_bool).unwrap_or(false),
     })
 }
 
@@ -992,7 +967,7 @@ pub fn parse_written(v: &Value) -> std::io::Result<StdinWritten> {
 }
 
 /// The error for an endpoint that ignores something the request asked for.
-fn predates(what: &str) -> std::io::Error {
+pub(super) fn predates(what: &str) -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         format!("the endpoint predates {what}: it ran the job without it"),
@@ -1054,6 +1029,7 @@ pub fn parse_list(v: &Value) -> std::io::Result<Vec<JobInfo>> {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string(),
+            pty: pty_info(j),
         });
     }
     Ok(out)
@@ -1208,5 +1184,103 @@ mod tests {
         assert_eq!(silence_limit(Some(240)), Duration::from_secs(490));
         assert!(check_beat(Some(0)).is_err() && check_beat(Some(241)).is_err());
         assert!(check_beat(Some(240)).is_ok() && check_beat(None).is_ok());
+    }
+
+    #[test]
+    fn a_started_frame_echoes_the_terminal_only_when_it_is_a_valid_size() {
+        let echoed = decode_job_frame(br#"{"started":7,"stdin":true,"pty":{"cols":80,"rows":24}}"#);
+        assert_eq!(
+            echoed,
+            Ok(JobFrame::Event(Event::Started(
+                7,
+                None,
+                true,
+                PtySize::new(80, 24),
+                None
+            )))
+        );
+        for bad in [
+            r#"{"started":7,"stdin":true}"#,
+            r#"{"started":7,"stdin":true,"pty":{"cols":0,"rows":24}}"#,
+            r#"{"started":7,"stdin":true,"pty":{"cols":80,"rows":1025}}"#,
+            r#"{"started":7,"stdin":true,"pty":"80x24"}"#,
+        ] {
+            assert_eq!(
+                decode_job_frame(bad.as_bytes()),
+                Ok(JobFrame::Event(Event::Started(7, None, true, None, None))),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_terminal_size_is_one_to_1024_each_way() {
+        assert!(PtySize::new(1, 1).is_some() && PtySize::new(1024, 1024).is_some());
+        for (c, r) in [(0, 24), (1025, 24), (80, 0), (80, 1025), (70_000, 24)] {
+            assert_eq!(PtySize::new(c, r), None, "{c}x{r}");
+        }
+    }
+
+    #[test]
+    fn list_and_read_report_the_terminal_of_a_terminal_job_only() {
+        let base =
+            json!({"mark": "m", "command": "sh", "args": [], "outputStart": 0, "outputEnd": 0});
+        let with = |extra: Value| {
+            let mut v = base.clone();
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            v
+        };
+        let list = json!({"jobs": [
+            with(json!({"id": "aa", "state": "running", "pty": {"cols": 120, "rows": 40, "open": true}})),
+            with(json!({"id": "bb", "state": "running"})),
+        ]});
+        let jobs = parse_list(&list).unwrap();
+        assert_eq!(
+            jobs[0].pty,
+            Some(PtyInfo {
+                size: PtySize::new(120, 40).unwrap(),
+                open: true
+            })
+        );
+        assert_eq!(jobs[1].pty, None);
+        let read = json!({"state": "running", "offset": 0, "end": 0, "data": "",
+            "pty": {"cols": 80, "rows": 24, "open": false}});
+        let chunk = parse_read(&read).unwrap();
+        assert_eq!(chunk.pty.map(|p| (p.size.cols, p.open)), Some((80, false)));
+        assert!(chunk.stderr.is_empty());
+    }
+
+    #[test]
+    fn a_resize_refusal_is_the_job_condition_of_its_status() {
+        let c = JobError::classify;
+        let code = |st| c(JobOp::Resize, st, "x").map(|j| j.code());
+        assert_eq!(code(404), Some("job_gone"));
+        assert_eq!(code(409), Some("conflict"));
+        // 400 is the caller's size, which the client checks first; it is no job condition.
+        assert_eq!(code(400), None);
+        assert_eq!(c(JobOp::Resize, 409, "x").unwrap().kind(), "conflict");
+        // A hung-up terminal on a write is the closed stdin, with its `written`.
+        assert_eq!(
+            c(
+                JobOp::Write,
+                409,
+                r#"{"error":"the terminal hung up","written":4}"#
+            )
+            .map(|j| j.code()),
+            Some("stdin_closed")
+        );
+        assert!(matches!(
+            c(
+                JobOp::Write,
+                409,
+                r#"{"error":"the terminal hung up","written":4}"#
+            ),
+            Some(JobError::StdinClosed {
+                reason: super::super::jobs::StdinClosedReason::HungUp,
+                ..
+            })
+        ));
     }
 }

@@ -4597,6 +4597,1900 @@
           }
         }
       ]
+    },
+    {
+      "id": "jobs.pty.start-is-a-terminal",
+      "description": "A job started with `pty` runs with a terminal on stdin, stdout and stderr at the size asked for, the start answer echoes the terminal, and `read` reports it.",
+      "requires": {
+        "features": [
+          "job_pty"
+        ]
+      },
+      "steps": [
+        {
+          "id": "start",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "pt01",
+          "command": "sh",
+          "args": [
+            "-c",
+            "test -t 0 && test -t 1 && test -t 2 && stty size"
+          ],
+          "pty": {
+            "cols": 80,
+            "rows": 24
+          },
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              },
+              "pty": {
+                "cols": 80,
+                "rows": 24
+              }
+            }
+          }
+        },
+        {
+          "id": "ended",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "pt01",
+          "offset": 0,
+          "expect": {
+            "ok": {
+              "state": "ended",
+              "code": 0,
+              "data_utf8": "24 80\r\n",
+              "pty": {
+                "cols": 80,
+                "rows": 24
+              }
+            }
+          },
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.pty.controlling-terminal",
+      "description": "The command's terminal is its controlling terminal: opening /dev/tty works.",
+      "requires": {
+        "features": [
+          "job_pty"
+        ]
+      },
+      "steps": [
+        {
+          "id": "start",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "pt02",
+          "command": "sh",
+          "args": [
+            "-c",
+            "exec 3</dev/tty && echo ctty"
+          ],
+          "pty": {
+            "cols": 80,
+            "rows": 24
+          },
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              },
+              "pty": {
+                "cols": 80,
+                "rows": 24
+              }
+            }
+          }
+        },
+        {
+          "id": "ended",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "pt02",
+          "offset": 0,
+          "expect": {
+            "ok": {
+              "state": "ended",
+              "code": 0,
+              "data_utf8": "ctty\r\n"
+            }
+          },
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.pty.output-is-one-stream",
+      "description": "A terminal merges stderr into its one output stream: both lines come as stdout with the terminal's CRLF, `read` names no stderr bytes and `attach` no stderr frames.",
+      "requires": {
+        "features": [
+          "job_pty"
+        ]
+      },
+      "steps": [
+        {
+          "id": "start",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "pt03",
+          "command": "sh",
+          "args": [
+            "-c",
+            "echo out; echo err >&2"
+          ],
+          "pty": {
+            "cols": 80,
+            "rows": 24
+          },
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              },
+              "pty": {
+                "cols": 80,
+                "rows": 24
+              }
+            }
+          }
+        },
+        {
+          "id": "ended",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "pt03",
+          "offset": 0,
+          "expect": {
+            "ok": {
+              "state": "ended",
+              "code": 0,
+              "data_utf8": "out\r\nerr\r\n",
+              "stderr_ranges": {
+                "$absent": true
+              }
+            }
+          },
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          }
+        },
+        {
+          "id": "attach",
+          "op": "job_attach",
+          "scope": "${SCOPE}",
+          "job": "pt03",
+          "offset": 0,
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "output_utf8": "out\r\nerr\r\n",
+              "stderr_b64": {
+                "$absent": true
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.pty.input-is-echoed-and-run",
+      "description": "Input written to a terminal is echoed by the terminal and run by the shell.",
+      "requires": {
+        "features": [
+          "job_pty"
+        ]
+      },
+      "steps": [
+        {
+          "id": "start",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "pt04",
+          "command": "sh",
+          "args": [
+            "-c",
+            "exec env PS1= sh"
+          ],
+          "pty": {
+            "cols": 80,
+            "rows": 24
+          },
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              },
+              "pty": {
+                "cols": 80,
+                "rows": 24
+              }
+            }
+          }
+        },
+        {
+          "id": "w",
+          "op": "job_write",
+          "scope": "${SCOPE}",
+          "job": "pt04",
+          "at": 0,
+          "data_b64": "ZWNobyBoaQo=",
+          "expect": {
+            "ok": {
+              "written": 8
+            }
+          }
+        },
+        {
+          "id": "echoed",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "pt04",
+          "offset": 0,
+          "expect": {
+            "ok": {
+              "data_utf8": {
+                "$contains": "echo hi\r\nhi\r\n"
+              }
+            }
+          },
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          }
+        },
+        {
+          "id": "exit",
+          "op": "job_write",
+          "scope": "${SCOPE}",
+          "job": "pt04",
+          "at": 8,
+          "data_b64": "ZXhpdAo=",
+          "expect": {
+            "ok": {
+              "written": 13
+            }
+          }
+        },
+        {
+          "id": "ended",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "pt04",
+          "offset": 0,
+          "expect": {
+            "ok": {
+              "state": "ended",
+              "code": 0
+            }
+          },
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.pty.writes-land-once",
+      "description": "Positional writes to a terminal land once: a repeat of the same bytes at the same position applies nothing, and the bytes are echoed by the terminal once and printed by the program once.",
+      "requires": {
+        "features": [
+          "job_pty"
+        ]
+      },
+      "steps": [
+        {
+          "id": "start",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "pt05",
+          "command": "cat",
+          "args": [],
+          "pty": {
+            "cols": 80,
+            "rows": 24
+          },
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              },
+              "pty": {
+                "cols": 80,
+                "rows": 24
+              }
+            }
+          }
+        },
+        {
+          "id": "w1",
+          "op": "job_write",
+          "scope": "${SCOPE}",
+          "job": "pt05",
+          "at": 0,
+          "data_b64": "YWI=",
+          "expect": {
+            "ok": {
+              "written": 2
+            }
+          }
+        },
+        {
+          "id": "again",
+          "op": "job_write",
+          "scope": "${SCOPE}",
+          "job": "pt05",
+          "at": 0,
+          "data_b64": "YWI=",
+          "expect": {
+            "ok": {
+              "written": 2
+            }
+          }
+        },
+        {
+          "id": "w2",
+          "op": "job_write",
+          "scope": "${SCOPE}",
+          "job": "pt05",
+          "at": 2,
+          "data_b64": "Ywo=",
+          "expect": {
+            "ok": {
+              "written": 4
+            }
+          }
+        },
+        {
+          "id": "once",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "pt05",
+          "offset": 0,
+          "expect": {
+            "ok": {
+              "state": "running",
+              "data_utf8": "abc\r\nabc\r\n"
+            }
+          },
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          }
+        },
+        {
+          "id": "eot",
+          "op": "job_write",
+          "scope": "${SCOPE}",
+          "job": "pt05",
+          "at": 4,
+          "data_b64": "BA==",
+          "expect": {
+            "ok": {
+              "written": 5
+            }
+          }
+        },
+        {
+          "id": "ended",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "pt05",
+          "offset": 0,
+          "expect": {
+            "ok": {
+              "state": "ended",
+              "code": 0
+            }
+          },
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.pty.resize-reaches-the-program",
+      "description": "A resize changes the terminal's size and the program is told: it gets SIGWINCH and reads the new size.",
+      "requires": {
+        "features": [
+          "job_pty"
+        ]
+      },
+      "steps": [
+        {
+          "id": "start",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "pt06",
+          "command": "sh",
+          "args": [
+            "-c",
+            "trap \"stty size\" WINCH; echo ready; while :; do sleep 0.05; done"
+          ],
+          "pty": {
+            "cols": 80,
+            "rows": 24
+          },
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              },
+              "pty": {
+                "cols": 80,
+                "rows": 24
+              }
+            }
+          }
+        },
+        {
+          "id": "ready",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "pt06",
+          "offset": 0,
+          "expect": {
+            "ok": {
+              "data_utf8": {
+                "$contains": "ready\r\n"
+              }
+            }
+          },
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          }
+        },
+        {
+          "id": "resize",
+          "op": "job_resize",
+          "scope": "${SCOPE}",
+          "job": "pt06",
+          "cols": 120,
+          "rows": 40,
+          "expect": {
+            "ok": {
+              "cols": 120,
+              "rows": 40
+            }
+          }
+        },
+        {
+          "id": "told",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "pt06",
+          "offset": 0,
+          "expect": {
+            "ok": {
+              "data_utf8": {
+                "$contains": "40 120\r\n"
+              }
+            }
+          },
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          }
+        },
+        {
+          "id": "kill",
+          "op": "job_kill",
+          "scope": "${SCOPE}",
+          "jobs": [
+            "pt06"
+          ],
+          "expect": {
+            "ok": {
+              "survivors": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.pty.resize-bounds",
+      "description": "A size outside 1 to 1024 is invalid_request and changes nothing; the same job then takes 1024 by 1024.",
+      "requires": {
+        "features": [
+          "job_pty"
+        ]
+      },
+      "steps": [
+        {
+          "id": "start",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "pt07",
+          "command": "cat",
+          "args": [],
+          "pty": {
+            "cols": 80,
+            "rows": 24
+          },
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              },
+              "pty": {
+                "cols": 80,
+                "rows": 24
+              }
+            }
+          }
+        },
+        {
+          "id": "zero-cols",
+          "op": "job_resize",
+          "scope": "${SCOPE}",
+          "job": "pt07",
+          "cols": 0,
+          "rows": 24,
+          "expect": {
+            "error": {
+              "kind": "invalid_request"
+            }
+          }
+        },
+        {
+          "id": "wide",
+          "op": "job_resize",
+          "scope": "${SCOPE}",
+          "job": "pt07",
+          "cols": 1025,
+          "rows": 24,
+          "expect": {
+            "error": {
+              "kind": "invalid_request"
+            }
+          }
+        },
+        {
+          "id": "zero-rows",
+          "op": "job_resize",
+          "scope": "${SCOPE}",
+          "job": "pt07",
+          "cols": 80,
+          "rows": 0,
+          "expect": {
+            "error": {
+              "kind": "invalid_request"
+            }
+          }
+        },
+        {
+          "id": "unchanged",
+          "op": "job_list",
+          "scope": "${SCOPE}",
+          "expect": {
+            "ok": {
+              "jobs": {
+                "$includes": [
+                  {
+                    "id": "pt07",
+                    "pty": {
+                      "cols": 80,
+                      "rows": 24,
+                      "open": true
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "id": "max",
+          "op": "job_resize",
+          "scope": "${SCOPE}",
+          "job": "pt07",
+          "cols": 1024,
+          "rows": 1024,
+          "expect": {
+            "ok": {
+              "cols": 1024,
+              "rows": 1024
+            }
+          }
+        },
+        {
+          "id": "changed",
+          "op": "job_list",
+          "scope": "${SCOPE}",
+          "expect": {
+            "ok": {
+              "jobs": {
+                "$includes": [
+                  {
+                    "id": "pt07",
+                    "pty": {
+                      "cols": 1024,
+                      "rows": 1024
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "id": "kill",
+          "op": "job_kill",
+          "scope": "${SCOPE}",
+          "jobs": [
+            "pt07"
+          ],
+          "expect": {
+            "ok": {
+              "survivors": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.pty.resize-refusals",
+      "description": "A resize of a job that is not there is not_found; of a job with no terminal, or of a terminal that has ended, conflict.",
+      "requires": {
+        "features": [
+          "job_pty"
+        ]
+      },
+      "steps": [
+        {
+          "id": "setup-plain",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "pt08p",
+          "command": "sleep",
+          "args": [
+            "30"
+          ],
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              }
+            }
+          }
+        },
+        {
+          "id": "start",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "pt08",
+          "command": "true",
+          "args": [],
+          "pty": {
+            "cols": 80,
+            "rows": 24
+          },
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              },
+              "pty": {
+                "cols": 80,
+                "rows": 24
+              }
+            }
+          }
+        },
+        {
+          "id": "ended",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "pt08",
+          "offset": 0,
+          "expect": {
+            "ok": {
+              "state": "ended",
+              "code": 0
+            }
+          },
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          }
+        },
+        {
+          "id": "unknown",
+          "op": "job_resize",
+          "scope": "${SCOPE}",
+          "job": "pt08x",
+          "cols": 80,
+          "rows": 24,
+          "expect": {
+            "error": {
+              "kind": "not_found"
+            }
+          }
+        },
+        {
+          "id": "no-terminal",
+          "op": "job_resize",
+          "scope": "${SCOPE}",
+          "job": "pt08p",
+          "cols": 80,
+          "rows": 24,
+          "expect": {
+            "error": {
+              "kind": "conflict"
+            }
+          }
+        },
+        {
+          "id": "ended-terminal",
+          "op": "job_resize",
+          "scope": "${SCOPE}",
+          "job": "pt08",
+          "cols": 80,
+          "rows": 24,
+          "expect": {
+            "error": {
+              "kind": "conflict"
+            }
+          }
+        },
+        {
+          "id": "kill",
+          "op": "job_kill",
+          "scope": "${SCOPE}",
+          "jobs": [
+            "pt08p"
+          ],
+          "expect": {
+            "ok": {
+              "survivors": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.pty.ctrl-c-interrupts-the-foreground",
+      "description": "Writing 0x03 to a terminal is Ctrl-C: the terminal sends SIGINT to the foreground program.",
+      "requires": {
+        "features": [
+          "job_pty",
+          "exit_signal"
+        ]
+      },
+      "steps": [
+        {
+          "id": "start",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "pt09",
+          "command": "sleep",
+          "args": [
+            "30"
+          ],
+          "pty": {
+            "cols": 80,
+            "rows": 24
+          },
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              },
+              "pty": {
+                "cols": 80,
+                "rows": 24
+              }
+            }
+          }
+        },
+        {
+          "id": "ctrl-c",
+          "op": "job_write",
+          "scope": "${SCOPE}",
+          "job": "pt09",
+          "at": 0,
+          "data_b64": "Aw==",
+          "expect": {
+            "ok": {
+              "written": 1
+            }
+          }
+        },
+        {
+          "id": "interrupted",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "pt09",
+          "offset": 0,
+          "expect": {
+            "ok": {
+              "state": "ended",
+              "code": 130,
+              "signal": 2
+            }
+          },
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.pty.ctrl-d-is-data-and-eof-is-refused",
+      "description": "A terminal has no end of input: `eof` is invalid_request and applies nothing; the same position still takes data, and 0x04 at the start of a line ends cat.",
+      "requires": {
+        "features": [
+          "job_pty"
+        ]
+      },
+      "steps": [
+        {
+          "id": "start",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "pt10",
+          "command": "cat",
+          "args": [],
+          "pty": {
+            "cols": 80,
+            "rows": 24
+          },
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              },
+              "pty": {
+                "cols": 80,
+                "rows": 24
+              }
+            }
+          }
+        },
+        {
+          "id": "eof",
+          "op": "job_write",
+          "scope": "${SCOPE}",
+          "job": "pt10",
+          "at": 0,
+          "data_b64": "",
+          "eof": true,
+          "expect": {
+            "error": {
+              "kind": "invalid_request"
+            }
+          }
+        },
+        {
+          "id": "probe",
+          "op": "job_write",
+          "scope": "${SCOPE}",
+          "job": "pt10",
+          "at": 0,
+          "data_b64": "",
+          "expect": {
+            "ok": {
+              "written": 0
+            }
+          }
+        },
+        {
+          "id": "data",
+          "op": "job_write",
+          "scope": "${SCOPE}",
+          "job": "pt10",
+          "at": 0,
+          "data_b64": "aGkK",
+          "expect": {
+            "ok": {
+              "written": 3
+            }
+          }
+        },
+        {
+          "id": "ctrl-d",
+          "op": "job_write",
+          "scope": "${SCOPE}",
+          "job": "pt10",
+          "at": 3,
+          "data_b64": "BA==",
+          "expect": {
+            "ok": {
+              "written": 4
+            }
+          }
+        },
+        {
+          "id": "ended",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "pt10",
+          "offset": 0,
+          "expect": {
+            "ok": {
+              "state": "ended",
+              "code": 0,
+              "data_utf8": {
+                "$contains": "hi\r\nhi\r\n"
+              }
+            }
+          },
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.pty.signal-reaches-the-session",
+      "description": "`signal` reaches the terminal's whole session: a shell and the program it runs both end.",
+      "requires": {
+        "features": [
+          "job_pty",
+          "job_signal_op"
+        ]
+      },
+      "steps": [
+        {
+          "id": "start",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "pt11",
+          "command": "sh",
+          "args": [
+            "-c",
+            "sleep 30 & sleep 30"
+          ],
+          "pty": {
+            "cols": 80,
+            "rows": 24
+          },
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              },
+              "pty": {
+                "cols": 80,
+                "rows": 24
+              }
+            }
+          }
+        },
+        {
+          "id": "term",
+          "op": "job_signal",
+          "scope": "${SCOPE}",
+          "jobs": [
+            "pt11"
+          ],
+          "signal": "SIGTERM",
+          "expect": {
+            "ok": {
+              "sent": [
+                "pt11"
+              ]
+            }
+          }
+        },
+        {
+          "id": "ended",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "pt11",
+          "offset": 0,
+          "expect": {
+            "ok": {
+              "state": "ended"
+            }
+          },
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.pty.kept-survives-detach",
+      "description": "A kept terminal outlives the stream that started it: a new connection lists it running with its terminal, writes to it, and attaches from the offset it had.",
+      "requires": {
+        "features": [
+          "job_pty",
+          "job_options"
+        ]
+      },
+      "steps": [
+        {
+          "id": "start",
+          "op": "job_start_held",
+          "scope": "${SCOPE}",
+          "job": "pt12",
+          "command": "sh",
+          "args": [
+            "-c",
+            "exec env PS1= sh"
+          ],
+          "pty": {
+            "cols": 80,
+            "rows": 24
+          },
+          "keep": true,
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              },
+              "pty": {
+                "cols": 80,
+                "rows": 24
+              }
+            }
+          }
+        },
+        {
+          "id": "before",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "pt12",
+          "offset": 0,
+          "expect": {
+            "ok": {
+              "state": "running"
+            }
+          },
+          "save": {
+            "end0": "end"
+          }
+        },
+        {
+          "id": "listed",
+          "op": "job_list",
+          "scope": "${SCOPE}",
+          "expect": {
+            "ok": {
+              "jobs": {
+                "$includes": [
+                  {
+                    "id": "pt12",
+                    "state": "running",
+                    "pty": {
+                      "cols": 80,
+                      "rows": 24,
+                      "open": true
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "id": "w",
+          "op": "job_write",
+          "scope": "${SCOPE}",
+          "job": "pt12",
+          "at": 0,
+          "data_b64": "ZWNobyBiYWNrCg==",
+          "expect": {
+            "ok": {
+              "written": 10
+            }
+          }
+        },
+        {
+          "id": "echoed",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "pt12",
+          "offset": "${end0}",
+          "expect": {
+            "ok": {
+              "data_utf8": {
+                "$contains": "echo back\r\nback\r\n"
+              }
+            }
+          },
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          }
+        },
+        {
+          "id": "exit",
+          "op": "job_write",
+          "scope": "${SCOPE}",
+          "job": "pt12",
+          "at": 10,
+          "data_b64": "ZXhpdAo=",
+          "expect": {
+            "ok": {
+              "written": 15
+            }
+          }
+        },
+        {
+          "id": "attach",
+          "op": "job_attach",
+          "scope": "${SCOPE}",
+          "job": "pt12",
+          "offset": "${end0}",
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "output_utf8": {
+                "$contains": "echo back\r\nback\r\n"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.pty.list-shows-the-terminal",
+      "description": "`list` shows a terminal job's size and that it is open; a job without a terminal has no `pty`.",
+      "requires": {
+        "features": [
+          "job_pty"
+        ]
+      },
+      "steps": [
+        {
+          "id": "plain",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "pt13p",
+          "command": "sleep",
+          "args": [
+            "30"
+          ],
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              }
+            }
+          }
+        },
+        {
+          "id": "start",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "pt13",
+          "command": "cat",
+          "args": [],
+          "pty": {
+            "cols": 80,
+            "rows": 24
+          },
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              },
+              "pty": {
+                "cols": 80,
+                "rows": 24
+              }
+            }
+          }
+        },
+        {
+          "id": "resize",
+          "op": "job_resize",
+          "scope": "${SCOPE}",
+          "job": "pt13",
+          "cols": 120,
+          "rows": 40,
+          "expect": {
+            "ok": {
+              "cols": 120,
+              "rows": 40
+            }
+          }
+        },
+        {
+          "id": "terminal",
+          "op": "job_list",
+          "scope": "${SCOPE}",
+          "expect": {
+            "ok": {
+              "jobs": {
+                "$includes": [
+                  {
+                    "id": "pt13",
+                    "pty": {
+                      "cols": 120,
+                      "rows": 40,
+                      "open": true
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "id": "plain-has-none",
+          "op": "job_list",
+          "scope": "${SCOPE}",
+          "expect": {
+            "ok": {
+              "jobs": {
+                "$includes": [
+                  {
+                    "id": "pt13p",
+                    "pty": {
+                      "$absent": true
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "id": "kill",
+          "op": "job_kill",
+          "scope": "${SCOPE}",
+          "jobs": [
+            "pt13p"
+          ],
+          "expect": {
+            "ok": {
+              "survivors": []
+            }
+          }
+        },
+        {
+          "id": "kill-terminal",
+          "op": "job_kill",
+          "scope": "${SCOPE}",
+          "jobs": [
+            "pt13"
+          ],
+          "expect": {
+            "ok": {
+              "survivors": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.pty.ended-terminal-refuses-input",
+      "description": "After the terminal's job has ended, a write is conflict (it says how much was written) and so is a resize.",
+      "requires": {
+        "features": [
+          "job_pty"
+        ]
+      },
+      "steps": [
+        {
+          "id": "start",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "pt14",
+          "command": "true",
+          "args": [],
+          "pty": {
+            "cols": 80,
+            "rows": 24
+          },
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              },
+              "pty": {
+                "cols": 80,
+                "rows": 24
+              }
+            }
+          }
+        },
+        {
+          "id": "ended",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "pt14",
+          "offset": 0,
+          "expect": {
+            "ok": {
+              "state": "ended",
+              "code": 0
+            }
+          },
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          }
+        },
+        {
+          "id": "late",
+          "op": "job_write",
+          "scope": "${SCOPE}",
+          "job": "pt14",
+          "at": 0,
+          "data_b64": "eA==",
+          "expect": {
+            "error": {
+              "kind": "conflict",
+              "written": 0
+            }
+          }
+        },
+        {
+          "id": "late-resize",
+          "op": "job_resize",
+          "scope": "${SCOPE}",
+          "job": "pt14",
+          "cols": 80,
+          "rows": 24,
+          "expect": {
+            "error": {
+              "kind": "conflict"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.pty.survives-execd-restart",
+      "description": "A terminal survives a restart of the endpoint's process: the shell is the same one, offsets continue, a write at the old position lands once, and its real exit code is reported.",
+      "requires": {
+        "features": [
+          "job_pty"
+        ],
+        "host": [
+          "restart_execd"
+        ]
+      },
+      "steps": [
+        {
+          "id": "start",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "pt15",
+          "command": "sh",
+          "args": [
+            "-c",
+            "exec env PS1= sh"
+          ],
+          "pty": {
+            "cols": 80,
+            "rows": 24
+          },
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              },
+              "pty": {
+                "cols": 80,
+                "rows": 24
+              }
+            }
+          }
+        },
+        {
+          "id": "w1",
+          "op": "job_write",
+          "scope": "${SCOPE}",
+          "job": "pt15",
+          "at": 0,
+          "data_b64": "ZWNobyBiZWZvcmUK",
+          "expect": {
+            "ok": {
+              "written": 12
+            }
+          }
+        },
+        {
+          "id": "before",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "pt15",
+          "offset": 0,
+          "expect": {
+            "ok": {
+              "data_utf8": {
+                "$contains": "echo before\r\nbefore\r\n"
+              }
+            }
+          },
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          },
+          "save": {
+            "end0": "end"
+          }
+        },
+        {
+          "id": "restart",
+          "host": "restart_execd"
+        },
+        {
+          "id": "still-there",
+          "op": "job_list",
+          "scope": "${SCOPE}",
+          "expect": {
+            "ok": {
+              "jobs": {
+                "$includes": [
+                  {
+                    "id": "pt15",
+                    "state": "running",
+                    "pty": {
+                      "cols": 80,
+                      "rows": 24,
+                      "open": true
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          }
+        },
+        {
+          "id": "offsets-continue",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "pt15",
+          "offset": "${end0}",
+          "expect": {
+            "ok": {
+              "offset": "${end0}"
+            }
+          },
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          }
+        },
+        {
+          "id": "w2",
+          "op": "job_write",
+          "scope": "${SCOPE}",
+          "job": "pt15",
+          "at": 12,
+          "data_b64": "c3R0eSBzaXplCg==",
+          "expect": {
+            "ok": {
+              "written": 22
+            }
+          }
+        },
+        {
+          "id": "size",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "pt15",
+          "offset": 0,
+          "expect": {
+            "ok": {
+              "data_utf8": {
+                "$contains": "24 80\r\n"
+              }
+            }
+          },
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          }
+        },
+        {
+          "id": "exit",
+          "op": "job_write",
+          "scope": "${SCOPE}",
+          "job": "pt15",
+          "at": 22,
+          "data_b64": "ZXhpdCAzCg==",
+          "expect": {
+            "ok": {
+              "written": 29
+            }
+          }
+        },
+        {
+          "id": "real-exit-code",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "pt15",
+          "offset": 0,
+          "expect": {
+            "ok": {
+              "state": "ended",
+              "code": 3
+            }
+          },
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.pty.survives-execd-crash",
+      "description": "A terminal survives a crash of the endpoint's process (SIGKILL, no shutdown at all, then a new process on the same URL): the shell is the same one, offsets continue, a write at the old position lands once, and its real exit code is reported.",
+      "requires": {
+        "features": [
+          "job_pty"
+        ],
+        "host": [
+          "crash_execd"
+        ]
+      },
+      "steps": [
+        {
+          "id": "start",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "pt16",
+          "command": "sh",
+          "args": [
+            "-c",
+            "exec env PS1= sh"
+          ],
+          "pty": {
+            "cols": 80,
+            "rows": 24
+          },
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              },
+              "pty": {
+                "cols": 80,
+                "rows": 24
+              }
+            }
+          }
+        },
+        {
+          "id": "w1",
+          "op": "job_write",
+          "scope": "${SCOPE}",
+          "job": "pt16",
+          "at": 0,
+          "data_b64": "ZWNobyBiZWZvcmUK",
+          "expect": {
+            "ok": {
+              "written": 12
+            }
+          }
+        },
+        {
+          "id": "before",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "pt16",
+          "offset": 0,
+          "expect": {
+            "ok": {
+              "data_utf8": {
+                "$contains": "echo before\r\nbefore\r\n"
+              }
+            }
+          },
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          },
+          "save": {
+            "end0": "end"
+          }
+        },
+        {
+          "id": "restart",
+          "host": "crash_execd"
+        },
+        {
+          "id": "still-there",
+          "op": "job_list",
+          "scope": "${SCOPE}",
+          "expect": {
+            "ok": {
+              "jobs": {
+                "$includes": [
+                  {
+                    "id": "pt16",
+                    "state": "running",
+                    "pty": {
+                      "cols": 80,
+                      "rows": 24,
+                      "open": true
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          }
+        },
+        {
+          "id": "offsets-continue",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "pt16",
+          "offset": "${end0}",
+          "expect": {
+            "ok": {
+              "offset": "${end0}"
+            }
+          },
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          }
+        },
+        {
+          "id": "w2",
+          "op": "job_write",
+          "scope": "${SCOPE}",
+          "job": "pt16",
+          "at": 12,
+          "data_b64": "c3R0eSBzaXplCg==",
+          "expect": {
+            "ok": {
+              "written": 22
+            }
+          }
+        },
+        {
+          "id": "size",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "pt16",
+          "offset": 0,
+          "expect": {
+            "ok": {
+              "data_utf8": {
+                "$contains": "24 80\r\n"
+              }
+            }
+          },
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          }
+        },
+        {
+          "id": "exit",
+          "op": "job_write",
+          "scope": "${SCOPE}",
+          "job": "pt16",
+          "at": 22,
+          "data_b64": "ZXhpdCAzCg==",
+          "expect": {
+            "ok": {
+              "written": 29
+            }
+          }
+        },
+        {
+          "id": "real-exit-code",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "pt16",
+          "offset": 0,
+          "expect": {
+            "ok": {
+              "state": "ended",
+              "code": 3
+            }
+          },
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.pty.keeper-killed-is-gone",
+      "description": "A terminal whose keeper is killed is hung up, not lost: it reads closed, input and resize are conflict, `eof` is still the client's error, the job can still be killed, and a new terminal opens.",
+      "requires": {
+        "features": [
+          "job_pty"
+        ],
+        "host": [
+          "kill_keepers"
+        ]
+      },
+      "steps": [
+        {
+          "id": "start",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "pt16",
+          "command": "sh",
+          "args": [
+            "-c",
+            "trap '' HUP; echo up; exec sleep 300"
+          ],
+          "pty": {
+            "cols": 80,
+            "rows": 24
+          },
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              },
+              "pty": {
+                "cols": 80,
+                "rows": 24
+              }
+            }
+          }
+        },
+        {
+          "id": "up",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "pt16",
+          "offset": 0,
+          "expect": {
+            "ok": {
+              "data_utf8": {
+                "$contains": "up\r\n"
+              }
+            }
+          },
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          }
+        },
+        {
+          "id": "kill-keeper",
+          "host": "kill_keepers"
+        },
+        {
+          "id": "hung-up",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "pt16",
+          "offset": 0,
+          "expect": {
+            "ok": {
+              "state": "running",
+              "pty": {
+                "cols": 80,
+                "rows": 24,
+                "open": false
+              }
+            }
+          },
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          }
+        },
+        {
+          "id": "write",
+          "op": "job_write",
+          "scope": "${SCOPE}",
+          "job": "pt16",
+          "at": 0,
+          "data_b64": "eA==",
+          "expect": {
+            "error": {
+              "kind": "conflict",
+              "written": 0
+            }
+          }
+        },
+        {
+          "id": "resize",
+          "op": "job_resize",
+          "scope": "${SCOPE}",
+          "job": "pt16",
+          "cols": 90,
+          "rows": 30,
+          "expect": {
+            "error": {
+              "kind": "conflict"
+            }
+          }
+        },
+        {
+          "id": "eof",
+          "op": "job_write",
+          "scope": "${SCOPE}",
+          "job": "pt16",
+          "at": 0,
+          "data_b64": "",
+          "eof": true,
+          "expect": {
+            "error": {
+              "kind": "invalid_request"
+            }
+          }
+        },
+        {
+          "id": "kill",
+          "op": "job_kill",
+          "scope": "${SCOPE}",
+          "jobs": [
+            "pt16"
+          ],
+          "expect": {
+            "ok": {
+              "survivors": []
+            }
+          }
+        },
+        {
+          "id": "partner-start",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "pt16b",
+          "command": "echo",
+          "args": [
+            "again"
+          ],
+          "pty": {
+            "cols": 80,
+            "rows": 24
+          },
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              }
+            }
+          }
+        },
+        {
+          "id": "partner",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "pt16b",
+          "offset": 0,
+          "expect": {
+            "ok": {
+              "state": "ended",
+              "code": 0,
+              "data_utf8": "again\r\n"
+            }
+          },
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          }
+        }
+      ]
     }
   ]
 }

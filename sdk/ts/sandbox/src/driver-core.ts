@@ -32,6 +32,7 @@ import {
 } from "./errors.js";
 import type { ErrorKind } from "./errors.js";
 import type { CapabilityOverrides } from "./files.js";
+import { HttpTransport } from "./http.js";
 import { Sandbox } from "./sandbox.js";
 import type { SearchEngine } from "./search.js";
 import type { JobInfo, Survivor } from "./transport.js";
@@ -42,6 +43,8 @@ type DriverError = {
   detail: string;
   /** The job condition, when the error is a finer type of its kind (DRIVER.md, `job_errors`). */
   code?: string;
+  /** A refused stdin write's stream length applied so far, when the endpoint said (DRIVER.md, `job_pty`). */
+  written?: number;
 };
 
 export const OPS = [
@@ -61,6 +64,7 @@ export const OPS = [
   "job_wipe",
   "job_write",
   "job_signal",
+  "job_resize",
   "stat",
   "read",
   "write",
@@ -147,6 +151,27 @@ function flag(req: Json, key: string): boolean {
   return v;
 }
 
+/** `pty`: `{cols, rows}`, or nothing. The client checks the range. */
+function optPty(req: Json): { cols: number; rows: number } | undefined {
+  const v = req.pty;
+  if (v === undefined || v === null) return undefined;
+  if (typeof v !== "object" || Array.isArray(v)) {
+    throw invalid("`pty` must be an object");
+  }
+  const { cols, rows } = v as Json;
+  if (typeof cols !== "number" || typeof rows !== "number") {
+    throw invalid("`pty` needs numeric `cols` and `rows`");
+  }
+  return { cols, rows };
+}
+
+/** A number the client range-checks (a non-integer is `invalid_request` there). */
+function wireInt(req: Json, key: string): number {
+  const v = req[key];
+  if (typeof v !== "number") throw invalid(`\`${key}\` must be a number`);
+  return v;
+}
+
 function strings(req: Json, key: string): string[] {
   const v = req[key];
   if (v === undefined || v === null) return [];
@@ -177,6 +202,7 @@ const jobJson = (j: JobInfo): Json => ({
   started: j.started,
   ended: j.ended,
   label: j.label,
+  ...(j.pty === undefined ? {} : { pty: j.pty }),
   mark: j.mark,
   command: j.command,
   args: j.args,
@@ -193,17 +219,21 @@ export class Driver {
   }
 
   /**
-   * Connect (and probe) on the first request that needs it; a failure is that op's answer. The
-   * driver goes through `Sandbox`, so its wiring is under test too.
+   * The sandbox for the first request that needs it. No probe: an endpoint that cannot be reached is
+   * that op's answer, found by the op's own path (a job's start is judged by the client kernel).
    */
   private connect(): Promise<Sandbox> {
-    this.connected ??= Sandbox.connect({
-      url: this.cfg.url,
-      token: this.cfg.tokenCmd
-        ? tokenFromCommand(this.cfg.tokenCmd)
-        : this.cfg.bearer || undefined,
-      files: { overrides: this.cfg.caps },
-    });
+    this.connected ??= Promise.resolve(
+      new Sandbox(
+        new HttpTransport({
+          url: this.cfg.url,
+          token: this.cfg.tokenCmd
+            ? tokenFromCommand(this.cfg.tokenCmd)
+            : this.cfg.bearer || undefined,
+        }),
+        { files: { overrides: this.cfg.caps } },
+      ),
+    );
     return this.connected;
   }
 
@@ -235,6 +265,7 @@ export class Driver {
               "job_errors",
               "job_options",
               "job_marks",
+              "job_pty",
               "job_start_key",
             ],
           },
@@ -309,6 +340,7 @@ export class Driver {
         const cwd = optStr(req, "cwd");
         const label = optStr(req, "label");
         const env = optEnv(req);
+        const pty = optPty(req);
         const started = await jobs.start(str(req, "scope"), str(req, "job"), {
           command: str(req, "command"),
           args: strings(req, "args"),
@@ -316,11 +348,18 @@ export class Driver {
           ...(label !== undefined ? { label } : {}),
           ...(env !== undefined ? { env } : {}),
           ...(flag(req, "stdin_open") ? { stdinOpen: true } : {}),
+          ...(pty !== undefined ? { pty } : {}),
           ...(optStr(req, "idempotency_key") !== undefined
             ? { idempotencyKey: optStr(req, "idempotency_key") as string }
             : {}),
         });
-        return { pgid: started.pgid, mark: started.mark };
+        // The client refused (`not_offered`) an endpoint that did not echo `pty`, so a start that
+        // came back echoed it.
+        return {
+          pgid: started.pgid,
+          mark: started.mark,
+          ...(pty !== undefined ? { pty } : {}),
+        };
       }
       case "job_start_held": {
         // Start held, learn the pgid from the first frame, optionally `keep`, then drop the
@@ -330,6 +369,7 @@ export class Driver {
         const env = optEnv(req);
         const scope = str(req, "scope");
         const job = str(req, "job");
+        const pty = optPty(req);
         const stream = jobs.startHeld(scope, job, {
           command: str(req, "command"),
           args: strings(req, "args"),
@@ -337,12 +377,20 @@ export class Driver {
           ...(label !== undefined ? { label } : {}),
           ...(env !== undefined ? { env } : {}),
           ...(flag(req, "stdin_open") ? { stdinOpen: true } : {}),
+          ...(pty !== undefined ? { pty } : {}),
+          ...(optStr(req, "idempotency_key") !== undefined
+            ? { idempotencyKey: optStr(req, "idempotency_key") as string }
+            : {}),
         }, heartbeat(req));
         try {
           for await (const f of stream) {
             if (f.type !== "started") continue;
             if (flag(req, "keep")) await jobs.keep(scope, job);
-            return { pgid: f.pgid, mark: f.mark };
+            return {
+              pgid: f.pgid,
+              mark: f.mark,
+              ...(f.pty === undefined ? {} : { pty: f.pty }),
+            };
           }
         } finally {
           await stream.return(undefined);
@@ -401,6 +449,7 @@ export class Driver {
           end: c.end,
           data_b64: b64(c.data),
           ...(c.stderrRanges ? { stderr_ranges: c.stderrRanges } : {}),
+          ...(c.pty === undefined ? {} : { pty: c.pty }),
         };
       }
       case "job_attach": {
@@ -452,6 +501,15 @@ export class Driver {
           flag(req, "eof"),
         );
         return { written: w.written, ...(w.closed ? { closed: true } : {}) };
+      }
+      case "job_resize": {
+        const size = await jobs.resize(
+          str(req, "scope"),
+          str(req, "job"),
+          wireInt(req, "cols"),
+          wireInt(req, "rows"),
+        );
+        return { cols: size.cols, rows: size.rows };
       }
       case "job_signal":
         return {
@@ -667,10 +725,14 @@ function toError(e: unknown): DriverError {
   }
   if (e instanceof SandboxError) {
     const code = codeOf(e);
+    const written = e instanceof StdinClosedError || e instanceof StdinGapError
+      ? e.written
+      : undefined;
     return {
       kind: e.kind,
       detail: e.detail,
       ...(code === undefined ? {} : { code }),
+      ...(written === undefined ? {} : { written }),
     };
   }
   return { kind: "io", detail: e instanceof Error ? e.message : String(e) };

@@ -36,6 +36,12 @@ export class TransportError extends SandboxError {
   }
 }
 
+/**
+ * The connection was never made: refused, no route, or the name did not resolve. Nothing was sent, so
+ * nothing happened. A {@link TransportError}: a catch of that keeps working.
+ */
+export class ConnectError extends TransportError {}
+
 /** The request deadline passed (not a command's own exit 124). */
 export class TimeoutError extends SandboxError {
   constructor(detail: string, options?: { cause?: unknown }) {
@@ -188,12 +194,12 @@ export class DiskFullError extends IoError {
  * stream's length applied so far, when the endpoint says.
  */
 export class StdinClosedError extends ConflictError {
-  readonly reason: "closed" | "never_opened";
+  readonly reason: "closed" | "never_opened" | "hung_up";
   readonly written: number | undefined;
 
   constructor(
     detail: string,
-    reason: "closed" | "never_opened",
+    reason: "closed" | "never_opened" | "hung_up",
     written?: number,
     options?: { cause?: unknown },
   ) {

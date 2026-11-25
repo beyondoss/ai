@@ -69,6 +69,11 @@ class TransportError(SandboxError):
     kind = "transport"
 
 
+class ConnectError(TransportError):
+    """The connection was never made: refused, no route, or the name did not resolve. Nothing was sent, so
+    nothing happened. (A ``TransportError``: a caller that catches that keeps working.)"""
+
+
 class ProtocolError(SandboxError):
     kind = "protocol"
 
@@ -116,7 +121,7 @@ class DiskFullError(IoError):
 
 class StdinClosedError(ConflictError):
     """A stdin ``write`` the job cannot take (409): ``reason`` is ``"never_opened"`` (started without
-    ``stdin_open``) or ``"closed"`` (EOF sent, the job ended or its reader left). Retrying cannot
+    ``stdin_open``) or ``"closed"`` (EOF sent, the job ended or its reader left) or ``"hung_up"`` (a terminal's keeper is gone). Retrying cannot
     succeed. ``written`` is the stream's length applied so far, when the endpoint says."""
 
     def __init__(

@@ -18,6 +18,7 @@ variables alone ([Configuration](#configuration)).
 | `src/log.rs`        | the logger: one text line per event to stderr, level via `EXECD_LOG` / `log::set_level`, no subscriber                                                                                        |
 | `src/runas.rs`      | `EXECD_RUN_AS`: resolving the user, proving execd can switch, the switch helper                                                                                                               |
 | `src/http.rs`       | hyper (HTTP/1.1 and h2c), routing, `/livez`, the bearer check, the request limit, the log line                                                                                                |
+| `src/term.rs`       | a terminal job's keeper (the process that holds the pty master), its session helper, the keeper's socket frames, and execd's connection to it                                                 |
 | `src/exec.rs`       | one-shot envelope and streams: pumps, the sink, heartbeat, leftovers, timeout, disconnect                                                                                                     |
 | `src/jobs.rs`       | jobs: the table, the supervisor, job streams                                                                                                                                                  |
 | `src/ring.rs`       | the job output ring's I/O: chunk files, the tail, the bits' storage; every decision is `crates/execd-ring`                                                                                    |
@@ -201,6 +202,48 @@ parks the request on the reactor, `timeout_ms` bounds the wait (short write), a 
 128 KiB, `WAITERS_MAX` 16 per job (429). The token cancels and the pipe is dropped when the job ends or is removed, so no fd
 outlives the job. The std `Mutex<Job>` is never held across an await.
 
+**Terminals** (`src/term.rs`). `start` with `pty: {cols, rows}` makes the job a terminal: its stdin, stdout and stderr are one
+pseudo-terminal (`TERM=xterm-256color` unless the request sets it), the command leads a session of its own with the terminal as
+its controlling one, and `write`, `resize`, `read`, `attach`, `signal`, `kill` and a restart all work on it as on a job. The
+master is held by a **keeper**, one small process per terminal (execd's own binary again: `--execd-run-as-helper keep ...`), so
+a restart or crash of execd does not hang the terminal up, as it does not end a kept job. The keeper opens the pty, spawns the
+**session helper** (`... session ...`: `setsid`, `TIOCSCTTY` on the slave before any user switch, the slave on 0, 1 and 2, then
+`exec`; under `EXECD_RUN_AS` the command is the `run` helper, which switches after the terminal is the command's, and the slave is
+chowned to the target), copies the master into the job's `out` spool file (its own stdout: the same spool, ring, offsets,
+journal and resume as every job; `err` has no writer, so a terminal's output is stdout alone), and serves execd on
+`<spool>/term.sock` (the spool directory is `0700`; a peer must be execd's uid, `SO_PEERCRED`; the first frame, `Ready`,
+carries a format version, the session's group, the count of input that landed and the size). It blocks in `poll` with no
+timeout, so an idle terminal costs no wakeups, and holds one 64 KiB buffer and at most one write in flight.
+
+The keeper owns the **input count** (`written`): execd sends `Write{at, bytes}`, the keeper plans it with the kernel's
+`stdin_plan` (bytes below `written` are skipped) and answers `Written{n}`, so a write retried across a restart of execd lands
+once. On the shell's exit the keeper drains the master, writes `<spool>/status` (aside and renamed) and sends `Exit`, then ends
+when the master reads `EIO` (no slave open anywhere). A restarted execd asks each saved terminal's keeper (`recover`: the
+ledger entry has the keeper's pid and the size): an answer is adopted open at the keeper's size; none is hung up
+(`pty.open: false`; input and resize 409), and a dead keeper's `status` is the shell's real code where a plain job's is lost.
+Who may talk to whom is the kernel's `admit_peer` (P1), asked at both ends: the keeper admits a peer of execd's uid, execd a
+peer of its uid whose pid is the keeper's (the ledger's `keeper_pid`); a failed credential read, another uid or another pid is
+refused, and nothing is read from a refused peer. Which answer counts as the keeper's is `keeper_of` (T6a): an admitted peer's
+`Ready` in a version execd knows (`KEEPER_VERSION`). Adoption and the start's own wait for `Ready` both call it. A keeper
+whose spool cannot be written (no space, no device) fails closed (Q6): the kernel kills the shell's session once, and the
+status the keeper writes and tells is `SPOOL_FAILED_CODE` (74, no signal), so the reader sees an end with that code instead
+of a terminal that looks alive with its output gone. A start refused for want of a pty is `pty_cap` / `keeper_ended` (Q1: 503
+when a keeper exits 124 or the test cap is passed, else 500). A resize is idempotent (T14): asked twice at one size it leaves
+the job as asked once.
+A hung-up terminal is still a job: it ends when its processes do. A held terminal nobody kept dies with its client, every
+process of its session included (`Kill{marked}`).
+
+**Behaviour change for every held job.** A held start nobody kept that loses its client dies with the group and every process that carries its mark (`Kill{marked}`), on a dropped stream and when a restarted execd finds one in the ledger. Before, a restart's recovery killed the group alone. One guarantee for every job; for a terminal it is what makes a shell's job-control groups die with it.
+
+**For an embedding host.** `Handle::activity().terminals` lists each kept terminal that has not ended: `{scope, id, pgid, pts_rdev, pts_fs, attached, members}` (the slave's `st_rdev` and the `st_dev` of its devpts, whether a stream is open on it, and the job's processes: its group plus the marked ones that left it, the set `kill` signals). `Options::helper_exe` names the binary a keeper is started from when the host is not execd's own binary (a test binary); `EXECD_TERMINALS_MAX` caps open terminals (503 beyond it) and exists so a test can reach that refusal without filling the machine's ptys. A write refused because the terminal hung up is `409 {"error": "the terminal hung up", "written": N}`; the SDKs type it `StdinClosed` with reason `hung_up`.
+
+Every decision is the kernel's: `size_ok`, `write_gate` (a terminal has no end of input; nothing goes to one that hung up),
+`resizable`, `Ev::Resize` (applied at once if the job runs, at the spawn if it is still spawning), `Ev::Hangup`, `recover`'s
+`Keeper`, `sinks`, and the keeper's own `execd_jobs::keeper::step` (what it copies, applies, writes and tells, and when it
+ends). `tests/job_model.rs` (`faithful_terminal`: T1, T1-live, T6 to T10, T12) and `tests/keeper_model.rs` (K1, K2, T5) call
+those functions; `tests/pty.rs` drives the real binary. Each `mut_*` of `crates/execd-jobs` listed below turns its property
+red in Verus (`mise run verify:kernels -- --features <mut>`), and the ones the models name turn them red too.
+
 **Signal.** `signal` sends one of seven named signals with `proc::signal_job` (the group, plus marked processes that left
 it: each process of the job hears it once) off the runtime, never to a job that has ended (its group number may be reused), and
 answers the ids it signalled. No grace, no table change; a signal that kills the shell is seen by the supervisor like any death.
@@ -274,63 +317,110 @@ cargo test -p beyond-execd --test job_model faithful          # both bounds, all
 cargo test -p beyond-execd --features <mut> --test job_model the_mutation   # each MUST pass only if its property is red
 ```
 
-| mutation                      | property it turns red                              |
-| ----------------------------- | -------------------------------------------------- |
-| `mut_start_overwrites`        | J1                                                 |
-| `mut_scope_ignored`           | J2                                                 |
-| `mut_remove_keeps_entry`      | J3                                                 |
-| `mut_end_rewritten`           | J4 (`ended_is_final`, over every phase and event)  |
-| `mut_disconnect_kills_kept`   | J6                                                 |
-| `mut_remove_live`             | J7                                                 |
-| `mut_signal_ended`            | J8                                                 |
-| `mut_ended_not_removable`     | L1                                                 |
-| `mut_stream_follows_key`      | J9                                                 |
-| `mut_take_by_key`             | J10                                                |
-| `mut_follow_waits_after_end`  | L2                                                 |
-| `mut_signal_after_reap`       | J11 (`os_model`, and Verus on `may_deliver`)       |
-| `mut_held_forgets`            | J11-live (`os_model`, and Verus on `Held::insert`) |
-| `mut_stdin_replays`           | W2 (Verus on `stdin_plan`)                         |
-| `mut_stdin_written_shrinks`   | W2b (Verus on `advance`)                           |
-| `mut_stdin_apply_off_start`   | W2c (Verus on `stdin_plan`)                        |
-| `mut_stdin_wait_sticks`       | W5-live (progress lemma)                           |
-| `mut_stdin_closes_early`      | W4 (Verus on `closes`)                             |
-| `mut_stdin_applies_ahead`     | W5 (Verus on `stdin_plan`)                         |
-| `mut_stdin_writes_ended`      | W3 (Verus on `stdin_plan`)                         |
-| `mut_stdin_writes_after_eof`  | W4 (Verus on `stdin_plan`)                         |
-| `mut_stdin_waiters_unbounded` | W1 (Verus on `admit_waiter`)                       |
-| `mut_stdin_waiter_stuck`      | W1-live (Verus on `admit_waiter`)                  |
-| `mut_stdin_waits_at_written`  | W5-live (Verus on `stdin_plan`)                    |
-| `mut_id_length_unbounded`     | I1 (Verus on `id_ok`)                              |
-| `mut_id_any_byte`             | I2 (Verus on `id_ok`)                              |
-| `mut_id_rejects_dash`         | I1-live (Verus on `id_ok`)                         |
-| `mut_mark_ignored`            | M1 (Verus on `mark_ok`, and `job_model`)           |
-| `mut_mark_refuses`            | M1-live (Verus on `mark_ok`)                       |
-| `mut_remove_ignores_mark`     | M2 (Verus on `removal`, and `job_model`)           |
-| `mut_remove_never_takes`      | M2-live (Verus on `removal`)                       |
-| `mut_running_unreported`      | M3 (Verus on `removal`)                            |
-| `mut_attach_ignores_mark`     | M4 (Verus on `attach_plan`, and `job_model`)       |
-| `mut_attach_refuses`          | M4-live (Verus on `attach_plan`)                   |
-| `mut_attach_offset_shifted`   | M5 (Verus on `attach_plan`)                        |
-| `mut_status_only_streams`     | M6 (Verus on `quiet_from`)                         |
-| `mut_status_only_sends`       | M7 (Verus on `stream_next`)                        |
-| ------------------------------ | -------------------------------------------------- |
-| `mut_key_replay_starts`        | K1 (`job_model`, Verus on `start_decision`)        |
-| `mut_key_digest_ignored`       | K2 (`job_model`, Verus on `start_decision`)        |
-| `mut_key_fresh_refused`        | K3 (`job_model`, Verus on `start_decision`)        |
-| `mut_unkeyed_replays`          | K4 (`job_model`, Verus on `Table::begin`)          |
-| `mut_key_forgotten_on_restart` | K6 (`job_model` K3, Verus on `keeps_record`)       |
-| `mut_key_record_clears`        | K7 (`job_model` K3, Verus on `Table::record`)      |
-| `mut_key_take_forgets_none`    | K8 (`job_model` K2, Verus on `Table::forget`)      |
-| `mut_intent_respawns` | K9 (`job_model` K1, Verus on `recover`) |
-| `mut_key_id_ignored` | K1, K2 (`job_model` K2, Verus on `Table::lookup`) |
-| `mut_key_held_starts` | K5 (`job_model` J1, Verus on `start_decision`) |
-| `mut_spawn_without_claim` | K10 (`job_model` K10, Verus on `launch`) |
-| `mut_orphan_survives` | K11 (`job_model` K11, Verus on `recover`) |
-| `mut_durable_claim_refused` | K16 (`job_model` K16, Verus on `launch`) |
-| `mut_bad_key_accepted` | K12 (Verus on `key_valid`) |
-| `mut_valid_key_refused` | K13 (Verus on `key_valid`) |
-| `mut_replay_refuses_started` | K14 (Verus on `replay_poll`) |
-| `mut_replay_waits_forever` | K15 (Verus on `replay_poll`) |
+| mutation                              | property it turns red                                                                 |
+| ------------------------------------- | ------------------------------------------------------------------------------------- |
+| `mut_start_overwrites`                | J1                                                                                    |
+| `mut_scope_ignored`                   | J2                                                                                    |
+| `mut_remove_keeps_entry`              | J3                                                                                    |
+| `mut_end_rewritten`                   | J4 (`ended_is_final`, over every phase and event)                                     |
+| `mut_disconnect_kills_kept`           | J6                                                                                    |
+| `mut_remove_live`                     | J7                                                                                    |
+| `mut_signal_ended`                    | J8                                                                                    |
+| `mut_ended_not_removable`             | L1                                                                                    |
+| `mut_stream_follows_key`              | J9                                                                                    |
+| `mut_take_by_key`                     | J10                                                                                   |
+| `mut_follow_waits_after_end`          | L2                                                                                    |
+| `mut_signal_after_reap`               | J11 (`os_model`, and Verus on `may_deliver`)                                          |
+| `mut_held_forgets`                    | J11-live (`os_model`, and Verus on `Held::insert`)                                    |
+| `mut_stdin_replays`                   | W2 (Verus on `stdin_plan`)                                                            |
+| `mut_stdin_written_shrinks`           | W2b (Verus on `advance`)                                                              |
+| `mut_stdin_apply_off_start`           | W2c (Verus on `stdin_plan`)                                                           |
+| `mut_stdin_wait_sticks`               | W5-live (progress lemma)                                                              |
+| `mut_stdin_closes_early`              | W4 (Verus on `closes`)                                                                |
+| `mut_stdin_applies_ahead`             | W5 (Verus on `stdin_plan`)                                                            |
+| `mut_stdin_writes_ended`              | W3 (Verus on `stdin_plan`)                                                            |
+| `mut_stdin_writes_after_eof`          | W4 (Verus on `stdin_plan`)                                                            |
+| `mut_stdin_waiters_unbounded`         | W1 (Verus on `admit_waiter`)                                                          |
+| `mut_stdin_waiter_stuck`              | W1-live (Verus on `admit_waiter`)                                                     |
+| `mut_stdin_waits_at_written`          | W5-live (Verus on `stdin_plan`)                                                       |
+| `mut_resize_ended`                    | T1 (Verus on `step`; `job_model` `PTY`)                                               |
+| `mut_resize_lost_while_spawning`      | T1-live (Verus on `step`, `lemma_resize_progress`; `job_model` `PTY`)                 |
+| `mut_size_unbounded`                  | T3 (Verus on `size_ok`)                                                               |
+| `mut_size_off_by_one`                 | T4 (Verus on `size_ok`, the completeness half)                                        |
+| `mut_pty_err_sink`                    | T5 (Verus on `sinks`)                                                                 |
+| `mut_recover_hangs_up_live_terminal`  | T6 (Verus on `recover`; `job_model` `PTY`)                                            |
+| `mut_recover_opens_silent_terminal`   | T7 (Verus on `recover`; `job_model` `PTY`)                                            |
+| `mut_recover_drops_status`            | T7b (Verus on `recover`)                                                              |
+| `mut_end_keeps_terminal`              | T8 (Verus on `step`; `job_model` `PTY`)                                               |
+| `mut_pty_kill_group_only`             | T9 (Verus on `step`; `job_model` `PTY`)                                               |
+| `mut_pty_eof_closes`                  | T10 (Verus on `write_gate`; `job_model` `PTY`)                                        |
+| `mut_gate_refuses_open`               | T11 (Verus on `write_gate`, the completeness half)                                    |
+| `mut_write_after_hangup`              | T12 (Verus on `write_gate`; `job_model` `PTY`)                                        |
+| `mut_exit_before_drain`               | K1 (Verus on `keeper::step`; `keeper_model`)                                          |
+| `mut_keeper_waits_forever`            | K2 (Verus on `keeper::step`; `keeper_model`)                                          |
+| `mut_keeper_reconnect_resets_written` | T5b (Verus on `keeper::step`; `keeper_model`)                                         |
+| `mut_hangup_keeps_terminal`           | T7 (Verus on `step`; `job_model` `PTY`; conformance `jobs.pty.keeper-killed-is-gone`) |
+| `mut_admit_any_peer`                  | P1 (Verus on `admit_peer`)                                                            |
+| `mut_pty_cap_ignored`                 | Q1 (Verus on `pty_cap`)                                                               |
+| `mut_keeper_no_pty_is_500`            | Q1 (Verus on `keeper_ended`)                                                          |
+| `mut_keeper_answer_unchecked`         | T6a (Verus on `keeper_of`)                                                            |
+| `mut_resize_not_idempotent`           | T14 (Verus on `step`, `resized`)                                                      |
+| `mut_spool_failure_silent`            | Q6 (Verus on `keeper::step`; `keeper_model`; `tests/pty.rs`)                          |
+| `mut_spool_failure_keeps_code`        | Q6 (Verus on `keeper::exit_status`; `keeper_model`; `tests/pty.rs`)                   |
+| `mut_start_overwrites`                | J1                                                                                    |
+| `mut_scope_ignored`                   | J2                                                                                    |
+| `mut_remove_keeps_entry`              | J3                                                                                    |
+| `mut_end_rewritten`                   | J4 (`ended_is_final`, over every phase and event)                                     |
+| `mut_disconnect_kills_kept`           | J6                                                                                    |
+| `mut_remove_live`                     | J7                                                                                    |
+| `mut_signal_ended`                    | J8                                                                                    |
+| `mut_ended_not_removable`             | L1                                                                                    |
+| `mut_stream_follows_key`              | J9                                                                                    |
+| `mut_take_by_key`                     | J10                                                                                   |
+| `mut_follow_waits_after_end`          | L2                                                                                    |
+| `mut_signal_after_reap`               | J11 (`os_model`, and Verus on `may_deliver`)                                          |
+| `mut_held_forgets`                    | J11-live (`os_model`, and Verus on `Held::insert`)                                    |
+| `mut_stdin_replays`                   | W2 (Verus on `stdin_plan`)                                                            |
+| `mut_stdin_written_shrinks`           | W2b (Verus on `advance`)                                                              |
+| `mut_stdin_apply_off_start`           | W2c (Verus on `stdin_plan`)                                                           |
+| `mut_stdin_wait_sticks`               | W5-live (progress lemma)                                                              |
+| `mut_stdin_closes_early`              | W4 (Verus on `closes`)                                                                |
+| `mut_stdin_applies_ahead`             | W5 (Verus on `stdin_plan`)                                                            |
+| `mut_stdin_writes_ended`              | W3 (Verus on `stdin_plan`)                                                            |
+| `mut_stdin_writes_after_eof`          | W4 (Verus on `stdin_plan`)                                                            |
+| `mut_stdin_waiters_unbounded`         | W1 (Verus on `admit_waiter`)                                                          |
+| `mut_stdin_waiter_stuck`              | W1-live (Verus on `admit_waiter`)                                                     |
+| `mut_stdin_waits_at_written`          | W5-live (Verus on `stdin_plan`)                                                       |
+| `mut_id_length_unbounded`             | I1 (Verus on `id_ok`)                                                                 |
+| `mut_id_any_byte`                     | I2 (Verus on `id_ok`)                                                                 |
+| `mut_id_rejects_dash`                 | I1-live (Verus on `id_ok`)                                                            |
+| `mut_mark_ignored`                    | M1 (Verus on `mark_ok`, and `job_model`)                                              |
+| `mut_mark_refuses`                    | M1-live (Verus on `mark_ok`)                                                          |
+| `mut_remove_ignores_mark`             | M2 (Verus on `removal`, and `job_model`)                                              |
+| `mut_remove_never_takes`              | M2-live (Verus on `removal`)                                                          |
+| `mut_running_unreported`              | M3 (Verus on `removal`)                                                               |
+| `mut_attach_ignores_mark`             | M4 (Verus on `attach_plan`, and `job_model`)                                          |
+| `mut_attach_refuses`                  | M4-live (Verus on `attach_plan`)                                                      |
+| `mut_attach_offset_shifted`           | M5 (Verus on `attach_plan`)                                                           |
+| `mut_status_only_streams`             | M6 (Verus on `quiet_from`)                                                            |
+| `mut_status_only_sends`               | M7 (Verus on `stream_next`)                                                           |
+| `mut_key_replay_starts`               | K1 (`job_model`, Verus on `start_decision`)                                           |
+| `mut_key_digest_ignored`              | K2 (`job_model`, Verus on `start_decision`)                                           |
+| `mut_key_fresh_refused`               | K3 (`job_model`, Verus on `start_decision`)                                           |
+| `mut_unkeyed_replays`                 | K4 (`job_model`, Verus on `Table::begin`)                                             |
+| `mut_key_forgotten_on_restart`        | K6 (`job_model` K3, Verus on `keeps_record`)                                          |
+| `mut_key_record_clears`               | K7 (`job_model` K3, Verus on `Table::record`)                                         |
+| `mut_key_take_forgets_none`           | K8 (`job_model` K2, Verus on `Table::forget`)                                         |
+| `mut_intent_respawns`                 | K9 (`job_model` K1, Verus on `recover`)                                               |
+| `mut_key_id_ignored`                  | K1, K2 (`job_model` K2, Verus on `Table::lookup`)                                     |
+| `mut_key_held_starts`                 | K5 (`job_model` J1, Verus on `start_decision`)                                        |
+| `mut_spawn_without_claim`             | K10 (`job_model` K10, Verus on `launch`)                                              |
+| `mut_orphan_survives`                 | K11 (`job_model` K11, Verus on `recover`)                                             |
+| `mut_durable_claim_refused`           | K16 (`job_model` K16, Verus on `launch`)                                              |
+| `mut_bad_key_accepted`                | K12 (Verus on `key_valid`)                                                            |
+| `mut_valid_key_refused`               | K13 (Verus on `key_valid`)                                                            |
+| `mut_replay_refuses_started`          | K14 (Verus on `replay_poll`)                                                          |
+| `mut_replay_waits_forever`            | K15 (Verus on `replay_poll`)                                                          |
 
 ### The OS boundary (J11)
 

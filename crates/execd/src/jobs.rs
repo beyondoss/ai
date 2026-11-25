@@ -41,14 +41,16 @@ use crate::exec::{self, Cut, Sink};
 use crate::frame::{self, FRAME_MAX};
 use crate::http::{self, Line, Request, Resp};
 use crate::job_kernel::{
-    self as kernel, Act, Admit, Alive, Attach, Begin, Ev, Follow, Kind, Launch, Persist, Pick,
-    Rec, Recovery, Refusal, Removal, Replied, Sink as Dest, Sweep,
+    self as kernel, Act, Admit, Alive, Attach, Begin, Ev, Follow, Gate, Keeper, Kind, Launch,
+    Persist, Pick, Rec, Recovery, Refusal, Removal, Replied, Resizable, Sink as Dest, Size, Sweep,
+    Term,
 };
-use crate::ledger::{Entry, Idem, Ledger};
+use crate::ledger::{Entry, Idem, Ledger, Saved};
 use crate::notify::{self, Notifier, NotifyTarget};
 use crate::proc::{self, locked};
 use crate::ring::Ring;
 use crate::tail::{Journal, Spool, Start, Tail};
+use crate::term;
 use crate::{Ctx, StreamEnd, StreamStart};
 
 /// `(scope, id)`: a job's address.
@@ -77,6 +79,8 @@ pub(crate) struct Job {
     pub notifier: Notifier,
     /// The job's open stdin, when it was started with `stdin_open`.
     stdin: Option<Arc<JobStdin>>,
+    /// Streams open on it now (an `attach`, a held start): a terminal someone watches is attached.
+    streams: usize,
     /// The start's idempotency key and spec digest, for the ledger (the table's own record of the key is
     /// [`kernel::Rec`]); `None` for an unkeyed start. Written once, at the start or the restart.
     idem: Option<Idem>,
@@ -150,14 +154,19 @@ impl Jobs {
             .into_iter()
             .filter_map(|((scope, id), cell)| {
                 let j = locked(&cell);
+                let keeper = j
+                    .stdin
+                    .as_ref()
+                    .and_then(|s| s.term.as_ref())
+                    .map(|t| t.keeper_pid);
                 Entry::of(
-                    &scope,
-                    &id,
+                    (&scope, &id),
                     &j.label,
                     &j.argv,
                     &j.mark,
                     &j.k,
                     j.spool.as_ref().map(Spool::dir),
+                    keeper,
                     j.idem.as_ref(),
                 )
             })
@@ -207,6 +216,41 @@ impl Jobs {
         (alive, kept, owed)
     }
 
+    /// The kept terminals that have not ended and whose keeper holds them: what a host that sleeps
+    /// idle machines asks of each (a read, not a decision).
+    pub fn terminals(&self) -> Vec<crate::Terminal> {
+        let cells = locked(&self.map).all();
+        let mut out = Vec::new();
+        for ((scope, id), cell) in cells {
+            let (pgid, mark, (rdev, fs), attached) = {
+                let j = locked(&cell);
+                if j.removed
+                    || !matches!(j.k.term, Term::Open { .. })
+                    || !matches!(j.k.alive(), Alive::Kept)
+                {
+                    continue;
+                }
+                let ids = j
+                    .stdin
+                    .as_ref()
+                    .and_then(|s| s.term.as_ref())
+                    .map_or((0, 0), |t| (t.pts_rdev, t.pts_fs));
+                (j.k.pgid(), j.mark.clone(), ids, j.streams > 0)
+            };
+            // The same members the kill path signals: the group and every marked process that left it.
+            out.push(crate::Terminal {
+                scope,
+                id,
+                pgid,
+                pts_rdev: rdev,
+                pts_fs: fs,
+                attached,
+                members: proc::job_members(pgid, &mark),
+            });
+        }
+        out
+    }
+
     fn get(&self, key: &Key) -> Option<JobCell> {
         locked(&self.map).get(key)
     }
@@ -222,7 +266,7 @@ impl Jobs {
         let cells = locked(&self.map).take(checked, Arc::ptr_eq);
         for (_, cell) in cells {
             let mut j = locked(&cell);
-            if kernel::step(&mut j.k, Ev::Taken) == Act::Release {
+            if let Act::Release { .. } = kernel::step(&mut j.k, Ev::Taken) {
                 j.notifier = Notifier::removed();
                 if let Some(s) = &j.stdin {
                     s.close();
@@ -254,6 +298,20 @@ fn state_of(j: &Job) -> (&'static str, Value) {
 fn put_signal(j: &Job, obj: &mut Value) {
     if let Some(sig) = j.k.signal() {
         obj["signal"] = json!(sig);
+    }
+}
+
+/// `pty`, on a terminal job's `read` and `list` entries: its size, and whether its keeper still holds
+/// it. Absent for a job with no terminal.
+fn put_pty(j: &Job, obj: &mut Value) {
+    match j.k.term {
+        Term::No => {}
+        Term::Open { size, .. } => {
+            obj["pty"] = json!({ "cols": size.cols, "rows": size.rows, "open": true });
+        }
+        Term::Gone { size } => {
+            obj["pty"] = json!({ "cols": size.cols, "rows": size.rows, "open": false });
+        }
     }
 }
 
@@ -362,6 +420,11 @@ struct JobReq {
     /// the job's stdin after them.
     at: u64,
     eof: bool,
+    /// `start`: a terminal of this size (`{cols, rows}`), the job's stdin, stdout and stderr in one.
+    pty: Option<Value>,
+    /// `resize`: the terminal's new size.
+    cols: Option<u64>,
+    rows: Option<u64>,
 }
 
 /// The signals `signal` sends: names only, no `SIGSTOP` (it would freeze a sandbox's job beyond the
@@ -397,6 +460,9 @@ pub(crate) struct JobStdin {
     /// Cancelled when the job ends or is removed: pending writes stop, the pipe is dropped.
     dead: CancellationToken,
     waiters: AtomicUsize,
+    /// A terminal's input is its keeper's: the keeper holds the master and applies the writes.
+    /// `written` then mirrors the keeper's count.
+    term: Option<Arc<term::Link>>,
 }
 
 impl JobStdin {
@@ -406,17 +472,98 @@ impl JobStdin {
             written: watch::Sender::new(0),
             dead: CancellationToken::new(),
             waiters: AtomicUsize::new(0),
+            term: None,
+        })
+    }
+
+    /// A terminal's input, which its keeper has applied `written` bytes of.
+    fn terminal(link: Arc<term::Link>, written: u64) -> Arc<Self> {
+        Arc::new(Self {
+            pipe: tokio::sync::Mutex::new(None),
+            written: watch::Sender::new(written),
+            dead: CancellationToken::new(),
+            waiters: AtomicUsize::new(0),
+            term: Some(link),
         })
     }
 
     /// The job is over: no write lands again and the fd is released once any write in flight
-    /// has noticed.
+    /// has noticed. A terminal's connection to its keeper goes with it (the keeper ends when its
+    /// master reads EIO, which it does once no process of the session is left).
     fn close(self: &Arc<Self>) {
         self.dead.cancel();
         let me = self.clone();
         tokio::spawn(async move {
             me.pipe.lock().await.take();
+            if let Some(t) = &me.term {
+                t.close().await;
+            }
         });
+    }
+}
+
+/// Read a terminal keeper's frames until it is gone: the count of what landed is mirrored into
+/// `stdin.written`, the shell's status goes to `exit` once, and the end of the connection is the
+/// terminal hanging up (`Ev::Hangup`). Ends with the job (`stdin.dead`).
+async fn term_reader(
+    ctx: Arc<Ctx>,
+    cell: JobCell,
+    stdin: Arc<JobStdin>,
+    mut rd: tokio::net::unix::OwnedReadHalf,
+    mut frames: term::Frames,
+    exit: tokio::sync::oneshot::Sender<Option<(i32, Option<i32>)>>,
+) {
+    use tokio::io::AsyncReadExt as _;
+    let mut exit = Some(exit);
+    let mut buf = vec![0u8; 4096];
+    let mut alive = true;
+    'read: loop {
+        loop {
+            match frames.next() {
+                Ok(Some((tag, p))) => match term::parse_said(tag, &p) {
+                    Some(term::Said::Written(n)) | Some(term::Said::Ready { written: n, .. }) => {
+                        stdin.written.send_modify(|w| {
+                            if n > *w {
+                                *w = n;
+                            }
+                        });
+                    }
+                    Some(term::Said::Exit { code, signal }) => {
+                        if let Some(tx) = exit.take() {
+                            let _ = tx.send(Some((code, signal)));
+                        }
+                    }
+                    None => {}
+                },
+                Ok(None) => break,
+                Err(_) => break 'read,
+            }
+        }
+        tokio::select! {
+            r = rd.read(&mut buf) => match r {
+                Ok(0) | Err(_) => break,
+                Ok(n) => frames.push(&buf[..n]),
+            },
+            () = stdin.dead.cancelled() => {
+                alive = false;
+                break;
+            }
+        }
+    }
+    if let Some(tx) = exit.take() {
+        let _ = tx.send(None);
+    }
+    if alive {
+        // The keeper is gone: nothing more can be written or resized.
+        let hung = {
+            let mut j = locked(&cell);
+            kernel::step(&mut j.k, Ev::Hangup);
+            !j.k.ended()
+        };
+        stdin.dead.cancel();
+        let _ = hung;
+        ctx.jobs.bump();
+        ctx.jobs.save();
     }
 }
 
@@ -434,7 +581,25 @@ async fn write_stdin(ctx: &Arc<Ctx>, req: &Request, job: &JobReq, data: Vec<u8>)
     let Some(cell) = ctx.jobs.get(&(job.scope.clone(), job.id.clone())) else {
         return http::error_response(404, "no such job");
     };
-    let Some(stdin) = locked(&cell).stdin.clone() else {
+    let (term_state, stdin) = {
+        let j = locked(&cell);
+        (j.k.term, j.stdin.clone())
+    };
+    // A terminal has no end of input, and nothing goes to one that hung up (T10 to T12).
+    match kernel::write_gate(term_state, job.eof) {
+        Gate::NoEnd => {
+            return http::error_response(
+                400,
+                "a terminal has no end of input: write 0x04 (Ctrl-D)",
+            );
+        }
+        Gate::HungUp => {
+            let written = stdin.as_ref().map_or(0, |s| *s.written.borrow());
+            return hung_up(written);
+        }
+        Gate::Go => {}
+    }
+    let Some(stdin) = stdin else {
         return http::error_response(409, "the job has no stdin");
     };
     if !kernel::admit_waiter(stdin.waiters.fetch_add(1, Ordering::Relaxed)) {
@@ -478,6 +643,9 @@ async fn write_stdin(ctx: &Arc<Ctx>, req: &Request, job: &JobReq, data: Vec<u8>)
     let mut pipe = tokio::select! {
         p = stdin.pipe.lock() => p,
         () = stdin.dead.cancelled() => {
+            if stdin.term.is_some() {
+                return hung_up(*stdin.written.borrow());
+            }
             // Over: bytes already applied are idempotent, anything else is refused.
             let plan = kernel::stdin_plan(*stdin.written.borrow(), job.at, len, job.eof, false, true);
             return match plan {
@@ -486,6 +654,9 @@ async fn write_stdin(ctx: &Arc<Ctx>, req: &Request, job: &JobReq, data: Vec<u8>)
             };
         }
     };
+    if let Some(link) = stdin.term.clone() {
+        return write_term(&stdin, &link, job, &data, deadline).await;
+    }
     // The kernel decides what lands: the shell does the pipe's I/O it names.
     let plan = kernel::stdin_plan(
         *stdin.written.borrow(),
@@ -552,6 +723,76 @@ async fn write_stdin(ctx: &Arc<Ctx>, req: &Request, job: &JobReq, data: Vec<u8>)
         pipe.take();
     }
     http::json_response(200, &state(pipe.is_none()))
+}
+
+/// `409` for a terminal that hung up, with how much of the stream landed.
+fn hung_up(written: u64) -> Resp {
+    http::json_response(
+        409,
+        &json!({ "error": "the terminal hung up", "written": written }),
+    )
+}
+
+/// A write to a terminal: the keeper applies it (and counts it, so a retry across a restart of
+/// execd still lands once); this sends it and waits until the keeper says it landed, the terminal
+/// hung up, or the request's time ran out (a short write: the exact `written`). The `pipe` mutex,
+/// held by the caller, keeps one write in flight.
+async fn write_term(
+    stdin: &Arc<JobStdin>,
+    link: &Arc<term::Link>,
+    job: &JobReq,
+    data: &[u8],
+    deadline: Option<tokio::time::Instant>,
+) -> Resp {
+    let len = data.len() as u64;
+    let written = || *stdin.written.borrow();
+    let plan = kernel::stdin_plan(
+        written(),
+        job.at,
+        len,
+        false,
+        !stdin.dead.is_cancelled(),
+        stdin.dead.is_cancelled(),
+    );
+    match plan {
+        kernel::Plan::Done { .. } => {
+            return http::json_response(200, &json!({ "written": written() }));
+        }
+        kernel::Plan::Wait | kernel::Plan::Refuse => return hung_up(written()),
+        kernel::Plan::Apply { .. } => {}
+    }
+    let mut rx = stdin.written.subscribe();
+    if !link.send(&term::write_frame(job.at, data)).await {
+        return hung_up(written());
+    }
+    let target = job.at.saturating_add(len);
+    loop {
+        if *rx.borrow_and_update() >= target {
+            return http::json_response(200, &json!({ "written": written() }));
+        }
+        tokio::select! {
+            r = rx.changed() => {
+                if r.is_err() {
+                    return hung_up(written());
+                }
+            }
+            () = stdin.dead.cancelled() => {
+                return if written() >= target {
+                    http::json_response(200, &json!({ "written": written() }))
+                } else {
+                    hung_up(written())
+                };
+            }
+            () = async {
+                match deadline {
+                    Some(d) => tokio::time::sleep_until(d).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                return http::json_response(200, &json!({ "written": written() }));
+            }
+        }
+    }
 }
 
 fn closed(state: &Value) -> Resp {
@@ -655,6 +896,7 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq, data: Vec<u8>) -> 
                             ranges.iter().map(|&(a, n)| json!([a, n])).collect();
                     }
                     put_signal(&j, &mut body);
+                    put_pty(&j, &mut body);
                     body
                 }
             };
@@ -690,6 +932,7 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq, data: Vec<u8>) -> 
             .await;
             http::json_response(200, &json!({ "sent": sent }))
         }
+        "resize" => resize_job(ctx, &job).await,
         "keep" | "seen" => keep_or_seen(ctx, &job),
         "kill" | "wipe" => {
             let wipe = job.op == "wipe";
@@ -775,6 +1018,7 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq, data: Vec<u8>) -> 
                         "label": j.label,
                     });
                     put_signal(&j, &mut entry);
+                    put_pty(&j, &mut entry);
                     entry
                 })
                 .collect();
@@ -825,6 +1069,41 @@ async fn removable(cell: &JobCell, ended_counts: bool) -> bool {
     ) == Act::Take
 }
 
+/// `resize`: set a terminal's size (absolute, so a retry is idempotent). Nothing is changed unless
+/// the terminal is open and its job has not ended (T1); a size asked for while the job is spawning
+/// is recorded and applied at its spawn (T1-live).
+async fn resize_job(ctx: &Arc<Ctx>, job: &JobReq) -> Resp {
+    let Some(size) = job
+        .cols
+        .zip(job.rows)
+        .and_then(|(c, r)| kernel::size_ok(c, r))
+    else {
+        return http::error_response(400, "pty: cols and rows are integers from 1 to 1024");
+    };
+    let Some(cell) = ctx.jobs.get(&(job.scope.clone(), job.id.clone())) else {
+        return http::error_response(404, "no such job");
+    };
+    let (answer, act, link) = {
+        let mut j = locked(&cell);
+        let answer = kernel::resizable(&j.k);
+        let act = kernel::step(&mut j.k, Ev::Resize { size });
+        (answer, act, j.stdin.as_ref().and_then(|s| s.term.clone()))
+    };
+    match answer {
+        Resizable::NoTerminal => return http::error_response(409, "the job has no terminal"),
+        Resizable::Ended => return http::error_response(409, "the job has ended"),
+        Resizable::HungUp => return http::error_response(409, "the terminal hung up"),
+        Resizable::Yes => {}
+    }
+    if let (Act::Resize { size }, Some(link)) = (act, link)
+        && !link.send(&term::resize_frame(size)).await
+    {
+        return http::error_response(409, "the terminal hung up");
+    }
+    ctx.jobs.save();
+    http::json_response(200, &json!({ "cols": size.cols, "rows": size.rows }))
+}
+
 /// `keep` (the job is the endpoint's now, with its `notify`) and `seen` (how much output the model
 /// has been shown).
 fn keep_or_seen(ctx: &Arc<Ctx>, job: &JobReq) -> Resp {
@@ -872,12 +1151,157 @@ fn keep_or_seen(ctx: &Arc<Ctx>, job: &JobReq) -> Resp {
     http::json_response(200, &json!({}))
 }
 
+/// The terminal's size a start asked for: `Ok(None)` for none, `Err` for one that is not two integers
+/// from 1 to 1024 (T3, T4).
+fn pty_size(pty: Option<&Value>) -> Result<Option<Size>, ()> {
+    let Some(v) = pty else { return Ok(None) };
+    let get = |k: &str| v.get(k).and_then(Value::as_u64);
+    match (get("cols"), get("rows")) {
+        (Some(c), Some(r)) => kernel::size_ok(c, r).map(Some).ok_or(()),
+        _ => Err(()),
+    }
+}
+
+/// What a start put in motion: a command's own process, or a terminal's keeper and its session.
+enum Lead {
+    Proc(proc::Proc),
+    Term(TermLead),
+}
+
+/// A launched terminal: its keeper (execd's child), the connection to it, and what its `Ready` said.
+struct TermLead {
+    keeper: proc::Proc,
+    link: Arc<term::Link>,
+    rd: tokio::net::unix::OwnedReadHalf,
+    frames: term::Frames,
+    pgid: i32,
+    written: u64,
+}
+
+/// Start a terminal's keeper over `out` (the job's spool file) and wait for its `Ready`: the session
+/// leads its own group, and the pty is open at `size`. `Err`: what a start answers.
+async fn launch_term(
+    ctx: &Arc<Ctx>,
+    req: &Request,
+    cmd: &mut std::process::Command,
+    size: Size,
+    out: std::fs::File,
+    dir: &Path,
+) -> Result<TermLead, (u16, &'static str)> {
+    // A cap on open terminals (a test's way to the 503 without filling the machine's ptys).
+    let max = ctx.opts.terminals_max.map(|m| m as u64);
+    if max.is_some() {
+        // The start itself is in the table already.
+        let open = locked(&ctx.jobs.map)
+            .all()
+            .into_iter()
+            .filter(|(_, c)| matches!(locked(c).k.term, Term::Open { .. }))
+            .count() as u64;
+        if kernel::pty_cap(open, max) == kernel::PtyBegin::NoPty {
+            return Err((503, "no pseudo-terminal is free"));
+        }
+    }
+    // The request's own TERM wins; a terminal otherwise gets the usual one.
+    if !req.env_pairs.iter().any(|(k, _)| k == "TERM") {
+        cmd.env("TERM", "xterm-256color");
+    }
+    let chown = ctx.opts.run_as.as_ref().map(|r| (r.uid, r.gid));
+    let env = term::full_env(cmd);
+    let exe = ctx
+        .opts
+        .helper_exe
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("/proc/self/exe"));
+    let mut k = term::keeper_command(&exe, dir, size, cmd, chown, &env);
+    // The keeper's own errors go where execd's do (its log).
+    k.stdin(Stdio::null())
+        .stdout(Stdio::from(out))
+        .stderr(Stdio::inherit());
+    let mut keeper = proc::spawn(&mut k).map_err(|e| {
+        crate::log_warn!("cannot start a terminal's keeper: {e}");
+        (500, "cannot start the terminal")
+    })?;
+    drop(k);
+    ctx.groups.insert(keeper.pg(), Kind::Job);
+    let pid = keeper.pgid;
+    let give_up = |ctx: &Arc<Ctx>, keeper: &proc::Proc| {
+        proc::kill_group(keeper.pg());
+        ctx.groups.remove(keeper.pg());
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let (stream, said, frames) = loop {
+        let d = dir.to_path_buf();
+        let mut attempt = Box::pin(proc::off_runtime(move || {
+            term::connect_sync(&d, pid)
+                .ok()
+                .and_then(term::Met::answered)
+        }));
+        let answered = tokio::select! {
+            r = &mut attempt => r,
+            st = keeper.wait() => {
+                // A keeper whose shell ended at once serves execd before it ends: its answer is
+                // already in the socket, so the attempt in flight gets to read it.
+                let late = attempt.await;
+                if late.is_none() {
+                    ctx.groups.remove(keeper.pg());
+                    crate::log_warn!("a terminal's keeper ended before it answered: {st:?}");
+                    // 124: no pseudo-terminal is free (the table is full, or the kernel is out of memory for one).
+                    return Err(
+                        match kernel::keeper_ended(st.as_ref().ok().and_then(|s| s.code())) {
+                            kernel::PtyBegin::NoPty => (503, "no pseudo-terminal is free"),
+                            _ => (500, "cannot start the terminal"),
+                        },
+                    );
+                }
+                late
+            }
+        };
+        match answered {
+            Some(c) => break c,
+            None if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            None => {
+                crate::log_warn!("a terminal's keeper did not answer");
+                give_up(ctx, &keeper);
+                return Err((500, "cannot start the terminal"));
+            }
+        }
+    };
+    let term::Said::Ready { pgid, written, .. } = said else {
+        give_up(ctx, &keeper);
+        return Err((500, "cannot start the terminal"));
+    };
+    let stream = stream
+        .set_nonblocking(true)
+        .and_then(|()| tokio::net::UnixStream::from_std(stream))
+        .map_err(|_| {
+            give_up(ctx, &keeper);
+            (500, "cannot start the terminal")
+        })?;
+    let (rd, wr) = stream.into_split();
+    Ok(TermLead {
+        keeper,
+        link: Arc::new(term::Link::new(pid, wr, term::pts_ids(pgid))),
+        rd,
+        frames,
+        pgid,
+        written,
+    })
+}
+
 /// Start a job: its own process group, its output kept under the retention, its end recorded once
 /// the group is empty.
 async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
     if !kernel::id_ok(job.id.as_bytes()) {
         return http::error_response(400, "bad job id: 1 to 64 characters of [0-9a-z_-]");
     }
+    let pty = match pty_size(job.pty.as_ref()) {
+        Ok(p) => p,
+        Err(()) => {
+            return http::error_response(400, "pty: cols and rows are integers from 1 to 1024");
+        }
+    };
     let key = (job.scope.clone(), job.id.clone());
     let idem = match job.idempotency_key.as_deref() {
         None => None,
@@ -932,10 +1356,11 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
                     },
                     out: Ring::new(ctx.opts.job_output_retention, ctx.spool.new_job()),
                     spool: None,
-                    k: kernel::State::new(epoch(), job.hold),
+                    k: kernel::State::new(epoch(), job.hold, pty),
                     notify: None,
                     notifier: Notifier::default(),
                     stdin: None,
+                    streams: 0,
                     idem: idem.clone(),
                 }));
                 map.insert(key.clone(), cell.clone());
@@ -978,7 +1403,7 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
         }
     }
     let mut cmd = exec::command_for(ctx, req, Kind::Job);
-    cmd.stdin(if job.stdin_open {
+    cmd.stdin(if job.stdin_open && pty.is_none() {
         Stdio::piped()
     } else {
         Stdio::null()
@@ -986,8 +1411,11 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
     let mark = locked(&cell).mark.clone();
     cmd.env(proc::JOB_MARK_ENV, &mark);
     // The job's output goes where the kernel says (S1): its spool files, which the job inherits
-    // and which outlive execd, read by a tail that wakes on each write.
+    // and which outlive execd, read by a tail that wakes on each write. A terminal's output is one
+    // stream: its keeper writes `out` and nothing writes `err` (`kernel::sinks`).
     let mut tail = None;
+    let mut keeper_out = None;
+    let mut spool_dir = None;
     if kernel::output_sink(Kind::Job) == Dest::Spool {
         let made = Spool::create(spool_base(ctx), &mark).and_then(|(sp, w)| {
             let made = Journal::create(&sp.access(), sp.guard(), [0, 0], Vec::new(), 0)
@@ -1002,7 +1430,12 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
         });
         match made {
             Ok((sp, w, t, journal)) => {
-                cmd.stdout(Stdio::from(w.out)).stderr(Stdio::from(w.err));
+                if kernel::sinks(locked(&cell).k.term).err {
+                    cmd.stdout(Stdio::from(w.out)).stderr(Stdio::from(w.err));
+                } else {
+                    keeper_out = Some(w.out);
+                }
+                spool_dir = Some(sp.dir().to_path_buf());
                 {
                     let mut j = locked(&cell);
                     // The ring's chunks live in the spool, which a restart reads again.
@@ -1021,13 +1454,24 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
             }
         }
     }
-    let mut proc = match proc::spawn(&mut cmd) {
-        Ok(p) => p,
-        Err(e) => {
-            ctx.jobs.remove(&[(key, cell.clone())]);
-            let (_, why) = exec::spawn_failure(ctx, req, &e);
-            return http::error_response(500, why.trim_end());
+    let lead = match (pty, keeper_out, &spool_dir) {
+        (Some(size), Some(out), Some(dir)) => {
+            match launch_term(ctx, req, &mut cmd, size, out, dir).await {
+                Ok(t) => Lead::Term(t),
+                Err((status, why)) => {
+                    ctx.jobs.remove(&[(key, cell.clone())]);
+                    return http::error_response(status, why);
+                }
+            }
         }
+        _ => match proc::spawn(&mut cmd) {
+            Ok(p) => Lead::Proc(p),
+            Err(e) => {
+                ctx.jobs.remove(&[(key, cell.clone())]);
+                let (_, why) = exec::spawn_failure(ctx, req, &e);
+                return http::error_response(500, why.trim_end());
+            }
+        },
     };
     // The child has its own copies of the write ends; execd holds none.
     drop(cmd);
@@ -1035,29 +1479,73 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
         // A test's crash of execd between the spawn and the group's save (K11).
         std::process::exit(86);
     }
-    let pgid = proc.pgid;
-    let stdin = proc.stdin.take().map(JobStdin::new);
-    {
+    let (pgid, pg) = match &lead {
+        Lead::Proc(p) => (p.pgid, p.pg()),
+        // The session leads a group of its own, which a keeper started: held as an adopted one.
+        Lead::Term(t) => (t.pgid, proc::adopt_group(t.pgid)),
+    };
+    let mut lead = lead;
+    let stdin = match &mut lead {
+        Lead::Proc(p) => p.stdin.take().map(JobStdin::new),
+        Lead::Term(t) => Some(JobStdin::terminal(t.link.clone(), t.written)),
+    };
+    let act = {
         let mut j = locked(&cell);
-        kernel::step(&mut j.k, Ev::Spawned { pgid });
-        j.sp = proc.sp;
-        j.stdin = stdin;
+        let act = kernel::step(&mut j.k, Ev::Spawned { pgid });
+        j.sp = pg.sp;
+        j.stdin = stdin.clone();
+        act
+    };
+    ctx.groups.insert(pg, Kind::Job);
+    if let (Act::Resize { size }, Some(link)) = (&act, stdin.as_ref().and_then(|s| s.term.as_ref()))
+    {
+        // A size asked for while the job was spawning reaches the terminal at its spawn (T1-live).
+        link.send(&term::resize_frame(*size)).await;
     }
-    ctx.groups.insert(proc.pg(), Kind::Job);
     ctx.jobs.bump_activity();
     ctx.jobs.save();
 
     let tail = tail.map(|(t, journal)| Tailing::start(ctx, &cell, t, journal));
-    tokio::spawn(supervise(
-        ctx.clone(),
-        cell.clone(),
-        key.clone(),
-        proc,
-        tail,
-    ));
+    match lead {
+        Lead::Proc(proc) => {
+            tokio::spawn(supervise(
+                ctx.clone(),
+                cell.clone(),
+                key.clone(),
+                proc,
+                tail,
+            ));
+        }
+        Lead::Term(t) => {
+            let TermLead {
+                keeper, rd, frames, ..
+            } = t;
+            let Some(stdin) = stdin.clone() else {
+                unreachable!()
+            };
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(term_reader(
+                ctx.clone(),
+                cell.clone(),
+                stdin,
+                rd,
+                frames,
+                tx,
+            ));
+            tokio::spawn(supervise_term(
+                ctx.clone(),
+                cell.clone(),
+                key.clone(),
+                pg,
+                (Some(keeper), None),
+                rx,
+                tail,
+            ));
+        }
+    }
 
-    let opened = job.stdin_open;
-    let echo = job.idempotency_key.clone();
+    let opened = job.stdin_open || pty.is_some();
+    let first_frame = started_json(pgid, &mark, opened, pty, job.idempotency_key.as_deref());
     if job.hold {
         let (resp, out) = http::stream_response();
         let seq = ctx.next_seq.fetch_add(1, Ordering::Relaxed);
@@ -1072,7 +1560,7 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
         }
         let ctx2 = ctx.clone();
         let beat = req.beat;
-        let first = started_json(pgid, &mark, opened, echo.as_deref());
+        let first = first_frame.clone();
         tokio::spawn(async move {
             let end = stream_job(
                 ctx2.clone(),
@@ -1093,7 +1581,7 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
         });
         resp
     } else {
-        http::json_response(200, &started_json(pgid, &mark, opened, echo.as_deref()))
+        http::json_response(200, &first_frame)
     }
 }
 
@@ -1134,11 +1622,11 @@ fn spec_digest(req: &Request, job: &JobReq) -> String {
     })
 }
 
-/// The answer to a start the key ledger already has: the original job's, as its start answered (its group; `stdin`
-/// when it was opened; the key, echoed), or, for a held start, its stream from the first byte. Nothing is spawned. A
-/// replay that arrives while the original is still spawning waits for its group, so it never answers a job with no
-/// process; what it answers at each look is the kernel's (K14, K15). `cell` is `None` when the table no longer holds
-/// the job: the same refusal as a job removed before it started.
+/// The answer to a start the key ledger already has: the original job's, as its start answered (its group, mark and
+/// `stdin`; the key, echoed), or, for a held start, its stream from the first byte. Nothing is spawned. A replay that
+/// arrives while the original is still spawning waits for its group, so it never answers a job with no process; what
+/// it answers at each look is the kernel's (K14, K15). `cell` is `None` when the table no longer holds the job: the
+/// same refusal as a job removed before it started.
 async fn replay_job(
     ctx: &Arc<Ctx>,
     req: &Request,
@@ -1166,11 +1654,17 @@ async fn replay_job(
             _ => return http::error_response(500, "the job did not start"),
         }
     };
-    let opened = job.stdin_open;
-    let echo = job.idempotency_key.clone();
-    // The replay answers as the first start did, with the same incarnation's mark.
-    let mark = locked(&cell).mark.clone();
-    let first = started_json(pgid, &mark, opened, echo.as_deref());
+    // The replay answers as the first start did, with the same incarnation's mark and terminal.
+    let (mark, pty) = {
+        let j = locked(&cell);
+        let pty = match j.k.term {
+            Term::Open { size, .. } | Term::Gone { size } => Some(size),
+            Term::No => None,
+        };
+        (j.mark.clone(), pty)
+    };
+    let opened = job.stdin_open || pty.is_some();
+    let first = started_json(pgid, &mark, opened, pty, job.idempotency_key.as_deref());
     if job.hold {
         let (resp, out) = http::stream_response();
         let ctx2 = ctx.clone();
@@ -1196,13 +1690,22 @@ async fn replay_job(
     }
 }
 
-/// What a start answers: the job's process group, its incarnation's mark, `stdin` when its stdin was opened, and the
-/// start's key when it had one: the echo that tells a client its key was kept (an execd that ignores keys says
-/// nothing). A held start's first frame is the same value.
-fn started_json(pgid: i32, mark: &str, opened: bool, key: Option<&str>) -> Value {
+/// What a start answers: the job's process group, its incarnation's mark, `stdin` when its stdin was opened, the
+/// terminal's size when it has one, and the start's key when it had one: the echo that tells a client its key was
+/// kept (an execd that ignores keys says nothing). A held start's first frame is the same value.
+fn started_json(
+    pgid: i32,
+    mark: &str,
+    opened: bool,
+    pty: Option<Size>,
+    key: Option<&str>,
+) -> Value {
     let mut body = json!({ "started": pgid, "mark": mark });
     if opened {
         body["stdin"] = json!(true);
+    }
+    if let Some(size) = pty {
+        body["pty"] = json!({ "cols": size.cols, "rows": size.rows });
     }
     if let Some(k) = key {
         body["key"] = json!(k);
@@ -1307,8 +1810,6 @@ async fn supervise(
     mut proc: proc::Proc,
     tail: Option<(Arc<Tailing>, tokio::task::JoinHandle<()>)>,
 ) {
-    let pgid = proc.pgid;
-    let mark = locked(&cell).mark.clone();
     let status = proc.wait().await;
     let (code, signal) = status.map_or((-1, None), |s| {
         use std::os::unix::process::ExitStatusExt as _;
@@ -1320,6 +1821,67 @@ async fn supervise(
             }
         }
     });
+    supervise_after(
+        &ctx,
+        &cell,
+        &key,
+        proc.pg(),
+        Some((code, signal)),
+        tail,
+        &[proc.pg()],
+    )
+    .await;
+}
+
+/// [`supervise`] for a terminal: the shell's status comes from its keeper (the frame, else the file
+/// the keeper wrote, else lost), and the keeper's own group is let go with the job's.
+async fn supervise_term(
+    ctx: Arc<Ctx>,
+    cell: JobCell,
+    key: Key,
+    pg: proc::Pg,
+    (keeper, adopted_keeper): (Option<proc::Proc>, Option<proc::Pg>),
+    exit: tokio::sync::oneshot::Receiver<Option<(i32, Option<i32>)>>,
+    tail: Option<(Arc<Tailing>, tokio::task::JoinHandle<()>)>,
+) {
+    let mut groups = vec![pg];
+    groups.extend(adopted_keeper);
+    if let Some(mut keeper) = keeper {
+        let kpg = keeper.pg();
+        groups.push(kpg);
+        let ctx2 = ctx.clone();
+        // The keeper is execd's child: collect it whenever it ends.
+        tokio::spawn(async move {
+            let _ = keeper.wait().await;
+            ctx2.groups.remove(kpg);
+        });
+    }
+    let status = exit.await.ok().flatten().or_else(|| {
+        let dir = locked(&cell)
+            .spool
+            .as_ref()
+            .map(|s| s.dir().to_path_buf())?;
+        term::read_status(&dir)
+    });
+    // No status at all (the keeper died before it wrote one): the shell's exit is unknown, so it is
+    // not said; the job ends when its group is empty, with the lost code.
+    supervise_after(&ctx, &cell, &key, pg, status, tail, &groups).await;
+}
+
+/// What a job's supervisor does once the shell has a status: say `shell_exit` if the group lives
+/// on, wait for it to empty and record the end.
+async fn supervise_after(
+    ctx: &Arc<Ctx>,
+    cell: &JobCell,
+    key: &Key,
+    pg: proc::Pg,
+    status: Option<(i32, Option<i32>)>,
+    tail: Option<(Arc<Tailing>, tokio::task::JoinHandle<()>)>,
+    release: &[proc::Pg],
+) {
+    let (code, signal) = status.unwrap_or((kernel::LOST_CODE, None));
+    let pgid = pg.id;
+    let mark = locked(cell).mark.clone();
     let mut exits = proc::ChildEvents::new();
     if !proc::job_gone(pgid, &mark, false).await {
         // What the shell printed goes before `shell_exit`: it is in the files already, so read to
@@ -1328,10 +1890,10 @@ async fn supervise(
             t.flush().await;
         }
         // The moment a held stream would send `shell_exit`: notify calls back.
-        {
-            let mut j = locked(&cell);
+        if status.is_some() {
+            let mut j = locked(cell);
             if kernel::step(&mut j.k, Ev::ShellExit { code, signal }) == Act::Exited {
-                notify::change(&ctx, &cell, &key, &mut j);
+                notify::change(ctx, cell, key, &mut j);
             }
         }
         ctx.jobs.bump();
@@ -1350,7 +1912,7 @@ async fn supervise(
     }
     // The end is observable from here on: notify calls back.
     {
-        let mut j = locked(&cell);
+        let mut j = locked(cell);
         let act = kernel::step(
             &mut j.k,
             Ev::GroupEmpty {
@@ -1359,16 +1921,18 @@ async fn supervise(
                 now: epoch(),
             },
         );
-        if let Act::Ended { notify } = act {
+        if let Act::Ended { notify, .. } = act {
             if let Some(s) = &j.stdin {
                 s.close();
             }
             if notify {
-                notify::change(&ctx, &cell, &key, &mut j);
+                notify::change(ctx, cell, key, &mut j);
             }
         }
     }
-    ctx.groups.remove(proc.pg());
+    for g in release {
+        ctx.groups.remove(*g);
+    }
     ctx.jobs.bump();
     ctx.jobs.save();
 }
@@ -1387,9 +1951,39 @@ pub(crate) fn recover(ctx: &Arc<Ctx>) {
     let mut adopted: Vec<std::path::PathBuf> = Vec::new();
     for e in ctx.jobs.ledger.load() {
         let alive = !proc::job_members(saved_pgid(&e), &e.mark).is_empty();
-        let (mut state, how, sweep) = kernel::recover(e.state(), alive, epoch(), e.idem.is_some());
+        // A terminal's keeper, asked while its group lives: it answers (and is the keeper this
+        // execd must trust: its pid and uid are checked) or it is gone, and it may have left the
+        // shell's status.
+        let mut conn = None;
+        let dir = e.spool.as_deref().map(Path::new);
+        let met = match (&e.term, dir) {
+            (Some(t), Some(dir)) if alive && t.open && e.phase != Saved::Ended => {
+                term::connect_sync(dir, t.keeper_pid).ok()
+            }
+            _ => None,
+        };
+        let status = dir.filter(|_| e.term.is_some()).and_then(term::read_status);
+        let keeper =
+            kernel::keeper_of(e.term.is_some(), met.as_ref().map(term::Met::reply), status);
+        if let (Keeper::Answered { .. }, Some(t), Some(m)) = (keeper, &e.term, met)
+            && let Some((stream, term::Said::Ready { written, .. }, frames)) = m.ready
+        {
+            conn = Some((stream, written, frames, t.keeper_pid));
+        }
+        let (mut state, how, sweep) =
+            kernel::recover(e.state(), alive, keeper, epoch(), e.idem.is_some());
         if how == Recovery::Drop {
             continue;
+        }
+        // The shell's status a keeper left, for a group that outlived the shell.
+        if let (
+            Recovery::Adopt,
+            Keeper::Silent {
+                status: Some((code, signal)),
+            },
+        ) = (how, keeper)
+        {
+            kernel::step(&mut state, Ev::ShellExit { code, signal });
         }
         if sweep == Sweep::KillMarked {
             // The intent's spawn may have happened and its save not: nobody can find its processes but by the
@@ -1416,8 +2010,15 @@ pub(crate) fn recover(ctx: &Arc<Ctx>) {
         let pg = if how == Recovery::Adopt {
             let pg = proc::adopt_group(pgid);
             // A held start's client was the old process's connection, which is gone.
-            if let Act::Kill { .. } = kernel::step(&mut state, Ev::Disconnect { hold: true }) {
-                proc::kill_group(pg);
+            if let Act::Kill { marked, .. } =
+                kernel::step(&mut state, Ev::Disconnect { hold: true })
+            {
+                // A terminal's whole session dies with its client (T9), not only its first group.
+                if marked {
+                    proc::signal_job(pg, &e.mark, Signal::SIGKILL);
+                } else {
+                    proc::kill_group(pg);
+                }
             }
             Some(pg)
         } else {
@@ -1457,6 +2058,7 @@ pub(crate) fn recover(ctx: &Arc<Ctx>) {
             notify: None,
             notifier: Notifier::default(),
             stdin: None,
+            streams: 0,
             idem: e.idem.clone(),
         }));
         {
@@ -1480,7 +2082,51 @@ pub(crate) fn recover(ctx: &Arc<Ctx>) {
         if let Some(pg) = pg {
             ctx.groups.insert(pg, Kind::Job);
             let tail = tail.map(|(t, j)| Tailing::start(ctx, &cell, t, j));
-            tokio::spawn(supervise_adopted(ctx.clone(), cell, key, pg, tail));
+            let open = matches!(locked(&cell).k.term, Term::Open { .. });
+            match conn {
+                // An adopted terminal: its keeper still holds the master, the count of what landed
+                // is the keeper's, and its shell's status arrives as a frame.
+                Some((stream, written, frames, kpid)) if open => {
+                    let adopted = stream
+                        .set_nonblocking(true)
+                        .and_then(|()| tokio::net::UnixStream::from_std(stream));
+                    match adopted {
+                        Ok(stream) => {
+                            let (rd, wr) = stream.into_split();
+                            let link = Arc::new(term::Link::new(kpid, wr, term::pts_ids(pgid)));
+                            let stdin = JobStdin::terminal(link, written);
+                            locked(&cell).stdin = Some(stdin.clone());
+                            let kpg = proc::adopt_group(kpid);
+                            ctx.groups.insert(kpg, Kind::Job);
+                            let (tx, rx) = tokio::sync::oneshot::channel();
+                            tokio::spawn(term_reader(
+                                ctx.clone(),
+                                cell.clone(),
+                                stdin,
+                                rd,
+                                frames,
+                                tx,
+                            ));
+                            tokio::spawn(supervise_term(
+                                ctx.clone(),
+                                cell,
+                                key,
+                                pg,
+                                (None, Some(kpg)),
+                                rx,
+                                tail,
+                            ));
+                        }
+                        Err(_) => {
+                            kernel::step(&mut locked(&cell).k, Ev::Hangup);
+                            tokio::spawn(supervise_adopted(ctx.clone(), cell, key, pg, tail));
+                        }
+                    }
+                }
+                _ => {
+                    tokio::spawn(supervise_adopted(ctx.clone(), cell, key, pg, tail));
+                }
+            }
         }
     }
     // A spool no job in the table owns (its job ended, or was removed, before the restart).
@@ -1606,7 +2252,7 @@ async fn supervise_adopted(
                 now: epoch(),
             },
         );
-        if let Act::Ended { notify } = act {
+        if let Act::Ended { notify, .. } = act {
             if let Some(s) = &j.stdin {
                 s.close();
             }
@@ -1628,6 +2274,32 @@ fn bound(ctx: &Ctx, key: &Key, attached: &JobCell) -> Option<JobCell> {
     kernel::bound(found, same)
 }
 
+/// One open stream on a job, counted for [`Jobs::terminals`] while it lives.
+struct Watching {
+    ctx: Arc<Ctx>,
+    cell: JobCell,
+}
+
+impl Watching {
+    fn new(ctx: &Arc<Ctx>, cell: &JobCell) -> Self {
+        locked(cell).streams += 1;
+        ctx.jobs.bump_activity();
+        Self {
+            ctx: ctx.clone(),
+            cell: cell.clone(),
+        }
+    }
+}
+
+impl Drop for Watching {
+    fn drop(&mut self) {
+        let mut j = locked(&self.cell);
+        j.streams = j.streams.saturating_sub(1);
+        drop(j);
+        self.ctx.jobs.bump_activity();
+    }
+}
+
 /// How a job stream opens: where it starts, whether it carries output, and the frame that says
 /// which job it is (`started` on a held start, `attached` on an attach).
 struct Opening {
@@ -1646,6 +2318,8 @@ async fn stream_job(
     open: Opening,
     mut sink: Sink,
 ) -> StreamEnd {
+    // While it is open the job is attached (a host that lets idle machines sleep asks).
+    let _open = Watching::new(&ctx, &attached);
     // A job stream has no deadline of its own: it lives as long as the job or the connection.
     if let Ok(end) = follow(&ctx, &key, &attached, open, &mut sink).await {
         return end;
@@ -1662,12 +2336,21 @@ async fn stream_job(
         let job = {
             let mut j = locked(&cell);
             match kernel::step(&mut j.k, Ev::Disconnect { hold }) {
-                Act::Kill { .. } => Some((j.pg(), j.mark.clone())),
+                Act::Kill { marked, .. } => Some((j.pg(), j.mark.clone(), marked)),
                 _ => None,
             }
         };
-        if let Some((g, m)) = job {
-            proc::off_runtime(move || proc::signal_job(g, &m, Signal::SIGKILL)).await;
+        if let Some((g, m, marked)) = job {
+            // The group, and with `marked` every process that carries the mark: a terminal's session
+            // (T9). Without it the group alone.
+            proc::off_runtime(move || {
+                if marked {
+                    proc::signal_job(g, &m, Signal::SIGKILL);
+                } else {
+                    proc::kill_group(g);
+                }
+            })
+            .await;
             return StreamEnd::Disconnected { killed: true };
         }
     }

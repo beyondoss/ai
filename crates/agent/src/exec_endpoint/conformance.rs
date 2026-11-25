@@ -1102,6 +1102,7 @@ impl Verifier {
             label: script.into(),
             env: Vec::new(),
             stdin_open: false,
+            pty: None,
             idempotency_key: None,
         }
     }

@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::job_kernel::{Claim, Persist, Phase, State};
+use crate::job_kernel::{Claim, Persist, Phase, Size, State, Term};
 
 const FILE: &str = "execd-jobs.json";
 const VERSION: u32 = 1;
@@ -58,11 +58,24 @@ pub(crate) struct Entry {
     /// this names. `None` for a job with no spool.
     #[serde(default)]
     pub spool: Option<String>,
+    /// A terminal's: its size, its keeper's pid and whether it was open. The keeper's socket is in the spool.
+    #[serde(default)]
+    pub term: Option<SavedTerm>,
     /// The start's idempotency key and the digest of the spec it started with (`jobs::spec_digest`): the
     /// job's record in the key ledger. Never the spec itself, which can hold secrets in its env. A restarted
     /// execd puts it back (K6), so a start retried across the restart replays the job. `None`: an unkeyed start.
     #[serde(default)]
     pub idem: Option<Idem>,
+}
+
+/// What a restart needs of a terminal: the keeper to ask (its pid is what `SO_PEERCRED` must say) and
+/// the size the job had.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SavedTerm {
+    pub cols: u16,
+    pub rows: u16,
+    pub keeper_pid: i32,
+    pub open: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,14 +111,15 @@ struct File {
 
 impl Entry {
     /// What to save of a job, or `None` for one not worth saving: no group yet, or removed.
+    #[allow(clippy::too_many_arguments)] // one saved row, each field from a different owner
     pub fn of(
-        scope: &str,
-        id: &str,
+        (scope, id): (&str, &str),
         label: &str,
         argv: &crate::jobs::Argv,
         mark: &str,
         k: &State,
         spool: Option<&Path>,
+        keeper_pid: Option<i32>,
         idem: Option<&Idem>,
     ) -> Option<Self> {
         if k.removed {
@@ -159,6 +173,21 @@ impl Entry {
             seen: k.seen,
             started: k.started,
             spool: spool.map(|p| p.to_string_lossy().into_owned()),
+            term: match k.term {
+                Term::No => None,
+                Term::Open { size, .. } => Some(SavedTerm {
+                    cols: size.cols,
+                    rows: size.rows,
+                    keeper_pid: keeper_pid.unwrap_or(0),
+                    open: true,
+                }),
+                Term::Gone { size } => Some(SavedTerm {
+                    cols: size.cols,
+                    rows: size.rows,
+                    keeper_pid: keeper_pid.unwrap_or(0),
+                    open: false,
+                }),
+            },
             idem: idem.cloned(),
         })
     }
@@ -191,6 +220,23 @@ impl Entry {
             seen: self.seen,
             removed: false,
             started: self.started,
+            term: match self.term {
+                None => Term::No,
+                Some(t) => {
+                    let size = Size {
+                        cols: t.cols,
+                        rows: t.rows,
+                    };
+                    if t.open {
+                        Term::Open {
+                            size,
+                            applied: true,
+                        }
+                    } else {
+                        Term::Gone { size }
+                    }
+                }
+            },
         }
     }
 }

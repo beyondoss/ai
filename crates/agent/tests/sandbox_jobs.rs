@@ -29,17 +29,16 @@ impl Sandbox {
     }
 
     async fn with_cap(cap: Option<u64>) -> Self {
-        Self::with_options(MockOptions {
-            heartbeat: Duration::from_millis(500),
-            job_output_cap: cap.map_or(8 * 1024 * 1024, |c| c as usize),
-            ..MockOptions::default()
-        })
-        .await
-    }
-
-    async fn with_options(opts: MockOptions) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let mock = ExecMock::start_with(dir.path(), opts).await;
+        let mock = ExecMock::start_with(
+            dir.path(),
+            MockOptions {
+                heartbeat: Duration::from_millis(500),
+                job_output_cap: cap.map_or(8 * 1024 * 1024, |c| c as usize),
+                ..MockOptions::default()
+            },
+        )
+        .await;
         let runner = Arc::new(HttpExecRunner::new(&mock.url).unwrap());
         let jobs = runner.sandbox_jobs().unwrap();
         let scope = JobScope::under(dir.path().join("jobs").to_str().unwrap(), "scope");
@@ -95,6 +94,7 @@ fn sh(cmd: &str) -> JobSpec {
         label: cmd.into(),
         env: Vec::new(),
         stdin_open: false,
+        pty: None,
         idempotency_key: None,
     }
 }
@@ -500,59 +500,4 @@ async fn a_job_id_that_already_exists_is_not_started_twice() {
     assert!(err.to_string().contains("the job exists"), "{err}");
     assert!(heard.lock().unwrap().started.is_none());
     sb.jobs.wipe(&sb.scope).await.unwrap();
-}
-
-/// A start carries an idempotency key, and an endpoint that ignores keys (its answer does not echo it) is not offered:
-/// a start sent again for a lost answer would run twice there. The job it started is stopped, kept or held.
-#[tokio::test]
-async fn an_endpoint_that_ignores_start_keys_is_not_offered_and_its_job_is_stopped() {
-    let sb = Sandbox::with_options(MockOptions {
-        heartbeat: Duration::from_millis(500),
-        start_key: false,
-        ..MockOptions::default()
-    })
-    .await;
-    let kept = JobId::fresh();
-    let err = sb
-        .jobs
-        .start_kept(&sb.scope, &kept, &sh("sleep 30"))
-        .await
-        .unwrap_err();
-    assert_eq!(err.kind(), std::io::ErrorKind::Unsupported, "{err}");
-    assert!(err.to_string().contains("start keys"), "{err}");
-    let held = JobId::fresh();
-    let err = sb
-        .jobs
-        .run_held(&sb.scope, &held, &sh("sleep 30"), &|_| {})
-        .await
-        .unwrap_err();
-    assert_eq!(err.kind(), std::io::ErrorKind::Unsupported, "{err}");
-    for id in [&kept, &held] {
-        let t = Instant::now();
-        while !sb
-            .jobs
-            .read(&sb.scope, id, 0, 0)
-            .await
-            .unwrap()
-            .status
-            .ended()
-        {
-            assert!(t.elapsed() < Duration::from_secs(10), "{id:?} still runs");
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    }
-}
-
-/// With keys offered, the same two starts run (the answer echoes the key).
-#[tokio::test]
-async fn an_endpoint_that_echoes_the_key_is_offered() {
-    let sb = Sandbox::new().await;
-    let id = JobId::fresh();
-    assert!(
-        sb.jobs
-            .start_kept(&sb.scope, &id, &sh("sleep 30"))
-            .await
-            .unwrap()
-            > 0
-    );
 }

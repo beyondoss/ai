@@ -1162,6 +1162,7 @@ impl SandboxMcp {
             label: a.label.unwrap_or_default(),
             env: a.env.into_inner().unwrap_or_default().into_iter().collect(),
             stdin_open: a.stdin_open.unwrap_or(false),
+            pty: None,
             idempotency_key: a.idempotency_key.into_inner(),
         };
         let t = self.target().await?;

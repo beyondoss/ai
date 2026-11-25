@@ -81,6 +81,8 @@ pub enum Protocol {
 /// How the endpoint behaves. [`Default`] is a conforming sandbox.
 #[derive(Clone, Debug)]
 pub struct MockOptions {
+    /// Ignore a start's `idempotency_key`, as an endpoint that predates keys does: nothing is echoed.
+    pub ignores_keys: bool,
     /// Answer every one-shot request with corrupted base64 in `stdout` and `stderr`: the
     /// non-conforming endpoint the verifier has to catch.
     pub corrupts_base64: bool,
@@ -143,9 +145,6 @@ pub struct MockOptions {
     pub command_env: bool,
     /// Implement the job `signal` op. `false` answers it as an unknown op.
     pub job_signal_op: bool,
-    /// Keep a start's `idempotency_key`, echoing it in the start's answer. `false` is the endpoint that ignores
-    /// keys: its answer says nothing of one.
-    pub start_key: bool,
 }
 
 /// One way per notify conformance check for an endpoint to get the spec wrong. Each is a change to
@@ -196,6 +195,7 @@ pub enum LoseCallbacks {
 impl Default for MockOptions {
     fn default() -> Self {
         Self {
+            ignores_keys: false,
             corrupts_base64: false,
             bare_spawn_errors: false,
             protocol: Protocol::Streaming,
@@ -217,7 +217,6 @@ impl Default for MockOptions {
             job_stdin: true,
             command_env: true,
             job_signal_op: true,
-            start_key: true,
         }
     }
 }
@@ -233,12 +232,11 @@ impl MockOptions {
             && self.job_stdin
             && self.command_env
             && self.job_signal_op
-            && self.start_key
     }
 
-    /// Conforming in everything but the five job-protocol additions
+    /// Conforming in everything but the four job-protocol additions
     /// ([`Self::splits_job_streams`], [`Self::job_stdin`], [`Self::command_env`],
-    /// [`Self::job_signal_op`], [`Self::start_key`]), which are each missing from an endpoint by a filter in front of
+    /// [`Self::job_signal_op`]), which are each missing from an endpoint by a filter in front of
     /// execd and not by a second implementation: see [`ExecMock::delegate_lacking`].
     fn conforming_but_for_job_protocol(&self) -> bool {
         !self.corrupts_base64
@@ -254,6 +252,7 @@ impl MockOptions {
             && self.faults == NotifyFaults::default()
             && self.enforces_timeout
             && self.reports_job_signal
+            && !self.ignores_keys
     }
 }
 
@@ -278,6 +277,29 @@ pub struct ExecMock {
     requests: Arc<Mutex<Vec<ExecRequest>>>,
     streams: Arc<Mutex<Vec<StreamRecord>>>,
     callbacks: Arc<Mutex<Vec<CallbackAttempt>>>,
+    /// What restarts the endpoint's execd ([`Self::restart_execd`]): only an endpoint that is execd itself.
+    ctl: Option<Arc<tokio::sync::Mutex<Ctl>>>,
+}
+
+/// The running execd of a mock, and how to make its successor: the same address, root, state and
+/// jobs directories, so a terminal's keeper (a process of its own) and the ledger outlive it.
+struct Ctl {
+    handle: Option<execd::Handle>,
+    addr: std::net::SocketAddr,
+    make: Box<dyn Fn() -> execd::Options + Send + Sync>,
+    /// The state and jobs directories, which last as long as the mock.
+    dirs: tempfile::TempDir,
+}
+
+/// The `execd` binary a terminal's keeper is started from: this process is a test binary and does not
+/// serve the helper modes. `EXECD_BIN`, else `execd` beside the test binary's `deps` directory.
+fn execd_bin() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("EXECD_BIN").filter(|p| !p.is_empty()) {
+        return Some(PathBuf::from(p));
+    }
+    let exe = std::env::current_exe().ok()?;
+    let p = exe.parent()?.parent()?.join("execd");
+    p.is_file().then_some(p)
 }
 
 #[derive(Clone)]
@@ -378,6 +400,7 @@ impl ExecMock {
             requests: shared.requests.clone(),
             streams: shared.streams.clone(),
             callbacks: shared.callbacks.clone(),
+            ctl: None,
         };
         if let Some(idle) = shared.opts.idle_kill {
             tokio::spawn(idle_killer(shared.clone(), idle));
@@ -398,26 +421,49 @@ impl ExecMock {
         url: String,
         opts: &MockOptions,
     ) -> Self {
-        let mock = Self {
-            url,
-            requests: Arc::default(),
-            streams: Arc::default(),
-            callbacks: Arc::default(),
+        let dirs = tempfile::tempdir().expect("a state directory");
+        let (state, jobs): (PathBuf, PathBuf) =
+            (dirs.path().join("state"), dirs.path().join("jobs"));
+        let requests: Arc<Mutex<Vec<ExecRequest>>> = Arc::default();
+        let streams: Arc<Mutex<Vec<StreamRecord>>> = Arc::default();
+        let callbacks: Arc<Mutex<Vec<CallbackAttempt>>> = Arc::default();
+        std::fs::create_dir_all(&jobs).expect("a jobs directory");
+        let (root, opts, helper) = (root.to_path_buf(), opts.clone(), execd_bin());
+        let make: Box<dyn Fn() -> execd::Options + Send + Sync> = {
+            let (requests, streams, callbacks) =
+                (requests.clone(), streams.clone(), callbacks.clone());
+            Box::new(move || {
+                let mut o = execd::Options::new(&root);
+                o.home = opts.home.clone();
+                o.bearer = opts.require_bearer.clone();
+                o.heartbeat = opts.heartbeat;
+                o.job_output_retention = opts.job_output_cap;
+                o.state_dir = Some(state.clone());
+                o.jobs_dir = Some(jobs.clone());
+                o.helper_exe = helper.clone();
+                o.observer = Some(Arc::new(Recorder {
+                    requests: requests.clone(),
+                    streams: streams.clone(),
+                    callbacks: callbacks.clone(),
+                    index: Mutex::default(),
+                }));
+                o
+            })
         };
-        let mut o = execd::Options::new(root);
-        o.home = opts.home.clone();
-        o.bearer = opts.require_bearer.clone();
-        o.heartbeat = opts.heartbeat;
-        o.job_output_retention = opts.job_output_cap;
-        o.observer = Some(Arc::new(Recorder {
-            requests: mock.requests.clone(),
-            streams: mock.streams.clone(),
-            callbacks: mock.callbacks.clone(),
-            index: Mutex::default(),
-        }));
-        // The handle is dropped: the server runs until the test's runtime ends, as the mock always has.
-        execd::serve(listener, o).expect("execd serves");
-        mock
+        let addr = listener.local_addr().expect("addr");
+        let handle = execd::serve(listener, make()).expect("execd serves");
+        Self {
+            url,
+            requests,
+            streams,
+            callbacks,
+            ctl: Some(Arc::new(tokio::sync::Mutex::new(Ctl {
+                handle: Some(handle),
+                addr,
+                make,
+                dirs,
+            }))),
+        }
     }
 
     /// execd behind a filter that takes away the job-protocol additions `opts` turns off, so that
@@ -439,8 +485,6 @@ impl ExecMock {
             &opts,
         );
         let mock = Self { url, ..inner };
-        // The filter's client needs a TLS provider installed, as a test's own client does.
-        let _ = rustls::crypto::ring::default_provider().install_default();
         let client = reqwest::Client::new();
         tokio::spawn(async move {
             while let Ok((sock, _)) = outer.accept().await {
@@ -453,6 +497,62 @@ impl ExecMock {
             }
         });
         mock
+    }
+
+    /// Restart the endpoint as `SIGHUP` restarts execd: the old server stops and leaves its jobs
+    /// (and a terminal's keeper) running, and a new one serves the same address and finds them in
+    /// the ledger. `Err` for an endpoint that is not execd.
+    pub async fn restart_execd(&self) -> Result<(), String> {
+        let ctl = self.ctl.as_ref().ok_or("this endpoint is not execd")?;
+        let mut c = ctl.lock().await;
+        if let Some(h) = c.handle.take() {
+            h.restart().await;
+        }
+        let mut last = String::new();
+        for _ in 0..100 {
+            match tokio::net::TcpListener::bind(c.addr).await {
+                Ok(l) => {
+                    c.handle = Some(execd::serve(l, (c.make)()).map_err(|e| e.to_string())?);
+                    return Ok(());
+                }
+                Err(e) => last = e.to_string(),
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Err(format!("the address did not come back: {last}"))
+    }
+
+    /// Kill every terminal keeper of this endpoint (its jobs directory names them).
+    pub async fn kill_keepers(&self) -> Result<usize, String> {
+        let ctl = self.ctl.as_ref().ok_or("this endpoint is not execd")?;
+        let needle = ctl
+            .lock()
+            .await
+            .dirs
+            .path()
+            .join("jobs")
+            .to_string_lossy()
+            .into_owned();
+        let mut n = 0;
+        for e in std::fs::read_dir("/proc")
+            .map_err(|e| e.to_string())?
+            .flatten()
+        {
+            let Ok(raw) = std::fs::read(e.path().join("cmdline")) else {
+                continue;
+            };
+            let text = String::from_utf8_lossy(&raw).replace('\0', " ");
+            if text.contains("--execd-run-as-helper keep ")
+                && text.contains(&needle)
+                && let Ok(pid) = e.file_name().to_string_lossy().parse::<i32>()
+            {
+                let _ = std::process::Command::new("kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .status();
+                n += 1;
+            }
+        }
+        Ok(n)
     }
 
     pub fn requests(&self) -> Vec<ExecRequest> {
@@ -1067,7 +1167,8 @@ impl Jobs {
 fn fresh_mark(pgid: u32) -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
-    format!("{pgid:x}-{:x}", N.fetch_add(1, Ordering::Relaxed))
+    // Hex only, as execd's mark is: a client refuses any other spelling.
+    format!("{pgid:016x}{:x}", N.fetch_add(1, Ordering::Relaxed))
 }
 
 fn epoch() -> u64 {
@@ -1412,11 +1513,6 @@ async fn start_job(sock: tokio::net::TcpStream, req: Value, shared: Shared) {
     let scope = job["scope"].as_str().unwrap_or("").to_string();
     let id = job["id"].as_str().unwrap_or("").to_string();
     let hold = job["hold"].as_bool() == Some(true);
-    let echo = shared
-        .opts
-        .start_key
-        .then(|| job["idempotency_key"].as_str().map(str::to_string))
-        .flatten();
     let key = (scope, id);
     if shared.jobs.map.lock().unwrap().contains_key(&key) {
         return respond_json(sock, 409, &json!({ "error": "the job exists" })).await;
@@ -1539,17 +1635,24 @@ async fn start_job(sock: tokio::net::TcpStream, req: Value, shared: Shared) {
             streams.len() - 1
         };
         let mut head = json!({ "started": pgid, "mark": mark });
-        if let Some(k) = &echo {
-            head["key"] = json!(k);
+        if !shared.opts.ignores_keys {
+            echo_key(&mut head, job);
         }
         let end = stream_job(sock, shared.clone(), key, 0, true, Some(head), false).await;
         shared.streams.lock().unwrap()[index].end = Some((end, Instant::now()));
     } else {
-        let mut body = json!({ "started": pgid, "mark": mark });
-        if let Some(k) = echo {
-            body["key"] = json!(k);
+        let mut answer = json!({ "started": pgid, "mark": mark });
+        if !shared.opts.ignores_keys {
+            echo_key(&mut answer, job);
         }
-        respond_json(sock, 200, &body).await;
+        respond_json(sock, 200, &answer).await;
+    }
+}
+
+/// An endpoint that keeps start keys echoes the key it was sent beside `started`.
+fn echo_key(answer: &mut Value, job: &Value) {
+    if let Some(k) = job["idempotency_key"].as_str() {
+        answer["key"] = json!(k);
     }
 }
 
@@ -2088,9 +2191,6 @@ async fn lacking_one(
         }
         if !opts.job_stdin {
             job.remove("stdin_open");
-        }
-        if !opts.start_key {
-            job.remove("idempotency_key");
         }
     }
     let mut post = client.post(&inner).json(&req);
