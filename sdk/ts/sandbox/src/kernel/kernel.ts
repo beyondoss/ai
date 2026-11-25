@@ -56,12 +56,19 @@ export type KAction =
   | { t: "start"; key: bigint; silenceMs: number }
   | { t: "openAttach"; offset: number; mark: string; silenceMs: number }
   | { t: "closeStream" }
+  | { t: "kill" }
   | { t: "started"; mark: string; stdin: boolean }
   | { t: "attached"; mark: string; from: number }
   | { t: "shellExit"; code: number }
   | { t: "reconnecting"; attempts: number; sinceMs: number }
   | { t: "deliver"; at: number; len: number; dropped: number }
-  | { t: "deliverExit"; code: number; signal: number; dropped: number }
+  | {
+    t: "deliverExit";
+    code: number;
+    signal: number;
+    dropped: number;
+    killed: boolean;
+  }
   | { t: "sleep"; untilMs: number }
   | { t: "remove"; mark: string }
   | { t: "fail"; fault: Fault; status: number; offset: number }
@@ -81,6 +88,8 @@ export interface Policy {
   removeOnExit?: boolean;
   /** A start that needs the job's stdin opened: an echo that says it was not is refused. */
   stdinOpen?: boolean;
+  /** A start of a kept job (`hold: false`): a refused echo stops the job. */
+  kept?: boolean;
   /** The heartbeat the request chose, whole seconds; 0 for the default. */
   beatS?: number;
 }
@@ -100,10 +109,10 @@ interface Exports {
 type Call = (inp: number, n: number, out: number, cap: number) => number;
 
 /** The ABI `codec.rs` lays out. A change to a layout there bumps `ABI_VERSION`, and this must follow. */
-const ABI_VERSION = 3;
-/** Room for any one call's input or answer: a state (87 B) and an event (45 B at most), or a cursor. */
+const ABI_VERSION = 4;
+/** Room for any one call's input or answer: a state (88 B) and an event (45 B at most), or a cursor. */
 const BUF = 1024;
-const STATE = 87;
+const STATE = 88;
 
 const MAX_SAFE = BigInt(Number.MAX_SAFE_INTEGER);
 
@@ -284,6 +293,7 @@ function readAction(r: Rd): KAction {
         code: r.i32(),
         signal: r.i32(),
         dropped: r.u64("gap"),
+        killed: r.u8() === 1,
       };
     case 5:
       return { t: "sleep", untilMs: r.u64("time") };
@@ -302,6 +312,8 @@ function readAction(r: Rd): KAction {
       return { t: "started", mark: r.mark(), stdin: r.u8() === 1 };
     case 12:
       return { t: "attached", mark: r.mark(), from: r.u64("offset") };
+    case 14:
+      return { t: "kill" };
     case 13:
       return { t: "shellExit", code: r.i32() };
     case 10:
@@ -371,7 +383,7 @@ export class Kernel {
   /** A handle that starts a job. `key` is the shell's handle for the idempotency key it holds. */
   stateForStart(key: bigint, p: Policy = {}): KState {
     const w = new Wr().u64(key).u8(p.watch ? 1 : 0).u8(p.removeOnExit ? 1 : 0)
-      .u32(p.beatS ?? 0).u8(p.stdinOpen ? 1 : 0);
+      .u32(p.beatS ?? 0).u8(p.stdinOpen ? 1 : 0).u8(p.kept ? 1 : 0);
     return this.state(
       this.call(this.x.jc_state_for_start, Uint8Array.from(w.b)),
     );
@@ -416,8 +428,11 @@ export class Kernel {
   }
 
   /** What an HTTP answer to `op` means. */
-  classify(op: "start" | "attach" | "remove", status: number): Class {
-    const tag = { start: 0, attach: 1, remove: 2 }[op];
+  classify(
+    op: "start" | "attach" | "remove" | "other",
+    status: number,
+  ): Class {
+    const tag = { start: 0, attach: 1, remove: 2, other: 3 }[op];
     const r = new Rd(
       this.call(
         this.x.jc_classify,

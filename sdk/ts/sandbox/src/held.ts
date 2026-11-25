@@ -22,6 +22,7 @@ import type {
   JobOps,
   JobSpec,
 } from "./transport.js";
+import { DEFAULT_KILL_GRACE_MS } from "./transport.js";
 
 /**
  * A held job, followed by the client kernel (`crates/job-client`, proven in Verus, run as WASM).
@@ -99,6 +100,7 @@ export async function* held(
     beatS: req.heartbeatSeconds ?? 0,
     watch: req.output === false,
     stdinOpen: init.flow === "start" && init.spec.stdinOpen === true,
+    kept: init.flow === "start" && !init.hold,
   };
   let st: KState;
   try {
@@ -211,6 +213,13 @@ export async function* held(
           case "shellExit":
             yield { type: "shell_exit", code: a.code };
             break;
+          case "kill":
+            // A kept start whose echo was refused: nothing else can name the job.
+            await ops.kill(init.scope, [init.id], {
+              remove: true,
+              graceMs: DEFAULT_KILL_GRACE_MS,
+            }).catch(() => {});
+            break;
           case "closeStream":
             conn?.close();
             conn = undefined;
@@ -224,9 +233,9 @@ export async function* held(
             break;
           case "deliverExit":
             if (a.dropped > 0) yield { type: "gap", bytes: a.dropped };
-            yield a.signal === 0
-              ? { type: "exit", code: a.code }
-              : { type: "signal", signal: a.signal };
+            yield a.killed
+              ? { type: "signal", signal: a.signal }
+              : { type: "exit", code: a.code };
             ev = { t: "exitTaken" };
             break;
           case "sleep":

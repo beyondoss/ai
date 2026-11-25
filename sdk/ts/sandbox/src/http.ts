@@ -14,6 +14,7 @@ import {
   TooLargeError,
   TransportError,
 } from "./errors.js";
+import { Kernel } from "./kernel/kernel.js";
 import type { KFrame } from "./kernel/kernel.js";
 import {
   type Frame,
@@ -812,15 +813,17 @@ function writtenIn(detail: string): number | undefined {
  * 429 too many waiting writes. Each is a subclass of what this client threw before, so a catch of
  * `NotFoundError`, `ConflictError` or `IoError` keeps working.
  */
-function jobFailure(
+async function jobFailure(
   e: unknown,
   id: string,
   op: "write" | "other",
-): unknown {
+): Promise<unknown> {
   if (!(e instanceof EndpointError)) return e;
   const { status, detail } = e;
   const cause = { cause: e };
-  if (status === 404) {
+  // What a status means for an op on one job is the client kernel's table (`classify`).
+  const class_ = (await Kernel.load()).classify("other", status);
+  if (class_.t === "terminal" && class_.fault === "job_gone") {
     return new JobGoneError(`job ${id}: ${detail}`, id, cause);
   }
   if (op === "write") {
@@ -876,7 +879,7 @@ class HttpJobs implements JobOps {
     try {
       return await this.t.jobCall(job, req);
     } catch (e) {
-      throw jobFailure(e, id, kind);
+      throw await jobFailure(e, id, kind);
     }
   }
 
