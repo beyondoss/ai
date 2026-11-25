@@ -282,8 +282,6 @@ class JobLine:
     pgid: int = 0
     #: A ``started`` frame's terminal, as the endpoint echoed it.
     pty: Pty | None = None
-    #: A ``started`` frame's echo of the start's idempotency key (``None``: the endpoint ignores keys).
-    key: str | None = None
     #: Why the frame is ``bad``.
     note: str = ""
 
@@ -305,7 +303,7 @@ def _int32(v: Any) -> TypeGuard[int]:
     return isinstance(v, int) and not isinstance(v, bool) and -(2**31) <= v < 2**31
 
 
-def decode_job_line(line: bytes) -> JobLine:
+def decode_job_line(line: bytes, sent_key: str = "") -> JobLine:
     """One line of a job stream, read for the facts the kernel decides on. Never raises.
 
     Which known key a line has is a codec question (the precedence is the wire's: an error, then the
@@ -321,12 +319,12 @@ def decode_job_line(line: bytes) -> JobLine:
     if not isinstance(obj, dict):
         return _bad(f"unparseable job frame: {excerpt(line)[:200]}")
     try:
-        return _line_of(obj)
+        return _line_of(obj, sent_key)
     except ProtocolError as e:
         return _bad(e.detail)
 
 
-def _line_of(obj: dict[str, Any]) -> JobLine:
+def _line_of(obj: dict[str, Any], sent_key: str = "") -> JobLine:
     if "error" in obj:
         return _bad(str(obj["error"])[:400])
     att = obj.get("attached")
@@ -341,11 +339,13 @@ def _line_of(obj: dict[str, Any]) -> JobLine:
         pty = parse_pty(obj.get("pty"))
         return JobLine(
             K.Frame.started(
-                mark if isinstance(mark, str) else "", obj.get("stdin") is True, pty is not None
+                mark if isinstance(mark, str) else "",
+                obj.get("stdin") is True,
+                pty is not None,
+                bool(sent_key) and obj.get("key") == sent_key,
             ),
             pgid=int(started),
             pty=pty,
-            key=obj["key"] if isinstance(obj.get("key"), str) else None,
         )
     for key in ("stdout", "stderr"):
         if isinstance(obj.get(key), str):

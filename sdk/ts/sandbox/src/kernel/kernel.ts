@@ -34,7 +34,7 @@ const FAULTS: readonly Fault[] = [
 /** What the stream's frames said; the payload bytes stay in the shell. `mark` is hex, "" for none. */
 export type KFrame =
   | { t: "attached"; mark: string; from: number }
-  | { t: "started"; mark: string; stdin: boolean; pty: boolean }
+  | { t: "started"; mark: string; stdin: boolean; pty: boolean; key: boolean }
   | { t: "output"; len: number }
   | { t: "gap"; n: number }
   | { t: "heartbeat" }
@@ -93,6 +93,8 @@ export interface Policy {
   stdinOpen?: boolean;
   /** A start on a terminal: an echo that says none was opened is refused. */
   ptyOpen?: boolean;
+  /** A start that sent a key: an echo that does not say it was kept is refused. */
+  keySent?: boolean;
   /** A start of a kept job (`hold: false`): a refused echo stops the job. */
   kept?: boolean;
   /** The heartbeat the request chose, whole seconds; 0 for the default. */
@@ -115,9 +117,9 @@ type Call = (inp: number, n: number, out: number, cap: number) => number;
 
 /** The ABI `codec.rs` lays out. A change to a layout there bumps `ABI_VERSION`, and this must follow. */
 const ABI_VERSION = 5;
-/** Room for any one call's input or answer: a state (90 B) and an event (45 B at most), or a cursor. */
+/** Room for any one call's input or answer: a state (91 B) and an event (45 B at most), or a cursor. */
 const BUF = 1024;
-const STATE = 90;
+const STATE = 91;
 
 const MAX_SAFE = BigInt(Number.MAX_SAFE_INTEGER);
 
@@ -218,7 +220,9 @@ function frameBytes(w: Wr, f: KFrame): void {
       w.u8(0).mark(f.mark).u64(f.from);
       return;
     case "started":
-      w.u8(1).mark(f.mark).u8(f.stdin ? 1 : 0).u8(f.pty ? 1 : 0);
+      w.u8(1).mark(f.mark).u8(f.stdin ? 1 : 0).u8(f.pty ? 1 : 0).u8(
+        f.key ? 1 : 0,
+      );
       return;
     case "output":
       w.u8(2).u64(f.len);
@@ -397,7 +401,7 @@ export class Kernel {
   stateForStart(key: bigint, p: Policy = {}): KState {
     const w = new Wr().u64(key).u8(p.watch ? 1 : 0).u8(p.removeOnExit ? 1 : 0)
       .u32(p.beatS ?? 0).u8(p.stdinOpen ? 1 : 0).u8(p.ptyOpen ? 1 : 0)
-      .u8(p.kept ? 1 : 0);
+      .u8(p.keySent ? 1 : 0).u8(p.kept ? 1 : 0);
     return this.state(
       this.call(this.x.jc_state_for_start, Uint8Array.from(w.b)),
     );

@@ -1262,8 +1262,6 @@ export interface JobLine {
   pgid?: number;
   /** A `started` frame's terminal size (the shell keeps it; the kernel is told only whether one was echoed). */
   pty?: PtySize;
-  /** A `started` frame's echo of the start's idempotency key (absent: the endpoint ignores keys). */
-  key?: string;
   /** Why the frame is `bad`. */
   note?: string;
 }
@@ -1308,7 +1306,7 @@ function neverConnected(e: unknown, depth = 0): boolean {
 }
 
 /** One line of a job stream, read for the facts the kernel decides on. Never throws. */
-export function decodeJobLine(line: Uint8Array): JobLine {
+export function decodeJobLine(line: Uint8Array, sentKey?: string): JobLine {
   let s = text(line);
   if (s.endsWith("\r")) s = s.slice(0, -1);
   if (s.trim() === "") return { frame: { t: "heartbeat" } };
@@ -1334,10 +1332,10 @@ export function decodeJobLine(line: Uint8Array): JobLine {
         mark: typeof v.mark === "string" ? v.mark : "",
         stdin: v.stdin === true,
         pty: pty !== null,
+        key: sentKey !== undefined && v.key === sentKey,
       },
       pgid: v.started,
       ...(pty === null ? {} : { pty }),
-      ...(typeof v.key === "string" ? { key: v.key } : {}),
     };
   }
   const stream = typeof v.stdout === "string"

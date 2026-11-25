@@ -230,6 +230,8 @@ pub struct State {
     pub stdin_open: bool,
     /// The job is started on a terminal: the `started` echo must say so. Never changes.
     pub pty_open: bool,
+    /// The start sent an idempotency key: the `started` echo must say it kept it. Never changes.
+    pub key_sent: bool,
     /// The start is a kept job's (`hold: false`): no stream's close ends it, so a refused echo stops it.
     pub kept: bool,
     /// The consumer has been told the echo (`Started` or the first `Attached`): a reattach's is not told again.
@@ -263,7 +265,8 @@ pub enum Frame {
     /// `{"started": {"mark"}}`: the first frame of a start.
     /// `stdin` is whether the endpoint says the job's stdin was opened.
     /// `pty` is whether it says a terminal was opened.
-    Started { mark: Mark, stdin: bool, pty: bool },
+    /// `key` is whether it echoed the start's idempotency key.
+    Started { mark: Mark, stdin: bool, pty: bool, key: bool },
     /// An output frame of `len` decoded bytes.
     Output { len: u64 },
     /// `{"gap": n}`: `n` bytes are no longer kept.
@@ -588,6 +591,7 @@ pub open spec fn good_echo(s: State, ev: Event) -> bool {
     &&& echo_from(ev) >= s.offset as int
     &&& (s.flow is Start && s.stdin_open) ==> echo_stdin(ev)
     &&& (s.flow is Start && s.pty_open) ==> echo_pty(ev)
+    &&& (s.flow is Start && s.key_sent) ==> echo_key(ev)
 }
 
 /// Fairness: the server is reachable and answers as it should. A step under it is a fair step.
@@ -727,6 +731,13 @@ pub open spec fn echo_pty(ev: Event) -> bool {
     }
 }
 
+pub open spec fn echo_key(ev: Event) -> bool {
+    match ev {
+        Event::Frame(Frame::Started { key, .. }) => key,
+        _ => false,
+    }
+}
+
 pub open spec fn is_started_frame(ev: Event) -> bool {
     match ev {
         Event::Frame(Frame::Started { .. }) => true,
@@ -756,10 +767,11 @@ pub open spec fn post_surface(s: State, ev: Event, s2: State, out: Seq<Action>) 
     &&& forall|i: int| 0 <= i < out.len() ==> match #[trigger] out[i] {
         Action::Started { mark, stdin, pty } => {
             &&& s.phase is Confirming && s.flow is Start
-            &&& ev == Event::Frame(Frame::Started { mark, stdin, pty })
+            &&& is_started_frame(ev) && echo_mark(ev) == mark && echo_stdin(ev) == stdin && echo_pty(ev) == pty
             &&& s2.phase is Streaming
             &&& s.stdin_open ==> stdin
             &&& s.pty_open ==> pty
+            &&& s.key_sent ==> echo_key(ev)
         },
         Action::Attached { mark, from } => {
             &&& s.phase is Confirming && s.flow is Attach && !s.announced
@@ -784,6 +796,8 @@ pub open spec fn post_surface(s: State, ev: Event, s2: State, out: Seq<Action>) 
     &&& (s.phase is Confirming && s.flow is Start && s.stdin_open && is_started_frame(ev) && !echo_stdin(ev)
         && echo_mark(ev).len > 0 && (s.mark.len == 0 || echo_mark(ev) == s.mark)) ==> fails_with(out, Fault::NotOffered)
     &&& (s.phase is Confirming && s.flow is Start && s.pty_open && is_started_frame(ev) && !echo_pty(ev)
+        && echo_mark(ev).len > 0 && (s.mark.len == 0 || echo_mark(ev) == s.mark)) ==> fails_with(out, Fault::NotOffered)
+    &&& (s.phase is Confirming && s.flow is Start && s.key_sent && is_started_frame(ev) && !echo_key(ev)
         && echo_mark(ev).len > 0 && (s.mark.len == 0 || echo_mark(ev) == s.mark)) ==> fails_with(out, Fault::NotOffered)
     &&& (s.phase is Confirming && s.kept && s.flow is Start && s2.phase is Done && fails_with(out, Fault::NotOffered))
         ==> (out.len() == 3 && out[1] is Kill)
@@ -1609,6 +1623,7 @@ fn mark_reached(s: State, ev: Event) -> (r: State)
 }
 
 /// A request is in flight (start, attach or remove) and the answer, or the cut, came.
+#[verifier::rlimit(60)]
 fn step_request(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<Action>))
     requires
         wf(s),
@@ -1738,7 +1753,7 @@ fn step_confirming(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<
                     (t, out)
                 }
             },
-            Frame::Started { mark, stdin, pty } => {
+            Frame::Started { mark, stdin, pty, key } => {
                 if mark.len == 0 {
                     unoffered(s)
                 } else if s.mark.len > 0 && !mark_eq(&mark, &s.mark) && !cfg!(feature = "mut_echo_mark_unchecked") {
@@ -1748,6 +1763,8 @@ fn step_confirming(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<
                 } else if s.stdin_open && !stdin && !cfg!(feature = "mut_stdin_unchecked") {
                     unoffered(s)
                 } else if s.pty_open && !pty && !cfg!(feature = "mut_pty_unchecked") {
+                    unoffered(s)
+                } else if s.key_sent && !key && !cfg!(feature = "mut_key_echo_unchecked") {
                     unoffered(s)
                 } else {
                     let t = streaming(s, mark, 0);
@@ -2102,6 +2119,7 @@ impl Mark {
 
 impl State {
     /// A handle that starts a job. `key` is the shell's handle for the idempotency key it holds.
+    #[allow(clippy::too_many_arguments)] // one start policy, a flag per echo it must see
     pub fn for_start(
         key: u64,
         mode: Mode,
@@ -2109,6 +2127,7 @@ impl State {
         beat_s: u32,
         stdin_open: bool,
         pty_open: bool,
+        key_sent: bool,
         kept: bool,
     ) -> State {
         State {
@@ -2118,6 +2137,7 @@ impl State {
             remove_on_exit,
             stdin_open,
             pty_open,
+            key_sent,
             kept,
             announced: false,
             reached: false,
@@ -2147,6 +2167,7 @@ impl State {
             remove_on_exit,
             stdin_open: false,
             pty_open: false,
+            key_sent: false,
             kept: false,
             announced: false,
             reached: false,

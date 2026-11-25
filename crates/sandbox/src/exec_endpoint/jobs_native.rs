@@ -311,6 +311,7 @@ impl NativeJobs<'_> {
             beat.unwrap_or(0),
             spec.stdin_open,
             spec.pty.is_some(),
+            true,
             false,
         );
         handle::drive(&h, state, events).await
@@ -475,11 +476,7 @@ impl SandboxJobs for NativeJobs<'_> {
             let _ = self.kill(scope, std::slice::from_ref(id), true).await;
             return Err(predates("job terminals"));
         }
-        if answer.as_ref().and_then(|v| v.get("key")?.as_str()) != Some(key.as_str()) {
-            // The endpoint ignored the key: stop what it started, as for a stdin it ignored.
-            let _ = self.kill(scope, std::slice::from_ref(id), true).await;
-            return Err(predates("start keys"));
-        }
+        let echoed = answer.as_ref().and_then(|v| v.get("key")?.as_str()) == Some(key.as_str());
         let mark = answer
             .as_ref()
             .and_then(|v| v.get("mark")?.as_str())
@@ -497,6 +494,11 @@ impl SandboxJobs for NativeJobs<'_> {
                 "unreadable job answer: the endpoint reported an out-of-range job start: {started}"
             ))
         })?;
+        if !echoed {
+            // The endpoint ignored the key: stop what it started, as for a stdin it ignored.
+            let _ = self.kill(scope, std::slice::from_ref(id), true).await;
+            return Err(predates("start keys"));
+        }
         let mark = mark.ok_or_else(|| predates("job marks"))?;
         Ok(Started { pgid, mark })
     }

@@ -65,7 +65,14 @@ describe("job frames keep their stream", () => {
       mark: "00ff",
       stdin: false,
       pty: false,
+      key: false,
     });
+    expect(
+      decodeJobLine(line({ started: 7, mark: "00ff", key: "k" }), "k").frame,
+    ).toMatchObject({ key: true });
+    expect(
+      decodeJobLine(line({ started: 7, mark: "00ff", key: "j" }), "k").frame,
+    ).toMatchObject({ key: false });
     for (
       const v of [{ error: "boom" }, { gap: -1 }, { exit_code: 1.5 }, {
         timed_out: true,

@@ -16,6 +16,7 @@ variables alone ([Configuration](#configuration)).
 | `src/main.rs`       | the binary: bearer sources and the environment scrub, fail-closed start, subreaper, signals                                                                                                   |
 | `src/config.rs`     | the binary's settings: every `EXECD_*` variable, parsed once at startup, and the usage text                                                                                                   |
 | `src/log.rs`        | the logger: one text line per event to stderr, level via `EXECD_LOG` / `log::set_level`, no subscriber                                                                                        |
+| `src/fault.rs`      | the test knob `EXECD_TEST_FAULT` (debug builds only): where a keyed start's claim write fails or execd exits after the spawn                                                                  |
 | `src/runas.rs`      | `EXECD_RUN_AS`: resolving the user, proving execd can switch, the switch helper                                                                                                               |
 | `src/http.rs`       | hyper (HTTP/1.1 and h2c), routing, `/livez`, the bearer check, the request limit, the log line                                                                                                |
 | `src/term.rs`       | a terminal job's keeper (the process that holds the pty master), its session helper, the keeper's socket frames, and execd's connection to it                                                 |

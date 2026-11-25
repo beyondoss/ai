@@ -107,6 +107,7 @@ export async function* held(
     watch: req.output === false,
     stdinOpen: init.flow === "start" && init.spec.stdinOpen === true,
     ptyOpen: init.flow === "start" && init.spec.pty !== undefined,
+    keySent: init.flow === "start" && init.spec.idempotencyKey !== undefined,
     kept: init.flow === "start" && !init.hold,
   };
   let st: KState;
@@ -154,7 +155,10 @@ export async function* held(
     try {
       const n = await lines?.next();
       if (n === undefined || n.done) return { t: "broke" };
-      line = decodeJobLine(n.value);
+      line = decodeJobLine(
+        n.value,
+        init.flow === "start" ? init.spec.idempotencyKey : undefined,
+      );
     } catch (e) {
       if (e instanceof ProtocolError) {
         line = { frame: { t: "bad" }, note: e.detail };
@@ -211,22 +215,6 @@ export async function* held(
             });
             break;
           case "started":
-            if (
-              init.flow === "start" && init.spec.idempotencyKey !== undefined
-              && line?.key !== init.spec.idempotencyKey
-            ) {
-              // The endpoint ignored the key: a start sent again for a lost answer would run twice.
-              // Stop what it started (a held job dies with its stream).
-              if (!init.hold) {
-                await ops.kill(init.scope, [init.id], {
-                  remove: true,
-                  graceMs: DEFAULT_KILL_GRACE_MS,
-                }).catch(() => {});
-              }
-              throw new NotOfferedError(
-                "the endpoint did not echo the start's idempotency key: it ignores keys, so a start sent again for a lost answer would run twice",
-              );
-            }
             yield {
               type: "started",
               pgid: line?.pgid ?? 0,

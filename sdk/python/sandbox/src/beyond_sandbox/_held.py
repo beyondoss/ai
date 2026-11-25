@@ -116,6 +116,7 @@ def held(
         watch=isinstance(what, Attach) and not what.output,
         stdin_open=isinstance(what, Start) and what.stdin_open,
         pty_open=isinstance(what, Start) and what.pty is not None,
+        key_sent=isinstance(what, Start) and bool(what.key),
         kept=isinstance(what, Start) and not what.hold,
         beat_s=heartbeat_seconds or 0,
     )
@@ -139,7 +140,7 @@ def held(
             # The caller's deadline is the shell's clock and the kernel's event: it ends the handle.
             event, read = K.Event.DEADLINE, False
         elif event is None:
-            event, line = yield from _read()
+            event, line = yield from _read(what.key if isinstance(what, Start) else "")
         state, actions = k.step(state, event, K.now_ms(), K.draw())
         event = None
         for a in actions:
@@ -155,25 +156,6 @@ def held(
                 if on_reconnecting is not None:
                     on_reconnecting(Reconnecting(a.attempts, K.elapsed_ms(a.since_ms)))
             elif isinstance(a, K.Started):
-                if isinstance(what, Start) and what.key and (line is None or line.key != what.key):
-                    # The endpoint ignored the key: a start sent again for a lost answer would run twice.
-                    # Stop what it started (a held job dies with its stream), as for a stdin it ignored.
-                    if not what.hold:
-                        with contextlib.suppress(SandboxError):
-                            yield Call(
-                                _wire.job_op(
-                                    "kill",
-                                    scope,
-                                    ids=[job],
-                                    remove=True,
-                                    grace_ms=_wire.KILL_GRACE_MS,
-                                )
-                            )
-                    yield Release()
-                    raise NotOfferedError(
-                        "the endpoint did not echo the start's idempotency key: it ignores keys, so a "
-                        "start sent again for a lost answer would run twice"
-                    )
                 yield Emit(
                     JobStarted(
                         line.pgid if line else 0, a.stdin, a.mark, line.pty if line else None
@@ -255,7 +237,7 @@ def _send(open_: Open) -> Op[tuple[bytes, str]]:
     return K.Event.answered(opened.status, opened.retry_after_s), opened.detail
 
 
-def _read() -> Op[tuple[bytes, _wire.JobLine | None]]:
+def _read(sent_key: str = "") -> Op[tuple[bytes, _wire.JobLine | None]]:
     """The next line of the open stream, as an event, and the line."""
     try:
         raw = yield NextLine()
@@ -266,5 +248,5 @@ def _read() -> Op[tuple[bytes, _wire.JobLine | None]]:
         return K.Event.frame(bad.frame), bad
     if raw is None:
         return K.Event.BROKE, None
-    line = _wire.decode_job_line(raw)
+    line = _wire.decode_job_line(raw, sent_key)
     return K.Event.frame(line.frame), line

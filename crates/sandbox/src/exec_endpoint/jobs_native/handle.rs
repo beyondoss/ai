@@ -76,8 +76,9 @@ struct Payload {
     bytes: Vec<u8>,
     stream: Option<Stream>,
     pgid: u32,
-    /// The start's key as the `started` frame echoed it.
+    /// The start's key as the `started` frame echoed it, and the key the start sent.
     key: Option<String>,
+    sent: String,
     /// The text of an error frame.
     error: Option<String>,
 }
@@ -109,7 +110,10 @@ pub(super) async fn drive(
     let silence = |ms: u64| Duration::from_millis(ms);
     let mut reader: Option<FrameReader> = None;
     let mut refusal: Option<Refusal> = None;
-    let mut payload = Payload::default();
+    let mut payload = Payload {
+        sent: key.clone(),
+        ..Payload::default()
+    };
     let mut end: Option<JobEnd> = None;
     let mut ev = Ev::Go;
     let mut limit = silence(silence_limit_ms(h.beat));
@@ -135,14 +139,6 @@ pub(super) async fn drive(
                 }
                 // The kernel took the first frame: the sink hears of the incarnation.
                 Action::Started { mark, .. } => {
-                    // The endpoint ignored the key: a start sent again for a lost answer would run twice.
-                    // Stop what it started (a held job dies with its stream), as for a stdin it ignored.
-                    if h.spec.is_some() && payload.key.as_deref() != Some(key.as_str()) {
-                        let _ = NativeJobs::over(h.runner)
-                            .kill(h.scope, std::slice::from_ref(h.id), true)
-                            .await;
-                        return Err(super::predates("start keys"));
-                    }
                     events(JobEvent::Started(payload.pgid, mark_text(&mark)));
                 }
                 Action::Attached { mark, from } => {
@@ -412,6 +408,7 @@ async fn read(reader: &mut Option<FrameReader>, limit: Duration, p: &mut Payload
                 mark: as_mark(mark.as_deref(), p),
                 stdin,
                 pty: echoed.is_some(),
+                key: p.key.as_deref() == Some(p.sent.as_str()),
             }
         }
         Ok(JobFrame::Event(Event::Attached(mark, from))) => KFrame::Attached {
