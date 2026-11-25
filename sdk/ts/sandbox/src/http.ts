@@ -18,6 +18,7 @@ import {
   TransportError,
 } from "./errors.js";
 import {
+  type AttachOptions,
   DEFAULT_KILL_GRACE_MS,
   type Frame,
   HEARTBEAT_MAX_S,
@@ -29,10 +30,13 @@ import {
   type JobInfo,
   type JobOps,
   type JobSpec,
+  type JobStarted,
   type JobState,
   type KeepFields,
   type PtyInfo,
   type PtySize,
+  type RemoveOptions,
+  type RemoveResult,
   type ReqOptions,
   type RunOptions,
   type RunResult,
@@ -936,7 +940,7 @@ class HttpJobs implements JobOps {
     id: string,
     spec: JobSpec,
     req: ReqOptions = {},
-  ): Promise<number> {
+  ): Promise<JobStarted> {
     await this.t.proveEnv(spec.env);
     let ex: Exchange;
     try {
@@ -950,11 +954,13 @@ class HttpJobs implements JobOps {
         throw new TooLargeError("a job answer exceeded the response cap");
       }
       let started: unknown;
+      let mark: unknown;
       let echoed = false;
       let ptyEchoed = false;
       try {
         const v: unknown = JSON.parse(text(body));
         started = isRecord(v) ? v.started : undefined;
+        mark = isRecord(v) ? v.mark : undefined;
         echoed = isRecord(v) && v.stdin === true;
         ptyEchoed = isRecord(v) && ptySize(v.pty) !== null;
       } catch {
@@ -985,7 +991,12 @@ class HttpJobs implements JobOps {
           `the endpoint did not report the job's start: ${excerpt(body)}`,
         );
       }
-      return started;
+      if (typeof mark !== "string" || mark === "") {
+        throw new NotOfferedError(
+          "the endpoint predates job marks: it did not name the job's incarnation",
+        );
+      }
+      return { pgid: started, mark };
     } finally {
       ex.close();
     }
@@ -1021,6 +1032,11 @@ class HttpJobs implements JobOps {
               "the endpoint's held start did not begin with `started`",
             );
           }
+          if (f.mark === "") {
+            throw new NotOfferedError(
+              "the endpoint predates job marks: it did not name the job's incarnation",
+            );
+          }
           if (spec.stdinOpen === true && f.stdin !== true) {
             // Closing the stream kills the held job (nothing was kept).
             throw new NotOfferedError(
@@ -1053,6 +1069,16 @@ class HttpJobs implements JobOps {
       if (!isRecord(j) || typeof j.id !== "string" || !isJobId(j.id)) continue;
       const st = jobState(j.state, j.code);
       if (!st) continue;
+      // An endpoint that predates marks names none of these: its list is not trusted.
+      if (
+        typeof j.mark !== "string"
+        || typeof j.command !== "string"
+        || !Array.isArray(j.args)
+      ) {
+        throw new NotOfferedError(
+          "the endpoint predates job marks: its list did not name the job's incarnation",
+        );
+      }
       out.push({
         id: j.id,
         state: st.state,
@@ -1066,6 +1092,11 @@ class HttpJobs implements JobOps {
         ended: count(j.ended),
         label: typeof j.label === "string" ? j.label : "",
         ...ptyInfo(j),
+        mark: j.mark,
+        command: j.command,
+        args: j.args.filter((a): a is string => typeof a === "string"),
+        outputStart: count(j.outputStart),
+        outputEnd: count(j.outputEnd),
       });
     }
     return out;
@@ -1114,7 +1145,7 @@ class HttpJobs implements JobOps {
     scope: string,
     id: string,
     offset: number,
-    req: ReqOptions = {},
+    req: AttachOptions = {},
   ): AsyncGenerator<JobFrame> {
     let ex: Exchange;
     try {
@@ -1123,7 +1154,12 @@ class HttpJobs implements JobOps {
         args: [],
         timeoutMs: STREAM_DEADLINE_MS,
         stream: true,
-        job: this.job("attach", scope, { id, offset }),
+        job: this.job("attach", scope, {
+          id,
+          offset,
+          ...(req.mark !== undefined ? { mark: req.mark } : {}),
+          ...(req.output !== undefined ? { output: req.output } : {}),
+        }),
         heartbeatSeconds: req.heartbeatSeconds,
       });
     } catch (e) {
@@ -1135,9 +1171,18 @@ class HttpJobs implements JobOps {
           `exec endpoint ${this.t.url} answered a job stream with something that is not a stream`,
         );
       }
+      let first = true;
       for await (const line of this.t.lines(ex, req.heartbeatSeconds)) {
         const f = decodeJobFrame(line);
         if (f === "heartbeat") continue;
+        if (first) {
+          first = false;
+          if (f.type !== "attached") {
+            throw new NotOfferedError(
+              "the endpoint predates job marks: its attach did not begin with `attached`",
+            );
+          }
+        }
         yield f;
         if (f.type === "exit" || f.type === "signal") return;
       }
@@ -1198,10 +1243,28 @@ class HttpJobs implements JobOps {
   async remove(
     scope: string,
     ids: string[],
-    req?: ReqOptions,
-  ): Promise<void> {
-    if (ids.length === 0) return;
-    await this.t.jobCall(this.job("remove", scope, { ids }), req);
+    req?: RemoveOptions,
+  ): Promise<RemoveResult> {
+    if (ids.length === 0) return { running: [], mismatch: [] };
+    const v = await this.t.jobCall(
+      this.job("remove", scope, {
+        ids,
+        ...(req?.marks !== undefined ? { marks: req.marks } : {}),
+      }),
+      req,
+    );
+    const strings = (a: unknown): string[] | null =>
+      Array.isArray(a) && a.every((x) => typeof x === "string")
+        ? (a as string[])
+        : null;
+    const running = strings(v.running);
+    const mismatch = strings(v.mismatch);
+    if (!running || !mismatch) {
+      throw new NotOfferedError(
+        "the endpoint predates job marks: remove did not report what it skipped",
+      );
+    }
+    return { running, mismatch };
   }
 
   async writeStdin(
@@ -1307,9 +1370,19 @@ export function decodeJobFrame(line: Uint8Array): JobFrame | "heartbeat" {
     return {
       type: "started",
       pgid: v.started,
+      mark: typeof v.mark === "string" ? v.mark : "",
       stdin: v.stdin === true,
       ...(pty ? { pty } : {}),
     };
+  }
+  if (isRecord(v.attached)) {
+    const a = v.attached;
+    if (typeof a.mark !== "string" || typeof a.from !== "number") {
+      throw new ProtocolError(
+        `job stream: unreadable attached frame: ${s.slice(0, 200)}`,
+      );
+    }
+    return { type: "attached", mark: a.mark, from: a.from };
   }
   const stream = typeof v.stdout === "string"
     ? "stdout"

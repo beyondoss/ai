@@ -909,7 +909,7 @@ builds them there from plain commands, in
 `crates/sandbox/src/exec_endpoint/jobs.rs`. That is not part of this contract.)
 The driver ops are in DRIVER.md. Behaviours the scenarios pin:
 
-- a job id is 1 to 32 characters of `[0-9a-z]`, chosen by the caller, unique
+- a job id is 1 to 64 characters of `[0-9a-z_-]`, chosen by the caller, unique
   within its scope; a client rejects anything else before sending (`invalid_request`);
 - `read` returns `state` (`running`, `exited`, `ended`, `lost`, `gone`), `code`,
   `offset` (where the data starts; later than asked when old output was

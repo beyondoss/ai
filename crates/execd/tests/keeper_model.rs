@@ -16,7 +16,7 @@
 //! - K1 the shell's exit is told only after everything it printed before exiting was copied to the
 //!   output.
 //! - K2 once the shell is reaped and the master reads `EIO`, the keeper ends in that very step.
-//! - M6 a spool that cannot be written ends the terminal: the shell is killed once, and the status told
+//! - Q6 a spool that cannot be written ends the terminal: the shell is killed once, and the status told
 //!   is the failure's, whatever the shell did.
 //!
 //! Each `mut_*` of the keeper kernel (`the_mutation_turns_its_property_red`) turns one red.
@@ -258,7 +258,7 @@ impl Model for M {
                 },
             ),
             Property::always(
-                "M6: a failed spool kills the shell once and ends with the failure's code",
+                "Q6: a failed spool kills the shell once and ends with the failure's code",
                 |_, s: &St| {
                     s.kills <= 1
                         && (!s.broke || (s.k.failed && !s.shell_alive))
@@ -323,7 +323,7 @@ fn the_mutation_turns_its_property_red() {
     } else if cfg!(feature = "mut_spool_failure_silent")
         || cfg!(feature = "mut_spool_failure_keeps_code")
     {
-        "M6: "
+        "Q6: "
     } else {
         "T5: "
     };

@@ -441,7 +441,7 @@ async fn a_terminal_whose_keeper_died_is_hung_up() {
     read_until(a, "h2", "again").await;
 }
 
-/// M6: a keeper whose spool cannot be written fails closed: it kills the shell, and the end it writes
+/// Q6: a keeper whose spool cannot be written fails closed: it kills the shell, and the end it writes
 /// and tells execd is the failure's (code 74, no signal), not the shell's own `SIGKILL` and not a
 /// terminal that looks alive with its output silently gone. The spool here is `/dev/full`.
 #[tokio::test]

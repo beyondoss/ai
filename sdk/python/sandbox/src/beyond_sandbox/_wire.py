@@ -12,6 +12,7 @@ from .errors import (
     AuthError,
     EndpointError,
     InvalidRequestError,
+    NotOfferedError,
     ProtocolError,
     SandboxError,
     TooLargeError,
@@ -21,12 +22,14 @@ from .models import (
     ExecResult,
     Exit,
     Frame,
+    JobAttached,
     JobEnd,
     JobFrame,
     JobGap,
     JobInfo,
     JobOutput,
     JobRead,
+    JobRemoved,
     JobShellExit,
     JobStarted,
     Pty,
@@ -258,7 +261,20 @@ def decode_job_line(line: bytes) -> list[JobFrame]:
     if "error" in obj:
         raise TransportError(f"job stream: the endpoint failed mid-job: {obj['error']}")
     if isinstance(obj.get("started"), int):
-        return [JobStarted(obj["started"], obj.get("stdin") is True, parse_pty(obj.get("pty")))]
+        mark = obj.get("mark")
+        return [
+            JobStarted(
+                obj["started"],
+                obj.get("stdin") is True,
+                mark if isinstance(mark, str) else "",
+                parse_pty(obj.get("pty")),
+            )
+        ]
+    att = obj.get("attached")
+    if isinstance(att, dict):
+        if not isinstance(att.get("mark"), str) or _int(att, "from") is None:
+            raise ProtocolError(f"unparseable job frame: {excerpt(line)[:200]}")
+        return [JobAttached(att["mark"], att["from"])]
     for key in ("stdout", "stderr"):
         if key in obj:
             return [JobOutput(_b64(key, obj[key]), key == "stderr")]
@@ -275,11 +291,11 @@ def decode_job_line(line: bytes) -> list[JobFrame]:
     return []
 
 
-JOB_ID = re.compile(r"[0-9a-z]{1,32}")
+JOB_ID = re.compile(r"[0-9a-z_-]{1,64}")
 
 
 def _is_job_id(v: Any) -> bool:
-    """An id read back from a sandbox is never a path: 1 to 32 characters of ``[0-9a-z]``."""
+    """An id read back from a sandbox is never a path: 1 to 64 characters of ``[0-9a-z_-]``."""
     return isinstance(v, str) and JOB_ID.fullmatch(v) is not None
 
 
@@ -366,6 +382,15 @@ def parse_list(v: Any) -> list[JobInfo]:
         st = _state(j.get("state"), j.get("code"))
         if st is None:
             continue
+        # An endpoint that predates marks names none of these: its list is not trusted.
+        if (
+            not isinstance(j.get("mark"), str)
+            or not isinstance(j.get("command"), str)
+            or not isinstance(j.get("args"), list)
+        ):
+            raise NotOfferedError(
+                "the endpoint predates job marks: its list did not name the job's incarnation"
+            )
         out.append(
             JobInfo(
                 id=j["id"],
@@ -378,6 +403,11 @@ def parse_list(v: Any) -> list[JobInfo]:
                 started=_int(j, "started") or 0,
                 ended=_int(j, "ended") or 0,
                 label=j["label"] if isinstance(j.get("label"), str) else "",
+                mark=j["mark"],
+                command=j["command"],
+                args=tuple(a for a in j["args"] if isinstance(a, str)),
+                output_start=_int(j, "outputStart") or 0,
+                output_end=_int(j, "outputEnd") or 0,
                 signal=_signal(j, st[0]),
                 pty=parse_pty_info(j.get("pty")),
             )
@@ -466,3 +496,17 @@ def checked_token(value: object) -> str:
     if not isinstance(value, str) or not value.strip():
         raise AuthError("token source failed: it gave no token")
     return value
+
+
+def parse_removed(v: Any) -> JobRemoved:
+    """A ``remove`` answer: the ids it skipped. An endpoint that predates the mark answers neither."""
+    running, mismatch = (v.get(k) if isinstance(v, dict) else None for k in ("running", "mismatch"))
+    if not (
+        isinstance(running, list)
+        and isinstance(mismatch, list)
+        and all(isinstance(i, str) for i in (*running, *mismatch))
+    ):
+        raise NotOfferedError(
+            "the endpoint predates the job mark: its remove did not report what it skipped"
+        )
+    return JobRemoved(tuple(running), tuple(mismatch))

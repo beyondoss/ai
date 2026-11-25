@@ -85,6 +85,41 @@ export interface JobInfo {
   label: string;
   /** Present on a terminal job only. */
   pty?: PtyInfo;
+  /** Which incarnation of `id` this is (see {@link JobStarted.mark}). */
+  mark: string;
+  command: string;
+  args: string[];
+  /** The offset of the oldest byte of output the sandbox holds. */
+  outputStart: number;
+  /** The offset after the newest byte of output so far. */
+  outputEnd: number;
+}
+
+/** What `start` answers: the process group and the mark of this incarnation of the id. */
+export interface JobStarted {
+  pgid: number;
+  /** Names this incarnation: a later job that reuses the id has another mark. */
+  mark: string;
+}
+
+/** Options of `attach`. */
+export interface AttachOptions extends ReqOptions {
+  /** Attach only if the job is this incarnation; otherwise the job is gone (`JobGoneError`). */
+  mark?: string;
+  /** `false`: a status-only attach, which sends no output and no gap (default `true`). */
+  output?: boolean;
+}
+
+/** Options of `remove`. */
+export interface RemoveOptions extends ReqOptions {
+  /** Per id, the mark of the incarnation to remove; a job with another mark is left. */
+  marks?: Record<string, string>;
+}
+
+/** What `remove` skipped: jobs still running, and jobs whose mark was not the one named. */
+export interface RemoveResult {
+  running: string[];
+  mismatch: string[];
 }
 
 /** One `read`: the state, where the data starts, where the output ends so far, and the bytes. */
@@ -106,7 +141,15 @@ export interface JobChunk {
 
 /** What a job stream says: output, a gap, the shell's exit, and the final status. */
 export type JobFrame =
-  | { type: "started"; pgid: number; stdin?: boolean; pty?: PtySize }
+  | {
+    type: "started";
+    pgid: number;
+    mark: string;
+    stdin?: boolean;
+    pty?: PtySize;
+  }
+  /** The first frame of an attach: the job's mark and the offset the stream starts at. */
+  | { type: "attached"; mark: string; from: number }
   /** `stream` is the pipe the bytes came from; concatenated, the pieces are the combined output. */
   | { type: "output"; data: Uint8Array; stream: "stdout" | "stderr" }
   /** `bytes` of output from the requested offset are no longer kept. */
@@ -161,9 +204,9 @@ export interface Survivor {
   detail: string;
 }
 
-/** A job id is 1 to 32 characters of `[0-9a-z]`. */
+/** A job id is 1 to 64 characters of `[0-9a-z_-]`. */
 export function isJobId(s: string): boolean {
-  return /^[0-9a-z]{1,32}$/.test(s);
+  return /^[0-9a-z_-]{1,64}$/.test(s);
 }
 
 /** The SIGTERM grace a `kill` or `wipe` gives a job before SIGKILL when the caller names none. */
@@ -212,7 +255,7 @@ export interface KeepFields {
 
 /**
  * The sandbox's jobs: commands it keeps. `scope` is the opaque name of one session's jobs; `id` is
- * 1 to 32 characters of `[0-9a-z]`. Every wire op is here under its wire name, with every field it
+ * 1 to 64 characters of `[0-9a-z_-]`. Every wire op is here under its wire name, with every field it
  * takes. An op never reconnects and never retries.
  */
 export interface JobOps {
@@ -222,7 +265,7 @@ export interface JobOps {
     id: string,
     spec: JobSpec,
     req?: ReqOptions,
-  ): Promise<number>;
+  ): Promise<JobStarted>;
   /**
    * Start a job held by this stream (`hold: true`): the first frame is `started`, and if the stream
    * closes before the job's final frame and no `keep` arrived, the sandbox kills the job's group.
@@ -242,12 +285,12 @@ export interface JobOps {
     max: number,
     req?: ReqOptions,
   ): Promise<JobChunk>;
-  /** Follow a job's output from `offset`; the last frame is `exit`. Closing the iterator detaches. */
+  /** Follow a job's output from `offset`; the first frame is `attached`, the last `exit`. Closing the iterator detaches. */
   attach(
     scope: string,
     id: string,
     offset: number,
-    req?: ReqOptions,
+    req?: AttachOptions,
   ): AsyncIterable<JobFrame>;
   /** Hand a held job to the sandbox for good, recording `num`, `kind` and `seen`. */
   keep(
@@ -269,7 +312,11 @@ export interface JobOps {
     fields: { remove: boolean; graceMs: number },
     req?: ReqOptions,
   ): Promise<Survivor[]>;
-  remove(scope: string, ids: string[], req?: ReqOptions): Promise<void>;
+  remove(
+    scope: string,
+    ids: string[],
+    req?: RemoveOptions,
+  ): Promise<RemoveResult>;
   wipe(
     scope: string,
     fields: { graceMs: number },

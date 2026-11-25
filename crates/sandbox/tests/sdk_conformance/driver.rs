@@ -453,7 +453,7 @@ impl Driver {
                 "ops": self.ops(),
                 "features": [
                     "frames", "unbounded_stream", "exit_signal", "exec_env", "job_streams",
-                    "job_stdin", "job_signal_op", "job_errors", "job_options", "job_pty"
+                    "job_stdin", "job_signal_op", "job_errors", "job_options", "job_marks", "job_pty"
                 ],
             }));
         }
@@ -599,14 +599,17 @@ impl Driver {
             stdin_open: flag(req, "stdin_open")?,
             pty: pty_arg(req)?,
         };
-        let pgid = self
+        let started = self
             .jobs()?
             .start_kept(&scope, &id, &spec)
             .await
             .map_err(|e| job_err(&e))?;
         // The client refused (`not_offered`) an endpoint that did not echo `pty`, so a start that
         // came back echoed it.
-        Ok(pty_echo(json!({ "pgid": pgid }), spec.pty))
+        Ok(pty_echo(
+            json!({ "pgid": started.pgid, "mark": started.mark }),
+            spec.pty,
+        ))
     }
 
     /// Start held, learn the pgid from the first frame, optionally `keep`, then drop the stream: a
@@ -629,13 +632,13 @@ impl Driver {
         let native = NativeJobs::over(http);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let sink = |ev: JobEvent<'_>| {
-            if let JobEvent::Started(pgid) = ev {
-                let _ = tx.send(pgid);
+            if let JobEvent::Started(pgid, mark) = ev {
+                let _ = tx.send((pgid, mark.to_string()));
             }
         };
         let held = native.run_held_beat(&scope, &id, &spec, beat, &sink);
         tokio::pin!(held);
-        let pgid = tokio::select! {
+        let (pgid, mark) = tokio::select! {
             r = &mut held => {
                 return Err(match r {
                     Err(e) => job_err(&e),
@@ -651,7 +654,7 @@ impl Driver {
                 .map_err(|e| job_err(&e))?;
         }
         // Dropping the future closes the stream.
-        Ok(pty_echo(json!({ "pgid": pgid }), spec.pty))
+        Ok(pty_echo(json!({ "pgid": pgid, "mark": mark }), spec.pty))
     }
 
     async fn job_keep(&self, req: &Value) -> Out {
@@ -697,7 +700,8 @@ impl Driver {
             .map(|j| {
                 let (state, code) = state_of(j.status);
                 let mut entry = json!({
-                    "id": j.id.as_str(), "state": state, "code": code, "kept": j.kept,
+                    "id": j.id.as_str(), "mark": j.mark, "command": j.command, "args": j.args,
+                    "output_start": j.output_start, "output_end": j.output_end, "state": state, "code": code, "kept": j.kept,
                     "num": j.num, "kind": j.kind, "seen": j.seen,
                     "started": j.started, "ended": j.ended, "label": j.label,
                 });
@@ -747,10 +751,20 @@ impl Driver {
         let scope = self.scope(req)?;
         let id = Self::job_id(req, "job")?;
         let offset = u64_arg(req, "offset")?.unwrap_or(0);
+        let want_mark = opt_str(req, "mark")?;
+        let output = match req.get("output") {
+            None | Some(Value::Null) => true,
+            Some(Value::Bool(b)) => *b,
+            Some(_) => return Err(err("invalid_request", "`output` is a boolean")),
+        };
         let out = Mutex::new(Vec::new());
         let errs = Mutex::new(Vec::new());
         let gaps = Mutex::new(0u64);
+        let attached = Mutex::new(None::<(String, u64)>);
         let sink = |ev: JobEvent<'_>| match ev {
+            JobEvent::Attached { mark, from } => {
+                *attached.lock().unwrap() = Some((mark.to_string(), from));
+            }
             JobEvent::Output(b, s) => {
                 out.lock().unwrap().extend_from_slice(b);
                 if s == Stream::Stderr {
@@ -758,18 +772,27 @@ impl Driver {
                 }
             }
             JobEvent::Gap(n) => *gaps.lock().unwrap() += n,
-            JobEvent::Started(_) | JobEvent::ShellExit(_) => {}
+            JobEvent::Started(..) | JobEvent::ShellExit(_) => {}
         };
-        let end = match self.beat(req)? {
-            Some(beat) => {
-                NativeJobs::over(self.http()?)
-                    .follow_beat(&scope, &id, offset, Some(beat), &sink)
-                    .await
-            }
-            None => self.jobs()?.follow(&scope, &id, offset, &sink).await,
-        }
-        .map_err(|e| job_err(&e))?;
+        let end = NativeJobs::over(self.http()?)
+            .follow_opts(
+                &scope,
+                &id,
+                offset,
+                want_mark,
+                output,
+                self.beat(req)?,
+                &sink,
+            )
+            .await
+            .map_err(|e| job_err(&e))?;
+        let (mark, from) = attached
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| err("protocol", "the attach was not answered"))?;
         let mut v = json!({
+            "attached": { "mark": mark, "from": from },
             "output_b64": b64(&out.lock().unwrap()),
             "gap": *gaps.lock().unwrap(),
         });
@@ -889,11 +912,27 @@ impl Driver {
             .iter()
             .filter_map(|s| JobId::parse(s))
             .collect();
-        self.jobs()?
-            .remove(&scope, &ids)
+        let marks: Vec<(JobId, String)> = match req.get("marks") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Object(m)) => m
+                .iter()
+                .map(|(k, v)| {
+                    let id = JobId::parse(k).ok_or_else(|| err("invalid_request", "bad job id"))?;
+                    let mark = v
+                        .as_str()
+                        .ok_or_else(|| err("invalid_request", "a mark is a string"))?;
+                    Ok((id, mark.to_string()))
+                })
+                .collect::<Result<_, Value>>()?,
+            Some(_) => return Err(err("invalid_request", "`marks` is an object")),
+        };
+        let left = self
+            .jobs()?
+            .remove(&scope, &ids, &marks)
             .await
             .map_err(|e| io_err(&e))?;
-        Ok(json!({}))
+        let names = |v: &[JobId]| v.iter().map(|i| i.as_str().to_string()).collect::<Vec<_>>();
+        Ok(json!({ "running": names(&left.running), "mismatch": names(&left.mismatch) }))
     }
 
     async fn job_wipe(&self, req: &Value) -> Out {

@@ -211,7 +211,7 @@
 //! **Requests.** Every job operation is a request (the same URL, headers and envelope) plus a
 //! `"job"` object naming `op` and `scope`. A **scope** is an opaque name for one session's jobs
 //! (the agent sends a digest of tenant and session); an operation MUST only ever see the jobs of
-//! its own scope. A job **id** is chosen by the agent (lowercase hex, at most 32 characters) and is
+//! its own scope. A job **id** is chosen by the agent (1 to 64 characters of `[0-9a-z_-]`; any other is a 400) and is
 //! unique within its scope. A **status** is a job's exit code, or 128 + N for signal N; a job a signal
 //! killed also reports **`signal`**: N (see "States"). Except for
 //! `start`, the request's `command` is `true` with no arguments: harmless if run. Unknown fields are
@@ -221,14 +221,14 @@
 //!
 //! | op | `job` fields | answer |
 //! |---|---|---|
-//! | `start` | `id`, `hold`, `label`, `stdin_open`, `pty` — the command is the request's `command`/`args`/`cwd`/`env` | `hold: true` (with `"stream": true`): a job stream; `hold: false`: `{"started": pgid}`; both say `"stdin": true` when `stdin_open` was honoured, and `"pty": {"cols", "rows"}` when `pty` was ("Job terminals") |
-//! | `attach` | `id`, `offset` (with `"stream": true`) | a job stream from `offset` |
+//! | `start` | `id`, `hold`, `label`, `stdin_open`, `pty` — the command is the request's `command`/`args`/`cwd`/`env` | `hold: true` (with `"stream": true`): a job stream; `hold: false`: `{"started": pgid, "mark"}`; both name the job's `mark` (this incarnation of the id), say `"stdin": true` when `stdin_open` was honoured, and `"pty": {"cols", "rows"}` when `pty` was ("Job terminals") |
+//! | `attach` | `id`, `offset`, `mark`?, `output`? (default true) (with `"stream": true`) | a job stream from `offset`, `{"attached": {"mark", "from"}}` first; a `mark` that is not the job's is 404; `output: false` streams no output and no gap, only the end, and `from` is the output's end |
 //! | `read` | `id`, `offset`, `max` | `{"state", "code", "signal"?, "offset", "end", "data", "stderr_ranges"?, "pty"?}` |
 //! | `keep` | `id`, `num`, `kind`, `seen` | `{}` |
 //! | `seen` | `id`, `offset` | `{}` |
 //! | `kill` | `ids`, `remove`, `grace_ms` | `{"survivors": [{"id", "pids": [..]}]}` |
-//! | `list` | | `{"jobs": [{"id", "state", "code", "signal"?, "kept", "num", "kind", "seen", "started", "ended", "label", "pty"?}]}` |
-//! | `remove` | `ids` | `{}` |
+//! | `list` | | `{"jobs": [{"id", "mark", "command", "args", "outputStart", "outputEnd", "state", "code", "signal"?, "kept", "num", "kind", "seen", "started", "ended", "label", "pty"?}]}` |
+//! | `remove` | `ids`, `marks`? (`{id: mark}`) | `{"running": [ids], "mismatch": [ids]}`: a job whose group is not empty, or whose mark is not the one named, is left |
 //! | `wipe` | `grace_ms` | `{"survivors": [{"pids": [..]}]}` |
 //! | `write` | `id`, `at`, `data`, `eof` | `{"written": N, "closed"?: true}` |
 //! | `signal` | `ids`, `signal` | `{"sent": [id, ..]}` |
@@ -258,7 +258,7 @@
 //!   (recording `num`, `kind` and `seen` for `list`; `num` may be absent: a job kept only so that it outlives its stream is nobody's numbered job); after it a closed stream kills nothing. A job
 //!   started with `hold: false` is kept from the start. Closing an `attach` never kills.
 //! - **A job stream** is a stream (`application/x-ndjson`, heartbeats, frame size, flushing,
-//!   unknown fields) with two more frames: `{"started": pgid}` first on a held start, and
+//!   unknown fields) with two more frames: `{"started": pgid, "mark"}` first on a held start (`{"attached": {"mark", "from"}}` first on an attach), and
 //!   `{"gap": n}` when `n` bytes of output from the requested offset are no longer kept. Output
 //!   frames (`stdout`, or `stderr`: "Output streams") carry the combined output in order. `{"shell_exit":
 //!   N}` follows the output read up to the shell's exit when the shell exits leaving its group alive,

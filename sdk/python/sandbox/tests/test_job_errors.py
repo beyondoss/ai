@@ -23,6 +23,7 @@ from beyond_sandbox import (
     JobExistsError,
     JobGoneError,
     Jobs,
+    JobStart,
     JobStarted,
     NotFoundError,
     NotOfferedError,
@@ -106,7 +107,7 @@ def test_keep_seen_and_grace_ms_go_out_under_their_wire_names() -> None:
 
 
 def held_stream(h: Any, b: Any) -> None:
-    body = b'{"started":42}\n{"exit_code":0}\n'
+    body = b'{"started":42,"mark":"ab12"}\n{"exit_code":0}\n'
     reply(h, 200, body, NDJSON)
 
 
@@ -161,9 +162,11 @@ def test_async_jobs_carry_the_same_options() -> None:
 
 def test_pty_goes_out_on_start_and_its_echo_is_required() -> None:
     sb, e = jobs_over(
-        lambda h, b: reply(h, 200, {"started": 5, "stdin": True, "pty": b["job"].get("pty")})
+        lambda h, b: reply(
+            h, 200, {"started": 5, "mark": "m", "stdin": True, "pty": b["job"].get("pty")}
+        )
     )
-    assert sb.start("s", "aa", "sh", pty=Pty(80, 24)) == 5
+    assert sb.start("s", "aa", "sh", pty=Pty(80, 24)) == JobStart(5, "m")
     assert e.requests[0]["job"]["pty"] == {"cols": 80, "rows": 24}
     sb.start("s", "bb", "true")
     assert "pty" not in e.requests[1]["job"]
@@ -171,7 +174,9 @@ def test_pty_goes_out_on_start_and_its_echo_is_required() -> None:
 
 def test_an_endpoint_that_does_not_echo_pty_is_not_offered_and_the_job_is_stopped() -> None:
     def answer(h: Any, b: Any) -> None:
-        reply(h, 200, {"started": 5} if b["job"]["op"] == "start" else {"survivors": []})
+        reply(
+            h, 200, {"started": 5, "mark": "m"} if b["job"]["op"] == "start" else {"survivors": []}
+        )
 
     sb, e = jobs_over(answer)
     with pytest.raises(NotOfferedError):
@@ -181,11 +186,13 @@ def test_an_endpoint_that_does_not_echo_pty_is_not_offered_and_the_job_is_stoppe
 
 def test_a_held_terminal_start_needs_the_echo_in_its_first_frame() -> None:
     sb, _ = jobs_over(
-        lambda h, b: reply(h, 200, b'{"started":42,"stdin":true}\n{"exit_code":0}\n', NDJSON)
+        lambda h, b: reply(
+            h, 200, b'{"started":42,"mark":"m","stdin":true}\n{"exit_code":0}\n', NDJSON
+        )
     )
     with pytest.raises(NotOfferedError):
         list(sb.start_held("s", "aa", "sh", pty=Pty(80, 24)))
-    ok = b'{"started":42,"stdin":true,"pty":{"cols":80,"rows":24}}\n{"exit_code":0}\n'
+    ok = b'{"started":42,"mark":"m","stdin":true,"pty":{"cols":80,"rows":24}}\n{"exit_code":0}\n'
     sb, _ = jobs_over(lambda h, b: reply(h, 200, ok, NDJSON))
     first = next(iter(sb.start_held("s", "aa", "sh", pty=Pty(80, 24))))
     assert isinstance(first, JobStarted) and first.pty == Pty(80, 24)
@@ -235,10 +242,16 @@ def test_a_terminal_write_refuses_eof_and_a_hangup_is_stdin_closed_with_written(
 
 
 def test_list_and_read_carry_pty_on_terminals_only() -> None:
+    base = {"mark": "m", "command": "sh", "args": [], "outputStart": 0, "outputEnd": 0}
     listing = {
         "jobs": [
-            {"id": "aa", "state": "running", "pty": {"cols": 120, "rows": 40, "open": True}},
-            {"id": "bb", "state": "running"},
+            {
+                **base,
+                "id": "aa",
+                "state": "running",
+                "pty": {"cols": 120, "rows": 40, "open": True},
+            },
+            {**base, "id": "bb", "state": "running"},
         ]
     }
     sb, _ = jobs_over(lambda h, b: reply(h, 200, listing))
@@ -262,12 +275,12 @@ def test_async_resize_and_start() -> None:
         200,
         {"cols": 9, "rows": 8}
         if b["job"]["op"] == "resize"
-        else {"started": 3, "stdin": True, "pty": b["job"]["pty"]},
+        else {"started": 3, "mark": "m", "stdin": True, "pty": b["job"]["pty"]},
     )
 
     async def go() -> None:
         sb = AsyncJobs(AsyncHttpTransport(e.url))
-        assert await sb.start("s", "aa", "sh", pty=Pty(80, 24)) == 3
+        assert await sb.start("s", "aa", "sh", pty=Pty(80, 24)) == JobStart(3, "m")
         assert await sb.resize("s", "aa", 9, 8) == Pty(9, 8)
 
     asyncio.run(go())

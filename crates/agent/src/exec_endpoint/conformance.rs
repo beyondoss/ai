@@ -1139,7 +1139,7 @@ impl Verifier {
         let events = |e: JobEvent<'_>| {
             let mut h = heard.lock().unwrap_or_else(|e| e.into_inner());
             match e {
-                JobEvent::Started(p) => h.0 = Some(p),
+                JobEvent::Started(p, _) => h.0 = Some(p),
                 JobEvent::Output(b, _) => {
                     h.1.extend_from_slice(b);
                     h.2.get_or_insert_with(Instant::now);
@@ -1187,7 +1187,7 @@ impl Verifier {
         let id = JobId::fresh();
         let started = std::sync::Mutex::new(None::<u32>);
         let events = |e: JobEvent<'_>| {
-            if let JobEvent::Started(p) = e {
+            if let JobEvent::Started(p, _) = e {
                 *started.lock().unwrap_or_else(|e| e.into_inner()) = Some(p);
             }
         };
@@ -1247,7 +1247,7 @@ impl Verifier {
         let events = |e: JobEvent<'_>| {
             let mut h = heard.lock().unwrap_or_else(|e| e.into_inner());
             match e {
-                JobEvent::Started(p) => h.0 = Some(p),
+                JobEvent::Started(p, _) => h.0 = Some(p),
                 JobEvent::Output(b, _) => h.1.extend_from_slice(b),
                 _ => {}
             }
@@ -1470,7 +1470,8 @@ impl Verifier {
                     &Self::spec("trap '' TERM; sleep 60 & sleep 60 & wait"),
                 )
                 .await
-                .map_err(|e| format!("start: {e}"))?;
+                .map_err(|e| format!("start: {e}"))?
+                .pgid;
             tokio::time::sleep(Duration::from_millis(300)).await;
             if !self.group_alive(pgid).await? {
                 return Err("the job was not running".to_string());
@@ -1521,13 +1522,15 @@ impl Verifier {
                 mine.push(
                     jobs.start_kept(&a, &JobId::fresh(), &Self::spec("sleep 60"))
                         .await
-                        .map_err(|e| format!("start: {e}"))?,
+                        .map_err(|e| format!("start: {e}"))?
+                        .pgid,
                 );
             }
             let theirs = jobs
                 .start_kept(&b, &JobId::fresh(), &Self::spec("sleep 60"))
                 .await
-                .map_err(|e| format!("start: {e}"))?;
+                .map_err(|e| format!("start: {e}"))?
+                .pgid;
             let (la, lb) = (
                 jobs.list(&a).await.map_err(|e| e.to_string())?,
                 jobs.list(&b).await.map_err(|e| e.to_string())?,

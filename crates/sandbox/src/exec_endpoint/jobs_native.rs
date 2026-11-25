@@ -13,7 +13,8 @@ use serde_json::{Value, json};
 use super::HttpExecRunner;
 use super::jobs::{
     EventSink, JOB_SIGNALS, JobEnd, JobError, JobEvent, JobId, JobInfo, JobNotify, JobOp, JobScope,
-    JobSpec, JobStatus, PtyInfo, PtySize, ReadChunk, SandboxJobs, StdinWritten, Stream, WRITE_MAX,
+    JobSpec, JobStatus, PtyInfo, PtySize, ReadChunk, Removal, SandboxJobs, Started, StdinWritten,
+    Stream, WRITE_MAX,
 };
 use super::stream::{FrameReader, silence_limit};
 
@@ -86,7 +87,7 @@ impl SandboxJobs for HttpJobs {
         scope: &JobScope,
         id: &JobId,
         spec: &JobSpec,
-    ) -> std::io::Result<u32> {
+    ) -> std::io::Result<Started> {
         dispatch!(self, start_kept(scope, id, spec))
     }
 
@@ -98,6 +99,18 @@ impl SandboxJobs for HttpJobs {
         events: EventSink<'_>,
     ) -> std::io::Result<JobEnd> {
         dispatch!(self, follow(scope, id, from, events))
+    }
+
+    async fn follow_marked(
+        &self,
+        scope: &JobScope,
+        id: &JobId,
+        from: u64,
+        mark: Option<&str>,
+        output: bool,
+        events: EventSink<'_>,
+    ) -> std::io::Result<JobEnd> {
+        dispatch!(self, follow_marked(scope, id, from, mark, output, events))
     }
 
     async fn read(
@@ -179,8 +192,13 @@ impl SandboxJobs for HttpJobs {
         dispatch!(self, signal(scope, ids, signal))
     }
 
-    async fn remove(&self, scope: &JobScope, ids: &[JobId]) -> std::io::Result<()> {
-        dispatch!(self, remove(scope, ids))
+    async fn remove(
+        &self,
+        scope: &JobScope,
+        ids: &[JobId],
+        marks: &[(JobId, String)],
+    ) -> std::io::Result<Removal> {
+        dispatch!(self, remove(scope, ids, marks))
     }
 
     async fn wipe(&self, scope: &JobScope) -> std::io::Result<Vec<String>> {
@@ -252,9 +270,11 @@ impl<'a> NativeJobs<'a> {
         (stdin_open, pty): (bool, bool),
         beat: Option<u32>,
         op: JobOp,
+        attach: bool,
         events: EventSink<'_>,
     ) -> std::io::Result<JobEnd> {
         check_beat(beat)?;
+        let mut first = true;
         let resp = self
             .runner
             .send_env_beat(
@@ -282,8 +302,19 @@ impl<'a> NativeJobs<'a> {
                     "the stream ended before the job's final frame".into(),
                 ));
             };
-            match decode_job_frame(&line).map_err(broken)? {
-                JobFrame::Event(Event::Started(pgid, stdin, echoed)) => {
+            let frame = decode_job_frame(&line).map_err(broken)?;
+            if attach && first && frame != JobFrame::Heartbeat {
+                first = false;
+                // An attach is answered `attached` first; an endpoint that predates marks streams.
+                if !matches!(
+                    frame,
+                    JobFrame::Event(Event::Attached(..)) | JobFrame::Error(_)
+                ) {
+                    return Err(predates("job marks"));
+                }
+            }
+            match frame {
+                JobFrame::Event(Event::Started(pgid, mark, stdin, echoed)) => {
                     // An endpoint that predates job stdin ignores the flag and says nothing:
                     // the job it started would read EOF. Not a job to leave running.
                     if stdin_open && !stdin {
@@ -293,7 +324,15 @@ impl<'a> NativeJobs<'a> {
                     if pty && echoed.is_none() {
                         return Err(predates("job terminals"));
                     }
-                    events(JobEvent::Started(pgid));
+                    // The first frame of a held start names the incarnation; an endpoint that
+                    // predates marks says nothing.
+                    let Some(mark) = mark else {
+                        return Err(predates("job marks"));
+                    };
+                    events(JobEvent::Started(pgid, &mark));
+                }
+                JobFrame::Event(Event::Attached(mark, from)) => {
+                    events(JobEvent::Attached { mark: &mark, from });
                 }
                 JobFrame::Event(Event::Output(b, s)) => events(JobEvent::Output(&b, s)),
                 JobFrame::Event(Event::Gap(n)) => events(JobEvent::Gap(n)),
@@ -331,6 +370,7 @@ impl NativeJobs<'_> {
             (spec.stdin_open, spec.pty.is_some()),
             beat,
             JobOp::Start,
+            false,
             events,
         )
         .await
@@ -345,11 +385,30 @@ impl NativeJobs<'_> {
         beat: Option<u32>,
         events: EventSink<'_>,
     ) -> std::io::Result<JobEnd> {
-        let job = Self::op(
-            "attach",
-            scope,
-            json!({ "id": id.as_str(), "offset": from }),
-        );
+        self.follow_opts(scope, id, from, None, true, beat, events)
+            .await
+    }
+
+    /// [`SandboxJobs::follow`] naming the incarnation it means (`mark`: a job of another mark is
+    /// [`JobError::Gone`], and nothing is streamed) and whether to carry output (`false`: a status-only
+    /// attach, which starts at the job's current end). The first event is [`JobEvent::Attached`]; an
+    /// endpoint that does not say it predates marks.
+    #[allow(clippy::too_many_arguments)] // the request's parts, each used once
+    pub async fn follow_opts(
+        &self,
+        scope: &JobScope,
+        id: &JobId,
+        from: u64,
+        mark: Option<&str>,
+        output: bool,
+        beat: Option<u32>,
+        events: EventSink<'_>,
+    ) -> std::io::Result<JobEnd> {
+        let mut extra = json!({ "id": id.as_str(), "offset": from, "output": output });
+        if let Some(m) = mark {
+            extra["mark"] = json!(m);
+        }
+        let job = Self::op("attach", scope, extra);
         self.stream(
             INERT,
             &[],
@@ -359,6 +418,7 @@ impl NativeJobs<'_> {
             (false, false),
             beat,
             JobOp::Other,
+            true,
             events,
         )
         .await
@@ -436,7 +496,7 @@ impl SandboxJobs for NativeJobs<'_> {
         scope: &JobScope,
         id: &JobId,
         spec: &JobSpec,
-    ) -> std::io::Result<u32> {
+    ) -> std::io::Result<Started> {
         let job = Self::start_op(scope, id, false, spec);
         let resp = self
             .runner
@@ -470,6 +530,10 @@ impl SandboxJobs for NativeJobs<'_> {
             let _ = self.kill(scope, std::slice::from_ref(id), true).await;
             return Err(predates("job terminals"));
         }
+        let mark = answer
+            .as_ref()
+            .and_then(|v| v.get("mark")?.as_str())
+            .map(str::to_string);
         let started = answer
             .and_then(|v| v.get("started")?.as_u64())
             .ok_or_else(|| {
@@ -478,11 +542,13 @@ impl SandboxJobs for NativeJobs<'_> {
                     String::from_utf8_lossy(&body[..body.len().min(200)])
                 ))
             })?;
-        u32::try_from(started).map_err(|_| {
+        let pgid = u32::try_from(started).map_err(|_| {
             std::io::Error::other(format!(
                 "unreadable job answer: the endpoint reported an out-of-range job start: {started}"
             ))
-        })
+        })?;
+        let mark = mark.ok_or_else(|| predates("job marks"))?;
+        Ok(Started { pgid, mark })
     }
 
     async fn follow(
@@ -493,6 +559,19 @@ impl SandboxJobs for NativeJobs<'_> {
         events: EventSink<'_>,
     ) -> std::io::Result<JobEnd> {
         self.follow_beat(scope, id, from, None, events).await
+    }
+
+    async fn follow_marked(
+        &self,
+        scope: &JobScope,
+        id: &JobId,
+        from: u64,
+        mark: Option<&str>,
+        output: bool,
+        events: EventSink<'_>,
+    ) -> std::io::Result<JobEnd> {
+        self.follow_opts(scope, id, from, mark, output, None, events)
+            .await
     }
 
     async fn read(
@@ -673,14 +752,39 @@ impl SandboxJobs for NativeJobs<'_> {
             .collect())
     }
 
-    async fn remove(&self, scope: &JobScope, ids: &[JobId]) -> std::io::Result<()> {
+    async fn remove(
+        &self,
+        scope: &JobScope,
+        ids: &[JobId],
+        marks: &[(JobId, String)],
+    ) -> std::io::Result<Removal> {
         if ids.is_empty() {
-            return Ok(());
+            return Ok(Removal::default());
         }
-        let ids: Vec<&str> = ids.iter().map(JobId::as_str).collect();
-        self.call(Self::op("remove", scope, json!({ "ids": ids })))
-            .await
-            .map(drop)
+        let names: Vec<&str> = ids.iter().map(JobId::as_str).collect();
+        let marks: serde_json::Map<String, Value> = marks
+            .iter()
+            .map(|(i, m)| (i.as_str().to_string(), json!(m)))
+            .collect();
+        let v = self
+            .call(Self::op(
+                "remove",
+                scope,
+                json!({ "ids": names, "marks": marks }),
+            ))
+            .await?;
+        // An endpoint that predates marks answers `{}`: it removed on its own terms.
+        let list = |k: &str| -> std::io::Result<Vec<JobId>> {
+            let a = v
+                .get(k)
+                .and_then(Value::as_array)
+                .ok_or_else(|| predates("job marks"))?;
+            Ok(a.iter().filter_map(|i| JobId::parse(i.as_str()?)).collect())
+        };
+        Ok(Removal {
+            running: list("running")?,
+            mismatch: list("mismatch")?,
+        })
     }
 
     async fn wipe(&self, scope: &JobScope) -> std::io::Result<Vec<String>> {
@@ -702,17 +806,27 @@ pub enum JobFrame {
 /// A job stream's non-final news, owned.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Event {
-    /// The job's process group, whether it was started with its stdin open (the echo of
+    /// The job's process group, its mark, whether it was started with its stdin open (the echo of
     /// `stdin_open`) and the terminal's size (the echo of `pty`).
-    Started(u32, bool, Option<PtySize>),
+    Started(u32, Option<String>, bool, Option<PtySize>),
+    /// An attach's answer: the job's mark and the offset the stream starts at.
+    Attached(String, u64),
     Output(Vec<u8>, Stream),
     Gap(u64),
     ShellExit(i32),
 }
 
 #[derive(Deserialize)]
+struct WireAttached {
+    mark: String,
+    from: u64,
+}
+
+#[derive(Deserialize)]
 struct WireJobFrame {
     started: Option<u64>,
+    mark: Option<String>,
+    attached: Option<WireAttached>,
     #[serde(default)]
     stdin: bool,
     pty: Option<Value>,
@@ -750,10 +864,12 @@ pub fn decode_job_frame(line: &[u8]) -> Result<JobFrame, String> {
     // (the signal sum) and never a truncated status.
     Ok(if let Some(e) = w.error {
         JobFrame::Error(e)
+    } else if let Some(a) = w.attached {
+        JobFrame::Event(Event::Attached(a.mark, a.from))
     } else if let Some(p) = w.started {
         let p = u32::try_from(p).map_err(|_| wire_out_of_range("started", p))?;
         let pty = w.pty.as_ref().and_then(parse_pty);
-        JobFrame::Event(Event::Started(p, w.stdin, pty))
+        JobFrame::Event(Event::Started(p, w.mark, w.stdin, pty))
     } else if let Some(s) = w.stdout.as_deref() {
         JobFrame::Event(Event::Output(b64(s)?, Stream::Stdout))
     } else if let Some(s) = w.stderr.as_deref() {
@@ -907,7 +1023,7 @@ fn predates(what: &str) -> std::io::Error {
     )
 }
 
-/// A `list` answer: `{"jobs": [{"id", "state", "code", "signal"?, "kept", "num", "kind", "seen", "started",
+/// A `list` answer: `{"jobs": [{"id", "mark", "command", "args", "outputStart", "outputEnd", "state", "code", "signal"?, "kept", "num", "kind", "seen", "started",
 /// "ended", "label"}]}`. A job whose id is not one is skipped, never followed.
 pub fn parse_list(v: &Value) -> std::io::Result<Vec<JobInfo>> {
     let jobs = v
@@ -929,8 +1045,26 @@ pub fn parse_list(v: &Value) -> std::io::Result<Vec<JobInfo>> {
         };
         let signal = signal_field(j, status)?;
         let num = |k: &str| j.get(k).and_then(Value::as_u64);
+        let text = |k: &str| j.get(k).and_then(Value::as_str).map(str::to_string);
+        // An endpoint that predates marks says none: its list is not trusted.
+        let (Some(mark), Some(command), Some(args)) = (
+            text("mark"),
+            text("command"),
+            j.get("args").and_then(Value::as_array).map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+            }),
+        ) else {
+            return Err(predates("job marks"));
+        };
         out.push(JobInfo {
             id,
+            mark,
+            command,
+            args,
+            output_start: num("outputStart").unwrap_or(0),
+            output_end: num("outputEnd").unwrap_or(0),
             status,
             signal,
             kept: j.get("kept").and_then(Value::as_bool).unwrap_or(false),
@@ -1108,6 +1242,7 @@ mod tests {
             echoed,
             Ok(JobFrame::Event(Event::Started(
                 7,
+                None,
                 true,
                 PtySize::new(80, 24)
             )))
@@ -1120,7 +1255,7 @@ mod tests {
         ] {
             assert_eq!(
                 decode_job_frame(bad.as_bytes()),
-                Ok(JobFrame::Event(Event::Started(7, true, None))),
+                Ok(JobFrame::Event(Event::Started(7, None, true, None))),
                 "{bad}"
             );
         }
@@ -1136,9 +1271,18 @@ mod tests {
 
     #[test]
     fn list_and_read_report_the_terminal_of_a_terminal_job_only() {
+        let base =
+            json!({"mark": "m", "command": "sh", "args": [], "outputStart": 0, "outputEnd": 0});
+        let with = |extra: Value| {
+            let mut v = base.clone();
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            v
+        };
         let list = json!({"jobs": [
-            {"id": "aa", "state": "running", "pty": {"cols": 120, "rows": 40, "open": true}},
-            {"id": "bb", "state": "running"},
+            with(json!({"id": "aa", "state": "running", "pty": {"cols": 120, "rows": 40, "open": true}})),
+            with(json!({"id": "bb", "state": "running"})),
         ]});
         let jobs = parse_list(&list).unwrap();
         assert_eq!(

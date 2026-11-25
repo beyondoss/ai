@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use crate::exec::{ChunkSink, CommandRunner, ExecOutput, ExecResult};
 use crate::exec_endpoint::HttpExecRunner;
-use crate::exec_endpoint::jobs::{JobId, JobScope, JobSpec, SandboxJobs};
+use crate::exec_endpoint::jobs::{JobId, JobScope, JobSpec, SandboxJobs, Started};
 use crate::fs::shell::ShellFs;
 use crate::token::TokenSource;
 
@@ -99,8 +99,8 @@ impl StartJob<'_> {
         self
     }
 
-    /// Start the kept job; returns its process group once it runs.
-    pub async fn run(self) -> std::io::Result<u32> {
+    /// Start the kept job; returns its process group and mark once it runs.
+    pub async fn run(self) -> std::io::Result<Started> {
         self.jobs.start_kept(self.scope, self.id, &self.spec).await
     }
 }

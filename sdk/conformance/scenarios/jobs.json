@@ -1811,7 +1811,7 @@
     },
     {
       "id": "jobs.id.is-validated-by-the-client",
-      "description": "A job id is 1 to 32 characters of [0-9a-z]; anything else is refused before any request is sent.",
+      "description": "A job id is 1 to 64 characters of [0-9a-z_-]; anything else is refused before any request is sent.",
       "steps": [
         {
           "id": "upper",
@@ -1859,7 +1859,7 @@
           "id": "long",
           "op": "job_start",
           "scope": "${SCOPE}",
-          "job": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "job": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
           "command": "true",
           "args": [],
           "label": "",
@@ -3489,7 +3489,7 @@
     },
     {
       "id": "jobs.options.a-held-job-dies-with-its-stream",
-      "description": "hold: true ties the job to the stream that started it: closing the stream before the job ends and before keep kills its group.",
+      "description": "hold: true ties the job to the stream that started it: closing the stream before the job ends and before keep kills its group. The endpoint may learn of the close only at its next heartbeat write (a proxy between does not forward it), and the spec bounds that at two heartbeats; the start asks for a 1 s heartbeat so the bound is under the 8 s the check waits.",
       "requires": {
         "features": [
           "job_options"
@@ -3500,6 +3500,7 @@
           "id": "start",
           "op": "job_start_held",
           "scope": "${SCOPE}",
+          "heartbeat_seconds": 1,
           "job": "oo04",
           "command": "sh",
           "args": [
@@ -3814,6 +3815,790 @@
       ]
     },
     {
+      "id": "jobs.id.dash-and-underscore-are-allowed",
+      "description": "A job id may hold `-` and `_`, and be 64 characters long: the job starts and is listed under that id.",
+      "requires": {
+        "features": [
+          "job_marks"
+        ]
+      },
+      "steps": [
+        {
+          "id": "dash",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "a-b_c",
+          "command": "true",
+          "args": [],
+          "label": "",
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              },
+              "mark": {
+                "$re": "^[0-9a-f]+$"
+              }
+            }
+          }
+        },
+        {
+          "id": "long",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+          "command": "true",
+          "args": [],
+          "label": "",
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              },
+              "mark": {
+                "$re": "^[0-9a-f]+$"
+              }
+            }
+          }
+        },
+        {
+          "id": "listed",
+          "op": "job_list",
+          "scope": "${SCOPE}",
+          "expect": {
+            "ok": {
+              "jobs": {
+                "$includes": [
+                  {
+                    "id": "a-b_c"
+                  },
+                  {
+                    "id": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.mark.start-and-list-agree",
+      "description": "start answers the job's mark; list reports the same mark, the command and its arguments, and the window of output the sandbox holds.",
+      "requires": {
+        "features": [
+          "job_marks"
+        ]
+      },
+      "steps": [
+        {
+          "id": "start",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "mk01",
+          "command": "sh",
+          "args": [
+            "-c",
+            "printf hello"
+          ],
+          "label": "",
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              },
+              "mark": {
+                "$re": "^[0-9a-f]+$"
+              }
+            }
+          },
+          "save": {
+            "mark": "mark"
+          }
+        },
+        {
+          "id": "ended",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "mk01",
+          "offset": 0,
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          },
+          "expect": {
+            "ok": {
+              "state": "ended"
+            }
+          }
+        },
+        {
+          "id": "listed",
+          "op": "job_list",
+          "scope": "${SCOPE}",
+          "expect": {
+            "ok": {
+              "jobs": {
+                "$includes": [
+                  {
+                    "id": "mk01",
+                    "mark": "${mark}",
+                    "command": "sh",
+                    "args": [
+                      "-c",
+                      "printf hello"
+                    ],
+                    "output_start": 0,
+                    "output_end": 5
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.mark.a-reused-id-has-a-new-mark",
+      "description": "Removing a job and starting its id again is a new incarnation: it has a mark of its own.",
+      "requires": {
+        "features": [
+          "job_marks"
+        ]
+      },
+      "steps": [
+        {
+          "id": "first",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "mk02",
+          "command": "true",
+          "args": [],
+          "label": "",
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              },
+              "mark": {
+                "$re": "^[0-9a-f]+$"
+              }
+            }
+          },
+          "save": {
+            "first": "mark"
+          }
+        },
+        {
+          "id": "ended",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "mk02",
+          "offset": 0,
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          },
+          "expect": {
+            "ok": {
+              "state": "ended"
+            }
+          }
+        },
+        {
+          "id": "remove",
+          "op": "job_remove",
+          "scope": "${SCOPE}",
+          "jobs": [
+            "mk02"
+          ],
+          "expect": {
+            "ok": {
+              "running": [],
+              "mismatch": []
+            }
+          }
+        },
+        {
+          "id": "second",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "mk02",
+          "command": "true",
+          "args": [],
+          "label": "",
+          "expect": {
+            "ok": {
+              "mark": {
+                "$not": "${first}"
+              }
+            }
+          },
+          "save": {
+            "second": "mark"
+          }
+        },
+        {
+          "id": "listed",
+          "op": "job_list",
+          "scope": "${SCOPE}",
+          "expect": {
+            "ok": {
+              "jobs": {
+                "$includes": [
+                  {
+                    "id": "mk02",
+                    "mark": "${second}"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.mark.attach-echoes-its-mark-and-start",
+      "description": "attach answers first with the job's mark and the offset it starts at, whether or not the request named the mark.",
+      "requires": {
+        "features": [
+          "job_marks"
+        ]
+      },
+      "steps": [
+        {
+          "id": "start",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "mk03",
+          "command": "sh",
+          "args": [
+            "-c",
+            "printf hello"
+          ],
+          "label": "",
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              },
+              "mark": {
+                "$re": "^[0-9a-f]+$"
+              }
+            }
+          },
+          "save": {
+            "mark": "mark"
+          }
+        },
+        {
+          "id": "ended",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "mk03",
+          "offset": 0,
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          },
+          "expect": {
+            "ok": {
+              "state": "ended"
+            }
+          }
+        },
+        {
+          "id": "plain",
+          "op": "job_attach",
+          "scope": "${SCOPE}",
+          "job": "mk03",
+          "offset": 0,
+          "expect": {
+            "ok": {
+              "attached": {
+                "mark": "${mark}",
+                "from": 0
+              },
+              "output_utf8": "hello",
+              "exit_code": 0
+            }
+          }
+        },
+        {
+          "id": "named",
+          "op": "job_attach",
+          "scope": "${SCOPE}",
+          "job": "mk03",
+          "offset": 3,
+          "mark": "${mark}",
+          "expect": {
+            "ok": {
+              "attached": {
+                "mark": "${mark}",
+                "from": 3
+              },
+              "output_utf8": "lo",
+              "exit_code": 0
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.mark.attach-never-streams-a-later-incarnation",
+      "description": "An attach that names the mark of a removed job streams nothing of the job that reused its id: it is job_gone. The same attach with the later job's mark streams it.",
+      "requires": {
+        "features": [
+          "job_marks"
+        ]
+      },
+      "steps": [
+        {
+          "id": "first",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "mk04",
+          "command": "sh",
+          "args": [
+            "-c",
+            "printf first"
+          ],
+          "label": "",
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              },
+              "mark": {
+                "$re": "^[0-9a-f]+$"
+              }
+            }
+          },
+          "save": {
+            "old": "mark"
+          }
+        },
+        {
+          "id": "ended1",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "mk04",
+          "offset": 0,
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          },
+          "expect": {
+            "ok": {
+              "state": "ended"
+            }
+          }
+        },
+        {
+          "id": "remove",
+          "op": "job_remove",
+          "scope": "${SCOPE}",
+          "jobs": [
+            "mk04"
+          ],
+          "expect": {
+            "ok": {
+              "running": [],
+              "mismatch": []
+            }
+          }
+        },
+        {
+          "id": "second",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "mk04",
+          "command": "sh",
+          "args": [
+            "-c",
+            "printf second"
+          ],
+          "label": "",
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              },
+              "mark": {
+                "$re": "^[0-9a-f]+$"
+              }
+            }
+          },
+          "save": {
+            "new": "mark"
+          }
+        },
+        {
+          "id": "ended2",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "mk04",
+          "offset": 0,
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          },
+          "expect": {
+            "ok": {
+              "state": "ended"
+            }
+          }
+        },
+        {
+          "id": "stale",
+          "op": "job_attach",
+          "scope": "${SCOPE}",
+          "job": "mk04",
+          "offset": 0,
+          "mark": "${old}",
+          "expect": {
+            "error": {
+              "kind": "not_found"
+            }
+          }
+        },
+        {
+          "id": "current",
+          "op": "job_attach",
+          "scope": "${SCOPE}",
+          "job": "mk04",
+          "offset": 0,
+          "mark": "${new}",
+          "expect": {
+            "ok": {
+              "attached": {
+                "mark": "${new}",
+                "from": 0
+              },
+              "output_utf8": "second",
+              "exit_code": 0
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.mark.status-only-attach",
+      "description": "output:false follows a job to its end and sends no output: attached.from is the end of what the sandbox held at the attach, and bytes written afterwards are not sent either.",
+      "requires": {
+        "features": [
+          "job_marks"
+        ]
+      },
+      "steps": [
+        {
+          "id": "start",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "mk05",
+          "command": "sh",
+          "args": [
+            "-c",
+            "printf hello; sleep 1; printf later"
+          ],
+          "label": "",
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              },
+              "mark": {
+                "$re": "^[0-9a-f]+$"
+              }
+            }
+          },
+          "save": {
+            "mark": "mark"
+          }
+        },
+        {
+          "id": "first-bytes",
+          "op": "job_list",
+          "scope": "${SCOPE}",
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          },
+          "expect": {
+            "ok": {
+              "jobs": {
+                "$includes": [
+                  {
+                    "id": "mk05",
+                    "output_end": {
+                      "$gte": 5
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "id": "status",
+          "op": "job_attach",
+          "scope": "${SCOPE}",
+          "job": "mk05",
+          "output": false,
+          "mark": "${mark}",
+          "expect": {
+            "ok": {
+              "attached": {
+                "mark": "${mark}",
+                "from": {
+                  "$gte": 5
+                }
+              },
+              "output_len": 0,
+              "gap": 0,
+              "exit_code": 0
+            }
+          }
+        },
+        {
+          "id": "all-output",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "mk05",
+          "offset": 0,
+          "expect": {
+            "ok": {
+              "data_utf8": {
+                "$re": "^hello(later)?$"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.mark.remove-reports-what-it-skipped",
+      "description": "remove leaves a running job and reports it as running; a job whose mark is not the one named is left and reported as a mismatch; an id with no job is in neither. Naming the right mark removes it.",
+      "requires": {
+        "features": [
+          "job_marks"
+        ]
+      },
+      "steps": [
+        {
+          "id": "run",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "mk06",
+          "command": "sleep",
+          "args": [
+            "30"
+          ],
+          "label": "",
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              },
+              "mark": {
+                "$re": "^[0-9a-f]+$"
+              }
+            }
+          },
+          "save": {
+            "run": "mark"
+          }
+        },
+        {
+          "id": "done",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "mk07",
+          "command": "true",
+          "args": [],
+          "label": "",
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              },
+              "mark": {
+                "$re": "^[0-9a-f]+$"
+              }
+            }
+          },
+          "save": {
+            "done": "mark"
+          }
+        },
+        {
+          "id": "ended",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "mk07",
+          "offset": 0,
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          },
+          "expect": {
+            "ok": {
+              "state": "ended"
+            }
+          }
+        },
+        {
+          "id": "skip",
+          "op": "job_remove",
+          "scope": "${SCOPE}",
+          "jobs": [
+            "mk06",
+            "mk07",
+            "nojob"
+          ],
+          "expect": {
+            "ok": {
+              "running": [
+                "mk06"
+              ],
+              "mismatch": [
+                "mk07"
+              ]
+            }
+          },
+          "marks": {
+            "mk07": "${run}"
+          }
+        },
+        {
+          "id": "both-remain",
+          "op": "job_list",
+          "scope": "${SCOPE}",
+          "expect": {
+            "ok": {
+              "jobs": {
+                "$includes": [
+                  {
+                    "id": "mk06"
+                  },
+                  {
+                    "id": "mk07"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "id": "retry",
+          "op": "job_remove",
+          "scope": "${SCOPE}",
+          "jobs": [
+            "mk07"
+          ],
+          "expect": {
+            "ok": {
+              "running": [],
+              "mismatch": []
+            }
+          },
+          "marks": {
+            "mk07": "${done}"
+          }
+        },
+        {
+          "id": "done-gone",
+          "op": "job_list",
+          "scope": "${SCOPE}",
+          "expect": {
+            "ok": {
+              "jobs": {
+                "$len": 1
+              }
+            }
+          }
+        },
+        {
+          "id": "cleanup",
+          "op": "job_kill",
+          "scope": "${SCOPE}",
+          "jobs": [
+            "mk06"
+          ],
+          "remove": true,
+          "expect": {
+            "ok": {}
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs.mark.held-start-says-its-mark",
+      "description": "A held start's first frame carries the job's mark, the one list reports.",
+      "requires": {
+        "features": [
+          "job_marks",
+          "job_options"
+        ]
+      },
+      "steps": [
+        {
+          "id": "start",
+          "op": "job_start_held",
+          "scope": "${SCOPE}",
+          "job": "mk08",
+          "command": "sh",
+          "args": [
+            "-c",
+            "sleep 30"
+          ],
+          "keep": true,
+          "save": {
+            "mark": "mark"
+          },
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              },
+              "mark": {
+                "$re": "^[0-9a-f]+$"
+              }
+            }
+          }
+        },
+        {
+          "id": "listed",
+          "op": "job_list",
+          "scope": "${SCOPE}",
+          "expect": {
+            "ok": {
+              "jobs": {
+                "$includes": [
+                  {
+                    "id": "mk08",
+                    "mark": "${mark}"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "id": "cleanup",
+          "op": "job_kill",
+          "scope": "${SCOPE}",
+          "jobs": [
+            "mk08"
+          ],
+          "remove": true,
+          "expect": {
+            "ok": {}
+          }
+        }
+      ]
+    },
+    {
       "id": "jobs.pty.start-is-a-terminal",
       "description": "A job started with `pty` runs with a terminal on stdin, stdout and stderr at the size asked for, the start answer echoes the terminal, and `read` reports it.",
       "requires": {
@@ -4016,7 +4801,10 @@
           "scope": "${SCOPE}",
           "job": "pt04",
           "command": "sh",
-          "args": ["-c", "exec env PS1= sh"],
+          "args": [
+            "-c",
+            "exec env PS1= sh"
+          ],
           "pty": {
             "cols": 80,
             "rows": 24
@@ -4838,7 +5626,10 @@
           "scope": "${SCOPE}",
           "job": "pt12",
           "command": "sh",
-          "args": ["-c", "exec env PS1= sh"],
+          "args": [
+            "-c",
+            "exec env PS1= sh"
+          ],
           "pty": {
             "cols": 80,
             "rows": 24
@@ -5181,7 +5972,10 @@
           "scope": "${SCOPE}",
           "job": "pt15",
           "command": "sh",
-          "args": ["-c", "exec env PS1= sh"],
+          "args": [
+            "-c",
+            "exec env PS1= sh"
+          ],
           "pty": {
             "cols": 80,
             "rows": 24
@@ -5359,7 +6153,10 @@
           "scope": "${SCOPE}",
           "job": "pt16",
           "command": "sh",
-          "args": ["-c", "exec env PS1= sh"],
+          "args": [
+            "-c",
+            "exec env PS1= sh"
+          ],
           "pty": {
             "cols": 80,
             "rows": 24

@@ -44,7 +44,7 @@ pub struct K {
     /// retried across a restart of execd is still applied once.
     pub written: u64,
     pub size: Size,
-    /// The spool could not be written: the output is no longer kept, so the terminal ends (M6).
+    /// The spool could not be written: the output is no longer kept, so the terminal ends (Q6).
     pub failed: bool,
 }
 
@@ -98,7 +98,7 @@ pub struct KAct {
 /// status, so the reader sees why.
 pub const SPOOL_FAILED_CODE: i32 = 74;
 
-/// M6: the status the keeper writes and tells (`(code, signal)`), once the shell is reaped: the shell's
+/// Q6: the status the keeper writes and tells (`(code, signal)`), once the shell is reaped: the shell's
 /// own, or [`SPOOL_FAILED_CODE`] with no signal if the spool failed, whatever the shell did.
 pub fn exit_status(k: &K) -> (r: Option<(i32, Option<i32>)>)
     ensures
@@ -172,7 +172,7 @@ pub fn step(k: &mut K, ev: KEv) -> (act: KAct)
             && act.set_size == Some(ev->Resize_size)),
         !(ev is Resize) ==> final(k).size == old(k).size,
         act.set_size is Some ==> (ev is Resize && crate::in_bounds(ev->Resize_size)),
-        // M6: a spool that failed is final, and the shell it fed is killed, once, in that very step.
+        // Q6: a spool that failed is final, and the shell it fed is killed, once, in that very step.
         ev is SpoolFailed ==> final(k).failed,
         old(k).failed ==> final(k).failed,
         !(ev is SpoolFailed) ==> final(k).failed == old(k).failed,

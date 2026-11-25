@@ -99,10 +99,21 @@ description = "A terminal's keeper in a release build: 30 idle keepers, each und
 run = "cargo test --release -p beyond-execd --locked --test keeper_size -- --nocapture"
 
 [tasks."verify:execd-jobs-term-mutants"]
-description = "crates/execd-jobs under each terminal and keeper mut_* feature (T1 to T14, P1, M1, K1, K2, M6): every proof must go red (a Verus verification failure, not a build error). Pairs with `verify:kernels`, which must be green without a feature."
+description = "crates/execd-jobs under each terminal and keeper mut_* feature (T1 to T14, P1, Q1, K1, K2, Q6): every proof must go red (a Verus verification failure, not a build error). Pairs with `verify:kernels`, which must be green without a feature."
 run = '''
 set -u
 for m in mut_resize_ended mut_resize_lost_while_spawning mut_size_unbounded mut_size_off_by_one mut_pty_err_sink mut_pty_kill_group_only mut_pty_eof_closes mut_gate_refuses_open mut_write_after_hangup mut_end_keeps_terminal mut_recover_hangs_up_live_terminal mut_recover_opens_silent_terminal mut_recover_drops_status mut_exit_before_drain mut_keeper_waits_forever mut_keeper_exits_unasked mut_keeper_reconnect_resets_written mut_admit_any_peer mut_pty_cap_ignored mut_keeper_no_pty_is_500 mut_keeper_answer_unchecked mut_resize_not_idempotent mut_spool_failure_silent mut_spool_failure_keeps_code mut_hangup_keeps_terminal; do
+  out=$(KERNEL_CRATES=crates/execd-jobs .github/scripts/verify-kernels.sh --features "$m" 2>&1) && { echo "proof stayed green under $m" >&2; exit 1; }
+  line=$(grep -E "verification results:: .* [1-9][0-9]* errors" <<<"$out") || { echo "$m: failed without a Verus verification result (build error?)" >&2; exit 1; }
+  echo "red under $m: $line"
+done
+'''
+
+[tasks."verify:execd-jobs-mark-mutants"]
+description = "crates/execd-jobs under each of the mut_* features of the mark on the wire (I1, I2, I1-live, M1 to M7, one each): every proof must go red (a Verus verification failure, not a build error). Pairs with `verify:kernels`, which must be green without a feature."
+run = '''
+set -u
+for m in mut_id_length_unbounded mut_id_any_byte mut_id_rejects_dash mut_mark_ignored mut_mark_refuses mut_remove_ignores_mark mut_remove_never_takes mut_running_unreported mut_attach_ignores_mark mut_attach_refuses mut_attach_offset_shifted mut_status_only_streams mut_status_only_sends; do
   out=$(KERNEL_CRATES=crates/execd-jobs .github/scripts/verify-kernels.sh --features "$m" 2>&1) && { echo "proof stayed green under $m" >&2; exit 1; }
   line=$(grep -E "verification results:: .* [1-9][0-9]* errors" <<<"$out") || { echo "$m: failed without a Verus verification result (build error?)" >&2; exit 1; }
   echo "red under $m: $line"

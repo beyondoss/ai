@@ -39,6 +39,9 @@
 // The code inside `verus!` takes the shapes Verus can prove (a `match` where `matches!` reads better, an
 // explicit subtraction guard, a mutation's `cfg!` branch beside its twin); clippy's rewrites are not those.
 #![allow(
+    clippy::nonminimal_bool,
+    clippy::len_zero,
+    clippy::manual_range_contains,
     clippy::match_like_matches_macro,
     clippy::if_same_then_else,
     clippy::implicit_saturating_sub,
@@ -1198,7 +1201,7 @@ pub open spec fn cap_refuses(open: u64, max: Option<u64>) -> bool {
     max is Some && open > max.unwrap()
 }
 
-/// M1: a start is refused `NoPty` (503) exactly when a cap on open terminals is set and the terminals
+/// Q1: a start is refused `NoPty` (503) exactly when a cap on open terminals is set and the terminals
 /// open, the start's own included, are more than it. Never `Failed`.
 pub fn pty_cap(open: u64, max: Option<u64>) -> (r: Begin)
     ensures
@@ -1211,7 +1214,7 @@ pub fn pty_cap(open: u64, max: Option<u64>) -> (r: Begin)
     }
 }
 
-/// M1-live: each open terminal's end lowers the refusal's rank until it is zero, which is exactly no
+/// Q1-live: each open terminal's end lowers the refusal's rank until it is zero, which is exactly no
 /// refusal: a retried start is admitted once enough terminals have ended (F4: an open terminal ends,
 /// by its job's end or its hangup; the ranking function is how many must).
 pub open spec fn cap_rank(open: u64, max: u64) -> int {
@@ -1228,7 +1231,7 @@ pub proof fn lemma_pty_cap_progress(open: u64, max: u64)
 {
 }
 
-/// M1: a keeper that ended before it answered, with this exit code, is `NoPty` (503) when the code is
+/// Q1: a keeper that ended before it answered, with this exit code, is `NoPty` (503) when the code is
 /// [`NO_PTY_EXIT`] (it found no pseudo-terminal to open) and `Failed` (500) otherwise; never `Go`. The
 /// completeness half: the code that means "no pty" is always 503 (`code == Some(124)`).
 pub fn keeper_ended(code: Option<i32>) -> (r: Begin)
@@ -1784,6 +1787,166 @@ pub fn takes(same: bool) -> (r: bool)
         r == same,
 {
     same || cfg!(feature = "mut_take_by_key")
+}
+
+// ---------------------------------------------------------------------------------------------
+// The mark on the wire: which incarnation of an id a request means, and what an attach starts at.
+// ---------------------------------------------------------------------------------------------
+
+/// A job id's bytes: `[0-9a-z_-]`.
+pub open spec fn id_byte(b: u8) -> bool {
+    (48 <= b && b <= 57) || (97 <= b && b <= 122) || b == 45 || b == 95
+}
+
+/// I1, I2, I1-live: a start's id is 1 to 64 bytes of `[0-9a-z_-]`, and every such id is accepted.
+/// (The sandbox's own clients and the cursor of `crates/job-client` take the same rule.)
+pub fn id_ok(id: &[u8]) -> (r: bool)
+    ensures
+        r ==> (1 <= id@.len() <= 64),
+        r ==> (forall|j: int| 0 <= j < id@.len() ==> id_byte(#[trigger] id@[j])),
+        ((1 <= id@.len() <= 64) && (forall|j: int| 0 <= j < id@.len() ==> id_byte(#[trigger] id@[j]))) ==> r,
+{
+    if (id.len() < 1 || id.len() > 64) && !cfg!(feature = "mut_id_length_unbounded") {
+        return false;
+    }
+    let mut i = 0;
+    while i < id.len()
+        invariant
+            i <= id@.len(),
+            forall|j: int| 0 <= j < i ==> id_byte(#[trigger] id@[j]),
+        decreases id@.len() - i,
+    {
+        let b = id[i];
+        let dash = b == 45 && !cfg!(feature = "mut_id_rejects_dash");
+        if !((48 <= b && b <= 57) || (97 <= b && b <= 122) || dash || b == 95)
+            && !cfg!(feature = "mut_id_any_byte")
+        {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// M1, M1-live: a request that names a mark (`expected`) reaches the job only if it is that
+/// incarnation (`actual`); a request that names none reaches whichever job holds the id. Every
+/// request whose mark is the job's, or that names none, is let through.
+pub fn mark_ok(expected: &Option<String>, actual: &String) -> (r: bool)
+    ensures
+        r ==> (expected is None || expected->Some_0@ == actual@),
+        (expected is None || expected->Some_0@ == actual@) ==> r,
+{
+    match expected {
+        None => true,
+        Some(m) => {
+            if cfg!(feature = "mut_mark_ignored") {
+                true
+            } else if cfg!(feature = "mut_mark_refuses") {
+                false
+            } else {
+                *m == *actual
+            }
+        },
+    }
+}
+
+/// What `remove` does with one named job it found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Removal {
+    /// The job leaves the table.
+    Take,
+    /// It stays: its group is not empty. Reported to the caller (`running`).
+    Running,
+    /// It stays: the request named another incarnation's mark. Reported to the caller (`mismatch`).
+    Mismatch,
+}
+
+/// M2, M2-live, M3: `mark_ok` is whether the request's mark matches the job's; `take` is `step`'s
+/// answer to `Ev::Remove`. A mismatch removes nothing and is reported as a mismatch, whatever
+/// `take` says (M2). A job the request means that may go goes, so a retry with the right mark
+/// removes it (M2-live). A job the request means that may not go is reported as running (M3).
+pub fn removal(mark_ok: bool, take: bool) -> (r: Removal)
+    ensures
+        !mark_ok ==> r is Mismatch,
+        mark_ok && take ==> r is Take,
+        mark_ok && !take ==> r is Running,
+{
+    if !mark_ok && !cfg!(feature = "mut_remove_ignores_mark") {
+        Removal::Mismatch
+    } else if take {
+        if cfg!(feature = "mut_remove_never_takes") {
+            Removal::Running
+        } else {
+            Removal::Take
+        }
+    } else if cfg!(feature = "mut_running_unreported") {
+        Removal::Mismatch
+    } else {
+        Removal::Running
+    }
+}
+
+/// What an attach does with the job it found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Attach {
+    /// 404: the incarnation the request named is not the one holding the id.
+    Refuse,
+    /// Answer `attached{mark, from}` and stream from `from`.
+    Stream { from: u64 },
+}
+
+/// Where a stream stands once it takes `output` into account: an output stream stays at `sent`; a
+/// status-only one (`output: false`) is at the ring's `end`, whatever it was asked to start at: it
+/// skips everything held and everything still to come (M6).
+pub fn quiet_from(output: bool, sent: u64, end: u64) -> (r: u64)
+    ensures
+        output ==> r == sent,
+        !output ==> r == end,
+{
+    if output || cfg!(feature = "mut_status_only_streams") {
+        sent
+    } else {
+        end
+    }
+}
+
+/// M4, M4-live, M5, M6: an attach naming another incarnation is refused (M4); one that does not is
+/// answered, whatever the offset (M4-live). An attach with output starts at the offset it asked
+/// for, and says so (M5); a status-only attach starts at the current end, so there is no gap (M6).
+pub fn attach_plan(mark_ok: bool, output: bool, offset: u64, end: u64) -> (r: Attach)
+    ensures
+        !mark_ok ==> r is Refuse,
+        mark_ok ==> r is Stream,
+        (r is Stream && output) ==> r->Stream_from == offset,
+        (r is Stream && !output) ==> r->Stream_from == end,
+{
+    if !mark_ok && !cfg!(feature = "mut_attach_ignores_mark") {
+        Attach::Refuse
+    } else if cfg!(feature = "mut_attach_refuses") {
+        Attach::Refuse
+    } else if output && cfg!(feature = "mut_attach_offset_shifted") {
+        Attach::Stream { from: end }
+    } else {
+        Attach::Stream { from: quiet_from(output, offset, end) }
+    }
+}
+
+/// M7: what a stream sends next, from where `quiet_from` puts it. A status-only stream (`output:
+/// false`) of a ring `[base, end)` sends neither bytes nor a gap: its next frame is the shell's
+/// exit, the end, or a wait. Returns the stream's position and that frame.
+pub fn stream_next(output: bool, s: &State, sent: u64, base: u64, end: u64, shell_told: bool) -> (r: (u64, Follow))
+    ensures
+        post_follow(*s, r.0, base, end, shell_told, r.1),
+        (!output && base <= end) ==> !(r.1 is Data),
+        (!output && base <= end) ==> !(r.1 is Gap),
+{
+    let at = if !output && cfg!(feature = "mut_status_only_sends") {
+        sent
+    } else {
+        quiet_from(output, sent, end)
+    };
+    let f = follow(s, at, base, end, shell_told);
+    (at, f)
 }
 
 // ---------------------------------------------------------------------------------------------

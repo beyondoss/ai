@@ -1,4 +1,4 @@
-//! The MCP server: one sandbox connection, fourteen tools (sixteen with a local root) and one resource.
+//! The MCP server: one sandbox connection, sixteen tools (eighteen with a local root) and one resource.
 //!
 //! Every tool is a thin mapping from its arguments to one call of [`beyond_sandbox`] (raw exec,
 //! the file helpers, jobs) and from its outcome to a structured result. The connection is made on
@@ -274,7 +274,7 @@ pub struct JobStartArgs {
     cwd: Opt<String>,
     /// A short note shown in `job_list`.
     label: Opt<String>,
-    /// The job's id: 1 to 32 characters of [0-9a-z]. Default: a random one, returned.
+    /// The job's id: 1 to 64 characters of [0-9a-z_-]. Default: a random one, returned.
     id: Opt<String>,
     /// The group the job belongs to. Default: this server's.
     scope: Opt<String>,
@@ -333,6 +333,42 @@ pub struct JobOutputArgs {
     /// always returns base64. The result's `encoding` says which you got.
     encoding: Opt<String>,
     /// The group the job belongs to. Default: this server's.
+    scope: Opt<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct JobAttachArgs {
+    /// The job's id, from `job_start` or `job_list`.
+    id: String,
+    /// The `mark` `job_start` or `job_list` answered. A job of another mark (the id was reused) is
+    /// not found, and nothing is read. Default: whichever job holds the id.
+    mark: Opt<String>,
+    /// Byte offset in the job's combined output to start at. Default 0.
+    offset: Opt<u64>,
+    /// false: only wait for the job's end and report how it ended; no output is carried and
+    /// `from` is where the output ends now. Default true.
+    output: Opt<bool>,
+    /// The longest to wait for the job to end, in milliseconds. Default 30000. At that point the
+    /// call returns what it has with `state` running: call again from `next_offset`.
+    timeout_ms: Opt<u64>,
+    /// The most output bytes to return. Default 131072.
+    max: Opt<u64>,
+    /// `utf8` (default) or `base64`, as for `job_output`.
+    encoding: Opt<String>,
+    /// The group the job belongs to. Default: this server's.
+    scope: Opt<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct JobRemoveArgs {
+    /// The jobs to delete.
+    ids: Vec<String>,
+    /// A job id to the `mark` it must have: a job of another mark is left alone and reported in
+    /// `mismatch`. An id not named here is deleted whatever its mark.
+    marks: Opt<std::collections::BTreeMap<String, String>>,
+    /// The group the jobs belong to. Default: this server's.
     scope: Opt<String>,
 }
 
@@ -433,7 +469,9 @@ fn transfer(t: beyond_sandbox::Transfer) -> Value {
 
 fn job_id(s: &str) -> Result<JobId, ToolError> {
     JobId::parse(s).ok_or_else(|| {
-        ToolError::invalid(format!("bad job id {s:?}: 1 to 32 characters of [0-9a-z]"))
+        ToolError::invalid(format!(
+            "bad job id {s:?}: 1 to 64 characters of [0-9a-z_-]"
+        ))
     })
 }
 
@@ -706,6 +744,29 @@ impl SandboxMcp {
     )]
     async fn job_output(&self, Parameters(a): Parameters<JobOutputArgs>) -> ToolReply {
         Ok(reply(self.do_job_output(a).await))
+    }
+
+    #[tool(
+        name = "job_attach",
+        description = "Wait for a job to end and return its output from an offset, as the sandbox streams it. Names its incarnation: `mark` (from job_start or job_list) makes a job that reused the id not found instead of read. Returns mark and from (where the output starts), then state (ended, or running when timeout_ms passed first), code, signal, content, encoding, next_offset, gap (bytes no longer kept) and stderr_ranges. With output false it only waits and reports how the job ended.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn job_attach(&self, Parameters(a): Parameters<JobAttachArgs>) -> ToolReply {
+        Ok(reply(self.do_job_attach(a).await))
+    }
+
+    #[tool(
+        name = "job_remove",
+        description = "Delete jobs whose processes are gone, with their output. Returns running (ids left because their processes still run) and mismatch (ids left because their job's mark is not the one named in marks). An id with no job is in neither. Use job_kill to stop a running job.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn job_remove(&self, Parameters(a): Parameters<JobRemoveArgs>) -> ToolReply {
+        Ok(reply(self.do_job_remove(a).await))
     }
 
     #[tool(
@@ -1100,8 +1161,8 @@ impl SandboxMcp {
             pty: None,
         };
         let t = self.target().await?;
-        let pgid = t.sandbox.jobs()?.start_kept(&scope, &id, &spec).await?;
-        Ok(json!({ "id": id.as_str(), "scope": scope.name(), "pgid": pgid }))
+        let st = t.sandbox.jobs()?.start_kept(&scope, &id, &spec).await?;
+        Ok(json!({ "id": id.as_str(), "scope": scope.name(), "pgid": st.pgid, "mark": st.mark }))
     }
 
     async fn do_job_list(&self, a: JobListArgs) -> Out {
@@ -1113,7 +1174,8 @@ impl SandboxMcp {
             .map(|j| {
                 let (state, code) = state_of(j.status);
                 let mut entry = json!({
-                    "id": j.id.as_str(), "state": state, "code": code, "kept": j.kept,
+                    "id": j.id.as_str(), "mark": j.mark, "command": j.command, "args": j.args,
+                    "output_start": j.output_start, "output_end": j.output_end, "state": state, "code": code, "kept": j.kept,
                     "num": j.num, "kind": j.kind, "seen": j.seen,
                     "started": j.started, "ended": j.ended, "label": j.label,
                 });
@@ -1205,6 +1267,107 @@ impl SandboxMcp {
         Ok(json!({ "sent": sent }))
     }
 
+    async fn do_job_attach(&self, a: JobAttachArgs) -> Out {
+        use beyond_sandbox::exec_endpoint::jobs::{JobEvent, Stream};
+        let scope = self.scope(a.scope.as_deref())?;
+        let id = job_id(&a.id)?;
+        let mark = a.mark.into_inner();
+        let output = a.output.into_inner().unwrap_or(true);
+        let from = a.offset.into_inner().unwrap_or(0);
+        let wait = Duration::from_millis(a.timeout_ms.into_inner().unwrap_or(30_000));
+        let max = a.max.into_inner().map_or(DEFAULT_READ_MAX, count);
+        #[derive(Default)]
+        struct Heard {
+            attached: Option<(String, u64)>,
+            data: Vec<u8>,
+            stderr: Vec<(u64, u64)>,
+            at: u64,
+            gap: u64,
+        }
+        let heard = std::sync::Mutex::new(Heard::default());
+        // Enough output is a reason to answer: the caller attaches again from `next_offset`.
+        let full = tokio::sync::Notify::new();
+        let sink = |ev: JobEvent<'_>| {
+            let mut h = heard.lock().unwrap_or_else(|e| e.into_inner());
+            match ev {
+                JobEvent::Attached { mark, from } => {
+                    h.attached = Some((mark.to_string(), from));
+                    h.at = from;
+                }
+                JobEvent::Output(b, st) => {
+                    if st == Stream::Stderr {
+                        let at = h.at;
+                        h.stderr.push((at, b.len() as u64));
+                    }
+                    h.at += b.len() as u64;
+                    h.data.extend_from_slice(b);
+                    if h.data.len() >= max {
+                        full.notify_one();
+                    }
+                }
+                JobEvent::Gap(n) => {
+                    h.at += n;
+                    h.gap += n;
+                }
+                JobEvent::Started(..) | JobEvent::ShellExit(_) => {}
+            }
+        };
+        let t = self.target().await?;
+        let jobs = t.sandbox.jobs()?;
+        // Dropping the call closes the stream; closing an attach never kills.
+        let attach = jobs.follow_marked(&scope, &id, from, mark.as_deref(), output, &sink);
+        let end = tokio::select! {
+            r = attach => Some(r.map_err(|e| match beyond_sandbox::exec_endpoint::jobs::JobError::of(&e) {
+                Some(beyond_sandbox::exec_endpoint::jobs::JobError::Gone { .. }) => {
+                    ToolError::new("not_found", e.to_string())
+                }
+                _ => ToolError::from(e),
+            })?),
+            () = full.notified() => None,
+            () = tokio::time::sleep(wait) => None,
+        };
+        let h = heard.into_inner().unwrap_or_else(|e| e.into_inner());
+        let Some((mark, started)) = h.attached else {
+            return Err(ToolError::new("protocol", "the attach was not answered"));
+        };
+        let (encoding, content, used) =
+            payload(&h.data[..h.data.len().min(max)], a.encoding.as_deref())?;
+        let first = h.at - h.data.len() as u64;
+        let mut out = json!({
+            "id": id.as_str(), "mark": mark, "from": started,
+            "state": if end.is_some() { "ended" } else { "running" },
+            "code": end.map(|e| e.code()),
+            "encoding": encoding, "content": content, "bytes": used,
+            "next_offset": first + used as u64, "gap": h.gap,
+        });
+        put_signal(&mut out, end.and_then(|e| e.signal()));
+        let ranges: Vec<Value> = h.stderr.iter().map(|&(a, n)| json!([a, n])).collect();
+        if !ranges.is_empty() {
+            out["stderr_ranges"] = Value::Array(ranges);
+        }
+        Ok(out)
+    }
+
+    async fn do_job_remove(&self, a: JobRemoveArgs) -> Out {
+        let scope = self.scope(a.scope.as_deref())?;
+        let ids = a
+            .ids
+            .iter()
+            .map(|s| job_id(s))
+            .collect::<Result<Vec<_>, _>>()?;
+        let marks = a
+            .marks
+            .into_inner()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(k, v)| Ok((job_id(&k)?, v)))
+            .collect::<Result<Vec<_>, ToolError>>()?;
+        let t = self.target().await?;
+        let left = t.sandbox.jobs()?.remove(&scope, &ids, &marks).await?;
+        let names = |v: &[JobId]| v.iter().map(|i| i.as_str().to_string()).collect::<Vec<_>>();
+        Ok(json!({ "running": names(&left.running), "mismatch": names(&left.mismatch) }))
+    }
+
     async fn do_job_kill(&self, a: JobKillArgs) -> Out {
         let scope = self.scope(a.scope.as_deref())?;
         let ids = a
@@ -1242,7 +1405,7 @@ impl ServerHandler for SandboxMcp {
         .with_instructions(
             "Tools for one sandbox: exec, files (read_file, write_file, edit_file, list_dir, stat, \
              search, mkdir), bulk copy between this machine and the sandbox (upload, download; only \
-             when the server has a local root) and background jobs (job_start, job_list, job_output, job_write, job_signal, job_kill). A failed \
+             when the server has a local root) and background jobs (job_start, job_list, job_output, job_attach, job_remove, job_write, job_signal, job_kill). A failed \
              call returns isError with structuredContent.error.kind (not_found, permission_denied, \
              conflict, auth, transport, ...). The sandbox://capabilities resource says what the \
              sandbox supports.",

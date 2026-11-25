@@ -88,6 +88,62 @@
   },
   {
     "annotations": {
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Wait for a job to end and return its output from an offset, as the sandbox streams it. Names its incarnation: `mark` (from job_start or job_list) makes a job that reused the id not found instead of read. Returns mark and from (where the output starts), then state (ended, or running when timeout_ms passed first), code, signal, content, encoding, next_offset, gap (bytes no longer kept) and stderr_ranges. With output false it only waits and reports how the job ended.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "encoding": {
+          "description": "`utf8` (default) or `base64`, as for `job_output`.",
+          "type": "string"
+        },
+        "id": {
+          "description": "The job's id, from `job_start` or `job_list`.",
+          "type": "string"
+        },
+        "mark": {
+          "description": "The `mark` `job_start` or `job_list` answered. A job of another mark (the id was reused) is\nnot found, and nothing is read. Default: whichever job holds the id.",
+          "type": "string"
+        },
+        "max": {
+          "description": "The most output bytes to return. Default 131072.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "offset": {
+          "description": "Byte offset in the job's combined output to start at. Default 0.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "output": {
+          "description": "false: only wait for the job's end and report how it ended; no output is carried and\n`from` is where the output ends now. Default true.",
+          "type": "boolean"
+        },
+        "scope": {
+          "description": "The group the job belongs to. Default: this server's.",
+          "type": "string"
+        },
+        "timeout_ms": {
+          "description": "The longest to wait for the job to end, in milliseconds. Default 30000. At that point the\ncall returns what it has with `state` running: call again from `next_offset`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "name": "job_attach"
+  },
+  {
+    "annotations": {
       "destructiveHint": true,
       "idempotentHint": false,
       "openWorldHint": false,
@@ -185,6 +241,44 @@
   {
     "annotations": {
       "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Delete jobs whose processes are gone, with their output. Returns running (ids left because their processes still run) and mismatch (ids left because their job's mark is not the one named in marks). An id with no job is in neither. Use job_kill to stop a running job.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "ids": {
+          "description": "The jobs to delete.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "marks": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "A job id to the `mark` it must have: a job of another mark is left alone and reported in\n`mismatch`. An id not named here is deleted whatever its mark.",
+          "type": "object"
+        },
+        "scope": {
+          "description": "The group the jobs belong to. Default: this server's.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "ids"
+      ],
+      "type": "object"
+    },
+    "name": "job_remove"
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
       "idempotentHint": false,
       "openWorldHint": false,
       "readOnlyHint": false
@@ -246,7 +340,7 @@
           "type": "object"
         },
         "id": {
-          "description": "The job's id: 1 to 32 characters of [0-9a-z]. Default: a random one, returned.",
+          "description": "The job's id: 1 to 64 characters of [0-9a-z_-]. Default: a random one, returned.",
           "type": "string"
         },
         "label": {

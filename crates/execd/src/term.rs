@@ -464,7 +464,7 @@ fn keeper(args: &[OsString]) -> io::Result<()> {
                                 Ok(w) => off += w,
                                 Err(Errno::INTR) => {}
                                 Err(_) => {
-                                    // Fail closed (M6): the kernel ends the terminal; what is left to
+                                    // Fail closed (Q6): the kernel ends the terminal; what is left to
                                     // read is dropped, not kept past a gap.
                                     if event!(KEv::SpoolFailed, &[]) {
                                         return finish();

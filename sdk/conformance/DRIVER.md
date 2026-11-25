@@ -97,29 +97,40 @@ because the call it uses then merges them.)
 
 Every job op carries `scope`, a string of 1 to 64 characters of `[0-9a-z-]`
 naming one session's jobs; the harness sends a scope unique to the scenario.
-`job` is the job id, 1 to 32 characters of `[0-9a-z]`, chosen by the caller.
+`job` is the job id, 1 to 64 characters of `[0-9a-z_-]`, chosen by the caller.
 
-| op               | request                                                                                                                   | result                                                                                                                                                                                               |
-| ---------------- | ------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `job_start`      | `scope`, `job`, `command`, `args`, `cwd?`, `env?`, `stdin_open?`, `label?`, `pty?`                                        | `{pgid, pty?}`: the job is kept by the sandbox from the start                                                                                                                                        |
-| `job_list`       | `scope`                                                                                                                   | `{jobs: [{id, state, code, signal?, kept, num, kind, seen, started, ended, label, pty?}]}`                                                                                                           |
-| `job_read`       | `scope`, `job`, `offset` (0), `max` (131072)                                                                              | `{state, code, signal?, offset, end, data_b64, stderr_ranges?, pty?}`                                                                                                                                |
-| `job_attach`     | `scope`, `job`, `offset` (0)                                                                                              | `{exit_code \| signal, output_b64, stderr_b64?, gap}`: follows to the job's end, ending as `exec_stream` does (`signal` in place of `exit_code` for a shell a signal killed); `gap` is bytes dropped |
-| `job_kill`       | `scope`, `jobs: [ids]`, `remove?`                                                                                         | `{survivors: [{id, detail}]}`: groups still alive after TERM, grace and KILL                                                                                                                         |
-| `job_remove`     | `scope`, `jobs: [ids]`                                                                                                    | `{}`                                                                                                                                                                                                 |
-| `job_write`      | `scope`, `job`, `at`, `data_b64`, `eof?`                                                                                  | `{written, closed?}`: positional stdin write                                                                                                                                                         |
-| `job_signal`     | `scope`, `jobs: [ids]`, `signal`                                                                                          | `{sent: [ids]}`                                                                                                                                                                                      |
-| `job_resize`     | `scope`, `job`, `cols`, `rows`                                                                                            | `{cols, rows}`: sets a terminal job's size (`job_pty`)                                                                                                                                               |
-| `job_start_held` | `scope`, `job`, `command`, `args`, `cwd?`, `env?`, `stdin_open?`, `label?`, `pty?`, `keep?` (false), `heartbeat_seconds?` | `{pgid, pty?}`: starts the job held (`hold: true`), reads the first frame, calls `keep` when `keep` is true, then closes the stream; a job nobody kept dies with it                                  |
-| `job_keep`       | `scope`, `job`, `num?`, `kind?`, `seen?`                                                                                  | `{}`: `list` then reports the job as kept with these                                                                                                                                                 |
-| `job_seen`       | `scope`, `job`, `offset`                                                                                                  | `{}`: `list` then reports `seen`                                                                                                                                                                     |
-| `job_wipe`       | `scope`                                                                                                                   | `{survivors: [..]}`                                                                                                                                                                                  |
+| op               | request                                                                                                                   | result                                                                                                                                                                                                                                                 |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `job_start`      | `scope`, `job`, `command`, `args`, `cwd?`, `env?`, `stdin_open?`, `label?`, `pty?`                                        | `{pgid, mark, pty?}`: the job is kept by the sandbox from the start; `mark` names this incarnation of the id                                                                                                                                           |
+| `job_list`       | `scope`                                                                                                                   | `{jobs: [{id, mark, command, args, output_start, output_end, state, code, signal?, kept, num, kind, seen, started, ended, label, pty?}]}`: `output_start` and `output_end` are the offsets of the oldest and the next byte of output the sandbox holds |
+| `job_read`       | `scope`, `job`, `offset` (0), `max` (131072)                                                                              | `{state, code, signal?, offset, end, data_b64, stderr_ranges?, pty?}`                                                                                                                                                                                  |
+| `job_attach`     | `scope`, `job`, `offset` (0), `mark?`, `output?` (true)                                                                   | `{attached: {mark, from}, exit_code \| signal, output_b64, stderr_b64?, gap}`: follows to the job's end, ending as `exec_stream` does (`signal` in place of `exit_code` for a shell a signal killed); `gap` is bytes dropped                           |
+| `job_kill`       | `scope`, `jobs: [ids]`, `remove?`                                                                                         | `{survivors: [{id, detail}]}`: groups still alive after TERM, grace and KILL                                                                                                                                                                           |
+| `job_remove`     | `scope`, `jobs: [ids]`, `marks?: {id: mark}`                                                                              | `{running: [ids], mismatch: [ids]}`: `running` jobs are left (their group is not empty); `mismatch` jobs are left (their mark is not the one named in `marks`); an id with no job is in neither                                                        |
+| `job_resize`     | `scope`, `job`, `cols`, `rows`                                                                                            | `{cols, rows}`: sets a terminal job's size (`job_pty`)                                                                                                                                                                                                 |
+| `job_write`      | `scope`, `job`, `at`, `data_b64`, `eof?`                                                                                  | `{written, closed?}`: positional stdin write                                                                                                                                                                                                           |
+| `job_signal`     | `scope`, `jobs: [ids]`, `signal`                                                                                          | `{sent: [ids]}`                                                                                                                                                                                                                                        |
+| `job_start_held` | `scope`, `job`, `command`, `args`, `cwd?`, `env?`, `stdin_open?`, `label?`, `pty?`, `keep?` (false), `heartbeat_seconds?` | `{pgid, mark, pty?}`: starts the job held (`hold: true`), reads the first frame, calls `keep` when `keep` is true, then closes the stream; a job nobody kept dies with it                                                                              |
+| `job_keep`       | `scope`, `job`, `num?`, `kind?`, `seen?`                                                                                  | `{}`: `list` then reports the job as kept with these                                                                                                                                                                                                   |
+| `job_seen`       | `scope`, `job`, `offset`                                                                                                  | `{}`: `list` then reports `seen`                                                                                                                                                                                                                       |
+| `job_wipe`       | `scope`                                                                                                                   | `{survivors: [..]}`                                                                                                                                                                                                                                    |
 
 `state` is `running`, `exited` (the shell exited, its group runs on), `ended`,
 `lost` or `gone`; `code` is null unless `exited` or `ended`. `signal` is present
 only then, and only when a signal killed the job's shell (`code` is 128 + `signal`);
 a job that exited reports no `signal`, whatever its code. An invalid job id
 is `invalid_request` without sending anything.
+
+**The mark** (`job_marks`). Every incarnation of a job id has a `mark`, answered by `job_start`,
+`job_start_held` and `job_list`, and echoed first by `job_attach` (`attached`). A `job_attach` that
+names a `mark` which is not the job's current one is `job_gone` (`not_found`): it streams nothing, so a
+client never reads a later job that reused the id. `output: false` is a status-only attach: it sends no
+output and no gap, `attached.from` is the end of the job's output when it attached, and `output_b64` is
+empty. An attach with output has `attached.from` equal to its `offset`. `job_remove` with `marks` skips
+(and reports in `mismatch`) every id whose job's mark differs from the one named for it; an id that
+`marks` does not name is removed whatever its mark. A driver whose endpoint does not echo the mark
+(`started`, `attached`, `list`) or does not report `running` and `mismatch` fails closed:
+`not_offered`. The feature `job_marks` marks the scenarios that need these.
 
 `env` (on `exec` and `job_start`) is an object of strings: the command's own
 environment. `stdin_open: true` keeps the job's stdin open for `job_write`; a job started without it
@@ -362,18 +373,19 @@ whose `requires.features` names a feature that the driver's `hello.features` lac
 `hello.missing`. A driver that lists no `features` lacks them all. A feature marks a
 scenario whose point is something a driver's transport cannot show, however the outcome reads:
 
-| feature            | the scenario needs                                                                                                       |
-| ------------------ | ------------------------------------------------------------------------------------------------------------------------ |
-| `frames`           | the stream's own frames (heartbeats, splitting of output into frames), not only its final answer                         |
-| `unbounded_stream` | a stream longer than any retention window: output beyond 8 MiB arrives whole, with no head lost                          |
-| `exit_signal`      | a kill by signal N told apart from an exit of 128+N (`signal` in place of `exit_code`; for jobs, `signal` beside `code`) |
-| `exec_env`         | a command's own `env` on `exec` and `job_start`                                                                          |
-| `job_streams`      | a job's stderr told from its stdout: `stderr_ranges` in `job_read`, `stderr_b64` in `job_attach`                         |
-| `job_stdin`        | `job_start`'s `stdin_open` and `job_write`                                                                               |
-| `job_signal_op`    | `job_signal`                                                                                                             |
-| `job_errors`       | `error.code`: the typed job errors above                                                                                 |
-| `job_options`      | `job_start_held`, `job_keep`, `job_seen`, `grace_ms` on `job_kill` and `job_wipe`, `heartbeat_seconds`                   |
-| `job_pty`          | `pty` on `job_start` and `job_start_held`, `job_resize`, and `pty` in `job_list` and `job_read`                          |
+| feature            | the scenario needs                                                                                                                       |
+| ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `frames`           | the stream's own frames (heartbeats, splitting of output into frames), not only its final answer                                         |
+| `unbounded_stream` | a stream longer than any retention window: output beyond 8 MiB arrives whole, with no head lost                                          |
+| `exit_signal`      | a kill by signal N told apart from an exit of 128+N (`signal` in place of `exit_code`; for jobs, `signal` beside `code`)                 |
+| `exec_env`         | a command's own `env` on `exec` and `job_start`                                                                                          |
+| `job_streams`      | a job's stderr told from its stdout: `stderr_ranges` in `job_read`, `stderr_b64` in `job_attach`                                         |
+| `job_stdin`        | `job_start`'s `stdin_open` and `job_write`                                                                                               |
+| `job_signal_op`    | `job_signal`                                                                                                                             |
+| `job_errors`       | `error.code`: the typed job errors above                                                                                                 |
+| `job_marks`        | `mark` on `job_start`, `job_start_held`, `job_list` and `job_attach`; `output`, `marks`; `command`, `args`, `output_start`, `output_end` |
+| `job_options`      | `job_start_held`, `job_keep`, `job_seen`, `grace_ms` on `job_kill` and `job_wipe`, `heartbeat_seconds`                                   |
+| `job_pty`          | `pty` on `job_start` and `job_start_held`, `job_resize`, and `pty` in `job_list` and `job_read`                                          |
 
 ### Host steps
 
@@ -387,9 +399,9 @@ scenario **unsupported** there (never skipped quietly, never a pass). The action
 | `restart_execd` | Restarts the endpoint's process (SIGHUP, execd's restart, which leaves its jobs running; then starts a new one on the same URL, root, job directory and state directory), so what a job's keeper holds outlives it. The first request after it may hit a connection the old process closed: poll it. | the `local-*` backends |
 | `kill_keepers`  | SIGKILLs every terminal keeper process whose spool is under the endpoint's job directory; answers `{killed: N}`.                                                                                                                                                                                     | the `local-*` backends |
 
-The container backends, `e2b` and `beyond` do not offer them: nothing there supervises the endpoint's process (a
-container ends with it; the `e2b` VM starts it once with `setsid nohup`), so a restart would need a supervisor
-the backend does not have.
+The container backends and `beyond` do not offer them: nothing there supervises the endpoint's process (a
+container ends with it), so a restart would need a supervisor the backend does not have. The `e2b` backend does:
+it signals the VM's execd as root and starts a new one with the command that started the first.
 
 A backend may define directories beyond `${ROOT}` and `${WORK}`, as variables:
 `${RO}` (a read-only mount holding one file, `existing`, with content `old`),

@@ -148,6 +148,11 @@ class JobInfo:
     started: int
     ended: int
     label: str
+    mark: str  # names this incarnation of the id
+    command: str
+    args: tuple[str, ...]
+    output_start: int  # the offset of the oldest byte of output the sandbox holds
+    output_end: int  # the offset of the next byte of output
     signal: int | None = None  # the signal that killed the shell; None for a shell that exited
     pty: PtyInfo | None = None  # a terminal job only
 
@@ -196,7 +201,33 @@ class JobShellExit:
 class JobStarted:
     pgid: int
     stdin: bool = False  # the job was started with its stdin open (the echo of ``stdin_open``)
+    mark: str = ""  # names this incarnation of the id; empty only from an endpoint that predates it
     pty: Pty | None = None  # the terminal's size (the echo of ``pty``); None: no terminal
+
+
+@dataclass(frozen=True, slots=True)
+class JobStart:
+    """What ``start`` answers: the job's process group and the mark of this incarnation of its id."""
+
+    pgid: int
+    mark: str
+
+
+@dataclass(frozen=True, slots=True)
+class JobAttached:
+    """First frame of an attach: the incarnation it is following and the offset it starts at."""
+
+    mark: str
+    from_offset: int
+
+
+@dataclass(frozen=True, slots=True)
+class JobRemoved:
+    """What ``remove`` skipped: ``running`` jobs (their group is not empty) and ``mismatch`` jobs (their
+    mark is not the one named). An id with no job is in neither."""
+
+    running: tuple[str, ...]
+    mismatch: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,8 +247,8 @@ class JobEnd:
     signal: int | None = None
 
 
-JobEvent = Union[JobOutput, JobGap, JobShellExit, JobStarted]
-JobFrame = Union[JobOutput, JobGap, JobShellExit, JobStarted, JobEnd]
+JobEvent = Union[JobOutput, JobGap, JobShellExit, JobStarted, JobAttached]
+JobFrame = Union[JobOutput, JobGap, JobShellExit, JobStarted, JobAttached, JobEnd]
 
 
 @dataclass(slots=True)
@@ -230,6 +261,7 @@ class Attached:
     gap: int = 0
     shell_exit: int | None = field(default=None)
     signal: int | None = None  # the signal that killed the shell; None for a shell that exited
+    attached: JobAttached | None = None  # the stream's first frame
 
 
 @dataclass(frozen=True, slots=True)
