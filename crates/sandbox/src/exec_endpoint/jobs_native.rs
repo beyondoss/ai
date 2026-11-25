@@ -100,6 +100,18 @@ impl SandboxJobs for HttpJobs {
         dispatch!(self, follow(scope, id, from, events))
     }
 
+    async fn follow_marked(
+        &self,
+        scope: &JobScope,
+        id: &JobId,
+        from: u64,
+        mark: Option<&str>,
+        output: bool,
+        events: EventSink<'_>,
+    ) -> std::io::Result<JobEnd> {
+        dispatch!(self, follow_marked(scope, id, from, mark, output, events))
+    }
+
     async fn read(
         &self,
         scope: &JobScope,
@@ -525,6 +537,19 @@ impl SandboxJobs for NativeJobs<'_> {
         events: EventSink<'_>,
     ) -> std::io::Result<JobEnd> {
         self.follow_beat(scope, id, from, None, events).await
+    }
+
+    async fn follow_marked(
+        &self,
+        scope: &JobScope,
+        id: &JobId,
+        from: u64,
+        mark: Option<&str>,
+        output: bool,
+        events: EventSink<'_>,
+    ) -> std::io::Result<JobEnd> {
+        self.follow_opts(scope, id, from, mark, output, None, events)
+            .await
     }
 
     async fn read(

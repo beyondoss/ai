@@ -22,7 +22,7 @@ fn production_calls_the_verified_kernel() {
     for needle in [
         "kernel::step(",
         // The read window is `execd_ring::window` now (`ring.rs`, checked by its own structure test).
-        "kernel::follow(",
+        "kernel::stream_next(",
         "kernel::bound(",
         "kernel::State::new(",
         ".admit(&key)",

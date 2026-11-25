@@ -79,7 +79,7 @@ fn missing_features() -> Value {
         "frames": "an MCP tool result arrives whole, so there are no frames or heartbeats to see",
         "unbounded_stream": "exec_stream is job_output over a job's log, which keeps the last 8 MiB of output (a bound of the job protocol): a longer stream loses its head",
         "job_errors": "an MCP tool result carries an error message, not the typed job errors of the TypeScript and Python SDKs",
-        "job_options": "the MCP tools have no held start, keep, seen, grace_ms or heartbeat_seconds",
+                "job_options": "the MCP tools have no held start, keep, seen, grace_ms or heartbeat_seconds",
     })
 }
 
@@ -162,6 +162,16 @@ fn command_line(req: &Value) -> Result<String, Value> {
         line.push_str(&quote(&a));
     }
     Ok(line)
+}
+
+/// The command line a job runs: the tool starts `sh -c <line>`, so a request that is already that
+/// (`sh -c <line>`) hands over its line, and the job's listed argv is the one the request named.
+fn job_line(req: &Value) -> Result<String, Value> {
+    let a = strings(req, "args")?;
+    if req["command"] == json!("sh") && a.len() == 2 && a[0] == "-c" {
+        return Ok(a[1].clone());
+    }
+    command_line(req)
 }
 
 /// A tool's arguments: the keys given, with `null`s left out.
@@ -269,10 +279,6 @@ impl PrivateSandbox {
 /// What following a job to its end found.
 struct Followed {
     output: Vec<u8>,
-    /// The bytes of `output` that came from stderr (`job_output`'s `stderr_ranges`).
-    stderr: Vec<u8>,
-    /// Bytes the sandbox no longer had (a jump in the offset).
-    gap: u64,
     code: Option<i64>,
     /// The signal that killed the job's shell, from `job_output`'s `signal`.
     signal: Option<i64>,
@@ -448,7 +454,7 @@ impl Mcp {
                         args(vec![
                             ("scope", json!(str_arg(req, "scope")?)),
                             ("id", json!(str_arg(req, "job")?)),
-                            ("command", json!(command_line(req)?)),
+                            ("command", json!(job_line(req)?)),
                             ("cwd", json!(opt_str(req, "cwd")?)),
                             ("label", json!(opt_str(req, "label")?)),
                             ("env", req["env"].clone()),
@@ -456,7 +462,7 @@ impl Mcp {
                         ]),
                     )
                     .await?;
-                Ok(json!({ "pgid": r["pgid"] }))
+                Ok(json!({ "pgid": r["pgid"], "mark": r["mark"] }))
             }
             "job_write" => {
                 let r = self
@@ -539,20 +545,17 @@ impl Mcp {
                 Ok(json!({ "survivors": r["survivors"] }))
             }
             "job_remove" => {
-                let scope = str_arg(req, "scope")?;
-                let wanted = strings(req, "jobs")?;
-                let gone: Vec<String> = self
-                    .listed(scope)
-                    .await?
-                    .into_iter()
-                    .filter(|j| matches!(j["state"].as_str(), Some("ended" | "lost" | "gone")))
-                    .filter_map(|j| j["id"].as_str().map(str::to_string))
-                    .filter(|id| wanted.contains(id))
-                    .collect();
-                if !gone.is_empty() {
-                    self.kill_all(scope, gone).await?;
-                }
-                Ok(json!({}))
+                let r = self
+                    .tool(
+                        "job_remove",
+                        args(vec![
+                            ("scope", json!(str_arg(req, "scope")?)),
+                            ("ids", json!(strings(req, "jobs")?)),
+                            ("marks", req["marks"].clone()),
+                        ]),
+                    )
+                    .await?;
+                Ok(json!({ "running": r["running"], "mismatch": r["mismatch"] }))
             }
             "job_wipe" => {
                 let scope = str_arg(req, "scope")?;
@@ -826,25 +829,65 @@ impl Mcp {
     }
 
     /// `job_attach`: follow the job to its end.
+    /// `job_attach`: the tool waits for the job's end (at most `timeout_ms` a call), so a job still
+    /// running when it returns is attached again from where the output stopped.
     async fn job_attach(&self, req: &Value) -> Out {
-        let f = self
-            .follow(
-                str_arg(req, "scope")?,
-                str_arg(req, "job")?,
-                u64_arg(req, "offset")?.unwrap_or(0),
-                None,
-            )
-            .await?;
-        let mut out = json!({ "output_b64": b64(&f.output), "gap": f.gap });
-        if !f.stderr.is_empty() {
-            out["stderr_b64"] = json!(b64(&f.stderr));
+        let (scope, job) = (str_arg(req, "scope")?, str_arg(req, "job")?);
+        let mut offset = u64_arg(req, "offset")?.unwrap_or(0);
+        let output = req["output"] != json!(false);
+        let (mut out, mut stderr, mut gap) = (Vec::new(), Vec::new(), 0u64);
+        let mut attached = None;
+        loop {
+            let r = self
+                .tool(
+                    "job_attach",
+                    args(vec![
+                        ("scope", json!(scope)),
+                        ("id", json!(job)),
+                        ("offset", json!(offset)),
+                        ("mark", json!(opt_str(req, "mark")?)),
+                        ("output", json!(output)),
+                        ("timeout_ms", json!(60_000)),
+                        ("max", json!(16 * 1024 * 1024)),
+                        ("encoding", json!("base64")),
+                    ]),
+                )
+                .await?;
+            attached.get_or_insert_with(|| json!({ "mark": r["mark"], "from": r["from"] }));
+            let chunk = B64
+                .decode(r["content"].as_str().unwrap_or(""))
+                .map_err(|e| err("protocol", format!("job_attach: {e}")))?;
+            let next = r["next_offset"].as_u64().unwrap_or(offset);
+            let first = next - chunk.len() as u64;
+            for range in r["stderr_ranges"].as_array().into_iter().flatten() {
+                let (from, len) = (
+                    range[0].as_u64().unwrap_or(0),
+                    range[1].as_u64().unwrap_or(0),
+                );
+                let lo = usize::try_from(from.saturating_sub(first)).unwrap_or(usize::MAX);
+                let hi = usize::try_from((from + len).saturating_sub(first))
+                    .unwrap_or(usize::MAX)
+                    .min(chunk.len());
+                if lo < hi {
+                    stderr.extend_from_slice(&chunk[lo..hi]);
+                }
+            }
+            out.extend_from_slice(&chunk);
+            gap += r["gap"].as_u64().unwrap_or(0);
+            offset = next;
+            if r["state"] == json!("running") {
+                continue;
+            }
+            let mut v = json!({ "attached": attached, "output_b64": b64(&out), "gap": gap });
+            if !stderr.is_empty() {
+                v["stderr_b64"] = json!(b64(&stderr));
+            }
+            match r.get("signal").filter(|s| !s.is_null()) {
+                Some(s) => v["signal"] = s.clone(),
+                None => v["exit_code"] = r["code"].clone(),
+            }
+            return Ok(v);
         }
-        // As `exec_stream` ends: `signal` in place of `exit_code` for a death by signal.
-        match f.signal {
-            Some(s) => out["signal"] = json!(s),
-            None => out["exit_code"] = json!(f.code),
-        }
-        Ok(out)
     }
 
     /// Follow a job by reading its output, as the client library's polling follow does: a jump in
@@ -858,8 +901,7 @@ impl Mcp {
         deadline: Option<Duration>,
     ) -> Result<Followed, Value> {
         let started = std::time::Instant::now();
-        let (mut out, mut gap, mut timed_out) = (Vec::new(), 0u64, false);
-        let mut stderr: Vec<u8> = Vec::new();
+        let (mut out, mut timed_out) = (Vec::new(), false);
         let mut wait = Duration::from_millis(25);
         loop {
             let r = self
@@ -878,7 +920,6 @@ impl Mcp {
             }
             let at = r["offset"].as_u64().unwrap_or(offset);
             if at > offset {
-                gap += at - offset;
                 offset = at;
             }
             let chunk = B64
@@ -886,16 +927,6 @@ impl Mcp {
                 .map_err(|e| err("protocol", format!("job_output: {e}")))?;
             let end = r["end"].as_u64().unwrap_or(0);
             if !chunk.is_empty() {
-                for r in r["stderr_ranges"].as_array().into_iter().flatten() {
-                    let (from, len) = (r[0].as_u64().unwrap_or(0), r[1].as_u64().unwrap_or(0));
-                    let lo = usize::try_from(from.saturating_sub(offset)).unwrap_or(usize::MAX);
-                    let hi = usize::try_from((from + len).saturating_sub(offset))
-                        .unwrap_or(usize::MAX)
-                        .min(chunk.len());
-                    if lo < hi {
-                        stderr.extend_from_slice(&chunk[lo..hi]);
-                    }
-                }
                 offset += chunk.len() as u64;
                 out.extend_from_slice(&chunk);
                 wait = Duration::from_millis(25);
@@ -907,8 +938,6 @@ impl Mcp {
                 Some("ended") if offset >= end || chunk.is_empty() => {
                     return Ok(Followed {
                         output: out,
-                        stderr,
-                        gap,
                         code: r["code"].as_i64(),
                         signal: r["signal"].as_i64(),
                         timed_out,
@@ -980,7 +1009,7 @@ async fn main() {
                 let result = if op == "hello" {
                     Ok(json!({
                         "driver": DRIVER, "protocol": 1, "ops": OPS,
-                        "features": ["exit_signal", "exec_env", "job_streams", "job_stdin", "job_signal_op"], "missing": missing_features(),
+                        "features": ["exit_signal", "exec_env", "job_streams", "job_stdin", "job_signal_op", "job_marks"], "missing": missing_features(),
                     }))
                 } else if !OPS.contains(&op.as_str()) {
                     Err(err("unsupported", "no such op"))

@@ -60,7 +60,7 @@ async fn the_tool_list_is_the_pinned_one() {
 }
 
 #[tokio::test]
-async fn the_tools_are_exactly_the_documented_fourteen() {
+async fn the_tools_are_exactly_the_documented_sixteen() {
     let mut names: Vec<String> = listed()
         .await
         .iter()
@@ -72,9 +72,11 @@ async fn the_tools_are_exactly_the_documented_fourteen() {
         [
             "edit_file",
             "exec",
+            "job_attach",
             "job_kill",
             "job_list",
             "job_output",
+            "job_remove",
             "job_signal",
             "job_start",
             "job_write",
@@ -130,7 +132,7 @@ async fn a_local_root_adds_exactly_upload_and_download() {
     let without = names(&listed_with(false).await);
     let mut with_root = listed_with(true).await;
     let with = names(&with_root);
-    assert_eq!(without.len(), 14);
+    assert_eq!(without.len(), 16);
     let mut expect = without.clone();
     expect.extend(["download".to_string(), "upload".to_string()]);
     expect.sort();

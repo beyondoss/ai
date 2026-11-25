@@ -71,6 +71,17 @@ def test_list_reads_the_mark_the_command_and_the_output_window() -> None:
     )  # fmt: skip
 
 
+@pytest.mark.parametrize("missing", ["mark", "command", "args"])
+def test_a_list_entry_that_names_no_mark_command_or_args_is_not_offered(missing: str) -> None:
+    entry: dict[str, Any] = {
+        "id": "aa", "mark": "m1", "command": "sh", "args": [], "state": "running", "code": None,
+    }  # fmt: skip
+    del entry[missing]
+    sb, _ = jobs_over(lambda h, b: reply(h, 200, {"jobs": [entry]}))
+    with pytest.raises(NotOfferedError):
+        sb.list("s")
+
+
 def test_ids_are_1_to_64_of_lowercase_digits_dash_and_underscore() -> None:
     sb, e = jobs_over(lambda h, b: reply(h, 200, {"started": 1, "mark": "m"}))
     for ok in ("a", "a-b_c", "z" * 64):
