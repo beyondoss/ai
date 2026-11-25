@@ -326,6 +326,17 @@ async fn open(
             ) {
                 return Err(e);
             }
+            // Nothing reached a server: refused, or no route. The kernel ends a start nothing answered
+            // (`T`) and keeps every other handle reconnecting.
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::AddrNotAvailable
+                    | std::io::ErrorKind::HostUnreachable
+                    | std::io::ErrorKind::NetworkUnreachable
+            ) {
+                return Ok(Ev::Unreached);
+            }
             Ok(Ev::Broke)
         }
     }
@@ -459,6 +470,11 @@ fn fault_error(fault: Fault, status: u16, refusal: Option<Refusal>, p: &Payload)
                     format!(" ({body})")
                 }
             ),
+        ),
+        // A start nothing answered: the endpoint could not be reached at all.
+        Fault::Transport => std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "job stream: the endpoint could not be reached",
         ),
         // No caller sends it: a Rust caller's deadline is a dropped future.
         Fault::Deadline => {
