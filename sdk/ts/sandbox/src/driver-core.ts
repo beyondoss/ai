@@ -31,6 +31,7 @@ import {
 } from "./errors.js";
 import type { ErrorKind } from "./errors.js";
 import type { CapabilityOverrides } from "./files.js";
+import { HttpTransport } from "./http.js";
 import { Sandbox } from "./sandbox.js";
 import type { SearchEngine } from "./search.js";
 import type { JobInfo, Survivor } from "./transport.js";
