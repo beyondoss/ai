@@ -1228,9 +1228,17 @@ const NEVER_CONNECTED = new Set([
   "EHOSTUNREACH",
 ]);
 
-function neverConnected(e: unknown): boolean {
-  const code = (e as { cause?: { code?: unknown } } | undefined)?.cause?.code;
-  return typeof code === "string" && NEVER_CONNECTED.has(code);
+function neverConnected(e: unknown, depth = 0): boolean {
+  if (typeof e !== "object" || e === null || depth > 4) return false;
+  const { code, cause, errors } = e as {
+    code?: unknown;
+    cause?: unknown;
+    errors?: unknown;
+  };
+  if (typeof code === "string" && NEVER_CONNECTED.has(code)) return true;
+  if (neverConnected(cause, depth + 1)) return true;
+  return Array.isArray(errors)
+    && errors.some((x) => neverConnected(x, depth + 1));
 }
 
 /** One line of a job stream, read for the facts the kernel decides on. Never throws. */
