@@ -41,7 +41,7 @@ use crate::exec::{self, Cut, Sink};
 use crate::frame::{self, FRAME_MAX};
 use crate::http::{self, Line, Request, Resp};
 use crate::job_kernel::{
-    self as kernel, Act, Admit, Alive, Begin, Ev, Follow, Kind, Pick, Recovery, Refusal, Rec,
+    self as kernel, Act, Admit, Alive, Begin, Ev, Follow, Kind, Pick, Rec, Recovery, Refusal,
     Sink as Dest,
 };
 use crate::ledger::{Entry, Idem, Ledger};

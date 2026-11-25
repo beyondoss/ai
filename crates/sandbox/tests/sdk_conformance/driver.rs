@@ -402,7 +402,7 @@ impl Driver {
                 "ops": self.ops(),
                 "features": [
                     "frames", "unbounded_stream", "exit_signal", "exec_env", "job_streams",
-                    "job_stdin", "job_signal_op", "job_errors", "job_options"
+                    "job_stdin", "job_signal_op", "job_errors", "job_options", "job_start_key"
                 ],
             }));
         }

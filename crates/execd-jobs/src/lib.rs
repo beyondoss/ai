@@ -44,6 +44,7 @@
     clippy::implicit_saturating_sub,
     clippy::single_match,
     clippy::collapsible_if,
+    clippy::nonminimal_bool,
     non_shorthand_field_patterns
 )]
 

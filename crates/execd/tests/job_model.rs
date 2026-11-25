@@ -598,7 +598,10 @@ impl Model for Jobs {
             A::Start { scope, id, client } => {
                 let k = key(scope, id);
                 // `start_job`'s decision, with no key (K4, K5).
-                match s.table.begin(&scope_name(scope), &format!("i{id}"), None, "") {
+                match s
+                    .table
+                    .begin(&scope_name(scope), &format!("i{id}"), None, "")
+                {
                     Begin::Refuse(_) => return None,
                     Begin::Replay(_) => {
                         s.bad |= V_K4;
@@ -646,7 +649,12 @@ impl Model for Jobs {
                 key: kk,
                 spec,
             } => {
-                let (sc, idn, kn, dg) = (scope_name(scope), format!("i{id}"), key_name(kk), digest(spec));
+                let (sc, idn, kn, dg) = (
+                    scope_name(scope),
+                    format!("i{id}"),
+                    key_name(kk),
+                    digest(spec),
+                );
                 let in_table = |s: &St, f: &dyn Fn(&Sim) -> bool| {
                     s.table
                         .all()
@@ -658,7 +666,10 @@ impl Model for Jobs {
                     Begin::Replay(rid) => {
                         // K2: the job it names was started under this key and spec.
                         match s.table.get(&(sc.clone(), rid)) {
-                            Some(h) if s.sims[h].idem == Some((kk, spec)) && s.sims[h].scope == scope => {
+                            Some(h)
+                                if s.sims[h].idem == Some((kk, spec))
+                                    && s.sims[h].scope == scope =>
+                            {
                                 s.resolved(scope, h);
                             }
                             _ => s.bad |= V_K2,
@@ -670,7 +681,9 @@ impl Model for Jobs {
                         if in_table(&s, &|x| x.idem == Some((kk, spec))) {
                             s.bad |= V_K1;
                         }
-                        if in_table(&s, &|x| x.idem.is_some_and(|(k2, s2)| k2 == kk && s2 != spec)) {
+                        if in_table(&s, &|x| {
+                            x.idem.is_some_and(|(k2, s2)| k2 == kk && s2 != spec)
+                        }) {
                             s.bad |= V_K2;
                         }
                         if s.sims.len() >= self.max_jobs {
@@ -1084,8 +1097,12 @@ impl Model for Jobs {
                     let fresh = (0..m.scopes).all(|scope| {
                         (0..m.ids).all(|id| {
                             s.table.get(&key(scope, id)).is_some()
-                                || s.table.begin(&scope_name(scope), &format!("i{id}"), Some("fresh"), "d")
-                                    == Begin::Start
+                                || s.table.begin(
+                                    &scope_name(scope),
+                                    &format!("i{id}"),
+                                    Some("fresh"),
+                                    "d",
+                                ) == Begin::Start
                         })
                     });
                     retry && fresh
@@ -1309,7 +1326,8 @@ fn the_mutation_turns_its_property_red() {
         "L1: "
     } else if cfg!(feature = "mut_key_replay_starts") {
         "K1: "
-    } else if cfg!(feature = "mut_key_digest_ignored") || cfg!(feature = "mut_key_take_forgets_none")
+    } else if cfg!(feature = "mut_key_digest_ignored")
+        || cfg!(feature = "mut_key_take_forgets_none")
     {
         "K2: "
     } else if cfg!(feature = "mut_key_fresh_refused")

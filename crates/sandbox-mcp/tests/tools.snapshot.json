@@ -249,6 +249,10 @@
           "description": "The job's id: 1 to 32 characters of [0-9a-z]. Default: a random one, returned.",
           "type": "string"
         },
+        "idempotency_key": {
+          "description": "Makes the start safe to repeat: 1 to 128 characters of [0-9A-Za-z._:-]. A job_start that repeats an\nearlier call's key with the same command, cwd and env returns that job and runs nothing; the key of another\ncommand is an error. Default: a fresh key for each call.",
+          "type": "string"
+        },
         "label": {
           "description": "A short note shown in `job_list`.",
           "type": "string"

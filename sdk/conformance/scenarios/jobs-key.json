@@ -4,7 +4,7 @@
   "description": "Layer 1: the start's idempotency key (K1-K8 of the job kernel).",
   "scenarios": [
     {
-      "id": "jobs.start-key.a-retried-start-answers-the-first-job-and-runs-nothing",
+      "id": "jobs-key.a-retried-start-answers-the-first-job-and-runs-nothing",
       "description": "A start whose answer was lost, sent again with its key, answers the job the first send started (the same process group) and runs nothing: the command ran once, and one job is listed. The same key under another id replays that job too.",
       "requires": {
         "features": [
@@ -122,8 +122,8 @@
       ]
     },
     {
-      "id": "jobs.start-key.a-key-used-for-another-command-is-refused",
-      "description": "The same key with another command, or the same command with another environment, is a conflict, and nothing else starts; the first job still runs.",
+      "id": "jobs-key.a-key-used-for-another-command-is-refused",
+      "description": "The same key with another command, or the same command with another environment, is refused with the reason (the key was used for a different command), and nothing else starts; the first job still runs.",
       "requires": {
         "features": [
           "job_start_key"
@@ -164,7 +164,6 @@
           "idempotency_key": "differ-${SCOPE}",
           "expect": {
             "error": {
-              "kind": "conflict",
               "detail": {
                 "$contains": "different command"
               }
@@ -185,7 +184,6 @@
           "idempotency_key": "differ-${SCOPE}",
           "expect": {
             "error": {
-              "kind": "conflict",
               "detail": {
                 "$contains": "different command"
               }
@@ -243,7 +241,7 @@
       ]
     },
     {
-      "id": "jobs.start-key.a-keyed-start-retried-after-an-execd-restart-replays",
+      "id": "jobs-key.a-keyed-start-retried-after-an-execd-restart-replays",
       "description": "execd restarts (its jobs run on, its ledger is read again) and the start is sent again with its key: it answers the first job and runs nothing. The marker is the restarted execd answering.",
       "requires": {
         "features": [

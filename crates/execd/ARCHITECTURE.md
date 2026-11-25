@@ -156,14 +156,14 @@ as the first answer had it; a held start streams the job from its first byte) an
 digest is kept, never the env, which can hold secrets, and the label and the id are not in it. A start with the key of a job under another id
 answers that job: the key names the job, not the id.
 
-*Where the record lives, and how long.* The key's record (`Rec`: scope, key, id, digest) is the table's, written under its lock with the entry
+_Where the record lives, and how long._ The key's record (`Rec`: scope, key, id, digest) is the table's, written under its lock with the entry
 (K7), saved in the job's ledger entry (`Idem`, `execd-jobs.json`, a field the version-1 file already ignores) and put back by `recover` for
 every job it brings back (K6, `keeps_record`), so a retry after a restart of execd replays. It leaves only with its job, in `Table::take`
 (K8: exactly that job's records, no other's, never one a successor of the id could be mistaken for). There is no retention and no eviction
 (see Bounds), so a keyed record is never dropped before its job's output: a job that ended, even one whose group the restart found gone, is
 still answered by its key until it is removed. If a retention budget is ever added, a keyed job must not be evicted by it.
 
-*One window.* The ledger entry is written after the spawn (a job with no group is never saved, R4). A crash between the spawn and the save
+_One window._ The ledger entry is written after the spawn (a job with no group is never saved, R4). A crash between the spawn and the save
 loses the record of a job whose process runs on; its retry starts a second job. The window is the time of one file write; closing it needs the
 claim written before the spawn, and a restart that can tell a spawned job from one that never was.
 
@@ -255,39 +255,39 @@ cargo test -p beyond-execd --test job_model faithful          # both bounds, all
 cargo test -p beyond-execd --features <mut> --test job_model the_mutation   # each MUST pass only if its property is red
 ```
 
-| mutation                      | property it turns red                              |
-| ----------------------------- | -------------------------------------------------- |
-| `mut_start_overwrites`        | J1                                                 |
-| `mut_scope_ignored`           | J2                                                 |
-| `mut_remove_keeps_entry`      | J3                                                 |
-| `mut_end_rewritten`           | J4 (`ended_is_final`, over every phase and event)  |
-| `mut_disconnect_kills_kept`   | J6                                                 |
-| `mut_remove_live`             | J7                                                 |
-| `mut_signal_ended`            | J8                                                 |
-| `mut_ended_not_removable`     | L1                                                 |
-| `mut_stream_follows_key`      | J9                                                 |
-| `mut_take_by_key`             | J10                                                |
-| `mut_follow_waits_after_end`  | L2                                                 |
-| `mut_key_replay_starts`       | K1 (`job_model`, Verus on `start_decision`)        |
-| `mut_key_digest_ignored`      | K2 (`job_model`, Verus on `start_decision`)        |
-| `mut_key_fresh_refused`       | K3 (`job_model`, Verus on `start_decision`)        |
-| `mut_unkeyed_replays`         | K4 (`job_model`, Verus on `Table::begin`)          |
-| `mut_key_forgotten_on_restart` | K6 (`job_model` K3, Verus on `keeps_record`)      |
-| `mut_key_record_clears`       | K7 (`job_model` K3, Verus on `Table::record`)      |
-| `mut_key_take_forgets_none`   | K8 (`job_model` K2, Verus on `Table::forget`)      |
-| `mut_signal_after_reap`       | J11 (`os_model`, and Verus on `may_deliver`)       |
-| `mut_held_forgets`            | J11-live (`os_model`, and Verus on `Held::insert`) |
-| `mut_stdin_replays`           | W2 (Verus on `stdin_plan`)                         |
-| `mut_stdin_written_shrinks`   | W2b (Verus on `advance`)                           |
-| `mut_stdin_apply_off_start`   | W2c (Verus on `stdin_plan`)                        |
-| `mut_stdin_wait_sticks`       | W5-live (progress lemma)                           |
-| `mut_stdin_closes_early`      | W4 (Verus on `closes`)                             |
-| `mut_stdin_applies_ahead`     | W5 (Verus on `stdin_plan`)                         |
-| `mut_stdin_writes_ended`      | W3 (Verus on `stdin_plan`)                         |
-| `mut_stdin_writes_after_eof`  | W4 (Verus on `stdin_plan`)                         |
-| `mut_stdin_waiters_unbounded` | W1 (Verus on `admit_waiter`)                       |
-| `mut_stdin_waiter_stuck`      | W1-live (Verus on `admit_waiter`)                  |
-| `mut_stdin_waits_at_written`  | W5-live (Verus on `stdin_plan`)                    |
+| mutation                       | property it turns red                              |
+| ------------------------------ | -------------------------------------------------- |
+| `mut_start_overwrites`         | J1                                                 |
+| `mut_scope_ignored`            | J2                                                 |
+| `mut_remove_keeps_entry`       | J3                                                 |
+| `mut_end_rewritten`            | J4 (`ended_is_final`, over every phase and event)  |
+| `mut_disconnect_kills_kept`    | J6                                                 |
+| `mut_remove_live`              | J7                                                 |
+| `mut_signal_ended`             | J8                                                 |
+| `mut_ended_not_removable`      | L1                                                 |
+| `mut_stream_follows_key`       | J9                                                 |
+| `mut_take_by_key`              | J10                                                |
+| `mut_follow_waits_after_end`   | L2                                                 |
+| `mut_key_replay_starts`        | K1 (`job_model`, Verus on `start_decision`)        |
+| `mut_key_digest_ignored`       | K2 (`job_model`, Verus on `start_decision`)        |
+| `mut_key_fresh_refused`        | K3 (`job_model`, Verus on `start_decision`)        |
+| `mut_unkeyed_replays`          | K4 (`job_model`, Verus on `Table::begin`)          |
+| `mut_key_forgotten_on_restart` | K6 (`job_model` K3, Verus on `keeps_record`)       |
+| `mut_key_record_clears`        | K7 (`job_model` K3, Verus on `Table::record`)      |
+| `mut_key_take_forgets_none`    | K8 (`job_model` K2, Verus on `Table::forget`)      |
+| `mut_signal_after_reap`        | J11 (`os_model`, and Verus on `may_deliver`)       |
+| `mut_held_forgets`             | J11-live (`os_model`, and Verus on `Held::insert`) |
+| `mut_stdin_replays`            | W2 (Verus on `stdin_plan`)                         |
+| `mut_stdin_written_shrinks`    | W2b (Verus on `advance`)                           |
+| `mut_stdin_apply_off_start`    | W2c (Verus on `stdin_plan`)                        |
+| `mut_stdin_wait_sticks`        | W5-live (progress lemma)                           |
+| `mut_stdin_closes_early`       | W4 (Verus on `closes`)                             |
+| `mut_stdin_applies_ahead`      | W5 (Verus on `stdin_plan`)                         |
+| `mut_stdin_writes_ended`       | W3 (Verus on `stdin_plan`)                         |
+| `mut_stdin_writes_after_eof`   | W4 (Verus on `stdin_plan`)                         |
+| `mut_stdin_waiters_unbounded`  | W1 (Verus on `admit_waiter`)                       |
+| `mut_stdin_waiter_stuck`       | W1-live (Verus on `admit_waiter`)                  |
+| `mut_stdin_waits_at_written`   | W5-live (Verus on `stdin_plan`)                    |
 
 ### The OS boundary (J11)
 

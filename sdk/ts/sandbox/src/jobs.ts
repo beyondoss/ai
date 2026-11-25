@@ -65,7 +65,9 @@ function validId(id: string): void {
 function validKey(key: string): void {
   if (typeof key !== "string" || !/^[0-9A-Za-z._:-]{1,128}$/.test(key)) {
     throw new InvalidRequestError(
-      `bad idempotency key ${JSON.stringify(key)}: 1 to 128 characters of [0-9A-Za-z._:-]`,
+      `bad idempotency key ${
+        JSON.stringify(key)
+      }: 1 to 128 characters of [0-9A-Za-z._:-]`,
     );
   }
 }

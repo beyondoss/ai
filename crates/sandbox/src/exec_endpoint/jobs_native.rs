@@ -301,7 +301,8 @@ fn start_key(spec: &JobSpec) -> std::io::Result<String> {
         };
     }
     let mut b = [0u8; 16];
-    getrandom::fill(&mut b).map_err(|e| std::io::Error::other(format!("no randomness for the start key: {e}")))?;
+    getrandom::fill(&mut b)
+        .map_err(|e| std::io::Error::other(format!("no randomness for the start key: {e}")))?;
     Ok(hex::encode(b))
 }
 

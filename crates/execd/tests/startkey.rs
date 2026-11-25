@@ -118,14 +118,33 @@ async fn a_key_used_for_another_command_is_a_409_for_every_field_of_the_spec() {
     let (s, v) = start(a, "j1", Some("k"), sc, base.clone()).await;
     assert_eq!(s, 200, "{v}");
     // The env's order is not part of the spec.
-    let (s, _) = start(a, "j1", Some("k"), sc, json!({ "env": { "B": "2", "A": "1" }, "cwd": "/" })).await;
+    let (s, _) = start(
+        a,
+        "j1",
+        Some("k"),
+        sc,
+        json!({ "env": { "B": "2", "A": "1" }, "cwd": "/" }),
+    )
+    .await;
     assert_eq!(s, 200, "the same env in another order is the same spec");
     for (what, script, extra) in [
         ("command", "sleep 301", base.clone()),
-        ("env value", sc, json!({ "env": { "A": "1", "B": "3" }, "cwd": "/" })),
-        ("env name", sc, json!({ "env": { "A": "1", "C": "2" }, "cwd": "/" })),
+        (
+            "env value",
+            sc,
+            json!({ "env": { "A": "1", "B": "3" }, "cwd": "/" }),
+        ),
+        (
+            "env name",
+            sc,
+            json!({ "env": { "A": "1", "C": "2" }, "cwd": "/" }),
+        ),
         ("env gone", sc, json!({ "cwd": "/" })),
-        ("cwd", sc, json!({ "env": { "A": "1", "B": "2" }, "cwd": "/tmp" })),
+        (
+            "cwd",
+            sc,
+            json!({ "env": { "A": "1", "B": "2" }, "cwd": "/tmp" }),
+        ),
         ("cwd gone", sc, json!({ "env": { "A": "1", "B": "2" } })),
         (
             "stdin_open",
@@ -168,11 +187,19 @@ async fn an_id_in_the_table_is_refused_without_its_key_and_a_bad_key_is_400() {
     assert_eq!(s, 200);
     for key in [None, Some("k2")] {
         let (s, v) = start(a, "j1", key, "sleep 300", json!({})).await;
-        assert_eq!((s, v["error"].as_str()), (409, Some("the job exists")), "{key:?}");
+        assert_eq!(
+            (s, v["error"].as_str()),
+            (409, Some("the job exists")),
+            "{key:?}"
+        );
     }
     for bad in ["", "a b", "k/1", &"k".repeat(129)] {
         let (s, v) = start(a, "j3", Some(bad), "sleep 300", json!({})).await;
-        assert_eq!((s, v["error"].as_str()), (400, Some("bad idempotency key")), "{bad:?}");
+        assert_eq!(
+            (s, v["error"].as_str()),
+            (400, Some("bad idempotency key")),
+            "{bad:?}"
+        );
     }
     // An unkeyed job's id replays nothing either.
     let (s, _) = start(a, "j4", None, "sleep 300", json!({})).await;
@@ -240,13 +267,24 @@ async fn a_keyed_start_retried_after_a_restart_of_execd_replays() {
     let sc = script(&mark);
     let mut first = Execd::start(&settings, &[]);
     let a1 = SocketAddr::V4(first.addr);
-    let (s, live) = start(a1, "live", Some("deploy"), &sc, json!({ "env": { "TOKEN": "s3cr3t-value" } })).await;
+    let (s, live) = start(
+        a1,
+        "live",
+        Some("deploy"),
+        &sc,
+        json!({ "env": { "TOKEN": "s3cr3t-value" } }),
+    )
+    .await;
     assert_eq!(s, 200);
     let (s, done) = start(a1, "done", Some("build"), "echo built", json!({})).await;
     assert_eq!(s, 200);
     until("done ended", async || {
         let l = job(a1, json!({"op":"list","scope":"s"})).await;
-        l["jobs"].as_array().unwrap().iter().any(|j| j["id"] == "done" && j["state"] == "ended")
+        l["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|j| j["id"] == "done" && j["state"] == "ended")
     })
     .await;
     until("the run", async || runs(&mark) == 1).await;
@@ -264,10 +302,19 @@ async fn a_keyed_start_retried_after_a_restart_of_execd_replays() {
     let mut second = Execd::start(&settings, &[]);
     let a2 = SocketAddr::V4(second.addr);
     let spec = json!({ "env": { "TOKEN": "s3cr3t-value" } });
-    assert_eq!(start(a2, "live", Some("deploy"), &sc, spec.clone()).await, (200, live.clone()));
-    assert_eq!(start(a2, "done", Some("build"), "echo built", json!({})).await, (200, done.clone()));
+    assert_eq!(
+        start(a2, "live", Some("deploy"), &sc, spec.clone()).await,
+        (200, live.clone())
+    );
+    assert_eq!(
+        start(a2, "done", Some("build"), "echo built", json!({})).await,
+        (200, done.clone())
+    );
     let (s, v) = start(a2, "live", Some("deploy"), &sc, json!({})).await;
-    assert_eq!((s, v["error"].as_str()), (409, Some("the key was used for a different command")));
+    assert_eq!(
+        (s, v["error"].as_str()),
+        (409, Some("the key was used for a different command"))
+    );
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(runs(&mark), 1, "the command ran once, across the restart");
     // A crash leaves the same.
@@ -275,8 +322,14 @@ async fn a_keyed_start_retried_after_a_restart_of_execd_replays() {
     second.child.wait().unwrap();
     let third = Execd::start(&settings, &[]);
     let a3 = SocketAddr::V4(third.addr);
-    assert_eq!(start(a3, "live", Some("deploy"), &sc, spec).await, (200, live));
-    assert_eq!(start(a3, "done", Some("build"), "echo built", json!({})).await, (200, done));
+    assert_eq!(
+        start(a3, "live", Some("deploy"), &sc, spec).await,
+        (200, live)
+    );
+    assert_eq!(
+        start(a3, "done", Some("build"), "echo built", json!({})).await,
+        (200, done)
+    );
     assert_eq!(ids(a3).await, vec!["done".to_string(), "live".to_string()]);
     kill(a3, &["live", "done"]).await;
 }
@@ -302,7 +355,12 @@ async fn a_held_start_retried_with_its_key_streams_the_first_job() {
         &json!({"command":"sh","args":["-c", &sc],"job":{"op":"start","scope":"s","id":"h1","hold":true,"idempotency_key":"hk"}}),
     )
     .await;
-    assert_eq!(again.status, 200, "{}", String::from_utf8_lossy(&again.body));
+    assert_eq!(
+        again.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&again.body)
+    );
     let text = String::from_utf8_lossy(&again.body);
     assert!(text.contains("started"), "{text}");
     assert_eq!(runs(&mark), 1);
