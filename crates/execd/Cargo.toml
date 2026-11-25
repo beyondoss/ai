@@ -80,6 +80,30 @@ mut_key_id_ignored = [
 mut_take_by_key = [
   "beyond-execd-jobs/mut_take_by_key",
 ]
+mut_key_held_starts = [
+  "beyond-execd-jobs/mut_key_held_starts",
+]
+mut_spawn_without_claim = [
+  "beyond-execd-jobs/mut_spawn_without_claim",
+]
+mut_durable_claim_refused = [
+  "beyond-execd-jobs/mut_durable_claim_refused",
+]
+mut_orphan_survives = [
+  "beyond-execd-jobs/mut_orphan_survives",
+]
+mut_bad_key_accepted = [
+  "beyond-execd-jobs/mut_bad_key_accepted",
+]
+mut_valid_key_refused = [
+  "beyond-execd-jobs/mut_valid_key_refused",
+]
+mut_replay_refuses_started = [
+  "beyond-execd-jobs/mut_replay_refuses_started",
+]
+mut_replay_waits_forever = [
+  "beyond-execd-jobs/mut_replay_waits_forever",
+]
 mut_follow_waits_after_end = [
   "beyond-execd-jobs/mut_follow_waits_after_end",
 ] # a stream never sends its final frame (L2)

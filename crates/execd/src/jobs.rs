@@ -41,10 +41,10 @@ use crate::exec::{self, Cut, Sink};
 use crate::frame::{self, FRAME_MAX};
 use crate::http::{self, Line, Request, Resp};
 use crate::job_kernel::{
-    self as kernel, Act, Admit, Alive, Begin, Ev, Follow, Kind, Pick, Rec, Recovery, Refusal,
-    Sink as Dest,
+    self as kernel, Act, Admit, Alive, Begin, Ev, Follow, Kind, Launch, Persist, Pick, Rec,
+    Recovery, Refusal, Replied, Sink as Dest, Sweep,
 };
-use crate::ledger::{Entry, Idem, Ledger, Saved};
+use crate::ledger::{Entry, Idem, Ledger};
 use crate::notify::{self, Notifier, NotifyTarget};
 use crate::proc::{self, locked};
 use crate::ring::Ring;
@@ -126,24 +126,32 @@ impl Jobs {
         if !self.ledger.enabled() {
             return;
         }
-        self.ledger.save(|| {
-            let cells = locked(&self.map).all();
-            cells
-                .into_iter()
-                .filter_map(|((scope, id), cell)| {
-                    let j = locked(&cell);
-                    Entry::of(
-                        &scope,
-                        &id,
-                        &j.label,
-                        &j.mark,
-                        &j.k,
-                        j.spool.as_ref().map(Spool::dir),
-                        j.idem.as_ref(),
-                    )
-                })
-                .collect()
-        });
+        self.ledger.save(|| self.entries());
+    }
+
+    /// [`Self::save`] for a keyed start's claim: durable, and how it came out (K10).
+    fn claim(&self) -> Persist {
+        self.ledger.claim(|| self.entries())
+    }
+
+    /// What the ledger holds of the table: each job that has a group (or a keyed intent) and is not removed.
+    fn entries(&self) -> Vec<Entry> {
+        let cells = locked(&self.map).all();
+        cells
+            .into_iter()
+            .filter_map(|((scope, id), cell)| {
+                let j = locked(&cell);
+                Entry::of(
+                    &scope,
+                    &id,
+                    &j.label,
+                    &j.mark,
+                    &j.k,
+                    j.spool.as_ref().map(Spool::dir),
+                    j.idem.as_ref(),
+                )
+            })
+            .collect()
     }
 
     /// The server is shutting down and kills every group: nothing is left to recover.
@@ -826,7 +834,7 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
     let key = (job.scope.clone(), job.id.clone());
     let idem = match job.idempotency_key.as_deref() {
         None => None,
-        Some(k) if valid_key(k) => Some(Idem {
+        Some(k) if kernel::key_valid(k.as_bytes()) => Some(Idem {
             key: k.to_string(),
             digest: spec_digest(req, job),
         }),
@@ -897,15 +905,26 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
     let cell = match gate {
         Gate::Run(cell) => cell,
         Gate::Answer(resp) => return resp,
-        Gate::Replay(replayed, Some(cell)) => {
+        Gate::Replay(replayed, cell) => {
             return replay_job(ctx, req, job, replayed, cell).await;
         }
-        Gate::Replay(_, None) => return http::error_response(500, "the job did not start"),
     };
-    // A keyed start's claim is on disk before anything is spawned (K9): a crash from here to the group's save leaves
-    // an intent a restart answers as lost, never a start to run again.
-    if idem.is_some() {
-        ctx.jobs.save();
+    // A keyed start's claim is durable before anything is spawned (K9, K10): a crash from here to the group's save
+    // leaves an intent a restart answers as lost, never a start to run again. A claim that cannot be written is a
+    // start that does not run: the kernel says which refusal, and the retry, once the disk takes it, starts.
+    match kernel::launch(idem.is_some().then(|| ctx.jobs.claim())) {
+        Launch::Spawn => {}
+        Launch::DiskFull => {
+            ctx.jobs.remove(&[(key, cell)]);
+            return http::error_response(
+                507,
+                "the sandbox's disk is full: no room to record the start",
+            );
+        }
+        Launch::Failed => {
+            ctx.jobs.remove(&[(key, cell)]);
+            return http::error_response(500, "cannot record the start");
+        }
     }
     let mut cmd = exec::command_for(ctx, req, Kind::Job);
     cmd.stdin(if job.stdin_open {
@@ -961,6 +980,10 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
     };
     // The child has its own copies of the write ends; execd holds none.
     drop(cmd);
+    if crate::fault::at("after_spawn").as_deref() == Some("exit") {
+        // A test's crash of execd between the spawn and the group's save (K11).
+        std::process::exit(86);
+    }
     let pgid = proc.pgid;
     let stdin = proc.stdin.take().map(JobStdin::new);
     {
@@ -983,6 +1006,7 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
     ));
 
     let opened = job.stdin_open;
+    let echo = job.idempotency_key.clone();
     if job.hold {
         let (resp, out) = http::stream_response();
         let seq = ctx.next_seq.fetch_add(1, Ordering::Relaxed);
@@ -1004,7 +1028,7 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
                 cell,
                 0,
                 true,
-                Some((pgid, opened)),
+                Some((pgid, opened, echo)),
                 Sink::new(out, beat, None),
             )
             .await;
@@ -1014,15 +1038,8 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
         });
         resp
     } else {
-        started_body(pgid, opened)
+        started_body(pgid, opened, echo.as_deref())
     }
-}
-
-/// A key is 1 to 128 characters of `[0-9A-Za-z._:-]`: a UUID, or a name such as `deploy-2026-11-24`.
-fn valid_key(k: &str) -> bool {
-    (1..=128).contains(&k.len())
-        && k.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
 }
 
 /// The digest of what a start runs: command, args, cwd, env, stdin_open and hold, length-prefixed so no two
@@ -1063,26 +1080,39 @@ fn spec_digest(req: &Request, job: &JobReq) -> String {
 }
 
 /// The answer to a start the key ledger already has: the original job's, as its start answered (its group; `stdin`
-/// when it was opened), or, for a held start, its stream from the first byte. Nothing is spawned. A replay that
-/// arrives while the original is still spawning waits for its group, so it never answers a job with no process.
-async fn replay_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq, key: Key, cell: JobCell) -> Resp {
+/// when it was opened; the key, echoed), or, for a held start, its stream from the first byte. Nothing is spawned. A
+/// replay that arrives while the original is still spawning waits for its group, so it never answers a job with no
+/// process; what it answers at each look is the kernel's (K14, K15). `cell` is `None` when the table no longer holds
+/// the job: the same refusal as a job removed before it started.
+async fn replay_job(
+    ctx: &Arc<Ctx>,
+    req: &Request,
+    job: &JobReq,
+    key: Key,
+    cell: Option<JobCell>,
+) -> Resp {
     let mut waited = 0;
-    let pgid = loop {
-        let (pgid, removed, ended) = {
-            let j = locked(&cell);
-            (j.k.pgid(), j.k.removed, j.k.ended())
+    let (cell, pgid) = loop {
+        let (pgid, ended, removed) = match &cell {
+            Some(c) => {
+                let j = locked(c);
+                (j.k.pgid(), j.k.ended(), j.k.removed)
+            }
+            None => (0, false, true),
         };
-        // A job a restart found claimed and never spawned is ended with no group: its answer is that.
-        if pgid != 0 || ended {
-            break pgid;
+        match (kernel::replay_poll(pgid, ended, removed, waited), &cell) {
+            // A job a restart found claimed and never spawned is ended with no group: its answer is that.
+            (Replied::Answer, Some(c)) => break (c.clone(), pgid),
+            (Replied::Wait, _) => {
+                waited += 1;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            // A refusal, or (never: no job is no group, so the kernel refuses it) an answer with no job: fail closed.
+            _ => return http::error_response(500, "the job did not start"),
         }
-        if removed || waited >= 1000 {
-            return http::error_response(500, "the job did not start");
-        }
-        waited += 1;
-        tokio::time::sleep(Duration::from_millis(10)).await;
     };
     let opened = job.stdin_open;
+    let echo = job.idempotency_key.clone();
     if job.hold {
         let (resp, out) = http::stream_response();
         let ctx2 = ctx.clone();
@@ -1094,22 +1124,26 @@ async fn replay_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq, key: Key, cell:
                 cell,
                 0,
                 true,
-                Some((pgid, opened)),
+                Some((pgid, opened, echo)),
                 Sink::new(out, beat, None),
             )
             .await;
         });
         resp
     } else {
-        started_body(pgid, opened)
+        started_body(pgid, opened, echo.as_deref())
     }
 }
 
-/// What a start answers: the job's process group, and `stdin` when its stdin was opened.
-fn started_body(pgid: i32, opened: bool) -> Resp {
+/// What a start answers: the job's process group, `stdin` when its stdin was opened, and the start's key when it
+/// had one: the echo that tells a client its key was kept (an execd that ignores keys says nothing).
+fn started_body(pgid: i32, opened: bool, key: Option<&str>) -> Resp {
     let mut body = json!({ "started": pgid });
     if opened {
         body["stdin"] = json!(true);
+    }
+    if let Some(k) = key {
+        body["key"] = json!(k);
     }
     http::json_response(200, &body)
 }
@@ -1277,6 +1311,9 @@ async fn supervise(
     ctx.jobs.save();
 }
 
+/// How many times a restart's sweep of a lost claim's marked processes looks again after a kill.
+const SWEEP_PASSES: usize = 5;
+
 /// Start of a server: the jobs a previous execd saved ([`crate::ledger`]) come back as
 /// [`kernel::recover`] decides, each in the table under its address. A job whose group lives is
 /// adopted (watched until the group empties, then ended with the shell's saved status, else
@@ -1288,17 +1325,27 @@ pub(crate) fn recover(ctx: &Arc<Ctx>) {
     let mut adopted: Vec<std::path::PathBuf> = Vec::new();
     for e in ctx.jobs.ledger.load() {
         let alive = !proc::job_members(saved_pgid(&e), &e.mark).is_empty();
-        let (mut state, how) = kernel::recover(e.state(), alive, epoch(), e.idem.is_some());
+        let (mut state, how, sweep) = kernel::recover(e.state(), alive, epoch(), e.idem.is_some());
         if how == Recovery::Drop {
             continue;
         }
-        if matches!(e.phase, Saved::Spawning) && alive {
-            // The spawn happened and its save did not: nobody can find this job's processes but by its mark, and its
-            // answer is lost. Never leave them running unseen.
-            for pid in proc::job_members(0, &e.mark) {
-                if let Ok(raw) = i32::try_from(pid) {
-                    let _ =
-                        nix::sys::signal::kill(nix::unistd::Pid::from_raw(raw), Signal::SIGKILL);
+        if sweep == Sweep::KillMarked {
+            // The intent's spawn may have happened and its save not: nobody can find its processes but by the
+            // mark, and its answer is lost. Never leave them running unseen (K11). A process still between its
+            // fork and its exec carries execd's environment, not the mark, so the sweep looks again until a pass
+            // finds none.
+            for _ in 0..SWEEP_PASSES {
+                let marked = proc::job_members(0, &e.mark);
+                if marked.is_empty() {
+                    break;
+                }
+                for pid in marked {
+                    if let Ok(raw) = i32::try_from(pid) {
+                        let _ = nix::sys::signal::kill(
+                            nix::unistd::Pid::from_raw(raw),
+                            Signal::SIGKILL,
+                        );
+                    }
                 }
             }
         }
@@ -1523,7 +1570,7 @@ async fn stream_job(
     attached: JobCell,
     offset: u64,
     hold: bool,
-    started: Option<(i32, bool)>,
+    started: Option<(i32, bool, Option<String>)>,
     mut sink: Sink,
 ) -> StreamEnd {
     // A job stream has no deadline of its own: it lives as long as the job or the connection.
@@ -1560,13 +1607,16 @@ async fn follow(
     key: &Key,
     attached: &JobCell,
     offset: u64,
-    started: Option<(i32, bool)>,
+    started: Option<(i32, bool, Option<String>)>,
     sink: &mut Sink,
 ) -> Result<StreamEnd, Cut> {
-    if let Some((pgid, opened)) = started {
+    if let Some((pgid, opened, echo)) = started {
         let mut first = json!({ "started": pgid });
         if opened {
             first["stdin"] = json!(true);
+        }
+        if let Some(k) = echo {
+            first["key"] = json!(k);
         }
         sink.put(frame::json(&first)).await?;
     }

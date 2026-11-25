@@ -64,7 +64,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use execd::job_kernel::{
-    self as kernel, Act, Admit, Alive, Begin, Ev, Follow, Key, Phase, Pick, Rec, Recovery, State,
+    self as kernel, Act, Admit, Alive, Begin, Ev, Follow, Key, Launch, Persist, Phase, Pick, Rec,
+    Recovery, State, Sweep,
 };
 use stateright::{Checker, Model, Property};
 
@@ -80,6 +81,8 @@ const V_J10: u32 = 256;
 const V_K1: u32 = 512;
 const V_K2: u32 = 1024;
 const V_K4: u32 = 2048;
+const V_K10: u32 = 4096;
+const V_K16: u32 = 8192;
 
 fn key(scope: u8, id: u8) -> Key {
     (format!("S{scope}"), format!("i{id}"))
@@ -126,6 +129,19 @@ struct Sim {
     /// A restart dropped this keyed job's claim while its process may have been spawned: whatever starts for its key
     /// next would be a second spawn (K9). The model's own fact, never the kernel's.
     orphan: bool,
+    /// How far a keyed start's claim step is (K10): the claim's write, then the spawn.
+    claimed: Claimed,
+}
+
+/// A keyed start's claim step, as the environment saw it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Claimed {
+    /// Its claim has not been written yet: nothing may spawn.
+    Pending,
+    /// Its claim is on disk, or the start has no key.
+    Durable,
+    /// Its claim is not on disk and the start went on to spawn (the kernel said `Spawn`).
+    Unsaved,
 }
 
 impl Sim {
@@ -199,6 +215,10 @@ enum A {
     },
     /// execd restarts: its table is gone and the ledger's jobs come back as `recover` decides.
     Restart,
+    /// A keyed start's claim is written (K10).
+    ClaimOk(usize),
+    /// A keyed start's claim cannot be written (the disk is full, or the write fails): the kernel says what the start does.
+    ClaimFail(usize),
     /// A keyed job's process is spawned and execd restarts before the group's save: only the intent is on disk (K9).
     SpawnCrash(usize),
     SpawnOk(usize),
@@ -355,7 +375,14 @@ impl St {
         }
         for ((sc, idn), h) in old {
             let sim = &mut self.sims[h];
-            let (mut state, how) =
+            if sim.idem.is_some() && sim.claimed != Claimed::Durable {
+                // Its claim never reached the disk: the ledger has no entry for it, and a process it spawned (the
+                // kernel let it) is one no restart can name. The next start of its key would spawn it again.
+                sim.orphan = sim.alive();
+                kernel::step(&mut sim.k, Ev::Taken);
+                continue;
+            }
+            let (mut state, how, sweep) =
                 kernel::recover(sim.k.clone(), sim.alive(), 0, sim.idem.is_some());
             if how == Recovery::Drop {
                 // Never saved (it was spawning): the spawn died with the process. A keyed one's process may
@@ -364,8 +391,10 @@ impl St {
                 kernel::step(&mut sim.k, Ev::Taken);
                 continue;
             }
-            if how == Recovery::Restore && matches!(sim.k.phase, Phase::Spawning) {
-                // A claim with no group: the answer is lost, and the shell kills what carries the mark.
+            if sweep == Sweep::KillMarked {
+                // The kernel's action: the shell kills what carries the intent's mark. Whether a process of the
+                // claim lives is the environment's fact (`SpawnCrash` left one); the kill is only what the kernel
+                // asked for.
                 sim.shell = false;
                 sim.desc = false;
             }
@@ -595,10 +624,15 @@ impl Model for Jobs {
         for (i, sim) in s.sims.iter().enumerate() {
             // A failed spawn took the entry: nothing spawns after it.
             if sim.k.phase == Phase::Spawning && !sim.k.removed {
-                out.push(A::SpawnOk(i));
-                out.push(A::SpawnFail(i));
-                if self.restart && sim.idem.is_some() {
-                    out.push(A::SpawnCrash(i));
+                if sim.claimed == Claimed::Pending {
+                    out.push(A::ClaimOk(i));
+                    out.push(A::ClaimFail(i));
+                } else {
+                    out.push(A::SpawnOk(i));
+                    out.push(A::SpawnFail(i));
+                    if self.restart && sim.idem.is_some() {
+                        out.push(A::SpawnCrash(i));
+                    }
                 }
             }
             if sim.shell {
@@ -700,6 +734,7 @@ impl Model for Jobs {
                     was_kept: client.is_none(),
                     idem: None,
                     orphan: false,
+                    claimed: Claimed::Durable,
                 });
                 s.table.insert(k, h);
                 if let Some(c) = client {
@@ -780,6 +815,7 @@ impl Model for Jobs {
                             was_kept: true,
                             idem: Some((kk, spec)),
                             orphan: false,
+                            claimed: Claimed::Pending,
                         });
                         if let Some(old) = s.table.get(&key(scope, id))
                             && !s.sims[old].k.removed
@@ -797,7 +833,31 @@ impl Model for Jobs {
                 }
             }
             A::Restart => s.restart(),
+            A::ClaimOk(i) => {
+                // `start_job`: the claim is written, then the kernel says whether to spawn.
+                if kernel::launch(Some(Persist::Durable)) == Launch::Spawn {
+                    s.sims[i].claimed = Claimed::Durable;
+                } else {
+                    // K16: a durable claim always spawns.
+                    s.bad |= V_K16;
+                    let k = key(s.sims[i].scope, s.sims[i].id);
+                    s.take(&[(k, i)]);
+                }
+            }
+            A::ClaimFail(i) => {
+                // The claim could not be written: the kernel refuses (the entry goes, as a failed spawn's does) or,
+                // under a mutation, spawns with no claim on disk.
+                if kernel::launch(Some(Persist::Failed)) == Launch::Spawn {
+                    s.sims[i].claimed = Claimed::Unsaved;
+                } else {
+                    let k = key(s.sims[i].scope, s.sims[i].id);
+                    s.take(&[(k, i)]);
+                }
+            }
             A::SpawnCrash(i) => {
+                if s.sims[i].claimed != Claimed::Durable {
+                    s.bad |= V_K10;
+                }
                 let sim = &mut s.sims[i];
                 sim.shell = true;
                 sim.desc = true;
@@ -805,6 +865,9 @@ impl Model for Jobs {
                 s.restart();
             }
             A::SpawnOk(i) => {
+                if s.sims[i].idem.is_some() && s.sims[i].claimed != Claimed::Durable {
+                    s.bad |= V_K10;
+                }
                 let sim = &mut s.sims[i];
                 kernel::step(
                     &mut sim.k,
@@ -1142,6 +1205,24 @@ impl Model for Jobs {
                 s.bad & V_K4 == 0
             }),
             Property::always(
+                "K10: no process of a keyed start runs without its claim durable",
+                |_, s: &St| s.bad & V_K10 == 0,
+            ),
+            Property::always(
+                "K11: a restart leaves no process running for a claim it answers as lost",
+                |_, s: &St| {
+                    s.sims.iter().all(|x| {
+                        !(x.idem.is_some()
+                            && matches!(x.k.phase, Phase::Ended { pgid: 0, .. })
+                            && x.alive())
+                    })
+                },
+            ),
+            Property::always(
+                "K16: a keyed start whose claim is durable spawns",
+                |_, s: &St| s.bad & V_K16 == 0,
+            ),
+            Property::always(
                 "alive: a job counts as alive only with a group",
                 |_, s: &St| {
                     s.sims
@@ -1328,53 +1409,64 @@ fn ended_is_final() {
     feature = "mut_key_record_clears",
     feature = "mut_key_take_forgets_none",
     feature = "mut_intent_respawns",
-    feature = "mut_key_id_ignored"
+    feature = "mut_key_id_ignored",
+    feature = "mut_key_held_starts",
+    feature = "mut_spawn_without_claim",
+    feature = "mut_durable_claim_refused",
+    feature = "mut_orphan_survives"
 ))]
 #[test]
 fn the_mutation_turns_its_property_red() {
-    let property = if cfg!(feature = "mut_start_overwrites") {
-        "J1: "
-    } else if cfg!(feature = "mut_scope_ignored") {
-        "J2: "
-    } else if cfg!(feature = "mut_remove_keeps_entry") {
-        "J3: "
-    } else if cfg!(feature = "mut_end_rewritten") {
-        // The model's supervisor sends one end; the kernel check names this one.
-        let r = std::panic::catch_unwind(ended_is_final);
-        println!("red: [\"J4\"] kernel check failed: {}", r.is_err());
-        assert!(r.is_err(), "no property `J4` went red");
-        return;
-    } else if cfg!(feature = "mut_stream_follows_key") {
-        "J9: "
-    } else if cfg!(feature = "mut_disconnect_kills_kept") {
-        "J6: "
-    } else if cfg!(feature = "mut_remove_live") {
-        "J7: "
-    } else if cfg!(feature = "mut_signal_ended") {
-        "J8: "
-    } else if cfg!(feature = "mut_take_by_key") {
-        "J10: "
-    } else if cfg!(feature = "mut_ended_not_removable") {
-        "L1: "
-    } else if cfg!(feature = "mut_key_replay_starts") || cfg!(feature = "mut_intent_respawns") {
-        "K1: "
-    } else if cfg!(feature = "mut_key_digest_ignored")
-        || cfg!(feature = "mut_key_take_forgets_none")
-        || cfg!(feature = "mut_key_id_ignored")
-    {
-        "K2: "
-    } else if cfg!(feature = "mut_key_fresh_refused")
-        || cfg!(feature = "mut_key_forgotten_on_restart")
-        || cfg!(feature = "mut_key_record_clears")
-    {
-        "K3: "
-    } else if cfg!(feature = "mut_unkeyed_replays") {
-        "K4: "
-    } else if cfg!(feature = "mut_follow_waits_after_end") {
-        "L2: "
-    } else {
-        unreachable!("a mutation with no property")
-    };
+    let property =
+        if cfg!(feature = "mut_start_overwrites") || cfg!(feature = "mut_key_held_starts") {
+            "J1: "
+        } else if cfg!(feature = "mut_scope_ignored") {
+            "J2: "
+        } else if cfg!(feature = "mut_remove_keeps_entry") {
+            "J3: "
+        } else if cfg!(feature = "mut_end_rewritten") {
+            // The model's supervisor sends one end; the kernel check names this one.
+            let r = std::panic::catch_unwind(ended_is_final);
+            println!("red: [\"J4\"] kernel check failed: {}", r.is_err());
+            assert!(r.is_err(), "no property `J4` went red");
+            return;
+        } else if cfg!(feature = "mut_stream_follows_key") {
+            "J9: "
+        } else if cfg!(feature = "mut_disconnect_kills_kept") {
+            "J6: "
+        } else if cfg!(feature = "mut_remove_live") {
+            "J7: "
+        } else if cfg!(feature = "mut_signal_ended") {
+            "J8: "
+        } else if cfg!(feature = "mut_take_by_key") {
+            "J10: "
+        } else if cfg!(feature = "mut_ended_not_removable") {
+            "L1: "
+        } else if cfg!(feature = "mut_key_replay_starts") || cfg!(feature = "mut_intent_respawns") {
+            "K1: "
+        } else if cfg!(feature = "mut_key_digest_ignored")
+            || cfg!(feature = "mut_key_take_forgets_none")
+            || cfg!(feature = "mut_key_id_ignored")
+        {
+            "K2: "
+        } else if cfg!(feature = "mut_key_fresh_refused")
+            || cfg!(feature = "mut_key_forgotten_on_restart")
+            || cfg!(feature = "mut_key_record_clears")
+        {
+            "K3: "
+        } else if cfg!(feature = "mut_unkeyed_replays") {
+            "K4: "
+        } else if cfg!(feature = "mut_spawn_without_claim") {
+            "K10: "
+        } else if cfg!(feature = "mut_orphan_survives") {
+            "K11: "
+        } else if cfg!(feature = "mut_durable_claim_refused") {
+            "K16: "
+        } else if cfg!(feature = "mut_follow_waits_after_end") {
+            "L2: "
+        } else {
+            unreachable!("a mutation with no property")
+        };
     let mut red: Vec<&str> = Vec::new();
     for m in [SLOW, REUSE, SCOPES, IDS, STREAMS, KEYED] {
         // A red run stops when the named property fails: the counterexample is the evidence.
@@ -1422,6 +1514,10 @@ fn production_calls_the_kernel() {
     for needle in [
         "admit(&key)",
         ".begin(",
+        "kernel::key_valid(",
+        "kernel::replay_poll(",
+        "kernel::recover(",
+        "Sweep::KillMarked",
         ".record(Rec {",
         "kernel::keeps_record(",
         "kernel::State::new(",
@@ -1455,10 +1551,10 @@ fn production_calls_the_kernel() {
     ] {
         assert!(prod.contains(needle), "jobs.rs no longer calls {needle}");
     }
-    // K9: a keyed start's claim is on disk before anything is spawned.
+    // K9, K10: a keyed start's claim is durable before anything is spawned, and the kernel says whether to spawn.
     let intent = prod
-        .find("if idem.is_some() {\n        ctx.jobs.save();")
-        .expect("the keyed start saves its claim");
+        .find("kernel::launch(idem.is_some().then(|| ctx.jobs.claim()))")
+        .expect("the keyed start's claim goes through the kernel's launch");
     let spawn = prod.find("proc::spawn(&mut cmd)").expect("the spawn");
     assert!(intent < spawn, "the claim is saved after the spawn");
     // The table is the kernel's verified storage, not a map of the shell's.

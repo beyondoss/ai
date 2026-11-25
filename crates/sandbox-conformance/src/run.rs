@@ -425,8 +425,19 @@ pub async fn run_scenario_via(sc: &Value, be: &Backend, peer: Option<&Backend>) 
     let mut edge = None;
     let link: &dyn Link = match sc.get("connect") {
         Some(c) => {
-            let mut bearer = c.get("bearer").map(|b| b.as_str().map(str::to_string));
-            let mut url = c["url"].as_str().map(str::to_string);
+            // `connect.url` and `connect.bearer` may name a variable the backend defines (`"${EXECD_PRIOR_URL}"`): an
+            // endpoint of the backend's other than its own, such as a second execd. A scenario that names one the
+            // backend lacks is skipped by its `requires.vars`.
+            let named = |v: &Value| {
+                v.as_str().map(|s| {
+                    s.strip_prefix("${")
+                        .and_then(|n| n.strip_suffix('}'))
+                        .and_then(|n| be.vars.get(n))
+                        .map_or_else(|| s.to_string(), Clone::clone)
+                })
+            };
+            let mut bearer = c.get("bearer").map(named);
+            let mut url = c.get("url").and_then(named);
             let mut token_cmd = None;
             if let Some(cfg) = c.get("edge") {
                 let Some((up, up_bearer)) = be.connector.upstream() else {

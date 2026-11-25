@@ -91,7 +91,7 @@ export interface JobChunk {
 
 /** What a job stream says: output, a gap, the shell's exit, and the final status. */
 export type JobFrame =
-  | { type: "started"; pgid: number; stdin?: boolean }
+  | { type: "started"; pgid: number; stdin?: boolean; key?: string }
   /** `stream` is the pipe the bytes came from; concatenated, the pieces are the combined output. */
   | { type: "output"; data: Uint8Array; stream: "stdout" | "stderr" }
   /** `bytes` of output from the requested offset are no longer kept. */

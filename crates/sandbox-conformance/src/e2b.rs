@@ -38,6 +38,9 @@ const STATE_DIR: &str = "/run/execd-state";
 const JOBS_DIR: &str = "/var/tmp";
 /// The release installed: its `execd-<tag>-linux-<arch>.tar.gz`, checked against its `.sha256`.
 const DEFAULT_TAG: &str = "v0.1.16";
+/// The release that stands for an execd that ignores start keys (it predates them): the `jobs-key` suite's scenario
+/// that expects `not_offered` connects to it, on the port after [`PORT`], beside the execd under test.
+const PRIOR_TAG: &str = "v0.1.16";
 const READY_WITHIN: Duration = Duration::from_secs(90);
 
 pub fn key() -> Option<String> {
@@ -422,11 +425,61 @@ sudo chmod 700 @HOME@/bin/execd-restart"#
     if let Ok((_, log, _)) = vm.run("grep -m1 listening /tmp/execd.log", json!({})).await {
         eprintln!("e2b: {}", log.trim());
     }
+    // The prior release beside it, on the next port: the endpoint that ignores start keys.
+    let prior_port = PORT + 1;
+    let prior = format!(
+        "set -e; mkdir -p {HOME}/prior\n\
+         curl -fsSL --retry 3 https://github.com/beyondoss/ai/releases/download/{PRIOR_TAG}/install-execd.sh \
+           | EXECD_VERSION={PRIOR_TAG} EXECD_INSTALL_DIR={HOME}/prior sh\n\
+         sudo env -u SUDO_COMMAND -u SUDO_USER -u SUDO_UID -u SUDO_GID EXECD_LISTEN=0.0.0.0:{prior_port} \
+           EXECD_ROOT={HOME}/work EXECD_HOME={HOME} EXECD_RUN_AS=user EXECD_BEARER=\"$BEARER\" \
+           setsid nohup {HOME}/prior/execd >/tmp/execd-prior.log 2>&1 < /dev/null &\nsleep 1"
+    );
+    let prior_url = format!("https://{prior_port}-{}.e2b.app/exec", vm.id);
+    let mut prior_up = false;
+    if vm
+        .run(&prior, json!({"BEARER": bearer}))
+        .await
+        .is_ok_and(|r| r.0 == 0)
+    {
+        let t = Instant::now();
+        while t.elapsed() < READY_WITHIN {
+            let code = curl(
+                &[],
+                &[
+                    "-o",
+                    "/dev/null",
+                    "-w",
+                    "%{http_code}",
+                    "-m",
+                    "5",
+                    "-X",
+                    "POST",
+                    &prior_url,
+                    "-d",
+                    "{}",
+                ],
+                None,
+            )
+            .await
+            .unwrap_or_default();
+            if code == b"401" {
+                prior_up = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+    if !prior_up {
+        eprintln!(
+            "e2b: the prior execd ({PRIOR_TAG}) did not come up: the scenarios that need it are skipped"
+        );
+    }
     eprintln!("e2b: ready in {:.1}s", t0.elapsed().as_secs_f64());
     Ok(Started {
         name: name.into(),
         url,
-        bearer: Some(bearer),
+        bearer: Some(bearer.clone()),
         work: format!("{HOME}/work"),
         caps: None,
         suites: None,
@@ -437,7 +490,11 @@ sudo chmod 700 @HOME@/bin/execd-restart"#
                 "EXECD_RESTART".into(),
                 format!("sudo {HOME}/bin/execd-restart"),
             ),
-        ]),
+        ])
+        .into_iter()
+        .chain(prior_up.then(|| ("EXECD_PRIOR_URL".to_string(), prior_url.clone())))
+        .chain(prior_up.then(|| ("EXECD_PRIOR_BEARER".to_string(), bearer.clone())))
+        .collect(),
         lease: Some(Arc::new({
             let vm = vm.clone();
             move || {

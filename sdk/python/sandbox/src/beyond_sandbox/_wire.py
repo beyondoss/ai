@@ -256,7 +256,12 @@ def decode_job_line(line: bytes) -> list[JobFrame]:
     if "error" in obj:
         raise TransportError(f"job stream: the endpoint failed mid-job: {obj['error']}")
     if isinstance(obj.get("started"), int):
-        return [JobStarted(obj["started"], obj.get("stdin") is True)]
+        echo = obj.get("key")
+        return [
+            JobStarted(
+                obj["started"], obj.get("stdin") is True, echo if isinstance(echo, str) else None
+            )
+        ]
     for key in ("stdout", "stderr"):
         if key in obj:
             return [JobOutput(_b64(key, obj[key]), key == "stderr")]

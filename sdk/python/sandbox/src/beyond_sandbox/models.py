@@ -176,6 +176,8 @@ class JobShellExit:
 class JobStarted:
     pgid: int
     stdin: bool = False  # the job was started with its stdin open (the echo of ``stdin_open``)
+    # The start's idempotency key, echoed; absent from an endpoint that ignores keys.
+    key: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

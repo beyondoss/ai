@@ -143,6 +143,9 @@ pub struct MockOptions {
     pub command_env: bool,
     /// Implement the job `signal` op. `false` answers it as an unknown op.
     pub job_signal_op: bool,
+    /// Keep a start's `idempotency_key`, echoing it in the start's answer. `false` is the endpoint that ignores
+    /// keys: its answer says nothing of one.
+    pub start_key: bool,
 }
 
 /// One way per notify conformance check for an endpoint to get the spec wrong. Each is a change to
@@ -214,6 +217,7 @@ impl Default for MockOptions {
             job_stdin: true,
             command_env: true,
             job_signal_op: true,
+            start_key: true,
         }
     }
 }
@@ -229,11 +233,12 @@ impl MockOptions {
             && self.job_stdin
             && self.command_env
             && self.job_signal_op
+            && self.start_key
     }
 
-    /// Conforming in everything but the four job-protocol additions
+    /// Conforming in everything but the five job-protocol additions
     /// ([`Self::splits_job_streams`], [`Self::job_stdin`], [`Self::command_env`],
-    /// [`Self::job_signal_op`]), which are each missing from an endpoint by a filter in front of
+    /// [`Self::job_signal_op`], [`Self::start_key`]), which are each missing from an endpoint by a filter in front of
     /// execd and not by a second implementation: see [`ExecMock::delegate_lacking`].
     fn conforming_but_for_job_protocol(&self) -> bool {
         !self.corrupts_base64
@@ -434,6 +439,8 @@ impl ExecMock {
             &opts,
         );
         let mock = Self { url, ..inner };
+        // The filter's client needs a TLS provider installed, as a test's own client does.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let client = reqwest::Client::new();
         tokio::spawn(async move {
             while let Ok((sock, _)) = outer.accept().await {
@@ -1355,6 +1362,11 @@ async fn start_job(sock: tokio::net::TcpStream, req: Value, shared: Shared) {
     let scope = job["scope"].as_str().unwrap_or("").to_string();
     let id = job["id"].as_str().unwrap_or("").to_string();
     let hold = job["hold"].as_bool() == Some(true);
+    let echo = shared
+        .opts
+        .start_key
+        .then(|| job["idempotency_key"].as_str().map(str::to_string))
+        .flatten();
     let key = (scope, id);
     if shared.jobs.map.lock().unwrap().contains_key(&key) {
         return respond_json(sock, 409, &json!({ "error": "the job exists" })).await;
@@ -1472,10 +1484,14 @@ async fn start_job(sock: tokio::net::TcpStream, req: Value, shared: Shared) {
             });
             streams.len() - 1
         };
-        let end = stream_job(sock, shared.clone(), key, 0, true, Some(pgid)).await;
+        let end = stream_job(sock, shared.clone(), key, 0, true, Some((pgid, echo))).await;
         shared.streams.lock().unwrap()[index].end = Some((end, Instant::now()));
     } else {
-        respond_json(sock, 200, &json!({ "started": pgid })).await;
+        let mut body = json!({ "started": pgid });
+        if let Some(k) = echo {
+            body["key"] = json!(k);
+        }
+        respond_json(sock, 200, &body).await;
     }
 }
 
@@ -1487,16 +1503,17 @@ async fn stream_job(
     key: (String, String),
     offset: u64,
     hold: bool,
-    started: Option<u32>,
+    started: Option<(u32, Option<String>)>,
 ) -> StreamEnd {
     let (mut rd, mut wr) = sock.into_split();
     let head = "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nTransfer-Encoding: chunked\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n";
     let mut gone = wr.write_all(head.as_bytes()).await.is_err();
-    if let (false, Some(pgid)) = (gone, started) {
-        gone = wr
-            .write_all(&chunk(&json!({ "started": pgid })))
-            .await
-            .is_err();
+    if let (false, Some((pgid, echo))) = (gone, started) {
+        let mut first = json!({ "started": pgid });
+        if let Some(k) = echo {
+            first["key"] = json!(k);
+        }
+        gone = wr.write_all(&chunk(&first)).await.is_err();
     }
     let mut changed = shared.jobs.changed.subscribe();
     let mut sent = offset;
@@ -2013,6 +2030,9 @@ async fn lacking_one(
         }
         if !opts.job_stdin {
             job.remove("stdin_open");
+        }
+        if !opts.start_key {
+            job.remove("idempotency_key");
         }
     }
     let mut post = client.post(&inner).json(&req);

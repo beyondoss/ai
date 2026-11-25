@@ -48,6 +48,10 @@ def check_id(job: str) -> str:
     return job
 
 
+NO_START_KEY = (
+    "the endpoint does not keep start keys: a start sent again for a lost answer would run twice"
+)
+
 _KEY = re.compile(r"[0-9A-Za-z._:-]{1,128}")
 
 
@@ -156,6 +160,11 @@ def start(
         with contextlib.suppress(SandboxError):
             yield Call(_wire.job_op("kill", scope, ids=[job], remove=True, grace_ms=KILL_GRACE_MS))
         raise NotOfferedError("the endpoint predates job stdin: it ran the job without it")
+    if not (isinstance(v, dict) and v.get("key") == key):
+        # The endpoint ignored the key: a start sent again for a lost answer would run twice. Stop what it started.
+        with contextlib.suppress(SandboxError):
+            yield Call(_wire.job_op("kill", scope, ids=[job], remove=True, grace_ms=KILL_GRACE_MS))
+        raise NotOfferedError(NO_START_KEY)
     return pgid
 
 

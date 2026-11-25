@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::job_kernel::{Claim, Phase, State};
+use crate::job_kernel::{Claim, Persist, Phase, State};
 
 const FILE: &str = "execd-jobs.json";
 const VERSION: u32 = 1;
@@ -237,11 +237,44 @@ impl Ledger {
             version: VERSION,
             jobs: snapshot(),
         };
-        if let Err(e) = write_atomic(dir, &file) {
+        if let Err(e) = write_atomic(dir, &file, false) {
             crate::log_warn!(
                 "cannot save the jobs ledger dir={} error={e}",
                 dir.display()
             );
+        }
+    }
+
+    /// [`Self::save`] for a keyed start's claim (K10): the file is written, synced, renamed and its directory synced,
+    /// and how that came out is returned, so the start can refuse when the claim is not on disk. A ledger that is not
+    /// enabled keeps nothing across a restart, so there is nothing to lose: `Durable`.
+    pub fn claim(&self, snapshot: impl FnOnce() -> Vec<Entry>) -> Persist {
+        let Some(dir) = &self.dir else {
+            return Persist::Durable;
+        };
+        let _one = crate::proc::locked(&self.write);
+        let file = File {
+            version: VERSION,
+            jobs: snapshot(),
+        };
+        let written = match crate::fault::at("claim_save").as_deref() {
+            Some("full") => Err(std::io::ErrorKind::StorageFull.into()),
+            Some(_) => Err(std::io::Error::other("injected claim fault")),
+            None => write_atomic(dir, &file, true),
+        };
+        match written {
+            Ok(()) => Persist::Durable,
+            Err(e) => {
+                crate::log_warn!(
+                    "cannot save a start's claim dir={} error={e}",
+                    dir.display()
+                );
+                if e.kind() == std::io::ErrorKind::StorageFull {
+                    Persist::DiskFull
+                } else {
+                    Persist::Failed
+                }
+            }
         }
     }
 
@@ -263,15 +296,32 @@ impl Ledger {
     }
 }
 
-fn write_atomic(dir: &Path, file: &File) -> std::io::Result<()> {
+/// Replace the ledger file with `file`: write a temporary beside it, rename it over. With `durable`, the temporary is
+/// synced before the rename and the directory after, so a crash of the host leaves the old file or the new one, and
+/// a failure at any step is the caller's to see (the temporary is removed).
+fn write_atomic(dir: &Path, file: &File, durable: bool) -> std::io::Result<()> {
     let tmp = dir.join(format!("{FILE}.tmp"));
     let _ = fs::remove_file(&tmp);
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)?;
-    f.write_all(&serde_json::to_vec(file).map_err(std::io::Error::other)?)?;
-    drop(f);
-    fs::rename(&tmp, dir.join(FILE))
+    let put = || -> std::io::Result<()> {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(&serde_json::to_vec(file).map_err(std::io::Error::other)?)?;
+        if durable {
+            f.sync_all()?;
+        }
+        drop(f);
+        fs::rename(&tmp, dir.join(FILE))?;
+        if durable {
+            fs::File::open(dir)?.sync_all()?;
+        }
+        Ok(())
+    };
+    let r = put();
+    if r.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    r
 }

@@ -146,7 +146,7 @@ pub fn start_decision(id_held: bool, by_key: Option<(String, bool)>) -> (r: Begi
             }
         },
         None => {
-            if id_held {
+            if id_held && !cfg!(feature = "mut_key_held_starts") {
                 Begin::Refuse(Refusal::IdExists)
             } else if cfg!(feature = "mut_key_fresh_refused") {
                 Begin::Refuse(Refusal::IdExists)
@@ -172,6 +172,153 @@ pub fn keeps_record(how: Recovery) -> (r: bool)
         Recovery::Drop => false,
         Recovery::Adopt => true,
         Recovery::Restore => !cfg!(feature = "mut_key_forgotten_on_restart"),
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// A keyed start's claim, its key's grammar, and the answer to a replay.
+// ---------------------------------------------------------------------------------------------
+
+/// What writing a keyed start's claim (its key, digest and id, in the ledger) came to. `Durable`: the claim is on
+/// disk (written, synced, renamed, the directory synced), or there is no ledger, so nothing survives a restart to
+/// be lost. `DiskFull` and `Failed`: it is not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Persist {
+    Durable,
+    DiskFull,
+    Failed,
+}
+
+/// What a start does once its claim step is over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Launch {
+    /// Spawn the job.
+    Spawn,
+    /// Refuse, spawning nothing (`507`): the claim could not be written for want of space.
+    DiskFull,
+    /// Refuse, spawning nothing (`500`): the claim could not be written.
+    Failed,
+}
+
+/// K10, K16: whether a start spawns. `claim` is how its claim's write came out, `None` for a start with no key (it
+/// has no claim to write).
+///
+/// - K10: a keyed start whose claim is not durable spawns nothing: it is refused, `507` for a full disk and `500`
+///   otherwise. A crash after a spawn with no claim on disk would leave a process no restart can name, and the
+///   retry would start a second one (K9's hole).
+/// - K16 (K10's liveness partner): a start with no key, or whose claim is durable, always spawns. A refusal clears:
+///   the retry, once the disk takes the claim again, starts.
+pub fn launch(claim: Option<Persist>) -> (r: Launch)
+    ensures
+        (claim is Some && !(claim->Some_0 is Durable)) ==> !(r is Spawn),
+        (claim is Some && claim->Some_0 is DiskFull) ==> r is DiskFull,
+        (claim is Some && claim->Some_0 is Failed) ==> r is Failed,
+        (claim is None || claim->Some_0 is Durable) ==> r is Spawn,
+{
+    match claim {
+        None => Launch::Spawn,
+        Some(Persist::Durable) => {
+            if cfg!(feature = "mut_durable_claim_refused") { Launch::Failed } else { Launch::Spawn }
+        },
+        Some(Persist::DiskFull) => {
+            if cfg!(feature = "mut_spawn_without_claim") { Launch::Spawn } else { Launch::DiskFull }
+        },
+        Some(Persist::Failed) => {
+            if cfg!(feature = "mut_spawn_without_claim") { Launch::Spawn } else { Launch::Failed }
+        },
+    }
+}
+
+/// A byte of a start key: `[0-9A-Za-z._:-]`.
+pub open spec fn key_byte_spec(b: u8) -> bool {
+    (48 <= b && b <= 57) || (65 <= b && b <= 90) || (97 <= b && b <= 122) || b == 46 || b == 95 || b == 58 || b == 45
+}
+
+/// The longest start key, in bytes.
+pub const KEY_MAX: usize = 128;
+
+/// A key's byte, as the grammar says (K12, K13).
+#[allow(clippy::manual_range_contains)] // the proof speaks of comparisons, not ranges
+pub fn key_byte_ok(b: u8) -> (r: bool)
+    ensures
+        r == key_byte_spec(b),
+{
+    (48 <= b && b <= 57) || (65 <= b && b <= 90) || (97 <= b && b <= 122) || b == 46 || b == 95 || b == 58 || b == 45
+}
+
+/// K12, K13: whether a start's idempotency key is one. A key is 1 to 128 bytes of `[0-9A-Za-z._:-]`.
+///
+/// - K12: a key outside that is refused (`400`); it never reaches the ledger, the table or a spawn.
+/// - K13 (K12's liveness partner, the completeness of the validator): a key inside it is never refused, so the
+///   refusal clears by sending a valid key.
+#[allow(clippy::len_zero)] // the proof speaks of `len()`
+pub fn key_valid(k: &[u8]) -> (r: bool)
+    ensures
+        r ==> (1 <= k@.len() && k@.len() <= 128 && forall|j: int| 0 <= j < k@.len() ==> key_byte_spec(#[trigger] k@[j])),
+        (1 <= k@.len() && k@.len() <= 128 && forall|j: int| 0 <= j < k@.len() ==> key_byte_spec(#[trigger] k@[j])) ==> r,
+{
+    if k.len() == 0 {
+        return false;
+    }
+    if (k.len() > KEY_MAX && !cfg!(feature = "mut_bad_key_accepted"))
+        || (k.len() == KEY_MAX && cfg!(feature = "mut_valid_key_refused"))
+    {
+        return false;
+    }
+    let mut i = 0;
+    while i < k.len()
+        invariant
+            i <= k.len(),
+            forall|j: int| 0 <= j < i ==> key_byte_spec(#[trigger] k@[j]),
+        decreases k.len() - i,
+    {
+        if !key_byte_ok(k[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// How many times a replay polls for its job's group before it gives up.
+pub const REPLAY_POLLS: u32 = 1000;
+
+/// What a replay answers, one poll at a time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Replied {
+    /// Answer with the job: its group (or, for an ended job, the answer it ended with).
+    Answer,
+    /// The original start has not spawned yet: look again.
+    Wait,
+    /// The job never started (it was removed, or the wait ran out): `500`, "the job did not start".
+    Refuse,
+}
+
+/// K14, K15: what a replay does. `pgid` is the job's group (`0`: none yet), `ended` whether it has ended,
+/// `removed` whether it was taken out of the table, `waited` how many polls the replay has made.
+///
+/// - K14: a job that has a group, or has ended (a restart found it claimed and never spawned), is answered with it
+///   whatever else is true of it: the replay never says "did not start" of a job that did.
+/// - K15 (the progress half): a replay waits only while the job is in the table with no group and the wait has not
+///   run out (`waited < REPLAY_POLLS`, the ranking function), and it refuses only a job that never started: a
+///   replay always ends, in an answer or a refusal.
+pub fn replay_poll(pgid: i32, ended: bool, removed: bool, waited: u32) -> (r: Replied)
+    ensures
+        (pgid != 0 || ended) ==> r is Answer,
+        (pgid == 0 && !ended && (removed || waited >= REPLAY_POLLS)) ==> r is Refuse,
+        (pgid == 0 && !ended && !removed && waited < REPLAY_POLLS) ==> r is Wait,
+{
+    if cfg!(feature = "mut_replay_refuses_started") && removed {
+        return Replied::Refuse;
+    }
+    if pgid != 0 || ended {
+        Replied::Answer
+    } else if removed {
+        Replied::Refuse
+    } else if waited >= REPLAY_POLLS && !cfg!(feature = "mut_replay_waits_forever") {
+        Replied::Refuse
+    } else {
+        Replied::Wait
     }
 }
 
@@ -710,6 +857,16 @@ pub enum Recovery {
     Restore,
 }
 
+/// What a restart does about processes it cannot find by their group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sweep {
+    /// Nothing: the job's group is known, or it never ran.
+    Nothing,
+    /// Signal `KILL` to every process that carries the job's mark. A keyed start's intent has no group: if its
+    /// spawn happened and its group's save did not, the process can be found only by its mark.
+    KillMarked,
+}
+
 /// The exit code of a job whose shell's status no one saw: the shell was reparented when execd
 /// died, and a process that is not our child gives no status. The same `-1` a lost status is
 /// everywhere else in execd (`Proc::wait`).
@@ -727,7 +884,9 @@ pub const LOST_CODE: i32 = -1;
 /// - R4: a job that never had a group, or was removed, is not in the table.
 /// - R5 ([`lemma_recover_idempotent`]): recovering what recovery returned changes nothing (a
 ///   restart during a restart).
-pub fn recover(s: State, alive: bool, now: u64, keyed: bool) -> (r: (State, Recovery))
+/// - K11: a keyed intent with no group answers `KillMarked`, whatever the OS saw, and nothing else does: nothing
+///   that carries the intent's mark outlives the restart, so no process runs that no job names.
+pub fn recover(s: State, alive: bool, now: u64, keyed: bool) -> (r: (State, Recovery, Sweep))
     ensures
         s.phase is Ended ==> (r.1 is Restore && r.0 == s),
         (!s.removed && (s.phase is Running || s.phase is Exited) && alive) ==> (r.1 is Adopt && r.0 == s),
@@ -753,6 +912,7 @@ pub fn recover(s: State, alive: bool, now: u64, keyed: bool) -> (r: (State, Reco
             phase: Phase::Ended { pgid: 0i32, code: -1i32, signal: None, at: now, shell_told: false },
             ..s
         }),
+        (s.phase is Spawning && keyed && !s.removed) <==> r.2 is KillMarked,
         r.1 is Drop || r.0.claim == s.claim,
         r.1 is Drop || r.0.seen == s.seen,
         r.1 is Drop || r.0.started == s.started,
@@ -761,6 +921,12 @@ pub fn recover(s: State, alive: bool, now: u64, keyed: bool) -> (r: (State, Reco
         r.1 is Restore ==> r.0.phase is Ended,
 {
     let State { phase, claim, seen, removed, started } = s;
+    // K11: the intent's process, if its spawn happened and its group's save did not, is found by its mark.
+    let sweep = if keyed && !removed && matches!(phase, Phase::Spawning) && !cfg!(feature = "mut_orphan_survives") {
+        Sweep::KillMarked
+    } else {
+        Sweep::Nothing
+    };
     match phase {
         Phase::Spawning => {
             if keyed && !removed && !cfg!(feature = "mut_intent_respawns") {
@@ -773,9 +939,10 @@ pub fn recover(s: State, alive: bool, now: u64, keyed: bool) -> (r: (State, Reco
                         started,
                     },
                     Recovery::Restore,
+                    sweep,
                 )
             } else {
-                (State { phase: Phase::Spawning, claim, seen, removed, started }, Recovery::Drop)
+                (State { phase: Phase::Spawning, claim, seen, removed, started }, Recovery::Drop, sweep)
             }
         },
         Phase::Ended { pgid, code, signal, at, shell_told } => (
@@ -785,12 +952,13 @@ pub fn recover(s: State, alive: bool, now: u64, keyed: bool) -> (r: (State, Reco
             } else {
                 Recovery::Restore
             },
+            Sweep::Nothing,
         ),
         Phase::Running { pgid } => {
             if removed {
-                (State { phase: Phase::Running { pgid }, claim, seen, removed, started }, Recovery::Drop)
+                (State { phase: Phase::Running { pgid }, claim, seen, removed, started }, Recovery::Drop, Sweep::Nothing)
             } else if (alive && !cfg!(feature = "mut_recover_drops_live")) || cfg!(feature = "mut_recover_adopts_gone") {
-                (State { phase: Phase::Running { pgid }, claim, seen, removed, started }, Recovery::Adopt)
+                (State { phase: Phase::Running { pgid }, claim, seen, removed, started }, Recovery::Adopt, Sweep::Nothing)
             } else {
                 (
                     State {
@@ -801,14 +969,15 @@ pub fn recover(s: State, alive: bool, now: u64, keyed: bool) -> (r: (State, Reco
                         started,
                     },
                     Recovery::Restore,
+                    Sweep::Nothing,
                 )
             }
         },
         Phase::Exited { pgid, code, signal } => {
             if removed {
-                (State { phase: Phase::Exited { pgid, code, signal }, claim, seen, removed, started }, Recovery::Drop)
+                (State { phase: Phase::Exited { pgid, code, signal }, claim, seen, removed, started }, Recovery::Drop, Sweep::Nothing)
             } else if (alive && !cfg!(feature = "mut_recover_drops_live")) || cfg!(feature = "mut_recover_adopts_gone") {
-                (State { phase: Phase::Exited { pgid, code, signal }, claim, seen, removed, started }, Recovery::Adopt)
+                (State { phase: Phase::Exited { pgid, code, signal }, claim, seen, removed, started }, Recovery::Adopt, Sweep::Nothing)
             } else {
                 let kept = !cfg!(feature = "mut_recover_forgets_shell_status");
                 (
@@ -826,6 +995,7 @@ pub fn recover(s: State, alive: bool, now: u64, keyed: bool) -> (r: (State, Reco
                         started,
                     },
                     Recovery::Restore,
+                    Sweep::Nothing,
                 )
             }
         },
@@ -2208,6 +2378,7 @@ impl<C> Table<C> {
 
     /// K7: write a start key's record. A key's record is one: a second record of the same key in the same scope
     /// replaces the first (a record whose job is gone); every other key's record stays.
+    #[verifier::rlimit(40)]
     pub fn record(&mut self, rec: Rec)
         requires
             old(self).wf(),

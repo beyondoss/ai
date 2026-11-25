@@ -117,7 +117,10 @@ describe("job ops over HTTP", () => {
   });
 
   it("sends an idempotency key: one per start call, the caller's when given, checked", async () => {
-    const { t, seen } = await jobs(() => [200, { started: 5 }]);
+    const { t, seen } = await jobs((b) => [200, {
+      started: 5,
+      key: b.job.idempotency_key,
+    }]);
     const jobsApi = new Jobs(t);
     await jobsApi.start("s", "aa", { command: "true" });
     await jobsApi.start("s", "ab", { command: "true" });
@@ -137,6 +140,35 @@ describe("job ops over HTTP", () => {
       ).rejects.toMatchObject({ kind: "invalid_request" });
     }
     expect(seen).toHaveLength(3);
+  });
+
+  it("fails closed when the endpoint does not echo the start's key, and stops what it started", async () => {
+    const { t, seen } = await jobs((b) =>
+      b.job.op === "start" ? [200, { started: 5 }] : [200, { survivors: [] }]
+    );
+    await expect(
+      new Jobs(t).start("s", "aa", { command: "true" }),
+    ).rejects.toMatchObject({ kind: "not_offered" });
+    expect(seen.map((b) => b.job.op)).toEqual(["start", "kill"]);
+    // Level 3 sends exactly what it is given: a start with no key asks for no echo.
+    await expect(t.jobs.start("s", "ab", { command: "true" })).resolves.toBe(5);
+  });
+
+  it("fails closed when a held start's first frame does not echo the key", async () => {
+    const e = await fakeEndpoint((_r, res) => {
+      res.writeHead(200, { "content-type": "application/x-ndjson" });
+      res.end("{\"started\":42}\n{\"exit_code\":0}\n");
+    });
+    closers.push(e.close);
+    const t = new HttpTransport({ url: e.url });
+    const run = async () => {
+      for await (
+        const f of new Jobs(t).startHeld("s", "aa", { command: "true" })
+      ) {
+        void f;
+      }
+    };
+    await expect(run()).rejects.toMatchObject({ kind: "not_offered" });
   });
 
   it("kills a job whose stdin_open was ignored", async () => {

@@ -229,6 +229,7 @@ impl<'a> NativeJobs<'a> {
         env: &[(String, String)],
         job: Value,
         stdin_open: bool,
+        key: Option<&str>,
         beat: Option<u32>,
         op: JobOp,
         events: EventSink<'_>,
@@ -262,11 +263,15 @@ impl<'a> NativeJobs<'a> {
                 ));
             };
             match decode_job_frame(&line).map_err(broken)? {
-                JobFrame::Event(Event::Started(pgid, stdin)) => {
+                JobFrame::Event(Event::Started(pgid, stdin, echoed)) => {
                     // An endpoint that predates job stdin ignores the flag and says nothing:
                     // the job it started would read EOF. Not a job to leave running.
                     if stdin_open && !stdin {
                         return Err(predates("job stdin"));
+                    }
+                    // Nor one that ignores the start's key: a start sent again for a lost answer would run twice.
+                    if key.is_some() && echoed.as_deref() != key {
+                        return Err(predates("start keys"));
                     }
                     events(JobEvent::Started(pgid));
                 }
@@ -318,13 +323,14 @@ impl NativeJobs<'_> {
         beat: Option<u32>,
         events: EventSink<'_>,
     ) -> std::io::Result<JobEnd> {
+        let key = start_key(spec)?;
         let job = Self::op(
             "start",
             scope,
             json!({
                 "id": id.as_str(), "hold": true, "label": spec.label,
                 "stdin_open": spec.stdin_open,
-                "idempotency_key": start_key(spec)?,
+                "idempotency_key": key,
             }),
         );
         self.stream(
@@ -334,6 +340,7 @@ impl NativeJobs<'_> {
             &spec.env,
             job,
             spec.stdin_open,
+            Some(&key),
             beat,
             JobOp::Start,
             events,
@@ -362,6 +369,7 @@ impl NativeJobs<'_> {
             &[],
             job,
             false,
+            None,
             beat,
             JobOp::Other,
             events,
@@ -442,13 +450,14 @@ impl SandboxJobs for NativeJobs<'_> {
         id: &JobId,
         spec: &JobSpec,
     ) -> std::io::Result<u32> {
+        let key = start_key(spec)?;
         let job = Self::op(
             "start",
             scope,
             json!({
                 "id": id.as_str(), "hold": false, "label": spec.label,
                 "stdin_open": spec.stdin_open,
-                "idempotency_key": start_key(spec)?,
+                "idempotency_key": key,
             }),
         );
         let resp = self
@@ -472,6 +481,11 @@ impl SandboxJobs for NativeJobs<'_> {
             // Started without its stdin: stop it, so nothing is left running that reads EOF.
             let _ = self.kill(scope, std::slice::from_ref(id), true).await;
             return Err(predates("job stdin"));
+        }
+        if answer.as_ref().and_then(|v| v.get("key")?.as_str()) != Some(key.as_str()) {
+            // The endpoint ignored the key: stop what it started, as for a stdin it ignored.
+            let _ = self.kill(scope, std::slice::from_ref(id), true).await;
+            return Err(predates("start keys"));
         }
         let started = answer
             .and_then(|v| v.get("started")?.as_u64())
@@ -680,9 +694,10 @@ pub enum JobFrame {
 /// A job stream's non-final news, owned.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Event {
-    /// The job's process group, and whether it was started with its stdin open (the echo of
-    /// `stdin_open`).
-    Started(u32, bool),
+    /// The job's process group, whether it was started with its stdin open (the echo of
+    /// `stdin_open`), and the start's idempotency key as the endpoint echoed it (`None` from an endpoint that
+    /// ignores keys).
+    Started(u32, bool, Option<String>),
     Output(Vec<u8>, Stream),
     Gap(u64),
     ShellExit(i32),
@@ -693,6 +708,7 @@ struct WireJobFrame {
     started: Option<u64>,
     #[serde(default)]
     stdin: bool,
+    key: Option<String>,
     stdout: Option<String>,
     stderr: Option<String>,
     gap: Option<u64>,
@@ -729,7 +745,7 @@ pub fn decode_job_frame(line: &[u8]) -> Result<JobFrame, String> {
         JobFrame::Error(e)
     } else if let Some(p) = w.started {
         let p = u32::try_from(p).map_err(|_| wire_out_of_range("started", p))?;
-        JobFrame::Event(Event::Started(p, w.stdin))
+        JobFrame::Event(Event::Started(p, w.stdin, w.key))
     } else if let Some(s) = w.stdout.as_deref() {
         JobFrame::Event(Event::Output(b64(s)?, Stream::Stdout))
     } else if let Some(s) = w.stderr.as_deref() {

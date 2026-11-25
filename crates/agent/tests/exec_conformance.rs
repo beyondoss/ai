@@ -394,6 +394,7 @@ fn merge(quick: MockOptions, broken: MockOptions) -> MockOptions {
         job_stdin: broken.job_stdin,
         command_env: broken.command_env,
         job_signal_op: broken.job_signal_op,
+        start_key: broken.start_key,
         ..quick
     }
 }

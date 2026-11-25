@@ -503,6 +503,56 @@
           }
         }
       ]
+    },
+    {
+      "id": "jobs-key.an-endpoint-that-ignores-keys-is-not-offered",
+      "description": "An endpoint that predates start keys (the prior release, beside the one under test) starts the job and does not echo the key. The client fails closed: not_offered, because a start sent again for a lost answer would run twice there. It also stops the job it started, so nothing is left running that the caller thinks failed.",
+      "requires": {
+        "features": [
+          "job_start_key"
+        ],
+        "vars": [
+          "EXECD_PRIOR_URL"
+        ]
+      },
+      "connect": {
+        "url": "${EXECD_PRIOR_URL}",
+        "bearer": "${EXECD_PRIOR_BEARER}"
+      },
+      "steps": [
+        {
+          "id": "start",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "kn01",
+          "command": "sh",
+          "args": [
+            "-c",
+            "echo run >> \"${ROOT}/mark\"; sleep 30"
+          ],
+          "label": "",
+          "idempotency_key": "prior-${SCOPE}",
+          "expect": {
+            "error": {
+              "kind": "not_offered"
+            }
+          }
+        },
+        {
+          "id": "nothing-left-running",
+          "op": "job_list",
+          "scope": "${SCOPE}",
+          "poll": {
+            "timeout_ms": 5000,
+            "interval_ms": 100
+          },
+          "expect": {
+            "ok": {
+              "jobs": []
+            }
+          }
+        }
+      ]
     }
   ]
 }

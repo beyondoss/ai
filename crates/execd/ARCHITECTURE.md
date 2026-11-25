@@ -147,10 +147,11 @@ beside `code` 128 + S, set in the same step as `shell_exit` or the end, so no re
 in place of `{"exit_code": 128 + S}`, as a one-shot stream's is. A job stopped by `kill` therefore reports the signal that
 killed its shell (15, or 9 after the grace). Nothing is persisted: a job lives in the table and is gone with execd.
 
-**The start key.** `start` may carry `idempotency_key` (1 to 128 characters of `[0-9A-Za-z._:-]`, else `400`): a start retried
+**The start key.** `start` may carry `idempotency_key` (1 to 128 characters of `[0-9A-Za-z._:-]`, else `400`; `execd_jobs::key_valid`, K12 and K13): a start retried
 after its answer was lost never runs a second job. What `start` does is `Table::begin`'s decision (`start_decision`, K1 to K5, proven in
 `crates/execd-jobs`): a key already used for this command, by a job still in the table, answers that job (`200`, its process group, `stdin`
-as the first answer had it; a held start streams the job from its first byte) and runs nothing; the same key for another command is `409`
+as the first answer had it, and `key`, the key echoed: the answer, or a held start's first frame, says the endpoint kept the key, and a client that
+sent one and got no echo fails closed with `not_offered`; a held start streams the job from its first byte) and runs nothing; the same key for another command is `409`
 "the key was used for a different command or id" (`"code": "key_conflict"`; the id is part of what the client asked for); an id in the table with no key that names it (no key, or another) is `409` "the job exists".
 "The same command" is a SHA-256 digest of command, args, cwd, env (as a set), `stdin_open` and `hold` (`jobs::spec_digest`); only the
 digest is kept, never the env, which can hold secrets, and the label and the id are not in it.
@@ -162,11 +163,26 @@ every job it brings back (K6, `keeps_record`), so a retry after a restart of exe
 (see Bounds), so a keyed record is never dropped before its job's output: a job that ended, even one whose group the restart found gone, is
 still answered by its key until it is removed. If a retention budget is ever added, a keyed job must not be evicted by it.
 
-_The claim comes first (K9)._ A keyed start's ledger entry is written as an intent (phase `spawning`, the key, digest and id) before
-anything is spawned, then rewritten with the group. A restart that finds an intent with no group (a crash between the two) asks
-`recover(.., keyed = true)`: the job comes back ended with the lost status (`-1`, no group), in the table, its record kept, and the
-processes carrying its mark, if the spawn did happen, are killed. The retry replays it (`started` is `0`: there is no group), and no
-restart sequence runs the command twice. An unkeyed start with no group is still not saved (R4).
+_The claim comes first (K9, K10)._ A keyed start's ledger entry is written as an intent (phase `spawning`, the key, digest and id) before
+anything is spawned, then rewritten with the group. The write of the claim is durable: the file is written aside, synced, renamed, and
+its directory synced (`Ledger::claim`; the best-effort `save` of every other change is not). How it came out goes to the kernel
+(`launch(Option<Persist>)`, K10 and its liveness partner K16): a claim that is not durable is a start that does not run, `507` when the disk is full and
+`500` otherwise, with nothing spawned and the entry taken out of the table (its key's record with it, K8), so the retry, once the disk takes the
+claim, starts. A server with no state directory keeps nothing across a restart, so there is no claim to lose.
+
+_The restart (K9, K11)._ A restart that finds an intent with no group (a crash between the claim and the group's save) asks
+`recover(.., keyed = true)`: the job comes back ended with the lost status (`-1`, no group), in the table, its record kept, and `recover`
+returns the action `Sweep::KillMarked`, whatever the OS saw: the shell kills every process carrying the intent's mark (`proc::job_members`
+then `SIGKILL`, looking again until a pass finds none), because the spawn may have happened and nobody can find those processes by a group.
+A process between its fork and its exec carries execd's environment and not the mark yet; the repeated look catches it once it execs.
+The retry replays the lost job (`started` is `0`: there is no group), and no restart sequence runs the command twice. An unkeyed start with no group is still not saved (R4).
+
+_The replay's wait (K14, K15)._ A replay that arrives while the original is still spawning polls for its group; what each poll answers
+(`replay_poll`: answer, wait, or refuse with `500` "the job did not start") is the kernel's, over the group, whether the job ended, whether it was removed
+and how many polls were made. A job that has a group or has ended is always answered; a refusal is only for a job that never started, and the wait is bounded.
+
+_Test knob._ `EXECD_TEST_FAULT` (a debug build only) names a file whose lines `claim_save=full|eio` and `after_spawn=exit` make the claim's write fail or
+execd exit between the spawn and the group's save; removing the file clears the fault. It is read in `fault.rs` alone.
 
 **Output streams.** (`src/ring.rs` does the I/O; which offsets are held, where a read starts, which chunks retention drops and which bytes are stderr are the Verus-proven kernel `crates/execd-ring`, R1 to R6 in its docs, and `ring.rs`'s tests hold the whole to a plain `Vec` under random pushes, reads and refused chunks.) The ring keeps which pipe each byte came from, one bit per byte: an in-memory bitmap for the unfinished tail,
 allocated at the job's first stderr byte, and a `<chunk>.e` sidecar (8 KiB, same `0600`, `O_EXCL|O_NOFOLLOW`) beside each full

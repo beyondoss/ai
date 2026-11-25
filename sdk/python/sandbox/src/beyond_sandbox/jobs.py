@@ -39,6 +39,11 @@ def _no_stdin(ev: JobFrame, stdin_open: bool) -> bool:
 _NO_STDIN = "the endpoint predates job stdin: it ran the job without it"
 
 
+def _no_key(ev: JobFrame, key: str) -> bool:
+    """A held start's ``started`` frame does not echo the start's idempotency key (the endpoint ignores keys)."""
+    return isinstance(ev, JobStarted) and ev.key != key
+
+
 def _collect(a: Attached, ev: JobFrame) -> None:
     if isinstance(ev, JobOutput):
         a.output += ev.data
@@ -111,6 +116,7 @@ class Jobs:
         """Start a job held by the returned stream (wire ``hold: true``): events, the first a
         :class:`JobStarted`, ending with a :class:`JobEnd`. If you stop before the end and did not
         :meth:`keep` the job, the sandbox kills its group."""
+        key = _jobs.start_key(idempotency_key)
         op = _jobs.start_held(
             scope,
             job,
@@ -121,7 +127,7 @@ class Jobs:
             env,
             stdin_open,
             heartbeat_seconds,
-            idempotency_key,
+            key,
         )
         items = drive_iter(op, self._t)
         try:
@@ -131,6 +137,8 @@ class Jobs:
                 else:
                     if _no_stdin(item, stdin_open):
                         raise NotOfferedError(_NO_STDIN)
+                    if _no_key(item, key):
+                        raise NotOfferedError(_jobs.NO_START_KEY)
                     yield item
         finally:
             items.close()
@@ -266,6 +274,7 @@ class AsyncJobs:
         idempotency_key: str | None = None,
     ) -> AsyncGenerator[JobFrame, None]:
         """As :meth:`Jobs.start_held`."""
+        key = _jobs.start_key(idempotency_key)
         op = _jobs.start_held(
             scope,
             job,
@@ -276,7 +285,7 @@ class AsyncJobs:
             env,
             stdin_open,
             heartbeat_seconds,
-            idempotency_key,
+            key,
         )
         events = aiter_events(op, self._t)
         try:
@@ -286,6 +295,8 @@ class AsyncJobs:
                 else:
                     if _no_stdin(item, stdin_open):
                         raise NotOfferedError(_NO_STDIN)
+                    if _no_key(item, key):
+                        raise NotOfferedError(_jobs.NO_START_KEY)
                     yield item
         finally:
             await events.aclose()

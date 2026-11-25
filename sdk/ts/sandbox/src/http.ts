@@ -42,6 +42,10 @@ import {
 } from "./transport.js";
 
 /** The response cap: a larger one-shot answer fails with `too_large` (the command ran). */
+/** What a start says when the endpoint does not echo its idempotency key. */
+const NO_START_KEY =
+  "the endpoint does not keep start keys: a start sent again for a lost answer would run twice";
+
 export const DEFAULT_MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
 
 const DEFAULT_TIMEOUT_MS = 120_000;
@@ -926,10 +930,12 @@ class HttpJobs implements JobOps {
       }
       let started: unknown;
       let echoed = false;
+      let keyEcho: unknown;
       try {
         const v: unknown = JSON.parse(text(body));
         started = isRecord(v) ? v.started : undefined;
         echoed = isRecord(v) && v.stdin === true;
+        keyEcho = isRecord(v) ? v.key : undefined;
       } catch {
         started = undefined;
       }
@@ -942,6 +948,16 @@ class HttpJobs implements JobOps {
         throw new NotOfferedError(
           "the endpoint predates job stdin: it ran the job without it",
         );
+      }
+      if (
+        spec.idempotencyKey !== undefined && keyEcho !== spec.idempotencyKey
+      ) {
+        // The endpoint ignored the key: a start sent again for a lost answer would run twice. Stop what it started.
+        await this.kill(scope, [id], {
+          remove: true,
+          graceMs: DEFAULT_KILL_GRACE_MS,
+        }).catch(() => {});
+        throw new NotOfferedError(NO_START_KEY);
       }
       if (typeof started !== "number") {
         throw new ProtocolError(
@@ -989,6 +1005,11 @@ class HttpJobs implements JobOps {
             throw new NotOfferedError(
               "the endpoint predates job stdin: it ran the job without it",
             );
+          }
+          if (
+            spec.idempotencyKey !== undefined && f.key !== spec.idempotencyKey
+          ) {
+            throw new NotOfferedError(NO_START_KEY);
           }
         }
         yield f;
@@ -1240,7 +1261,12 @@ export function decodeJobFrame(line: Uint8Array): JobFrame | "heartbeat" {
     throw new TransportError(`job stream: ${v.error}`);
   }
   if (typeof v.started === "number") {
-    return { type: "started", pgid: v.started, stdin: v.stdin === true };
+    return {
+      type: "started",
+      pgid: v.started,
+      stdin: v.stdin === true,
+      ...(typeof v.key === "string" ? { key: v.key } : {}),
+    };
   }
   const stream = typeof v.stdout === "string"
     ? "stdout"
