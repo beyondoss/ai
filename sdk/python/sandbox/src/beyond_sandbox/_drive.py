@@ -3,8 +3,10 @@
 A helper (``_fs``, ``_jobs``) is written once as a generator that yields :class:`Run` and receives
 the :class:`~beyond_sandbox.ExecResult` back. The sync driver answers with ``transport.run``, the
 async one awaits it. So the control flow of every helper exists exactly once, and only the I/O
-differs. Jobs add :class:`Call` and :class:`Follow` (job operations) and :class:`Emit` (an event for
-the caller of ``follow``).
+differs. Jobs add :class:`Call` (one job operation, one JSON answer) and the handle's four effects:
+:class:`Open` (send a request, learn its status), :class:`NextLine` (the next line of the open stream),
+:class:`Sleep` and :class:`Emit` (an event for the caller of ``follow``). What to send, read and wait for
+is the kernel's call (``_held.py``); a driver only does it.
 
 A transport error is thrown into the generator at the ``yield``, so cleanup (``except``/``finally``)
 works as it would in straight-line code.
@@ -14,20 +16,26 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 from dataclasses import dataclass
 from typing import (
     Any,
     AsyncGenerator,
+    AsyncIterator,
     Awaitable,
     Callable,
     Generator,
+    Iterator,
     Sequence,
     TypeVar,
     Union,
 )
 
+from . import _kernel
+from .atransport import AsyncJobOpened
 from .errors import SandboxError
-from .models import ExecResult, Exit, JobEnd, Signal, Stderr, Stdout, TimedOut
+from .models import ExecResult, Exit, Signal, Stderr, Stdout, TimedOut
+from .transport import JobOpened
 
 T = TypeVar("T")
 
@@ -61,16 +69,35 @@ class Call:
 
 
 @dataclass(frozen=True, slots=True)
-class Follow:
-    """A native job stream (``attach``, or a held ``start`` that runs ``command``): its events are
-    emitted; answered with the final status."""
+class Open:
+    """One request of a job handle: a held ``start`` (which runs ``command``) or an ``attach``. Answered
+    with what the endpoint said (a :class:`~beyond_sandbox.transport.JobOpened`): its status, never an
+    error for a refusal. A driver keeps the one connection it opens; a later :class:`Open` replaces it."""
 
     job: dict[str, Any]
+    silence_ms: int
     command: str = "true"
     args: Sequence[str] = ()
     cwd: str | None = None
     env: dict[str, str] | None = None
     heartbeat_seconds: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class NextLine:
+    """The next line of the open stream, answered as bytes; ``None`` when the stream ended."""
+
+
+@dataclass(frozen=True, slots=True)
+class Release:
+    """Close the open stream, if there is one. Closing a held start's stream detaches nothing it kept."""
+
+
+@dataclass(frozen=True, slots=True)
+class Sleep:
+    """Wait until the kernel's time ``until_ms``."""
+
+    until_ms: int
 
 
 @dataclass(slots=True)
@@ -116,7 +143,7 @@ class _PipeAcc:
         return ExecResult(self.code if self.code is not None else -1, b"", bytes(self.stderr))
 
 
-Effect = Union[Run, Emit, Call, Follow, Pipe]
+Effect = Union[Run, Emit, Call, Open, NextLine, Release, Sleep, Pipe]
 Op = Generator[Effect, Any, T]
 
 #: Marks the end of a driven op's items; carries its result.
@@ -136,8 +163,8 @@ def _call_extras(effect: Call) -> dict[str, Any]:
     return extras
 
 
-def _follow_extras(effect: Follow) -> dict[str, Any]:
-    """What a ``Follow`` passes beyond its ``job``: only what is set (a plain ``attach`` sets none)."""
+def _open_extras(effect: Open) -> dict[str, Any]:
+    """What an ``Open`` passes beyond its ``job`` and silence limit: only what is set."""
     extras: dict[str, Any] = {}
     if effect.command != "true":
         extras["command"] = effect.command
@@ -154,6 +181,8 @@ def _follow_extras(effect: Follow) -> dict[str, Any]:
 
 def drive_iter(op: Op[T], transport: Any) -> Generator[Any, None, None]:
     """Run ``op`` on a sync transport, yielding each emitted item; the last is ``(_DONE, result)``."""
+    conn: JobOpened | None = None
+    lines: Iterator[bytes] = iter(())
     try:
         effect = next(op)
         while True:
@@ -183,17 +212,23 @@ def drive_iter(op: Op[T], transport: Any) -> Generator[Any, None, None]:
                     finally:
                         frames.close()
                     answer = acc.result()
-                elif isinstance(effect, Follow):
-                    stream = transport.job_stream(effect.job, **_follow_extras(effect))
-                    try:
-                        answer = None
-                        for frame in stream:
-                            if isinstance(frame, JobEnd):
-                                answer = frame
-                                break
-                            yield frame
-                    finally:
-                        stream.close()
+                elif isinstance(effect, Open):
+                    if conn is not None:
+                        conn.close()
+                        conn = None
+                    conn = transport.job_open(effect.job, effect.silence_ms, **_open_extras(effect))
+                    lines = iter(conn.lines)
+                    answer = conn
+                elif isinstance(effect, NextLine):
+                    answer = next(lines, None)
+                elif isinstance(effect, Release):
+                    if conn is not None:
+                        conn.close()
+                        conn = None
+                    answer = _NOTHING
+                elif isinstance(effect, Sleep):
+                    time.sleep(_kernel.wait_s(effect.until_ms))
+                    answer = _NOTHING
                 else:
                     raise AssertionError(f"unknown effect {effect!r}")
             except SandboxError as e:
@@ -204,6 +239,19 @@ def drive_iter(op: Op[T], transport: Any) -> Generator[Any, None, None]:
         yield _DONE, stop.value
     finally:
         op.close()
+        if conn is not None:
+            conn.close()
+
+
+def iter_items(op: Op[Any], transport: Any) -> Generator[Any, None, None]:
+    """Run ``op`` on a sync transport, yielding each emitted item; its result is dropped."""
+    items = drive_iter(op, transport)
+    try:
+        for item in items:
+            if not (isinstance(item, tuple) and item and item[0] is _DONE):
+                yield item
+    finally:
+        items.close()
 
 
 def drive(op: Op[T], transport: Any) -> T:
@@ -217,6 +265,8 @@ async def adrive_emit(
     op: Op[T], transport: Any, emit: Callable[[Any], Awaitable[None]] | None = None
 ) -> T:
     """Run ``op`` on an async transport; each emitted item is awaited into ``emit``."""
+    conn: AsyncJobOpened | None = None
+    lines: AsyncIterator[bytes] | None = None
     try:
         effect = next(op)
         while True:
@@ -247,18 +297,25 @@ async def adrive_emit(
                     finally:
                         await aframes.aclose()
                     answer = acc.result()
-                elif isinstance(effect, Follow):
-                    stream = await transport.job_stream(effect.job, **_follow_extras(effect))
-                    try:
-                        answer = None
-                        async for frame in stream:
-                            if isinstance(frame, JobEnd):
-                                answer = frame
-                                break
-                            if emit is not None:
-                                await emit(frame)
-                    finally:
-                        await stream.aclose()
+                elif isinstance(effect, Open):
+                    if conn is not None:
+                        await conn.close()
+                        conn = None
+                    conn = await transport.job_open(
+                        effect.job, effect.silence_ms, **_open_extras(effect)
+                    )
+                    lines = conn.lines.__aiter__()
+                    answer = conn
+                elif isinstance(effect, NextLine):
+                    answer = None if lines is None else await anext_or_none(lines)
+                elif isinstance(effect, Release):
+                    if conn is not None:
+                        await conn.close()
+                        conn = None
+                    answer = _NOTHING
+                elif isinstance(effect, Sleep):
+                    await asyncio.sleep(_kernel.wait_s(effect.until_ms))
+                    answer = _NOTHING
                 else:
                     raise AssertionError(f"unknown effect {effect!r}")
             except SandboxError as e:
@@ -269,10 +326,31 @@ async def adrive_emit(
         return stop.value  # type: ignore[no-any-return]
     finally:
         op.close()
+        if conn is not None:
+            await conn.close()
+
+
+async def anext_or_none(lines: AsyncIterator[bytes]) -> bytes | None:
+    """The next item of an async iterator, or ``None`` at its end."""
+    try:
+        return await lines.__anext__()
+    except StopAsyncIteration:
+        return None
 
 
 async def adrive(op: Op[T], transport: Any) -> T:
     return await adrive_emit(op, transport)
+
+
+async def aiter_items(op: Op[Any], transport: Any) -> AsyncGenerator[Any, None]:
+    """Run ``op`` on an async transport, yielding each emitted item; its result is dropped."""
+    events = aiter_events(op, transport)
+    try:
+        async for item in events:
+            if not (isinstance(item, tuple) and item and item[0] is _DONE):
+                yield item
+    finally:
+        await events.aclose()
 
 
 #: How many emitted items may wait for a slow consumer of :func:`aiter_events`.

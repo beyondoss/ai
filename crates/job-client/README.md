@@ -160,4 +160,4 @@ rows and the wait cap are single-call facts) is Verus's alone.
 - The frame codec (JSON and base64 to a `Frame`, the precedence of the keys on a line) stays in each shell,
   covered by the shared fixtures. The kernel takes the decoded `Frame`.
 - The stdin positions and their retry are a later slice.
-- The FFI crate (WASM for TypeScript, a native library for Python) is lane B3: this crate stays free of unsafe.
+- The FFI crate (WASM for TypeScript, a native library for Python's `ctypes`) is `crates/job-client-ffi`: this crate stays free of unsafe.

@@ -15,6 +15,16 @@ import pytest
 REPO = Path(__file__).resolve().parents[4]
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _kernel_under_test() -> None:
+    """``KERNEL_LIB_UNDER_TEST=<path>`` runs the whole suite against that library instead of the package's:
+    ``scripts/broken_kernel.sh`` points it at a build with one constant of the kernel changed."""
+    if path := os.environ.get("KERNEL_LIB_UNDER_TEST"):
+        from beyond_sandbox import _kernel
+
+        _kernel._loaded = _kernel.load(path)
+
+
 def execd_binary() -> Path | None:
     """``$EXECD_BIN``, else a built ``target/debug|release/execd`` of this repo, else ``execd``."""
     if env := os.environ.get("EXECD_BIN"):

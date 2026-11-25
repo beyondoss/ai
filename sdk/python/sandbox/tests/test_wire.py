@@ -4,21 +4,19 @@ from __future__ import annotations
 
 import base64
 import json
+import struct
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from beyond_sandbox import _kernel as K
 from beyond_sandbox import _wire
 from beyond_sandbox._http import Malformed, ResponseReader, Truncated, build_request, parse_url
 from beyond_sandbox.errors import InvalidRequestError, ProtocolError, TooLargeError, TransportError
 from beyond_sandbox.models import (
     Exit,
     JobEnd,
-    JobGap,
-    JobOutput,
-    JobShellExit,
-    JobStarted,
     ShellExit,
     Signal,
     Stderr,
@@ -128,34 +126,39 @@ def test_an_overlong_line_is_refused() -> None:
 
 
 def test_the_v13_job_stream_vectors() -> None:
+    """Each line of the shared vectors decodes to the facts the kernel is told: which frame, and its numbers."""
     for case in fixture("jobs.json")["streams"]:
         name, want = case["name"], case["expect"]
-        started, out, gap, shell, end, error = None, bytearray(), 0, [], None, None
-        end_signal = None
-        dec = _wire.job_decoder()
-        try:
-            for line in case["lines"]:
-                for f in dec.feed(line.encode() + b"\n"):
-                    if isinstance(f, JobStarted):
-                        started = f.pgid
-                    elif isinstance(f, JobOutput):
-                        out += f.data
-                    elif isinstance(f, JobGap):
-                        gap += f.bytes
-                    elif isinstance(f, JobShellExit):
-                        shell.append(f.code)
-                    elif isinstance(f, JobEnd):
-                        end = f.code
-                        end_signal = f.signal
-            if not dec.finished:
-                dec.eof()
-        except (ProtocolError, TransportError) as e:
-            error = str(e)
+        started, out, gap, shell, end, end_signal, error = (
+            None,
+            bytearray(),
+            0,
+            [],
+            None,
+            None,
+            None,
+        )
+        for raw in case["lines"]:
+            line = _wire.decode_job_line(raw.encode())
+            tag, body = line.frame[0], line.frame[1:]
+            if tag == 6:  # bad
+                error = line.note
+                break
+            if tag == 1:  # started
+                started = line.pgid
+            elif tag == 2:  # output
+                assert line.data is not None and struct.unpack("<Q", body) == (len(line.data),)
+                out += line.data
+            elif tag == 3:  # gap
+                gap += struct.unpack("<Q", body)[0]
+            elif tag == 7:  # shell exit
+                shell.append(struct.unpack("<i", body)[0])
+            elif tag == 5:  # the end
+                code, signal = struct.unpack("<ii", body)
+                e = JobEnd.of(code, signal)
+                end, end_signal = e.code, e.signal
         if want.get("error"):
             assert error and want["error"] in error, name
-            continue
-        if want["end"] is None:
-            assert error is not None, name
             continue
         assert error is None, (name, error)
         assert (started, bytes(out), gap, shell, end) == (
@@ -339,10 +342,35 @@ def test_the_one_shot_answer_vectors() -> None:
 
 
 def test_job_frames_keep_their_stream_and_the_stdin_echo() -> None:
-    assert _wire.decode_job_line(b'{"stderr":"ZXJy"}') == [JobOutput(b"err", True)]
-    assert _wire.decode_job_line(b'{"stdout":"b3V0"}') == [JobOutput(b"out", False)]
-    assert _wire.decode_job_line(b'{"started":7,"stdin":true}') == [JobStarted(7, True)]
-    assert _wire.decode_job_line(b'{"started":7}') == [JobStarted(7, False)]
+    err = _wire.decode_job_line(b'{"stderr":"ZXJy"}')
+    assert (err.data, err.stderr, err.frame) == (b"err", True, K.Frame.output(3))
+    out = _wire.decode_job_line(b'{"stdout":"b3V0"}')
+    assert (out.data, out.stderr) == (b"out", False)
+    echoed = _wire.decode_job_line(b'{"started":7,"stdin":true}')
+    assert (echoed.pgid, echoed.frame) == (7, K.Frame.started("", True))
+    plain = _wire.decode_job_line(b'{"started":7,"mark":"ab"}')
+    assert (plain.pgid, plain.frame) == (7, K.Frame.started("ab", False))
+
+
+def test_a_line_is_one_fact_and_a_line_it_cannot_hold_is_bad() -> None:
+    f = _wire.decode_job_line
+    assert f(b"").frame == K.Frame.HEARTBEAT == f(b'{"seq":1}').frame
+    assert f(b'{"attached":{"mark":"0a","from":5}}').frame == K.Frame.attached("0a", 5)
+    assert f(b'{"signal":9}').frame == K.Frame.exit(0, 9)
+    for bad in (
+        b"not json",
+        b"[1]",
+        b'{"error":"x"}',
+        b'{"gap":-1}',
+        b'{"gap":1.5}',
+        b'{"exit_code":4294967296}',
+        b'{"stdout":"!!"}',
+        b'{"attached":{"mark":"0a"}}',
+        b'{"timed_out":true}',
+        b'{"started":1,"mark":"' + b"a" * 33 + b'"}',
+    ):
+        assert f(bad).frame == K.Frame.BAD, bad
+    assert f(b'{"error":"lost it"}').note == "lost it"
 
 
 def test_a_read_answer_names_its_stderr_ranges() -> None:

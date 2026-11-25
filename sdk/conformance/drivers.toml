@@ -15,10 +15,12 @@ run = "node sdk/ts/sandbox/dist/driver.mjs"
 
 [[driver]]
 name = "python"
+build = "crates/job-client-ffi/build-native.sh"
 run = "env PYTHONPATH=sdk/python/sandbox/src python3 -m beyond_sandbox.driver"
 
 [[driver]]
 name = "python-async"
+build = "crates/job-client-ffi/build-native.sh"
 run = "env PYTHONPATH=sdk/python/sandbox/src python3 -m beyond_sandbox.driver --async"
 
 # The MCP server, through a real MCP session: the driver spawns `sandbox-mcp` (built beside it) and

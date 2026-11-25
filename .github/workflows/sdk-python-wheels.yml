@@ -1,0 +1,97 @@
+name: Python SDK wheels
+# Builds beyond-sandbox's platform wheels: the pure-Python package plus the job client's kernel
+# (crates/job-client-ffi, proven in Verus) as a native library that Python loads with ctypes. The library needs
+# no CPython ABI, so each platform gets one `py3-none-<platform>` wheel, not one per Python version. There is no
+# sdist and no pure-Python fallback: a platform with no wheel fails to install.
+#
+# Each wheel is built natively on a runner of its platform (cibuildwheel; the compiler is the one pinned in
+# crates/job-client-ffi/toolchain, as for the WASM module) and tested there: the smoke test imports the
+# *installed* wheel, loads the library and follows a job over a cut loopback stream.
+#
+# Platforms: linux x86_64 and aarch64 (manylinux and musllinux), macOS x86_64 and arm64, windows x86_64.
+# A tag `sdk/python/vX.Y.Z` publishes them to PyPI (trusted publishing, no token stored); the tag is the version.
+on:
+  pull_request:
+    paths:
+      - "sdk/python/sandbox/**"
+      - "crates/job-client/**"
+      - "crates/job-client-ffi/**"
+      - ".github/workflows/sdk-python-wheels.yml"
+  push:
+    tags: ["sdk/python/v*"]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: sdk-python-wheels-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  wheel:
+    name: wheel (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {name: linux x86_64 manylinux, runner: ubuntu-24.04, build: cp312-manylinux_x86_64}
+          - {name: linux aarch64 manylinux, runner: ubuntu-24.04-arm, build: cp312-manylinux_aarch64}
+          - {name: linux x86_64 musllinux, runner: ubuntu-24.04, build: cp312-musllinux_x86_64}
+          - {name: linux aarch64 musllinux, runner: ubuntu-24.04-arm, build: cp312-musllinux_aarch64}
+          - {name: macos x86_64, runner: macos-15-intel, build: cp312-macosx_x86_64}
+          - {name: macos arm64, runner: macos-15, build: cp312-macosx_arm64}
+          - {name: windows x86_64, runner: windows-2022, build: cp312-win_amd64}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set the version from the tag
+        if: startsWith(github.ref, 'refs/tags/sdk/python/v')
+        shell: bash
+        run: |
+          VERSION=${GITHUB_REF_NAME#sdk/python/v}
+          sed -i.bak "s/^version = .*/version = \"$VERSION\"/" sdk/python/sandbox/pyproject.toml
+          rm sdk/python/sandbox/pyproject.toml.bak
+      # macOS and Windows build on the runner, which has rustup; Linux builds in a container, which installs it.
+      - name: Install the pinned compiler
+        if: runner.os != 'Linux'
+        shell: bash
+        run: rustup toolchain install "$(cat crates/job-client-ffi/toolchain)" --profile minimal
+      - uses: pypa/cibuildwheel@v4.3.5
+        with:
+          package-dir: sdk/python/sandbox
+          output-dir: wheelhouse
+        env:
+          CIBW_BUILD: ${{ matrix.build }}
+          CIBW_BEFORE_ALL_LINUX: sh {package}/scripts/install_rust.sh
+          CIBW_ENVIRONMENT_LINUX: PATH="$HOME/.cargo/bin:$PATH"
+          CIBW_TEST_COMMAND: python {package}/scripts/smoke_wheel.py
+          CIBW_BUILD_VERBOSITY: 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.build }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+          retention-days: 7
+  # Every wheel built and passed its smoke test, and the set is the set promised.
+  wheels:
+    name: wheels
+    needs: wheel
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - run: test "${{ needs.wheel.result }}" = success
+  publish:
+    name: publish beyond-sandbox
+    needs: wheels
+    if: startsWith(github.ref, 'refs/tags/sdk/python/v')
+    runs-on: ubuntu-24.04
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          path: dist
+          merge-multiple: true
+      - run: ls -l dist
+      - uses: pypa/gh-action-pypi-publish@release/v1

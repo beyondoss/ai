@@ -7,12 +7,11 @@ started it, and its output can be read from any offset.
 from __future__ import annotations
 
 import builtins
-from typing import AsyncGenerator, AsyncIterator, Generator, Iterator, Sequence
+from typing import AsyncGenerator, AsyncIterator, Callable, Generator, Iterator, Sequence
 
 from . import _jobs
-from ._drive import _DONE, adrive, adrive_emit, aiter_events, drive, drive_iter
+from ._drive import adrive, adrive_emit, aiter_items, drive, iter_items
 from .atransport import AsyncJobTransport
-from .errors import NotOfferedError
 from .models import (
     Attached,
     JobAttached,
@@ -25,32 +24,13 @@ from .models import (
     JobRemoved,
     JobShellExit,
     JobStart,
-    JobStarted,
+    Reconnecting,
     StdinWritten,
     Survivor,
 )
 from .transport import JobTransport
 
 READ_MAX = _jobs.READ_MAX
-
-
-def _held_refusal(ev: JobFrame, stdin_open: bool) -> str | None:
-    """Why a held start's first frame shows an endpoint that lacks a feature asked for, if it does:
-    no stdin echo for ``stdin_open``, or no mark."""
-    if not isinstance(ev, JobStarted):
-        return None
-    if stdin_open and not ev.stdin:
-        return "the endpoint predates job stdin: it ran the job without it"
-    if not ev.mark:
-        return "the endpoint predates the job mark: its started frame did not name one"
-    return None
-
-
-def _attach_refusal(first: bool, ev: JobFrame) -> str | None:
-    """An attach stream opens with ``attached``; one that does not is an endpoint that predates it."""
-    if first and not isinstance(ev, JobAttached):
-        return "the endpoint predates the job mark: its attach did not answer with `attached`"
-    return None
 
 
 def _collect(a: Attached, ev: JobFrame) -> None:
@@ -106,24 +86,26 @@ class Jobs:
         env: dict[str, str] | None = None,
         stdin_open: bool = False,
         heartbeat_seconds: int | None = None,
+        on_reconnecting: Callable[[Reconnecting], None] | None = None,
     ) -> Generator[JobFrame, None, None]:
         """Start a job held by the returned stream (wire ``hold: true``): events, the first a
         :class:`JobStarted`, ending with a :class:`JobEnd`. If you stop before the end and did not
-        :meth:`keep` the job, the sandbox kills its group."""
+        :meth:`keep` the job, the sandbox kills its group. A cut or silent stream is reopened at the
+        offset reached, by the client kernel; a handle that cannot reopen says so through
+        ``on_reconnecting`` and keeps trying."""
         op = _jobs.start_held(
-            scope, job, command, args, cwd, label, env, stdin_open, heartbeat_seconds
+            scope,
+            job,
+            command,
+            args,
+            cwd,
+            label,
+            env,
+            stdin_open,
+            heartbeat_seconds,
+            on_reconnecting,
         )
-        items = drive_iter(op, self._t)
-        try:
-            for item in items:
-                if isinstance(item, tuple) and item and item[0] is _DONE:
-                    yield item[1]
-                else:
-                    if (why := _held_refusal(item, stdin_open)) is not None:
-                        raise NotOfferedError(why)
-                    yield item
-        finally:
-            items.close()
+        yield from iter_items(op, self._t)
 
     def keep(
         self,
@@ -169,25 +151,21 @@ class Jobs:
         heartbeat_seconds: int | None = None,
         mark: str | None = None,
         output: bool = True,
+        on_reconnecting: Callable[[Reconnecting], None] | None = None,
     ) -> Iterator[JobFrame]:
         """Events, the first a :class:`JobAttached` (the job's mark and where the stream starts), then
         (:class:`JobOutput`, :class:`JobGap`, :class:`JobShellExit`, …), ending with a
         :class:`JobEnd` once the job's group is empty. Stopping early leaves the job running. A job
-        that does not exist is :class:`~beyond_sandbox.JobGoneError`. ``heartbeat_seconds`` (1 to 240,
-        the ``Keepalive-Ping-Interval`` header) sets the stream's beat; it is presumed dead only after
-        two beats and ten seconds of silence, never under 30 s. ``mark`` names the incarnation of the
-        id to follow: another is a ``JobGoneError`` and nothing is streamed. ``output=False`` sends no
-        output and no gap, only the end."""
-        op = _jobs.follow(scope, job, offset, heartbeat_seconds, mark, output)
-        first = True
-        for item in drive_iter(op, self._t):
-            if isinstance(item, tuple) and item and item[0] is _DONE:
-                yield item[1]
-            else:
-                if (why := _attach_refusal(first, item)) is not None:
-                    raise NotOfferedError(why)
-                first = False
-                yield item
+        that does not exist is :class:`~beyond_sandbox.JobGoneError`. A cut or silent stream is
+        reopened at the offset reached, by the client kernel (``crates/job-client``); a handle that
+        cannot reopen says so through ``on_reconnecting`` and keeps trying. ``heartbeat_seconds`` (1 to
+        240, the ``Keepalive-Ping-Interval`` header) sets the stream's beat; the stream is presumed
+        dead after two beats and ten seconds of silence, never under 30 s. ``mark`` names the
+        incarnation of the id to follow: another is a ``JobGoneError`` and nothing is streamed.
+        ``output=False`` sends no output and no gap, only the end. An endpoint that does not name the
+        mark is :class:`~beyond_sandbox.NotOfferedError`, before any byte."""
+        op = _jobs.follow(scope, job, offset, heartbeat_seconds, mark, output, on_reconnecting)
+        yield from iter_items(op, self._t)
 
     def collect(
         self,
@@ -198,11 +176,18 @@ class Jobs:
         heartbeat_seconds: int | None = None,
         mark: str | None = None,
         output: bool = True,
+        on_reconnecting: Callable[[Reconnecting], None] | None = None,
     ) -> Attached:
         """Follow the job to its end and collect everything."""
         result = Attached(-1)
         for ev in self.follow(
-            scope, job, offset, heartbeat_seconds=heartbeat_seconds, mark=mark, output=output
+            scope,
+            job,
+            offset,
+            heartbeat_seconds=heartbeat_seconds,
+            mark=mark,
+            output=output,
+            on_reconnecting=on_reconnecting,
         ):
             if isinstance(ev, JobEnd):
                 result.exit_code, result.signal = ev.code, ev.signal
@@ -267,22 +252,23 @@ class AsyncJobs:
         env: dict[str, str] | None = None,
         stdin_open: bool = False,
         heartbeat_seconds: int | None = None,
+        on_reconnecting: Callable[[Reconnecting], None] | None = None,
     ) -> AsyncGenerator[JobFrame, None]:
         """As :meth:`Jobs.start_held`."""
         op = _jobs.start_held(
-            scope, job, command, args, cwd, label, env, stdin_open, heartbeat_seconds
+            scope,
+            job,
+            command,
+            args,
+            cwd,
+            label,
+            env,
+            stdin_open,
+            heartbeat_seconds,
+            on_reconnecting,
         )
-        events = aiter_events(op, self._t)
-        try:
-            async for item in events:
-                if isinstance(item, tuple) and item and item[0] is _DONE:
-                    yield item[1]
-                else:
-                    if (why := _held_refusal(item, stdin_open)) is not None:
-                        raise NotOfferedError(why)
-                    yield item
-        finally:
-            await events.aclose()
+        async for item in aiter_items(op, self._t):
+            yield item
 
     async def keep(
         self,
@@ -321,22 +307,12 @@ class AsyncJobs:
         heartbeat_seconds: int | None = None,
         mark: str | None = None,
         output: bool = True,
+        on_reconnecting: Callable[[Reconnecting], None] | None = None,
     ) -> AsyncIterator[JobFrame]:
         """As :meth:`Jobs.follow`."""
-        op = _jobs.follow(scope, job, offset, heartbeat_seconds, mark, output)
-        events = aiter_events(op, self._t)
-        first = True
-        try:
-            async for item in events:
-                if isinstance(item, tuple) and item and item[0] is _DONE:
-                    yield item[1]
-                else:
-                    if (why := _attach_refusal(first, item)) is not None:
-                        raise NotOfferedError(why)
-                    first = False
-                    yield item
-        finally:
-            await events.aclose()
+        op = _jobs.follow(scope, job, offset, heartbeat_seconds, mark, output, on_reconnecting)
+        async for item in aiter_items(op, self._t):
+            yield item
 
     async def collect(
         self,
@@ -347,20 +323,18 @@ class AsyncJobs:
         heartbeat_seconds: int | None = None,
         mark: str | None = None,
         output: bool = True,
+        on_reconnecting: Callable[[Reconnecting], None] | None = None,
     ) -> Attached:
         result = Attached(-1)
-        op = _jobs.follow(scope, job, offset, heartbeat_seconds, mark, output)
-        first = True
+        op = _jobs.follow(scope, job, offset, heartbeat_seconds, mark, output, on_reconnecting)
 
         async def collect(ev: JobFrame) -> None:
-            nonlocal first
-            if (why := _attach_refusal(first, ev)) is not None:
-                raise NotOfferedError(why)
-            first = False
-            _collect(result, ev)
+            if isinstance(ev, JobEnd):
+                result.exit_code, result.signal = ev.code, ev.signal
+            else:
+                _collect(result, ev)
 
-        end = await adrive_emit(op, self._t, collect)
-        result.exit_code, result.signal = end.code, end.signal
+        await adrive_emit(op, self._t, collect)
         return result
 
     async def kill(

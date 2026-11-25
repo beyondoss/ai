@@ -14,7 +14,17 @@ import ssl
 import threading
 import time
 from collections import deque
-from typing import Any, Callable, Iterator, Protocol, Sequence, Union, runtime_checkable
+from dataclasses import dataclass
+from typing import (
+    Any,
+    Callable,
+    Iterable,
+    Iterator,
+    Protocol,
+    Sequence,
+    Union,
+    runtime_checkable,
+)
 
 from . import _http, _wire
 from .errors import (
@@ -25,7 +35,7 @@ from .errors import (
     TooLargeError,
     TransportError,
 )
-from .models import ExecResult, Frame, JobFrame
+from .models import ExecResult, Frame
 
 DEFAULT_TIMEOUT_MS = 120_000
 
@@ -40,10 +50,26 @@ class FrameStream(Protocol):
     def close(self) -> None: ...
 
 
-class JobFrameStream(Protocol):
-    def __iter__(self) -> Iterator[JobFrame]: ...
-    def __next__(self) -> JobFrame: ...
-    def close(self) -> None: ...
+@dataclass(slots=True)
+class JobOpened:
+    """The answer to one request of a job handle, whatever its status.
+
+    A refusal is an answer, never an exception: ``status`` is what the endpoint said, and the job handle
+    (the client kernel) decides what it means. ``lines`` are the stream's lines, each without its newline,
+    when the status is a success: iterating them raises :class:`~beyond_sandbox.TransportError` or
+    :class:`~beyond_sandbox.TimeoutError` when the stream is cut or silent for the limit asked for, and
+    :class:`~beyond_sandbox.ProtocolError` for a line it cannot hold. A transport that has no answer
+    (the endpoint was not reached) raises those from ``job_open`` itself.
+    """
+
+    status: int
+    #: The server's ``Retry-After``, whole seconds; 0 when it sent none.
+    retry_after_s: int = 0
+    #: What a refusal said, for the error that reports it.
+    detail: str = ""
+    lines: Iterable[bytes] = ()
+    #: Release the connection.
+    close: Callable[[], None] = lambda: None
 
 
 class Transport(Protocol):
@@ -85,15 +111,18 @@ class JobTransport(Transport, Protocol):
         cwd: str | None = None,
     ) -> Any:
         """One job operation; its JSON answer. A caller that chose a heartbeat also passes
-        ``heartbeat_seconds`` (the ``Keepalive-Ping-Interval`` header), and one that starts a job with
-        ``env`` passes ``env``; a transport that has no use for either may omit the parameter, and is
+        ``heartbeat_seconds`` (the ``Keepalive-Ping-Interval`` header); a transport that has no use for it may omit the parameter, and is
         only ever passed it when it is set."""
         ...
 
-    def job_stream(self, job: dict[str, Any]) -> JobFrameStream:
-        """A job operation answered by a stream (``attach``, or a held ``start``). When set, the
-        caller also passes ``command``, ``args``, ``cwd`` and ``env`` (a held start runs a command) and
-        ``heartbeat_seconds``; a transport is only ever passed what is set."""
+    def job_open(self, job: dict[str, Any], silence_ms: int) -> JobOpened:
+        """One request of a job handle (an ``attach``, or a ``start``): what the endpoint answered.
+
+        A held start (``hold: true``) and an attach answer with a stream of lines; a start that is not held
+        answers with its one JSON record as the only line. ``silence_ms`` is the longest the stream may go
+        without a line before it is presumed dead. When set, the caller also passes ``command``, ``args``,
+        ``cwd`` and ``env`` (a start runs a command) and ``heartbeat_seconds``; a transport is only ever
+        passed what is set. It never retries and never raises for a refusal."""
         ...
 
 
@@ -217,6 +246,41 @@ class _Frames:
         self.close()
 
 
+class _Lines:
+    """The lines of a job stream, each without its newline. A body that ends is the end of the iteration:
+    whether that is a clean end or a cut is the kernel's to say."""
+
+    def __init__(self, resp: _Response, silence: float) -> None:
+        self._resp, self._silence = resp, silence
+        self._split = _wire.LineSplitter()
+        self._pending: deque[bytes] = deque()
+
+    def __iter__(self) -> _Lines:
+        return self
+
+    def __next__(self) -> bytes:
+        while not self._pending:
+            try:
+                data = self._resp.next_chunk(self._silence)
+            except SandboxError:
+                self._resp.close()
+                raise
+            if not data:
+                self._resp.close()
+                raise StopIteration
+            self._pending.extend(self._split.feed(data))
+        return self._pending.popleft()
+
+
+@dataclass(frozen=True, slots=True)
+class _Refusal:
+    """A non-2xx answer, read to its end."""
+
+    status: int
+    retry_after_s: int
+    body: bytes
+
+
 class HttpTransport:
     """The exec protocol over HTTP, on the standard library alone.
 
@@ -288,6 +352,20 @@ class HttpTransport:
         heartbeat_seconds: int | None = None,
     ) -> _Response:
         """POST ``body``; return the response once its head is read. A non-2xx answer raises."""
+        got = self._open_raw(body, timeout_ms, refresh=refresh, heartbeat_seconds=heartbeat_seconds)
+        if isinstance(got, _Refusal):
+            raise _wire.status_error(self.url, got.status, got.body)
+        return got
+
+    def _open_raw(
+        self,
+        body: bytes,
+        timeout_ms: int,
+        *,
+        refresh: bool = False,
+        heartbeat_seconds: int | None = None,
+    ) -> _Response | _Refusal:
+        """POST ``body``; the response once its head is read, or the refusal a non-2xx answer is."""
         deadline = time.monotonic() + timeout_ms / 1000 + _wire.GRACE_S
         beat = _wire.check_heartbeat(heartbeat_seconds)
         extra = [] if beat is None else [(_wire.HEARTBEAT_HEADER, str(beat))]
@@ -319,8 +397,10 @@ class HttpTransport:
             err_body = b""
         resp.close()
         if reader.status == 401 and callable(self._token) and not refresh:
-            return self._open(body, timeout_ms, refresh=True, heartbeat_seconds=heartbeat_seconds)
-        raise _wire.status_error(self.url, reader.status, err_body)
+            return self._open_raw(
+                body, timeout_ms, refresh=True, heartbeat_seconds=heartbeat_seconds
+            )
+        return _Refusal(reader.status, _wire.retry_after_s(reader.headers), err_body)
 
     def _post(
         self,
@@ -393,28 +473,37 @@ class HttpTransport:
         except TooLargeError:
             raise TooLargeError("a job answer exceeded the response cap") from None
 
-    def job_stream(
+    def job_open(
         self,
         job: dict[str, Any],
+        silence_ms: int,
         command: str = "true",
         args: Sequence[str] = (),
         cwd: str | None = None,
         env: dict[str, str] | None = None,
         heartbeat_seconds: int | None = None,
-    ) -> JobFrameStream:
+    ) -> JobOpened:
         if env:
             self._prove_env()
+        kept_start = job.get("op") == "start" and not job.get("hold")
+        ms = 30_000 if kept_start else _wire.STREAM_DEADLINE_MS
         body = _wire.request_body(
-            command,
-            args,
-            cwd=cwd,
-            timeout_ms=_wire.STREAM_DEADLINE_MS,
-            stream=True,
-            job=job,
-            env=env,
+            command, args, cwd=cwd, timeout_ms=ms, stream=not kept_start, job=job, env=env
         )
-        resp = self._open(body, _wire.STREAM_DEADLINE_MS, heartbeat_seconds=heartbeat_seconds)
-        return _Frames(resp, _wire.job_decoder(), _wire.silence_s(heartbeat_seconds))
+        got = self._open_raw(body, ms, heartbeat_seconds=heartbeat_seconds)
+        if isinstance(got, _Refusal):
+            return JobOpened(got.status, got.retry_after_s, _wire.excerpt(got.body))
+        if kept_start:
+            # A kept job's start is one JSON answer, the same record a held start's first frame is.
+            try:
+                answer = got.read_capped(self._cap)
+            finally:
+                got.close()
+            return JobOpened(got.status, lines=(answer,))
+        if not _http.is_ndjson(got.headers):
+            got.close()
+            raise _wire.not_a_stream(self.url)
+        return JobOpened(got.status, lines=_Lines(got, silence_ms / 1000), close=got.close)
 
     _env_proved = False
 

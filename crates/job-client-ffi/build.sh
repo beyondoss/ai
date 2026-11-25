@@ -4,6 +4,9 @@
 #   crates/job-client-ffi/build.sh           rebuild when the sources changed, write the artifacts
 #   crates/job-client-ffi/build.sh --check   rebuild always; fail if the committed artifacts differ
 #
+# The native library for Python's ctypes is built by build-native.sh from the same sources, and carries the
+# same source hash (source-hash.sh).
+#
 # Writes sdk/ts/sandbox/src/kernel/wasm.ts (the module as base64, inlined: no fetch and no file at
 # runtime) and kernel.src.sha256 beside it: the hash of the sources it was built from. The TS test
 # `kernel-pin.test.ts` fails when a source changed and this did not run; CI's `--check` fails when the
@@ -21,7 +24,7 @@ check=0
 # so a rustc bump is a visible change here and never a surprise red in CI.
 toolchain=$(tr -d '[:space:]' <"$here/toolchain")
 export RUSTUP_TOOLCHAIN=$toolchain
-src_hash=$(cd "$root/crates" && cat job-client-ffi/toolchain job-client-ffi/Cargo.toml job-client/Cargo.toml $(LC_ALL=C ls job-client-ffi/src/*.rs job-client/src/*.rs) | sha256sum | cut -d' ' -f1)
+src_hash=$("$here/source-hash.sh")
 if [[ $check == 0 && -f $out/wasm.ts && "$(cat "$out/kernel.src.sha256" 2>/dev/null)" == "$src_hash" ]]; then exit 0; fi
 
 target=${CARGO_TARGET_DIR:-$HOME/.cache/job-client-ffi-target}

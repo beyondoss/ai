@@ -11,8 +11,10 @@ import contextlib
 import ssl
 import time
 from collections import deque
+from dataclasses import dataclass, field
 from typing import (
     Any,
+    AsyncIterable,
     AsyncIterator,
     Awaitable,
     Callable,
@@ -31,8 +33,13 @@ from .errors import (
     TooLargeError,
     TransportError,
 )
-from .models import ExecResult, Frame, JobFrame
+from .models import ExecResult, Frame
 from .transport import DEFAULT_TIMEOUT_MS
+
+
+async def _nothing() -> None:
+    return None
+
 
 AsyncToken = Union[str, Callable[[], Union[str, Awaitable[str]]], None]
 
@@ -45,10 +52,16 @@ class AsyncFrameStream(Protocol):
     async def aclose(self) -> None: ...
 
 
-class AsyncJobFrameStream(Protocol):
-    def __aiter__(self) -> AsyncIterator[JobFrame]: ...
-    async def __anext__(self) -> JobFrame: ...
-    async def aclose(self) -> None: ...
+@dataclass(slots=True)
+class AsyncJobOpened:
+    """:class:`~beyond_sandbox.transport.JobOpened`, awaited: the answer to one request of a job handle,
+    whatever its status. ``lines`` raises as the sync one does; ``close`` is awaited."""
+
+    status: int
+    retry_after_s: int = 0
+    detail: str = ""
+    lines: AsyncIterable[bytes] = field(default_factory=lambda: _no_lines())
+    close: Callable[[], Awaitable[None]] = lambda: _nothing()
 
 
 class AsyncTransport(Protocol):
@@ -89,11 +102,11 @@ class AsyncJobTransport(AsyncTransport, Protocol):
         env: dict[str, str] | None = None,
     ) -> Any: ...
 
-    async def job_stream(self, job: dict[str, Any]) -> AsyncJobFrameStream: ...
+    async def job_open(self, job: dict[str, Any], silence_ms: int) -> AsyncJobOpened: ...
 
-    # A caller that chose a heartbeat also passes ``heartbeat_seconds``, and one that starts a job
-    # with ``env`` passes ``env``; a held start passes ``command``, ``args``, ``cwd`` too. A
-    # transport is only ever passed what is set, so one without a parameter keeps working.
+    # As :meth:`JobTransport.job_open`. A caller that chose a heartbeat also passes
+    # ``heartbeat_seconds``; a start passes ``command``, ``args``, ``cwd`` and ``env`` too. A transport
+    # is only ever passed what is set, so one without a parameter keeps working.
 
 
 class _Response:
@@ -208,6 +221,47 @@ class _Frames:
         await self.aclose()
 
 
+class _Lines:
+    """The lines of a job stream, each without its newline; the end of the body is the end of the iteration."""
+
+    def __init__(self, resp: _Response, silence: float) -> None:
+        self._resp, self._silence = resp, silence
+        self._split = _wire.LineSplitter()
+        self._pending: deque[bytes] = deque()
+
+    def __aiter__(self) -> _Lines:
+        return self
+
+    async def __anext__(self) -> bytes:
+        while not self._pending:
+            try:
+                data = await self._resp.next_chunk(self._silence)
+            except SandboxError:
+                await self._resp.close()
+                raise
+            if not data:
+                await self._resp.close()
+                raise StopAsyncIteration
+            self._pending.extend(self._split.feed(data))
+        return self._pending.popleft()
+
+
+@dataclass(frozen=True, slots=True)
+class _Refusal:
+    status: int
+    retry_after_s: int
+    body: bytes
+
+
+async def _no_lines() -> AsyncIterator[bytes]:
+    return
+    yield b""
+
+
+async def _one_line(line: bytes) -> AsyncIterator[bytes]:
+    yield line
+
+
 class AsyncHttpTransport:
     """The exec protocol over HTTP, on asyncio alone. See :class:`~beyond_sandbox.HttpTransport`.
 
@@ -263,6 +317,21 @@ class AsyncHttpTransport:
         refresh: bool = False,
         heartbeat_seconds: int | None = None,
     ) -> _Response:
+        got = await self._open_raw(
+            body, timeout_ms, refresh=refresh, heartbeat_seconds=heartbeat_seconds
+        )
+        if isinstance(got, _Refusal):
+            raise _wire.status_error(self.url, got.status, got.body)
+        return got
+
+    async def _open_raw(
+        self,
+        body: bytes,
+        timeout_ms: int,
+        *,
+        refresh: bool = False,
+        heartbeat_seconds: int | None = None,
+    ) -> _Response | _Refusal:
         deadline = time.monotonic() + timeout_ms / 1000 + _wire.GRACE_S
         beat = _wire.check_heartbeat(heartbeat_seconds)
         extra = [] if beat is None else [(_wire.HEARTBEAT_HEADER, str(beat))]
@@ -306,10 +375,10 @@ class AsyncHttpTransport:
             err_body = b""
         await resp.close()
         if parsed.status == 401 and callable(self._token) and not refresh:
-            return await self._open(
+            return await self._open_raw(
                 body, timeout_ms, refresh=True, heartbeat_seconds=heartbeat_seconds
             )
-        raise _wire.status_error(self.url, parsed.status, err_body)
+        return _Refusal(parsed.status, _wire.retry_after_s(parsed.headers), err_body)
 
     async def _post(
         self,
@@ -378,28 +447,39 @@ class AsyncHttpTransport:
         except TooLargeError:
             raise TooLargeError("a job answer exceeded the response cap") from None
 
-    async def job_stream(
+    async def job_open(
         self,
         job: dict[str, Any],
+        silence_ms: int,
         command: str = "true",
         args: Sequence[str] = (),
         cwd: str | None = None,
         env: dict[str, str] | None = None,
         heartbeat_seconds: int | None = None,
-    ) -> AsyncJobFrameStream:
+    ) -> AsyncJobOpened:
         if env:
             await self._prove_env()
+        kept_start = job.get("op") == "start" and not job.get("hold")
+        ms = 30_000 if kept_start else _wire.STREAM_DEADLINE_MS
         body = _wire.request_body(
-            command,
-            args,
-            cwd=cwd,
-            timeout_ms=_wire.STREAM_DEADLINE_MS,
-            stream=True,
-            job=job,
-            env=env,
+            command, args, cwd=cwd, timeout_ms=ms, stream=not kept_start, job=job, env=env
         )
-        resp = await self._open(body, _wire.STREAM_DEADLINE_MS, heartbeat_seconds=heartbeat_seconds)
-        return _Frames(resp, _wire.job_decoder(), _wire.silence_s(heartbeat_seconds))
+        got = await self._open_raw(body, ms, heartbeat_seconds=heartbeat_seconds)
+        if isinstance(got, _Refusal):
+            return AsyncJobOpened(
+                got.status, got.retry_after_s, _wire.excerpt(got.body), _no_lines()
+            )
+        if kept_start:
+            # A kept job's start is one JSON answer, the same record a held start's first frame is.
+            try:
+                answer = await got.read_capped(self._cap)
+            finally:
+                await got.close()
+            return AsyncJobOpened(got.status, lines=_one_line(answer))
+        if not _http.is_ndjson(got.headers):
+            await got.close()
+            raise _wire.not_a_stream(self.url)
+        return AsyncJobOpened(got.status, lines=_Lines(got, silence_ms / 1000), close=got.close)
 
     _env_proved = False
 

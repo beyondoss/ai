@@ -362,6 +362,10 @@ dir = "sdk/ts"
 description = "Rebuild the job client kernel as WASM and inline it into the TypeScript SDK (sdk/ts/sandbox/src/kernel/). `-- --check` rebuilds and fails if the committed bytes differ."
 run = "crates/job-client-ffi/build.sh"
 
+[tasks."build:py-kernel"]
+description = "Build the job client kernel as a native library into the Python SDK's package (sdk/python/sandbox/src/beyond_sandbox/_native/, untracked): the library beyond_sandbox loads with ctypes. Same sources and pinned compiler as build:job-client-wasm; a wheel build runs the same script."
+run = "crates/job-client-ffi/build-native.sh"
+
 [tasks."build:ts"]
 description = "Build the TypeScript SDK (tsdown): sandbox + @beyond.dev/tools dist."
 run = "npm run build"
@@ -459,7 +463,8 @@ cargo test -q -p beyond-sandbox-conformance --test differential -- --include-ign
 # ---- python client: beyond-sandbox (sdk/python/sandbox) ---------------------------------------------
 
 [tasks."install:py"]
-description = "Install beyond-sandbox and its dev tools into sdk/python/sandbox/.venv (uv when present, else venv + pip)."
+description = "Install beyond-sandbox and its dev tools into sdk/python/sandbox/.venv (uv when present, else venv + pip), and build its native kernel (build:py-kernel)."
+depends = ["build:py-kernel"]
 run = """
 set -e
 cd sdk/python/sandbox
@@ -481,6 +486,14 @@ cd sdk/python/sandbox
 .venv/bin/ruff format --check .
 .venv/bin/ruff check .
 .venv/bin/mypy
+"""
+
+[tasks."test:py-broken-kernel"]
+description = "beyond-sandbox's behaviour comes from the kernel library: build it with 429 changed to 428 in a scratch copy of the repository, and run a test against it. It must go red there (and be green with the package's own library)."
+depends = ["install:py"]
+run = """
+set -e
+PATH="$PWD/sdk/python/sandbox/.venv/bin:$PATH" sdk/python/sandbox/scripts/broken_kernel.sh
 """
 
 [tasks."test:py"]

@@ -8,7 +8,13 @@ Three layers, each usable alone:
 3. **Surface**: :class:`Sandbox` / :class:`AsyncSandbox`, which gather both and keep raw exec in reach.
 """
 
-from .atransport import AsyncFrameStream, AsyncHttpTransport, AsyncJobTransport, AsyncTransport
+from .atransport import (
+    AsyncFrameStream,
+    AsyncHttpTransport,
+    AsyncJobOpened,
+    AsyncJobTransport,
+    AsyncTransport,
+)
 from .errors import (
     AuthError,
     ConflictError,
@@ -54,6 +60,7 @@ from .models import (
     JobShellExit,
     JobStart,
     JobStarted,
+    Reconnecting,
     SearchResult,
     ShellExit,
     Signal,
@@ -65,7 +72,7 @@ from .models import (
     Transfer,
 )
 from .sandbox import AsyncFrames, AsyncSandbox, Frames, Sandbox
-from .transport import FrameStream, HttpTransport, JobTransport, Transport
+from .transport import FrameStream, HttpTransport, JobOpened, JobTransport, Transport
 
 __version__ = "0.1.0.dev0"
 
@@ -74,6 +81,7 @@ __all__ = [
     "AsyncFrameStream",
     "AsyncFrames",
     "AsyncHttpTransport",
+    "AsyncJobOpened",
     "AsyncJobTransport",
     "AsyncJobs",
     "AsyncSandbox",
@@ -105,6 +113,7 @@ __all__ = [
     "JobGap",
     "JobGoneError",
     "JobInfo",
+    "JobOpened",
     "JobOutput",
     "JobRead",
     "JobRemoved",
@@ -118,6 +127,7 @@ __all__ = [
     "NotOfferedError",
     "PermissionDeniedError",
     "ProtocolError",
+    "Reconnecting",
     "Sandbox",
     "SandboxError",
     "SearchResult",

@@ -6,8 +6,10 @@ import base64
 import binascii
 import json
 import re
-from typing import Any, Callable, Generic, Sequence, TypeVar
+from dataclasses import dataclass
+from typing import Any, Callable, Generic, Sequence, TypeGuard, TypeVar
 
+from . import _kernel as K
 from .errors import (
     AuthError,
     EndpointError,
@@ -22,16 +24,9 @@ from .models import (
     ExecResult,
     Exit,
     Frame,
-    JobAttached,
-    JobEnd,
-    JobFrame,
-    JobGap,
     JobInfo,
-    JobOutput,
     JobRead,
     JobRemoved,
-    JobShellExit,
-    JobStarted,
     ShellExit,
     Signal,
     Stderr,
@@ -45,8 +40,8 @@ from .models import (
 DEFAULT_MAX_RESPONSE = 16 * 1024 * 1024
 #: Grace added to ``timeout_ms`` for the whole exchange, so the endpoint's own timeout report wins.
 GRACE_S = 30.0
-#: A stream with no frame (not even a heartbeat) for this long is a dead connection, unless the
-#: request chose its own heartbeat (see :func:`silence_s`).
+#: An exec stream with no frame (not even a heartbeat) for this long is a dead connection. (A job
+#: stream's limit is the kernel's, derived from the heartbeat the request chose.)
 SILENCE_S = 30.0
 #: The request header that names a heartbeat interval, whole seconds, and its range.
 HEARTBEAT_HEADER = "Keepalive-Ping-Interval"
@@ -75,16 +70,6 @@ def check_heartbeat(heartbeat_seconds: int | None) -> int | None:
             f"{HEARTBEAT_MAX_S}, got {heartbeat_seconds!r}"
         )
     return heartbeat_seconds
-
-
-def silence_s(heartbeat_seconds: int | None = None) -> float:
-    """How long a stream may go without any frame before it is presumed dead, given the heartbeat the
-    request asked for (``None``: the endpoint's own, 5 s): two beats and ten seconds of slack, never
-    under :data:`SILENCE_S`, so a stream that asked for a 60 s beat is not killed by its own client.
-    A pure function of its argument: it moves into the client kernel unchanged (B1)."""
-    if heartbeat_seconds is None:
-        return SILENCE_S
-    return max(SILENCE_S, heartbeat_seconds * 2.0 + 10.0)
 
 
 def request_body(
@@ -126,6 +111,12 @@ def status_error(url: str, status: int, body: bytes) -> SandboxError:
     if status == 422 and "cap" in text.lower():
         return TooLargeError(detail, status=status)
     return EndpointError(detail, status=status)
+
+
+def retry_after_s(headers: dict[str, str]) -> int:
+    """The ``Retry-After`` of an answer, whole seconds; 0 when it sent none (or a date, which no endpoint here sends)."""
+    value = headers.get("retry-after", "").strip()
+    return int(value) if value.isdigit() else 0
 
 
 def too_large(url: str, cap: int) -> TooLargeError:
@@ -198,7 +189,7 @@ def decode_line(line: bytes) -> list[Frame]:
         frames.append(Stdout(_b64("stdout", obj["stdout"])))
     if "stderr" in obj:
         frames.append(Stderr(_b64("stderr", obj["stderr"])))
-    if isinstance(obj.get("shell_exit"), int):
+    if _num(obj.get("shell_exit")):
         frames.append(ShellExit(obj["shell_exit"]))
     if "error" in obj:
         raise TransportError(f"the endpoint failed mid-command: {obj['error']}")
@@ -245,45 +236,109 @@ def job_op(op: str, scope: str, **extra: Any) -> dict[str, Any]:
     return {"op": op, "scope": scope, **extra}
 
 
-def decode_job_line(line: bytes) -> list[JobFrame]:
-    """One line of a job stream: an event, the final :class:`JobEnd`, or nothing (a heartbeat)."""
+@dataclass(frozen=True, slots=True)
+class JobLine:
+    """What one line of a job stream said: the frame the kernel is told of, and what the shell keeps of it."""
+
+    #: The kernel's bytes for the frame (``_kernel.Frame``).
+    frame: bytes
+    #: An output frame's bytes: they stay here, and the kernel is told only their length.
+    data: bytes | None = None
+    stderr: bool = False
+    #: A ``started`` frame's process group.
+    pgid: int = 0
+    #: Why the frame is ``bad``.
+    note: str = ""
+
+
+def _bad(note: str) -> JobLine:
+    return JobLine(K.Frame.BAD, note=note)
+
+
+def _count(v: Any) -> TypeGuard[int]:
+    """A non-negative integer of the wire: a byte count or an offset."""
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+
+def _num(v: Any) -> TypeGuard[float]:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _int32(v: Any) -> TypeGuard[int]:
+    return isinstance(v, int) and not isinstance(v, bool) and -(2**31) <= v < 2**31
+
+
+def decode_job_line(line: bytes) -> JobLine:
+    """One line of a job stream, read for the facts the kernel decides on. Never raises.
+
+    Which known key a line has is a codec question (the precedence is the wire's: an error, then the
+    echoes, output, gap, the shell's exit, the end); what each fact means is the kernel's.
+    """
     line = line.removesuffix(b"\r")
     if not line.strip():
-        return []
+        return JobLine(K.Frame.HEARTBEAT)
     try:
         obj = json.loads(line)
     except ValueError as e:
-        raise ProtocolError(f"unparseable job frame ({e}): {excerpt(line)[:200]}") from None
+        return _bad(f"unparseable job frame ({e}): {excerpt(line)[:200]}")
     if not isinstance(obj, dict):
-        raise ProtocolError(f"unparseable job frame: {excerpt(line)[:200]}")
+        return _bad(f"unparseable job frame: {excerpt(line)[:200]}")
+    try:
+        return _line_of(obj)
+    except ProtocolError as e:
+        return _bad(e.detail)
+
+
+def _line_of(obj: dict[str, Any]) -> JobLine:
     if "error" in obj:
-        raise TransportError(f"job stream: the endpoint failed mid-job: {obj['error']}")
-    if isinstance(obj.get("started"), int):
-        mark = obj.get("mark")
-        return [
-            JobStarted(
-                obj["started"], obj.get("stdin") is True, mark if isinstance(mark, str) else ""
-            )
-        ]
+        return _bad(str(obj["error"])[:400])
     att = obj.get("attached")
     if isinstance(att, dict):
-        if not isinstance(att.get("mark"), str) or _int(att, "from") is None:
-            raise ProtocolError(f"unparseable job frame: {excerpt(line)[:200]}")
-        return [JobAttached(att["mark"], att["from"])]
+        mark, from_ = att.get("mark"), att.get("from")
+        if isinstance(mark, str) and _count(from_):
+            return JobLine(K.Frame.attached(mark, from_))
+        return _bad("an `attached` frame without its mark and offset")
+    started = obj.get("started")
+    if _num(started):
+        mark = obj.get("mark")
+        return JobLine(
+            K.Frame.started(mark if isinstance(mark, str) else "", obj.get("stdin") is True),
+            pgid=int(started),
+        )
     for key in ("stdout", "stderr"):
-        if key in obj:
-            return [JobOutput(_b64(key, obj[key]), key == "stderr")]
-    if isinstance(obj.get("gap"), int):
-        return [JobGap(obj["gap"])]
-    if isinstance(obj.get("shell_exit"), int):
-        return [JobShellExit(obj["shell_exit"])]
-    if isinstance(obj.get("exit_code"), int):
-        return [JobEnd(obj["exit_code"])]
-    if isinstance(obj.get("signal"), int):
-        return [JobEnd(128 + obj["signal"], obj["signal"])]
+        if isinstance(obj.get(key), str):
+            data = _b64(key, obj[key])
+            return JobLine(K.Frame.output(len(data)), data=data, stderr=key == "stderr")
+    if _num(obj.get("gap")):
+        return (
+            JobLine(K.Frame.gap(obj["gap"]))
+            if _count(obj["gap"])
+            else _bad("a gap that is not a count")
+        )
+    if _num(obj.get("shell_exit")):
+        code = obj["shell_exit"]
+        return (
+            JobLine(K.Frame.shell_exit(code))
+            if _int32(code)
+            else _bad("a shell_exit that is not an integer")
+        )
+    if _num(obj.get("exit_code")):
+        code = obj["exit_code"]
+        return (
+            JobLine(K.Frame.exit(code, 0))
+            if _int32(code)
+            else _bad("an exit_code that is not an integer")
+        )
+    if _num(obj.get("signal")):
+        sig = obj["signal"]
+        return (
+            JobLine(K.Frame.exit(0, sig))
+            if _int32(sig)
+            else _bad("a signal that is not an integer")
+        )
     if obj.get("timed_out") is True:
-        raise TransportError("job stream: the endpoint timed the job out")
-    return []
+        return _bad("the endpoint timed the job out")
+    return JobLine(K.Frame.HEARTBEAT)
 
 
 JOB_ID = re.compile(r"[0-9a-z_-]{1,64}")
@@ -439,10 +494,6 @@ class StreamDecoder(Generic[T]):
 
 def frame_decoder() -> StreamDecoder[Frame]:
     return StreamDecoder(decode_line, lambda f: isinstance(f, (Exit, Signal, TimedOut)))
-
-
-def job_decoder() -> StreamDecoder[JobFrame]:
-    return StreamDecoder(decode_job_line, lambda f: isinstance(f, JobEnd))
 
 
 def not_a_stream(url: str) -> ProtocolError:

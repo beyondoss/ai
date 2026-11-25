@@ -27,7 +27,9 @@ from beyond_sandbox import (
     StdinBusyError,
     StdinClosedError,
     StdinGapError,
-    _wire,
+)
+from beyond_sandbox import (
+    _kernel as K,
 )
 from beyond_sandbox.jobs import AsyncJobs
 
@@ -129,12 +131,11 @@ def test_the_heartbeat_is_1_to_240_whole_seconds_and_checked_before_anything_is_
 
 
 def test_the_silence_limit_follows_the_heartbeat_the_request_chose() -> None:
-    assert _wire.silence_s() == 30.0
-    assert _wire.silence_s(1) == 30.0
-    assert _wire.silence_s(5) == 30.0
-    # A 60 s beat would be killed by a 30 s limit; two beats and slack hold.
-    assert _wire.silence_s(60) == 130.0
-    assert _wire.silence_s(240) == 490.0
+    """The kernel's limit: two beats and ten seconds, never under 30 s (a 60 s beat is not killed by 30 s)."""
+    k = K.load()
+    assert [k.silence_ms(b) for b in (0, 1, 10, 11, 60, 240)] == [
+        30_000, 30_000, 30_000, 32_000, 130_000, 490_000,
+    ]  # fmt: skip
 
 
 def test_async_jobs_carry_the_same_options() -> None:

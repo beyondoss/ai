@@ -21,6 +21,8 @@ jobs:
         with:
           shared-key: clients
           save-if: "false"
+      - name: Install the pinned compiler (the Python drivers build the job kernel)
+        run: rustup toolchain install "$(cat crates/job-client-ffi/toolchain)" --profile minimal
       - name: matrix on E2B
         env:
           E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
