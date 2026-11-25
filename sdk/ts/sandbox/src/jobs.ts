@@ -1,8 +1,10 @@
 import { concat } from "./bytes.js";
 import { InvalidRequestError, JobGoneError, ProtocolError } from "./errors.js";
+import { held } from "./held.js";
 import { DEFAULT_KILL_GRACE_MS, isJobId } from "./transport.js";
 import type {
   AttachOptions,
+  HeldOptions,
   JobChunk,
   JobFrame,
   JobInfo,
@@ -100,7 +102,15 @@ export class Jobs {
   ): Promise<JobStarted> {
     validScope(scope);
     validId(id);
-    return this.transport.jobs.start(scope, id, spec, req);
+    const frames = held(
+      this.transport.jobs,
+      { flow: "start", scope, id, spec, hold: false },
+      req,
+    );
+    for await (const f of frames) {
+      if (f.type === "started") return { pgid: f.pgid, mark: f.mark };
+    }
+    throw new ProtocolError("the endpoint did not report the job's start");
   }
 
   /**
@@ -112,11 +122,15 @@ export class Jobs {
     scope: string,
     id: string,
     spec: JobSpec,
-    req: ReqOptions = {},
+    req: HeldOptions = {},
   ): AsyncGenerator<JobFrame> {
     validScope(scope);
     validId(id);
-    yield* this.transport.jobs.startHeld(scope, id, spec, req);
+    yield* held(
+      this.transport.jobs,
+      { flow: "start", scope, id, spec, hold: true },
+      req,
+    );
   }
 
   /** Every job in the scope. */
@@ -157,8 +171,9 @@ export class Jobs {
    * Follow a job's output from `offset` to its end: frames in order, the last one `exit` or
    * `signal`. Stopping early detaches and never kills the job. (The transport wire call is
    * {@link Transport.jobs}.attach; this surface names the stream `follow` so it is not confused
-   * with {@link Jobs.collect}.) A job that does not exist is {@link JobGoneError}. A stream that
-   * asked for a `heartbeatSeconds` is presumed dead only after silence longer than two beats.
+   * with {@link Jobs.collect}.) A job that does not exist is {@link JobGoneError}. A cut or silent
+   * stream is reopened at the offset reached, by the client kernel (`crates/job-client`); a handle that
+   * cannot reopen says so through `onReconnecting` and keeps trying.
    */
   async *follow(
     scope: string,
@@ -169,7 +184,11 @@ export class Jobs {
     validScope(scope);
     validId(id);
     count("offset", offset, 0);
-    yield* this.transport.jobs.attach(scope, id, offset, req);
+    yield* held(
+      this.transport.jobs,
+      { flow: "attach", scope, id, offset },
+      req,
+    );
   }
 
   /** {@link Jobs.follow} to the end, collected into one {@link JobOutput}. */

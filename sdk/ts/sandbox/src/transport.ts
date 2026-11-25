@@ -89,8 +89,18 @@ export interface JobStarted {
   mark: string;
 }
 
-/** Options of `attach`. */
-export interface AttachOptions extends ReqOptions {
+/** Options of a held job (`startHeld`, `follow`). */
+export interface HeldOptions extends ReqOptions {
+  /**
+   * Called when the handle has failed to reopen its stream 12 times in a row, and again at each
+   * further failure. A status, not an end: the handle keeps trying until the job ends, the endpoint
+   * refuses for good, or the caller stops iterating.
+   */
+  onReconnecting?: (status: { attempts: number; sinceMs: number }) => void;
+}
+
+/** Options of `follow` and `collect`. */
+export interface AttachOptions extends HeldOptions {
   /** Attach only if the job is this incarnation; otherwise the job is gone (`JobGoneError`). */
   mark?: string;
   /** `false`: a status-only attach, which sends no output and no gap (default `true`). */
@@ -138,6 +148,32 @@ export type JobFrame =
   | { type: "exit"; code: number }
   /** Final: signal `signal` killed the shell (its status is 128+`signal`). */
   | { type: "signal"; signal: number };
+
+/** One request of a held job (see {@link JobOps.open}). */
+export type JobOpen =
+  & { scope: string; id: string; heartbeatSeconds?: number; silenceMs: number }
+  & (
+    | { op: "start"; spec: JobSpec; hold: boolean }
+    | { op: "attach"; offset: number; mark: string; output?: boolean }
+  );
+
+/** The answer to one {@link JobOpen}. */
+export interface JobOpened {
+  /** The HTTP status. */
+  status: number;
+  /** The server's `Retry-After`, whole seconds; 0 when it sent none. */
+  retryAfterS: number;
+  /** What a refusal said, for the error that reports it. */
+  detail: string;
+  /**
+   * The stream's lines, each without its newline, when the status is a success. It throws
+   * `TransportError` or `TimeoutError` when the stream is cut or silent for `silenceMs`, and
+   * `ProtocolError` for a line it cannot hold.
+   */
+  lines: AsyncIterable<Uint8Array>;
+  /** Release the connection. */
+  close(): void;
+}
 
 /** What `start` takes: the same command, arguments and directory as `run`, plus a label. */
 export interface JobSpec {
@@ -232,23 +268,14 @@ export interface KeepFields {
  * takes. An op never reconnects and never retries.
  */
 export interface JobOps {
-  /** Start a job that the sandbox keeps from the start (`hold: false`); its process group. */
-  start(
-    scope: string,
-    id: string,
-    spec: JobSpec,
-    req?: ReqOptions,
-  ): Promise<JobStarted>;
   /**
-   * Start a job held by this stream (`hold: true`): the first frame is `started`, and if the stream
-   * closes before the job's final frame and no `keep` arrived, the sandbox kills the job's group.
+   * One request of a held job, answered with the status the endpoint gave: a held start (`hold: true`,
+   * the stream's first frame is `started`; if it closes before the job's final frame and no `keep`
+   * arrived, the sandbox kills the job's group) or an attach (closing never kills). It never retries
+   * and never throws for a refusal: the status is the answer, and `JobHandle` (the client kernel)
+   * decides what it means. It throws only when no answer came (`TransportError`, `TimeoutError`).
    */
-  startHeld(
-    scope: string,
-    id: string,
-    spec: JobSpec,
-    req?: ReqOptions,
-  ): AsyncIterable<JobFrame>;
+  open(open: JobOpen): Promise<JobOpened>;
   list(scope: string, req?: ReqOptions): Promise<JobInfo[]>;
   /** Up to `max` bytes from `offset`. An unknown or removed job answers state `gone`. */
   read(
@@ -258,13 +285,6 @@ export interface JobOps {
     max: number,
     req?: ReqOptions,
   ): Promise<JobChunk>;
-  /** Follow a job's output from `offset`; the first frame is `attached`, the last `exit`. Closing the iterator detaches. */
-  attach(
-    scope: string,
-    id: string,
-    offset: number,
-    req?: AttachOptions,
-  ): AsyncIterable<JobFrame>;
   /** Hand a held job to the sandbox for good, recording `num`, `kind` and `seen`. */
   keep(
     scope: string,
