@@ -52,6 +52,8 @@
 
 use vstd::prelude::*;
 
+pub mod keeper;
+
 verus! {
 
 // ---------------------------------------------------------------------------------------------
@@ -134,6 +136,33 @@ pub enum Claim {
     },
 }
 
+/// A terminal's size in cells.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Size {
+    pub cols: u16,
+    pub rows: u16,
+}
+
+/// The most columns or rows a terminal has (a curses program allocates the grid: 1 Mi cells at most).
+pub const SIZE_MAX: u16 = 1024;
+
+/// A size is inside the bounds: 1 to [`SIZE_MAX`] columns and rows.
+pub open spec fn in_bounds(z: Size) -> bool {
+    1 <= z.cols && z.cols <= 1024 && 1 <= z.rows && z.rows <= 1024
+}
+
+/// Whether a job has a terminal. `No` is fixed at birth; `Open` goes to `Gone` and never back.
+#[verifier::allow(autoderive_clone_without_spec)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Term {
+    /// Not a terminal: every existing path, unchanged.
+    No,
+    /// The terminal's keeper holds its master. `applied`: the last accepted size reached the master.
+    Open { size: Size, applied: bool },
+    /// The keeper is gone or the job ended: final. Input and resize are refused.
+    Gone { size: Size },
+}
+
 /// One job's state. Changed only by [`step`] (and built by [`State::new`]).
 #[verifier::allow(autoderive_clone_without_spec)]
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -146,6 +175,8 @@ pub struct State {
     pub removed: bool,
     /// When it started (the shell's epoch seconds).
     pub started: u64,
+    /// Its terminal, if it has one.
+    pub term: Term,
 }
 
 /// The state a job is read in: `read` and `list` name it.
@@ -187,13 +218,17 @@ pub open spec fn shell_code_s(s: State) -> Option<i32> {
 
 impl State {
     /// A job just entered the table: spawning, kept unless its start is held (and so `background`).
-    pub fn new(started: u64, hold: bool) -> (s: State)
+    pub fn new(started: u64, hold: bool, pty: Option<Size>) -> (s: State)
+        requires
+            pty is Some ==> in_bounds(pty.unwrap()),
         ensures
             s.phase is Spawning,
             hold <==> s.claim is Held,
             s.seen == 0,
             !s.removed,
             s.started == started,
+            pty is None <==> s.term is No,
+            pty is Some ==> s.term == (Term::Open { size: pty.unwrap(), applied: true }),
     {
         State {
             phase: Phase::Spawning,
@@ -205,6 +240,10 @@ impl State {
             seen: 0,
             removed: false,
             started,
+            term: match pty {
+                None => Term::No,
+                Some(size) => Term::Open { size, applied: true },
+            },
         }
     }
 
@@ -359,6 +398,10 @@ pub enum Ev {
     Remove { empty: bool, ended_counts: bool },
     /// The connection of a held start (`hold`) or an attach ended before the job did.
     Disconnect { hold: bool },
+    /// `resize`: the size asked for (the shell hands it over as it came; `step` refuses one outside the bounds).
+    Resize { size: Size },
+    /// The terminal's keeper is gone (its connection closed with no job end).
+    Hangup,
 }
 
 /// What the shell does, under the job's lock.
@@ -374,20 +417,30 @@ pub enum Act {
     Signal,
     /// Stop the job's processes (`SIGTERM`, then `SIGKILL` after the grace).
     Stop,
-    /// `SIGKILL` the job's group: its client left and nobody kept it.
+    /// `SIGKILL` the job's group: its client left and nobody kept it. `marked`: every process that
+    /// carries the job's mark goes too (a terminal's whole session), not only the first group.
     Kill {
         pgid: i32,
+        marked: bool,
+    },
+    /// Set the terminal's size on its keeper.
+    Resize {
+        size: Size,
     },
     /// The job may leave the table.
     Take,
     /// Close the job's stdin; a callback is owed for the change unless the job is removed.
     Ended {
         notify: bool,
+        /// Close the terminal (its keeper's connection): the job is over.
+        close_term: bool,
     },
     /// The shell's own exit is observable: a callback is owed.
     Exited,
-    /// Drop the job's notifier, close its stdin.
-    Release,
+    /// Drop the job's notifier, close its stdin (and its terminal, if it was open).
+    Release {
+        close_term: bool,
+    },
     /// `keep` recorded: feed notify's kernel.
     Kept,
 }
@@ -445,6 +498,31 @@ pub open spec fn post_life(old: State, ev: Ev, s: State) -> bool {
     &&& (s.seen != old.seen ==> (ev is Keep || ev is Seen))
     &&& (ev is Keep ==> s.seen == (match ev->Keep_seen { Some(o) => o, None => old.seen }))
     &&& s.started == old.started
+    // T: a job's terminal is fixed at birth (`No`), `Open` goes to `Gone` and never back, and it is
+    // `Gone` only by a hangup, the job's end or its removal. Its size changes only by a `Resize`
+    // inside the bounds, and the size of a `Gone` terminal is the one it had.
+    &&& (old.term is No <==> s.term is No)
+    &&& (old.term is Gone ==> s.term == old.term)
+    &&& (s.term is Gone && !(old.term is Gone) ==> (ev is Hangup || ev is Taken
+        || (ev is GroupEmpty && (old.phase is Running || old.phase is Exited))))
+    &&& (old.term is Open && !(s.term is Gone) ==> s.term is Open)
+    &&& ((old.term is Open && (ev is Hangup || ev is Taken
+        || (ev is GroupEmpty && (old.phase is Running || old.phase is Exited)))) ==> s.term == (Term::Gone {
+        size: old.term->Open_size,
+    }))
+    &&& (old.term is Open && s.term is Open && s.term->Open_size != old.term->Open_size
+        ==> (ev is Resize && in_bounds(ev->Resize_size) && !(old.phase is Ended)
+        && s.term->Open_size == ev->Resize_size))
+    // T1-live: a resize inside the bounds of an open terminal whose job has not ended is recorded at
+    // exactly the size asked, and `applied` at once if the job runs.
+    &&& (ev is Resize && in_bounds(ev->Resize_size) && old.term is Open && !(old.phase is Ended)
+        ==> s.term == (Term::Open { size: ev->Resize_size, applied: !(old.phase is Spawning) }))
+    // The spawn applies a size recorded while spawning.
+    &&& (ev is Spawned && old.phase is Spawning && old.term is Open ==> s.term == (Term::Open {
+        size: old.term->Open_size,
+        applied: true,
+    }))
+    &&& (!(ev is Resize) && !(ev is Spawned) && old.term is Open && !(s.term is Gone) ==> s.term == old.term)
 }
 
 /// What `step` tells the shell to do: J3 (a removed job's pump is discarded and its end owes no
@@ -455,9 +533,9 @@ pub open spec fn post_act(old: State, ev: Ev, act: Act) -> bool {
     // J3: nothing is stored for a removed job, and its end owes no callback.
     &&& (ev is Push ==> ((act is Discard) <==> old.removed))
     &&& (ev is Push ==> ((act is Store) <==> !old.removed))
-    &&& (ev is Taken ==> act is Release)
+    &&& (ev is Taken ==> act == (Act::Release { close_term: old.term is Open }))
     &&& ((old.phase is Running || old.phase is Exited) && ev is GroupEmpty
-        ==> act == (Act::Ended { notify: !old.removed }))
+        ==> act == (Act::Ended { notify: !old.removed, close_term: old.term is Open }))
     &&& ((old.phase is Spawning || old.phase is Ended) && ev is GroupEmpty ==> act is Nothing)
     &&& (old.phase is Running && ev is ShellExit ==> act is Exited)
     &&& (!(old.phase is Running) && ev is ShellExit ==> act is Nothing)
@@ -466,6 +544,9 @@ pub open spec fn post_act(old: State, ev: Ev, act: Act) -> bool {
     // running, kills; a kept job never dies with a client.
     &&& (act is Kill ==> (ev is Disconnect && ev->Disconnect_hold && old.claim is Held
         && !(old.phase is Ended) && act->Kill_pgid == pgid_s(old)))
+    // T9: a held job nobody kept dies whole with its client: the group and every process that
+    // carries its mark; a terminal's session is one such (a shell puts each command in a group of its own).
+    &&& (act is Kill ==> act->Kill_marked)
     &&& (ev is Disconnect ==> ((act is Kill) <==> (ev->Disconnect_hold && old.claim is Held
         && !(old.phase is Ended))))
     &&& (old.claim is Kept ==> !(act is Kill))
@@ -479,6 +560,46 @@ pub open spec fn post_act(old: State, ev: Ev, act: Act) -> bool {
     &&& (ev is Signal ==> ((act is Signal) <==> (!(old.phase is Ended) && pgid_s(old) != 0)))
     &&& (ev is Stop ==> ((act is Stop) <==> !(old.phase is Ended)))
     &&& (act is Stop ==> ev is Stop)
+    // T1: a resize reaches a terminal only while its job has not ended and its terminal is open; the
+    // spawn applies one recorded while spawning, and a running job's resize is applied at once.
+    &&& (act is Resize ==> ((ev is Resize || ev is Spawned) && !(old.phase is Ended) && old.term is Open
+        && (ev is Resize ==> (act->Resize_size == ev->Resize_size && in_bounds(ev->Resize_size)
+        && !(old.phase is Spawning)))))
+    &&& (ev is Resize && in_bounds(ev->Resize_size) && old.term is Open
+        && (old.phase is Running || old.phase is Exited) ==> act == (Act::Resize { size: ev->Resize_size }))
+    &&& (ev is Spawned && old.phase is Spawning && old.term is Open && !old.term->Open_applied
+        ==> act == (Act::Resize { size: old.term->Open_size }))
+    &&& (ev is Spawned && old.phase is Spawning && old.term is Open && old.term->Open_applied
+        ==> act is Nothing)
+}
+
+/// T14: what a `resize` to `z` does to a job, as a spec: an open terminal of a job that has not ended
+/// takes a size inside the bounds, applied at once if the job runs; any other resize changes nothing.
+pub open spec fn resized(old: State, z: Size) -> State {
+    if old.term is Open && !(old.phase is Ended) && in_bounds(z) {
+        State { term: Term::Open { size: z, applied: !(old.phase is Spawning) }, ..old }
+    } else {
+        old
+    }
+}
+
+/// T14: what the shell does for that resize: set the size on the keeper, once the job runs.
+pub open spec fn resize_act(old: State, z: Size) -> Act {
+    if old.term is Open && !(old.phase is Ended) && in_bounds(z) && !(old.phase is Spawning) {
+        Act::Resize { size: z }
+    } else {
+        Act::Nothing
+    }
+}
+
+/// T14, idempotence: a resize asked twice is a resize asked once: the second leaves the job exactly as
+/// the first did, and tells the shell the very same thing (the size, again: it is the terminal's own
+/// `TIOCSWINSZ`, so a program that changed its own window size is put back).
+pub proof fn lemma_resize_idempotent(s: State, z: Size)
+    ensures
+        resized(resized(s, z), z) == resized(s, z),
+        resize_act(resized(s, z), z) == resize_act(s, z),
+{
 }
 
 /// Apply `ev` to `s` and say what to do. Total: an event that does not fit the phase changes
@@ -487,11 +608,19 @@ pub fn step(s: &mut State, ev: Ev) -> (act: Act)
     ensures
         post_life(*old(s), ev, *final(s)),
         post_act(*old(s), ev, act),
+        ev is Resize ==> (*final(s) == resized(*old(s), ev->Resize_size)
+            && act == resize_act(*old(s), ev->Resize_size)),
 {
     match ev {
         Ev::Spawned { pgid } => {
             if let Phase::Spawning = s.phase {
                 s.phase = Phase::Running { pgid };
+                if let Term::Open { size, applied } = s.term {
+                    s.term = Term::Open { size, applied: true };
+                    if !applied {
+                        return Act::Resize { size };
+                    }
+                }
             }
             Act::Nothing
         },
@@ -516,7 +645,14 @@ pub fn step(s: &mut State, ev: Ev) -> (act: Act)
                 Phase::Spawning => return Act::Nothing,
             };
             s.phase = Phase::Ended { pgid, code, signal, at: now, shell_told };
-            Act::Ended { notify: !s.removed }
+            let mut close_term = false;
+            if let Term::Open { size, .. } = s.term {
+                if !cfg!(feature = "mut_end_keeps_terminal") {
+                    s.term = Term::Gone { size };
+                    close_term = true;
+                }
+            }
+            Act::Ended { notify: !s.removed, close_term }
         },
         Ev::Keep { num, kind, seen } => {
             s.claim = Claim::Kept { num, kind };
@@ -532,7 +668,14 @@ pub fn step(s: &mut State, ev: Ev) -> (act: Act)
         },
         Ev::Taken => {
             s.removed = true;
-            Act::Release
+            let mut close_term = false;
+            if let Term::Open { size, .. } = s.term {
+                if !cfg!(feature = "mut_end_keeps_terminal") {
+                    s.term = Term::Gone { size };
+                    close_term = true;
+                }
+            }
+            Act::Release { close_term }
         },
         Ev::Push => {
             if s.removed {
@@ -567,10 +710,51 @@ pub fn step(s: &mut State, ev: Ev) -> (act: Act)
         Ev::Disconnect { hold } => {
             let kept = s.kept() && !cfg!(feature = "mut_disconnect_kills_kept");
             if hold && !kept && !s.ended() {
-                Act::Kill { pgid: s.pgid() }
+                let terminal = match s.term {
+                    Term::No => false,
+                    _ => true,
+                };
+                Act::Kill { pgid: s.pgid(), marked: !(terminal && cfg!(feature = "mut_pty_kill_group_only")) }
             } else {
                 Act::Nothing
             }
+        },
+        Ev::Resize { size } => {
+            if cfg!(feature = "mut_resize_ended") && s.ended() {
+                if let Term::Gone { .. } = s.term {
+                    return Act::Resize { size };
+                }
+            }
+            if let Term::Open { .. } = s.term {
+                let ok = size.cols >= 1 && size.cols <= SIZE_MAX && size.rows >= 1 && size.rows <= SIZE_MAX;
+                if (ok || cfg!(feature = "mut_size_unbounded"))
+                    && (!s.ended() || cfg!(feature = "mut_resize_ended"))
+                {
+                    let running = match s.phase {
+                        Phase::Spawning => false,
+                        _ => true,
+                    };
+                    if cfg!(feature = "mut_resize_lost_while_spawning") && !running {
+                        return Act::Nothing;
+                    }
+                    let again = match s.term {
+                        Term::Open { size: z, applied } => applied && z.cols == size.cols && z.rows == size.rows,
+                        _ => false,
+                    };
+                    // `mut_resize_not_idempotent`: a size the terminal already has is recorded as not applied.
+                    s.term = Term::Open { size, applied: running && !(cfg!(feature = "mut_resize_not_idempotent") && again) };
+                    return if running { Act::Resize { size } } else { Act::Nothing };
+                }
+            }
+            Act::Nothing
+        },
+        Ev::Hangup => {
+            if let Term::Open { size, .. } = s.term {
+                if !cfg!(feature = "mut_hangup_keeps_terminal") {
+                    s.term = Term::Gone { size };
+                }
+            }
+            Act::Nothing
         },
     }
 }
@@ -610,6 +794,31 @@ pub proof fn lemma_end_progress(old: State, ev: Ev, s: State, act: Act)
 {
 }
 
+/// The ranking function of a recorded resize: 1 while the last accepted size has not reached the
+/// master, 0 once it has (and for a job with no open terminal).
+pub open spec fn resize_rank(t: Term) -> int {
+    match t {
+        Term::Open { applied, .. } => if applied { 0int } else { 1int },
+        _ => 0int,
+    }
+}
+
+/// T1-live, progress: a size recorded while the job was spawning is applied by the spawn, the one
+/// fair step (F1: the supervisor delivers `Spawned`), which lowers `resize_rank` to zero and tells the
+/// shell to resize at exactly the size recorded.
+pub proof fn lemma_resize_progress(old: State, ev: Ev, s: State, act: Act)
+    requires
+        post_life(old, ev, s),
+        post_act(old, ev, act),
+        old.phase is Spawning && ev is Spawned,
+        old.term is Open && !old.term->Open_applied,
+    ensures
+        resize_rank(s.term) < resize_rank(old.term),
+        act == (Act::Resize { size: old.term->Open_size }),
+        s.term == (Term::Open { size: old.term->Open_size, applied: true }),
+{
+}
+
 // ---------------------------------------------------------------------------------------------
 // A restart of execd: what each job in the saved table becomes.
 // ---------------------------------------------------------------------------------------------
@@ -630,24 +839,77 @@ pub enum Recovery {
 /// everywhere else in execd (`Proc::wait`).
 pub const LOST_CODE: i32 = -1;
 
+/// What a restarted execd learns of a job's terminal from its keeper: not a terminal, the keeper
+/// answered at `size`, or it did not (gone), with the shell's status if the keeper wrote it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Keeper {
+    /// The saved job has no terminal.
+    NotTerminal,
+    /// The keeper accepted the connection (its peer was checked) and said its size.
+    Answered { size: Size },
+    /// Nobody answered: the keeper is gone. `status` is the shell's `(code, signal)` if it wrote one.
+    Silent { status: Option<(i32, Option<i32>)> },
+}
+
+/// The terminal a job has once recovery adopted it: open only if its keeper answered, else hung up.
+pub open spec fn term_adopted(t: Term, k: Keeper) -> Term {
+    match t {
+        Term::No => Term::No,
+        Term::Gone { size } => Term::Gone { size },
+        Term::Open { size, .. } => match k {
+            Keeper::Answered { size: ks } => Term::Open { size: ks, applied: true },
+            _ => Term::Gone { size },
+        },
+    }
+}
+
+/// The terminal a job has once recovery ended it: hung up.
+pub open spec fn term_closed(t: Term) -> Term {
+    match t {
+        Term::Open { size, .. } => Term::Gone { size },
+        _ => t,
+    }
+}
+
+/// The shell's status a keeper left, if it did.
+pub open spec fn keeper_status(k: Keeper) -> Option<(i32, Option<i32>)> {
+    match k {
+        Keeper::Silent { status } => status,
+        _ => None,
+    }
+}
+
 /// R1-R5: what a saved job (`s`, as [`step`] left it and the ledger wrote it) becomes when execd
 /// starts again. `alive` is what the OS says: some process of the job's group, or carrying its
-/// mark, is still running. `now` is the shell's epoch seconds.
+/// mark, is still running. `keeper` is what its terminal's keeper said (`NotTerminal` for a job
+/// with none). `now` is the shell's epoch seconds.
 ///
 /// - R1: an ended job comes back as it ended: its code, signal and time are exactly what was saved,
 ///   whatever the OS says now (the group number of an ended job may belong to another process).
 /// - R2: a job whose group is alive is adopted as saved: its phase and its shell's saved status stay.
-/// - R3: a job whose group is gone ends at once, with its shell's saved status, else [`LOST_CODE`]:
-///   never a status no one saw.
+/// - R3: a job whose group is gone ends at once, with its shell's saved status, else the status its
+///   keeper wrote (a terminal's), else [`LOST_CODE`]: never a status no one saw.
 /// - R4: a job that never had a group, or was removed, is not in the table.
 /// - R5 ([`lemma_recover_idempotent`]): recovering what recovery returned changes nothing (a
 ///   restart during a restart).
-pub fn recover(s: State, alive: bool, now: u64) -> (r: (State, Recovery))
+/// - T6: an adopted terminal is open exactly when its keeper answered, at the size the keeper says;
+///   one whose keeper did not answer is hung up, and a recovered job that ended has no open terminal.
+pub fn recover(s: State, alive: bool, keeper: Keeper, now: u64) -> (r: (State, Recovery))
     ensures
-        s.phase is Ended ==> (r.1 is Restore && r.0 == s),
-        (!s.removed && (s.phase is Running || s.phase is Exited) && alive) ==> (r.1 is Adopt && r.0 == s),
+        s.phase is Ended ==> (r.1 is Restore && r.0 == State { term: term_closed(s.term), ..s }),
+        (!s.removed && (s.phase is Running || s.phase is Exited) && alive) ==> (r.1 is Adopt && r.0 == State {
+            term: term_adopted(s.term, keeper),
+            ..s
+        }),
         (!s.removed && s.phase is Running && !alive) ==> (r.1 is Restore && r.0 == State {
-            phase: Phase::Ended { pgid: pgid_s(s), code: -1i32, signal: None, at: now, shell_told: false },
+            phase: Phase::Ended {
+                pgid: pgid_s(s),
+                code: match keeper_status(keeper) { Some((c, _)) => c, None => -1i32 },
+                signal: match keeper_status(keeper) { Some((_, g)) => g, None => None },
+                at: now,
+                shell_told: false,
+            },
+            term: term_closed(s.term),
             ..s
         }),
         (!s.removed && s.phase is Exited && !alive) ==> (r.1 is Restore && r.0 == State {
@@ -658,6 +920,7 @@ pub fn recover(s: State, alive: bool, now: u64) -> (r: (State, Recovery))
                 at: now,
                 shell_told: true,
             },
+            term: term_closed(s.term),
             ..s
         }),
         (s.phase is Spawning || (s.removed && !(s.phase is Ended))) ==> r.1 is Drop,
@@ -667,12 +930,48 @@ pub fn recover(s: State, alive: bool, now: u64) -> (r: (State, Recovery))
         r.1 is Drop || pgid_s(r.0) == pgid_s(s),
         r.1 is Adopt ==> (r.0.phase is Running || r.0.phase is Exited),
         r.1 is Restore ==> r.0.phase is Ended,
+        // T6: a terminal is never opened by recovery except by its keeper's answer; nothing recovered
+        // that ended has one open; no terminal appears for a job that had none.
+        r.1 is Restore ==> !(r.0.term is Open),
+        r.1 is Adopt && r.0.term is Open ==> (keeper is Answered && s.term is Open),
+        s.term is No ==> r.0.term is No,
 {
-    let State { phase, claim, seen, removed, started } = s;
+    let State { phase, claim, seen, removed, started, term } = s;
+    let adopted = match term {
+        Term::No => Term::No,
+        Term::Gone { size } => Term::Gone { size },
+        Term::Open { size, .. } => match keeper {
+            Keeper::Answered { size: ks } => {
+                if cfg!(feature = "mut_recover_hangs_up_live_terminal") {
+                    Term::Gone { size }
+                } else {
+                    Term::Open { size: ks, applied: true }
+                }
+            },
+            Keeper::Silent { .. } => {
+                if cfg!(feature = "mut_recover_opens_silent_terminal") {
+                    Term::Open { size, applied: true }
+                } else {
+                    Term::Gone { size }
+                }
+            },
+            Keeper::NotTerminal => Term::Gone { size },
+        },
+    };
+    let closed = match term {
+        Term::Open { size, .. } => Term::Gone { size },
+        t => t,
+    };
+    let (lost_code, lost_signal) = match keeper {
+        Keeper::Silent { status: Some((c, g)) } => {
+            if cfg!(feature = "mut_recover_drops_status") { (-1i32, None) } else { (c, g) }
+        },
+        _ => (-1i32, None),
+    };
     match phase {
-        Phase::Spawning => (State { phase: Phase::Spawning, claim, seen, removed, started }, Recovery::Drop),
+        Phase::Spawning => (State { phase: Phase::Spawning, claim, seen, removed, started, term }, Recovery::Drop),
         Phase::Ended { pgid, code, signal, at, shell_told } => (
-            State { phase: Phase::Ended { pgid, code, signal, at, shell_told }, claim, seen, removed, started },
+            State { phase: Phase::Ended { pgid, code, signal, at, shell_told }, claim, seen, removed, started, term: closed },
             if cfg!(feature = "mut_recover_reends_ended") && !alive {
                 Recovery::Drop
             } else {
@@ -681,17 +980,18 @@ pub fn recover(s: State, alive: bool, now: u64) -> (r: (State, Recovery))
         ),
         Phase::Running { pgid } => {
             if removed {
-                (State { phase: Phase::Running { pgid }, claim, seen, removed, started }, Recovery::Drop)
+                (State { phase: Phase::Running { pgid }, claim, seen, removed, started, term }, Recovery::Drop)
             } else if (alive && !cfg!(feature = "mut_recover_drops_live")) || cfg!(feature = "mut_recover_adopts_gone") {
-                (State { phase: Phase::Running { pgid }, claim, seen, removed, started }, Recovery::Adopt)
+                (State { phase: Phase::Running { pgid }, claim, seen, removed, started, term: adopted }, Recovery::Adopt)
             } else {
                 (
                     State {
-                        phase: Phase::Ended { pgid, code: -1i32, signal: None, at: now, shell_told: false },
+                        phase: Phase::Ended { pgid, code: lost_code, signal: lost_signal, at: now, shell_told: false },
                         claim,
                         seen,
                         removed,
                         started,
+                        term: closed,
                     },
                     Recovery::Restore,
                 )
@@ -699,9 +999,9 @@ pub fn recover(s: State, alive: bool, now: u64) -> (r: (State, Recovery))
         },
         Phase::Exited { pgid, code, signal } => {
             if removed {
-                (State { phase: Phase::Exited { pgid, code, signal }, claim, seen, removed, started }, Recovery::Drop)
+                (State { phase: Phase::Exited { pgid, code, signal }, claim, seen, removed, started, term }, Recovery::Drop)
             } else if (alive && !cfg!(feature = "mut_recover_drops_live")) || cfg!(feature = "mut_recover_adopts_gone") {
-                (State { phase: Phase::Exited { pgid, code, signal }, claim, seen, removed, started }, Recovery::Adopt)
+                (State { phase: Phase::Exited { pgid, code, signal }, claim, seen, removed, started, term: adopted }, Recovery::Adopt)
             } else {
                 let kept = !cfg!(feature = "mut_recover_forgets_shell_status");
                 (
@@ -717,6 +1017,7 @@ pub fn recover(s: State, alive: bool, now: u64) -> (r: (State, Recovery))
                         seen,
                         removed,
                         started,
+                        term: closed,
                     },
                     Recovery::Restore,
                 )
@@ -726,26 +1027,39 @@ pub fn recover(s: State, alive: bool, now: u64) -> (r: (State, Recovery))
 }
 
 /// [`recover`]'s answer as a spec, for [`lemma_recover_idempotent`].
-pub open spec fn recover_spec(s: State, alive: bool, now: u64) -> (State, Recovery) {
+pub open spec fn recover_spec(s: State, alive: bool, keeper: Keeper, now: u64) -> (State, Recovery) {
     match s.phase {
         Phase::Spawning => (s, Recovery::Drop),
-        Phase::Ended { .. } => (s, Recovery::Restore),
+        Phase::Ended { .. } => (State { term: term_closed(s.term), ..s }, Recovery::Restore),
         Phase::Running { pgid } => {
             if s.removed {
                 (s, Recovery::Drop)
             } else if alive {
-                (s, Recovery::Adopt)
+                (State { term: term_adopted(s.term, keeper), ..s }, Recovery::Adopt)
             } else {
-                (State { phase: Phase::Ended { pgid, code: -1i32, signal: None, at: now, shell_told: false }, ..s }, Recovery::Restore)
+                (
+                    State {
+                        phase: Phase::Ended {
+                            pgid,
+                            code: match keeper_status(keeper) { Some((c, _)) => c, None => -1i32 },
+                            signal: match keeper_status(keeper) { Some((_, g)) => g, None => None },
+                            at: now,
+                            shell_told: false,
+                        },
+                        term: term_closed(s.term),
+                        ..s
+                    },
+                    Recovery::Restore,
+                )
             }
         },
         Phase::Exited { pgid, code, signal } => {
             if s.removed {
                 (s, Recovery::Drop)
             } else if alive {
-                (s, Recovery::Adopt)
+                (State { term: term_adopted(s.term, keeper), ..s }, Recovery::Adopt)
             } else {
-                (State { phase: Phase::Ended { pgid, code, signal, at: now, shell_told: true }, ..s }, Recovery::Restore)
+                (State { phase: Phase::Ended { pgid, code, signal, at: now, shell_told: true }, term: term_closed(s.term), ..s }, Recovery::Restore)
             }
         },
     }
@@ -753,12 +1067,183 @@ pub open spec fn recover_spec(s: State, alive: bool, now: u64) -> (State, Recove
 
 /// R5: what [`recover`] put in the table as ended recovers to itself, whatever the OS says the second
 /// time and whenever it is asked: a restart during a restart changes nothing.
-pub proof fn lemma_recover_idempotent(s: State, alive: bool, now: u64, alive2: bool, now2: u64)
+pub proof fn lemma_recover_idempotent(s: State, alive: bool, keeper: Keeper, now: u64, alive2: bool, keeper2: Keeper, now2: u64)
     requires
-        recover_spec(s, alive, now).1 is Restore,
+        recover_spec(s, alive, keeper, now).1 is Restore,
     ensures
-        recover_spec(recover_spec(s, alive, now).0, alive2, now2) == recover_spec(s, alive, now),
+        recover_spec(recover_spec(s, alive, keeper, now).0, alive2, keeper2, now2) == recover_spec(s, alive, keeper, now),
 {
+}
+
+// ---------------------------------------------------------------------------------------------
+// A terminal's keeper: who may talk to it, who answered, and what a start that cannot have one says.
+// ---------------------------------------------------------------------------------------------
+
+/// A socket peer's credentials, as `SO_PEERCRED` read them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PeerCred {
+    pub uid: u32,
+    pub pid: i32,
+}
+
+/// Who a socket's peer must be: this `uid`, and this `pid` if one is expected (`None`: any process of
+/// that uid; the keeper knows its execd's uid, execd knows its keeper's pid too).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Expected {
+    pub uid: u32,
+    pub pid: Option<i32>,
+}
+
+/// Whether to talk to a socket's peer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Peer {
+    Admit,
+    Refuse,
+}
+
+/// The property of [`admit_peer`], as a spec.
+pub open spec fn peer_ok(cred: Option<PeerCred>, e: Expected) -> bool {
+    cred is Some && cred.unwrap().uid == e.uid && (e.pid is None || e.pid.unwrap() == cred.unwrap().pid)
+}
+
+/// P1: a peer is admitted exactly when its credentials were read, its uid is the expected one and, where
+/// a pid is expected, it is that pid. Whatever else (a failed read, another uid, another pid) is
+/// refused: fail closed. The keeper (accepting execd) and execd (connecting to its keeper) both ask.
+/// P1-live (completeness, the partner of every refusal): a peer that is the expected one is always
+/// admitted ([`lemma_admit_peer_complete`]), so a refusal of an impostor never turns the right peer away.
+pub fn admit_peer(cred: Option<PeerCred>, expected: Expected) -> (r: Peer)
+    ensures
+        r is Admit <==> peer_ok(cred, expected),
+{
+    if cfg!(feature = "mut_admit_any_peer") {
+        return Peer::Admit;
+    }
+    match cred {
+        Some(c) => {
+            if c.uid == expected.uid && match expected.pid {
+                Some(p) => p == c.pid,
+                None => true,
+            } {
+                Peer::Admit
+            } else {
+                Peer::Refuse
+            }
+        },
+        None => Peer::Refuse,
+    }
+}
+
+/// P1-live: the expected peer satisfies [`peer_ok`] (so [`admit_peer`] admits it).
+pub proof fn lemma_admit_peer_complete(cred: PeerCred, e: Expected)
+    requires
+        cred.uid == e.uid,
+        e.pid is None || e.pid.unwrap() == cred.pid,
+    ensures
+        peer_ok(Some(cred), e),
+{
+}
+
+/// The keeper protocol's version, which the keeper's `Ready` says and execd knows.
+pub const KEEPER_VERSION: u8 = 1;
+
+/// What answered execd's connect to a terminal's keeper: whom it was (`peer`) and, if it was admitted
+/// and spoke, its `Ready` (protocol version and size).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Reply {
+    pub peer: Peer,
+    pub ready: Option<(u8, Size)>,
+}
+
+/// T6a: what a restarted execd learns of a saved job's terminal. A job with none is `NotTerminal`; one
+/// with a terminal is `Answered` (at the size its keeper said) exactly when its keeper answered, as the
+/// peer execd expected (admitted) and in a version execd knows; every other case is `Silent`, with the
+/// status the dead keeper left (`status`). So [`recover`]'s T6 (an adopted terminal is open only if its
+/// keeper answered) is a statement about the peer's answer, not about the shell's reading of it.
+pub fn keeper_of(has_term: bool, reply: Option<Reply>, status: Option<(i32, Option<i32>)>) -> (r: Keeper)
+    ensures
+        !has_term ==> r is NotTerminal,
+        has_term ==> (r is Answered <==> (reply is Some && reply.unwrap().peer is Admit
+            && reply.unwrap().ready is Some && reply.unwrap().ready.unwrap().0 == KEEPER_VERSION)),
+        r is Answered ==> r->Answered_size == reply.unwrap().ready.unwrap().1,
+        has_term && !(r is Answered) ==> r == (Keeper::Silent { status }),
+{
+    if !has_term {
+        return Keeper::NotTerminal;
+    }
+    if let Some(Reply { peer, ready: Some((version, size)) }) = reply {
+        let admitted = match peer {
+            Peer::Admit => true,
+            Peer::Refuse => false,
+        };
+        if (admitted && version == KEEPER_VERSION) || cfg!(feature = "mut_keeper_answer_unchecked") {
+            return Keeper::Answered { size };
+        }
+    }
+    Keeper::Silent { status }
+}
+
+/// Why a start of a terminal does not go on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Begin {
+    /// It goes on.
+    Go,
+    /// No pseudo-terminal is free (503): retry once one is.
+    NoPty,
+    /// The terminal could not be started (500).
+    Failed,
+}
+
+/// The exit status of a keeper that found no pseudo-terminal to open.
+pub const NO_PTY_EXIT: i32 = 124;
+
+/// The property of [`pty_cap`], as a spec.
+pub open spec fn cap_refuses(open: u64, max: Option<u64>) -> bool {
+    max is Some && open > max.unwrap()
+}
+
+/// Q1: a start is refused `NoPty` (503) exactly when a cap on open terminals is set and the terminals
+/// open, the start's own included, are more than it. Never `Failed`.
+pub fn pty_cap(open: u64, max: Option<u64>) -> (r: Begin)
+    ensures
+        r is NoPty <==> cap_refuses(open, max),
+        r is Go <==> !cap_refuses(open, max),
+{
+    match max {
+        Some(m) => if open > m && !cfg!(feature = "mut_pty_cap_ignored") { Begin::NoPty } else { Begin::Go },
+        None => Begin::Go,
+    }
+}
+
+/// Q1-live: each open terminal's end lowers the refusal's rank until it is zero, which is exactly no
+/// refusal: a retried start is admitted once enough terminals have ended (F4: an open terminal ends,
+/// by its job's end or its hangup; the ranking function is how many must).
+pub open spec fn cap_rank(open: u64, max: u64) -> int {
+    if open > max { open as int - max as int } else { 0int }
+}
+
+pub proof fn lemma_pty_cap_progress(open: u64, max: u64)
+    requires
+        cap_refuses(open, Some(max)),
+    ensures
+        cap_rank(open, max) > 0,
+        cap_rank((open - 1) as u64, max) < cap_rank(open, max),
+        cap_rank((open - 1) as u64, max) == 0 ==> !cap_refuses((open - 1) as u64, Some(max)),
+{
+}
+
+/// Q1: a keeper that ended before it answered, with this exit code, is `NoPty` (503) when the code is
+/// [`NO_PTY_EXIT`] (it found no pseudo-terminal to open) and `Failed` (500) otherwise; never `Go`. The
+/// completeness half: the code that means "no pty" is always 503 (`code == Some(124)`).
+pub fn keeper_ended(code: Option<i32>) -> (r: Begin)
+    ensures
+        r is NoPty <==> code == Some(NO_PTY_EXIT),
+        r is Failed <==> code != Some(NO_PTY_EXIT),
+{
+    if code == Some(NO_PTY_EXIT) && !cfg!(feature = "mut_keeper_no_pty_is_500") {
+        Begin::NoPty
+    } else {
+        Begin::Failed
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1158,6 +1643,120 @@ pub proof fn lemma_stdin_progress(
                 ==> stdin_rank(written2, at, len) == 1 && p2 == (Plan::Done { close: eof }))
         }),
 {
+}
+
+// ---------------------------------------------------------------------------------------------
+// Terminals: the bounds of a size, what a write or a resize of one may do, where its output goes.
+// ---------------------------------------------------------------------------------------------
+
+/// T3, T4: a terminal's size is 1 to 1024 columns and 1 to 1024 rows, and every such size is
+/// accepted (the `<==>`: the completeness half, so a refusal of a size outside never sticks to one
+/// inside). `cols` and `rows` arrive as the request's integers.
+pub fn size_ok(cols: u64, rows: u64) -> (r: Option<Size>)
+    ensures
+        r is Some <==> (1 <= cols && cols <= 1024 && 1 <= rows && rows <= 1024),
+        r is Some ==> (r.unwrap().cols as u64 == cols && r.unwrap().rows as u64 == rows),
+        r is Some ==> in_bounds(r.unwrap()),
+{
+    let max: u64 = if cfg!(feature = "mut_size_unbounded") { 65535 } else if cfg!(feature = "mut_size_off_by_one") { 1023 } else { 1024 };
+    if cols >= 1 && cols <= max && rows >= 1 && rows <= max {
+        Some(Size { cols: cols as u16, rows: rows as u16 })
+    } else {
+        None
+    }
+}
+
+/// What a terminal's `write` may do before the stdin path decides it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Gate {
+    /// The write goes on (to `stdin_plan`).
+    Go,
+    /// `eof` on a terminal: refused (400), nothing is written. A terminal has no end of input.
+    NoEnd,
+    /// The terminal hung up: refused (409), nothing is written.
+    HungUp,
+}
+
+/// T10, T11, T12: a write that asks for end of input on a terminal is refused and writes nothing;
+/// the same write without `eof` to an open terminal goes on (completeness); nothing goes to a
+/// terminal that hung up. A job with no terminal is not decided here.
+pub fn write_gate(term: Term, eof: bool) -> (r: Gate)
+    ensures
+        !(term is No) && eof ==> r is NoEnd,
+        term is Open && !eof ==> r is Go,
+        term is Gone && !eof ==> r is HungUp,
+        term is No ==> r is Go,
+        r is Go ==> (term is No || term is Open) && !(!(term is No) && eof),
+{
+    match term {
+        Term::No => Gate::Go,
+        Term::Open { .. } => {
+            if eof && !cfg!(feature = "mut_pty_eof_closes") {
+                Gate::NoEnd
+            } else if cfg!(feature = "mut_gate_refuses_open") && !eof {
+                Gate::HungUp
+            } else {
+                Gate::Go
+            }
+        },
+        Term::Gone { .. } => {
+            if eof && !cfg!(feature = "mut_pty_eof_closes") {
+                Gate::NoEnd
+            } else if cfg!(feature = "mut_write_after_hangup") {
+                Gate::Go
+            } else {
+                Gate::HungUp
+            }
+        },
+    }
+}
+
+/// Why a resize has nothing to apply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Resizable {
+    /// The terminal takes it (now, or at the spawn).
+    Yes,
+    /// The job has no terminal (409).
+    NoTerminal,
+    /// The job has ended (409).
+    Ended,
+    /// The terminal hung up (409).
+    HungUp,
+}
+
+/// T1, T13: a resize is taken exactly while the job has an open terminal and has not ended; each
+/// refusal is named, and clears with a new terminal (the completeness half is `step`'s T1-live).
+pub fn resizable(s: &State) -> (r: Resizable)
+    ensures
+        r is Yes <==> (s.term is Open && !(s.phase is Ended)),
+        s.term is No ==> r is NoTerminal,
+        s.term is Gone ==> (r is HungUp || r is Ended),
+{
+    match s.term {
+        Term::No => Resizable::NoTerminal,
+        Term::Gone { .. } => if s.ended() { Resizable::Ended } else { Resizable::HungUp },
+        Term::Open { .. } => if s.ended() { Resizable::Ended } else { Resizable::Yes },
+    }
+}
+
+/// Which of a job's output streams has a writer: a terminal's output is one stream (`stdout`), and
+/// its `err` has none, so nothing it prints is ever labelled stderr.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sinks {
+    /// The job's `err` file has a writer.
+    pub err: bool,
+}
+
+/// T3: no byte of a terminal job's output is labelled stderr: its `err` stream has no writer.
+pub fn sinks(term: Term) -> (r: Sinks)
+    ensures
+        !(term is No) ==> !r.err,
+        term is No ==> r.err,
+{
+    match term {
+        Term::No => Sinks { err: true },
+        _ => Sinks { err: cfg!(feature = "mut_pty_err_sink") },
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

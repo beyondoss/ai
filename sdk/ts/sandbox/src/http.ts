@@ -1,6 +1,7 @@
 import { concat, fromBase64, text, toBase64 } from "./bytes.js";
 import {
   AuthError,
+  ConflictError,
   EndpointError,
   InvalidRequestError,
   JobGoneError,
@@ -30,6 +31,8 @@ import {
   type JobSpec,
   type JobState,
   type KeepFields,
+  type PtyInfo,
+  type PtySize,
   type RemoveOptions,
   type RemoveResult,
   type ReqOptions,
@@ -757,6 +760,25 @@ function jobSignal(
     : {};
 }
 
+/** A terminal's size as the wire echoes it, or null when absent or not two integers from 1 to 1024. */
+function ptySize(v: unknown): PtySize | null {
+  if (!isRecord(v)) return null;
+  const { cols, rows } = v;
+  const ok = (n: unknown): n is number =>
+    typeof n === "number" && Number.isInteger(n) && n >= 1 && n <= 1024;
+  return ok(cols) && ok(rows) ? { cols, rows } : null;
+}
+
+/** The `pty` member of a `list` entry or `read` answer: present on terminals only. */
+function ptyInfo(
+  v: Record<string, unknown>,
+): { pty: PtyInfo } | Record<string, never> {
+  const size = ptySize(v.pty);
+  return size && isRecord(v.pty)
+    ? { pty: { ...size, open: v.pty.open === true } }
+    : {};
+}
+
 function badJob(what: string, v: unknown): ProtocolError {
   return new ProtocolError(
     `unreadable job ${what}: ${JSON.stringify(v)?.slice(0, 200)}`,
@@ -816,7 +838,7 @@ function writtenIn(detail: string): number | undefined {
 async function jobFailure(
   e: unknown,
   id: string,
-  op: "write" | "other",
+  op: "write" | "resize" | "other",
 ): Promise<unknown> {
   if (!(e instanceof EndpointError)) return e;
   const { status, detail } = e;
@@ -845,7 +867,7 @@ async function jobFailure(
     if (status === 409) {
       return new StdinClosedError(
         `job stdin: ${detail}`,
-        "closed",
+        detail.includes("the terminal hung up") ? "hung_up" : "closed",
         writtenIn(detail),
         cause,
       );
@@ -853,7 +875,14 @@ async function jobFailure(
     if (status === 429) {
       return new StdinBusyError(`job stdin: ${detail}`, cause);
     }
-    if (status === 413) return new InvalidRequestError(detail, cause);
+    // 400 is a terminal's refusal of `eof`; 413 a write over the cap.
+    if (status === 400 || status === 413) {
+      return new InvalidRequestError(detail, cause);
+    }
+  }
+  if (op === "resize") {
+    if (status === 400) return new InvalidRequestError(detail, cause);
+    if (status === 409) return new ConflictError(`job ${id}: ${detail}`, cause);
   }
   return e;
 }
@@ -872,7 +901,7 @@ class HttpJobs implements JobOps {
   /** One non-stream job op: its JSON answer, a refusal typed. */
   private async call(
     id: string,
-    kind: "write" | "other",
+    kind: "write" | "resize" | "other",
     job: Record<string, unknown>,
     req?: ReqOptions,
   ): Promise<Record<string, unknown>> {
@@ -901,6 +930,9 @@ class HttpJobs implements JobOps {
         hold,
         label: spec.label ?? "",
         stdin_open: spec.stdinOpen === true,
+        ...(spec.pty
+          ? { pty: { cols: spec.pty.cols, rows: spec.pty.rows } }
+          : {}),
       }),
       env: spec.env,
       heartbeatSeconds: req.heartbeatSeconds,
@@ -1016,6 +1048,7 @@ class HttpJobs implements JobOps {
         started: count(j.started),
         ended: count(j.ended),
         label: typeof j.label === "string" ? j.label : "",
+        ...ptyInfo(j),
         mark: j.mark,
         command: j.command,
         args: j.args.filter((a): a is string => typeof a === "string"),
@@ -1061,6 +1094,7 @@ class HttpJobs implements JobOps {
       end: count(v.end),
       data,
       ...(stderrRanges ? { stderrRanges } : {}),
+      ...ptyInfo(v),
     };
   }
 
@@ -1160,6 +1194,24 @@ class HttpJobs implements JobOps {
     return { written: v.written, closed: v.closed === true };
   }
 
+  async resize(
+    scope: string,
+    id: string,
+    cols: number,
+    rows: number,
+    req?: ReqOptions,
+  ): Promise<PtySize> {
+    const v = await this.call(
+      id,
+      "resize",
+      this.job("resize", scope, { id, cols, rows }),
+      req,
+    );
+    const size = ptySize(v);
+    if (!size) throw badJob("resize", v);
+    return size;
+  }
+
   async signal(
     scope: string,
     ids: string[],
@@ -1204,6 +1256,8 @@ export interface JobLine {
   stream?: "stdout" | "stderr";
   /** A `started` frame's process group (the shell keeps it; the kernel is told the mark and the stdin echo). */
   pgid?: number;
+  /** A `started` frame's terminal size (the shell keeps it; the kernel is told only whether one was echoed). */
+  pty?: PtySize;
   /** Why the frame is `bad`. */
   note?: string;
 }
@@ -1238,13 +1292,16 @@ export function decodeJobLine(line: Uint8Array): JobLine {
       : bad("an `attached` frame without its mark and offset");
   }
   if (typeof v.started === "number") {
+    const pty = ptySize(v.pty);
     return {
       frame: {
         t: "started",
         mark: typeof v.mark === "string" ? v.mark : "",
         stdin: v.stdin === true,
+        pty: pty !== null,
       },
       pgid: v.started,
+      ...(pty === null ? {} : { pty }),
     };
   }
   const stream = typeof v.stdout === "string"

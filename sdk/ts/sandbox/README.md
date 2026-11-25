@@ -117,6 +117,13 @@ of `kill` and `wipe`, default 300 ms) and `heartbeatSeconds` (1 to 240, sent as 
 client treats a stream as dead after two beats and ten seconds of silence, never under 30 s). `keep`'s `notify` is not
 offered: it carries a bearer token, which this client does not hold.
 
+A terminal is a job: `jobs.start(scope, id, { command, pty: { cols, rows } })` (1 to 1024 each) runs the command on a
+pseudo-terminal, `jobs.resize(scope, id, cols, rows)` sets its size (absolute, so a retry changes nothing), and `list` and
+`read` carry `pty: { cols, rows, open }` for terminal jobs only. A terminal's output is one stream (stdout), its stdin is
+open, and `writeStdin` takes no `eof` (`InvalidRequestError`; write `0x04` for Ctrl-D). An endpoint that does not echo the
+terminal is `NotOfferedError`, and the job it started is stopped. A resize of an ended terminal, one with no terminal or one
+whose keeper is gone is `ConflictError`; a write to a hung-up terminal is `StdinClosedError` with `written`.
+
 A held job (`startHeld`, `follow`, `collect`) reconnects itself. Every decision it makes (the status table, the offset it
 reopens at, the wait before each retry, the silence limit, when it gives up) is made by the job client kernel
 (`crates/job-client`, proven in Verus), compiled to WASM and inlined in the package (`src/kernel/wasm.ts`, about 14 KB

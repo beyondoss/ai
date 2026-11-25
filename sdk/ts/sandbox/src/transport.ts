@@ -54,6 +54,17 @@ export type Frame =
 /** The state of a job as the sandbox reports it. */
 export type JobState = "running" | "exited" | "ended" | "lost" | "gone";
 
+/** A terminal's size: both are integers from 1 to 1024. */
+export interface PtySize {
+  cols: number;
+  rows: number;
+}
+
+/** A terminal job's size and whether its terminal is still held (`open`: false once its keeper is gone). */
+export interface PtyInfo extends PtySize {
+  open: boolean;
+}
+
 /** One job, as `list` reports it. */
 export interface JobInfo {
   id: string;
@@ -72,6 +83,8 @@ export interface JobInfo {
   /** Epoch seconds when it ended; 0 while it runs. */
   ended: number;
   label: string;
+  /** Present on a terminal job only. */
+  pty?: PtyInfo;
   /** Which incarnation of `id` this is (see {@link JobStarted.mark}). */
   mark: string;
   command: string;
@@ -132,11 +145,19 @@ export interface JobChunk {
   data: Uint8Array;
   /** Which bytes of `data` came from stderr, as absolute `[from, len]` offsets; absent when none. */
   stderrRanges?: [number, number][];
+  /** Present on a terminal job only. A terminal's output is one stream: no `stderrRanges`. */
+  pty?: PtyInfo;
 }
 
 /** What a job stream says: output, a gap, the shell's exit, and the final status. */
 export type JobFrame =
-  | { type: "started"; pgid: number; mark: string; stdin?: boolean }
+  | {
+    type: "started";
+    pgid: number;
+    mark: string;
+    stdin?: boolean;
+    pty?: PtySize;
+  }
   /** The first frame of an attach: the job's mark and the offset the stream starts at. */
   | { type: "attached"; mark: string; from: number }
   /** `stream` is the pipe the bytes came from; concatenated, the pieces are the combined output. */
@@ -185,6 +206,12 @@ export interface JobSpec {
   env?: Record<string, string>;
   /** Keep the job's stdin open for `writeStdin`; default: empty (EOF at once). */
   stdinOpen?: boolean;
+  /**
+   * Run the command on a pseudo-terminal of this size (wire `pty`; cols and rows are integers from 1
+   * to 1024). The job's stdin is open, its output is one stream (`stdout` only) and `writeStdin`
+   * takes no `eof`. An endpoint that does not echo `pty` is {@link NotOfferedError}.
+   */
+  pty?: PtySize;
 }
 
 /** The most bytes one `writeStdin` carries. */
@@ -324,6 +351,14 @@ export interface JobOps {
     eof: boolean,
     req?: ReqOptions,
   ): Promise<StdinWritten>;
+  /** Set a terminal job's size (wire op `resize`); absolute, so a retry is idempotent. */
+  resize(
+    scope: string,
+    id: string,
+    cols: number,
+    rows: number,
+    req?: ReqOptions,
+  ): Promise<PtySize>;
   /** Send a named signal to each running job's group; the ids that were signalled. */
   signal(
     scope: string,

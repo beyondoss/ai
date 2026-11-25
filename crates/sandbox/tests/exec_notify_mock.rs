@@ -77,6 +77,7 @@ fn spec(script: &str) -> JobSpec {
         label: script.into(),
         env: Vec::new(),
         stdin_open: false,
+        pty: None,
     }
 }
 

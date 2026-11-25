@@ -47,6 +47,7 @@ mod ring;
 mod runas;
 mod spool;
 mod tail;
+mod term;
 
 pub use notify::{
     ATTEMPT_TIMEOUT, CallbackAttempt, CallbackKind, NOTIFY_VERSION, NotifyTarget, parse_notify,
@@ -194,6 +195,14 @@ pub struct Options {
     /// only for an unknown op, after authentication and request parsing, never for one execd handles.
     /// It is synchronous and runs on the server's own thread, so it must be quick and must not block.
     pub job_op_hook: Option<JobOpHook>,
+    /// The binary a terminal's keeper is started from: execd's own, run in keeper mode. Default
+    /// `/proc/self/exe`; a host that embeds execd in a process that does not call [`helper_main`]
+    /// first (a test binary) names the `execd` binary here.
+    pub helper_exe: Option<PathBuf>,
+    /// At most this many open terminals; a start beyond it is `503 no pseudo-terminal is free`, as
+    /// when the kernel's table is full. `None` (the default) is the kernel's own limit. Set only by
+    /// `EXECD_TERMINALS_MAX`, so a test can reach the refusal without filling the machine's ptys.
+    pub terminals_max: Option<usize>,
     /// Shown every request except the health paths, after [`Self::authorizer`] or [`Self::bearer`]
     /// has accepted it (a refused one is answered `401` and the hook never sees it) and before its
     /// body is read: [`Route::Claimed`] takes the request over, [`Route::Declined`] hands it back to
@@ -229,6 +238,8 @@ impl Options {
             observer: None,
             idle_timeout: None,
             job_op_hook: None,
+            helper_exe: None,
+            terminals_max: None,
             route_hook: None,
         }
     }
@@ -306,6 +317,25 @@ pub struct KeptJob {
     pub id: String,
 }
 
+/// A kept terminal that has not ended and whose keeper holds it: what a host that lets idle machines
+/// sleep needs to tell a terminal waiting at its prompt from one at work.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Terminal {
+    pub scope: String,
+    pub id: String,
+    /// The session's process group.
+    pub pgid: i32,
+    /// The slave's device number (`st_rdev` of its `/dev/pts/N`); 0 if it could not be read.
+    pub pts_rdev: u64,
+    /// The `st_dev` of the devpts the slave lives on: a nested devpts reuses `st_rdev` numbers, so
+    /// the two together name the slave. 0 if it could not be read.
+    pub pts_fs: u64,
+    /// A stream (`attach`, a held start) is open on it now.
+    pub attached: bool,
+    /// The job's processes: its group plus every marked process that left it (the set `kill` signals).
+    pub members: Vec<u32>,
+}
+
 /// What the server is doing now.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Activity {
@@ -321,6 +351,8 @@ pub struct Activity {
     /// abandoned at the attempt limit, or the job is removed. A host that pauses idle machines
     /// must stay awake while this is not zero.
     pub callbacks_owed: usize,
+    /// Every kept terminal that has not ended (see [`Terminal`]).
+    pub terminals: Vec<Terminal>,
 }
 
 /// Everything a request handler shares.
@@ -379,6 +411,7 @@ impl Handle {
             running_kept,
             jobs_alive,
             callbacks_owed,
+            terminals: self.ctx.jobs.terminals(),
         }
     }
 

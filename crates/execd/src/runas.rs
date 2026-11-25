@@ -205,7 +205,7 @@ pub(crate) fn encode_env(pairs: &[(String, String)]) -> String {
         })
 }
 
-fn decode_env(hex: &str) -> Option<Vec<(String, String)>> {
+pub(crate) fn decode_env(hex: &str) -> Option<Vec<(String, String)>> {
     if !hex.len().is_multiple_of(2) {
         return None;
     }
@@ -223,7 +223,15 @@ pub fn helper_main() -> Option<ExitCode> {
     if args.next()? != HELPER_FLAG {
         return None;
     }
-    Some(helper(&args.collect::<Vec<_>>()))
+    let rest: Vec<OsString> = args.collect();
+    // A terminal's keeper and session helper take no identity: they run as execd, and the command's
+    // own switch (`run`) comes after the terminal is the command's.
+    if let Some((mode, tail)) = rest.split_first()
+        && let Some(code) = crate::term::helper(mode, tail)
+    {
+        return Some(code);
+    }
+    Some(helper(&rest))
 }
 
 fn helper(args: &[OsString]) -> ExitCode {

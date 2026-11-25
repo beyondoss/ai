@@ -220,6 +220,8 @@ pub struct State {
     pub key: u64,
     /// The job is started with its stdin open: the `started` echo must say it was honoured. Never changes.
     pub stdin_open: bool,
+    /// The job is started on a terminal: the `started` echo must say so. Never changes.
+    pub pty_open: bool,
     /// The start is a kept job's (`hold: false`): no stream's close ends it, so a refused echo stops it.
     pub kept: bool,
     /// The consumer has been told the echo (`Started` or the first `Attached`): a reattach's is not told again.
@@ -248,7 +250,8 @@ pub enum Frame {
     Attached { mark: Mark, from: u64 },
     /// `{"started": {"mark"}}`: the first frame of a start.
     /// `stdin` is whether the endpoint says the job's stdin was opened.
-    Started { mark: Mark, stdin: bool },
+    /// `pty` is whether it says a terminal was opened.
+    Started { mark: Mark, stdin: bool, pty: bool },
     /// An output frame of `len` decoded bytes.
     Output { len: u64 },
     /// `{"gap": n}`: `n` bytes are no longer kept.
@@ -294,7 +297,7 @@ pub enum Action {
     /// Release the connection, if one is open.
     CloseStream,
     /// Tell the consumer the job started (the `started` echo was accepted): `mark` names the incarnation.
-    Started { mark: Mark, stdin: bool },
+    Started { mark: Mark, stdin: bool, pty: bool },
     /// Tell the consumer, once, where an attach began: the first accepted `attached` echo.
     Attached { mark: Mark, from: u64 },
     /// Tell the consumer the job's shell exited with `code` (not final).
@@ -543,6 +546,7 @@ pub open spec fn good_echo(s: State, ev: Event) -> bool {
     &&& (s.flow is Attach) == (ev is Frame && ev->Frame_0 is Attached)
     &&& echo_from(ev) >= s.offset as int
     &&& (s.flow is Start && s.stdin_open) ==> echo_stdin(ev)
+    &&& (s.flow is Start && s.pty_open) ==> echo_pty(ev)
 }
 
 /// Fairness: the server is reachable and answers as it should. A step under it is a fair step.
@@ -675,6 +679,13 @@ pub open spec fn echo_stdin(ev: Event) -> bool {
     }
 }
 
+pub open spec fn echo_pty(ev: Event) -> bool {
+    match ev {
+        Event::Frame(Frame::Started { pty, .. }) => pty,
+        _ => false,
+    }
+}
+
 pub open spec fn is_started_frame(ev: Event) -> bool {
     match ev {
         Event::Frame(Frame::Started { .. }) => true,
@@ -702,11 +713,12 @@ pub open spec fn is_shell_exit_frame(ev: Event) -> bool {
 /// arrives and changes nothing else. Each telling comes from exactly the step it names.
 pub open spec fn post_surface(s: State, ev: Event, s2: State, out: Seq<Action>) -> bool {
     &&& forall|i: int| 0 <= i < out.len() ==> match #[trigger] out[i] {
-        Action::Started { mark, stdin } => {
+        Action::Started { mark, stdin, pty } => {
             &&& s.phase is Confirming && s.flow is Start
-            &&& ev == Event::Frame(Frame::Started { mark, stdin })
+            &&& ev == Event::Frame(Frame::Started { mark, stdin, pty })
             &&& s2.phase is Streaming
             &&& s.stdin_open ==> stdin
+            &&& s.pty_open ==> pty
         },
         Action::Attached { mark, from } => {
             &&& s.phase is Confirming && s.flow is Attach && !s.announced
@@ -729,6 +741,8 @@ pub open spec fn post_surface(s: State, ev: Event, s2: State, out: Seq<Action>) 
         &&& !s.announced ==> (out.len() == 1 && out[0] is Attached)
     }
     &&& (s.phase is Confirming && s.flow is Start && s.stdin_open && is_started_frame(ev) && !echo_stdin(ev)
+        && echo_mark(ev).len > 0 && (s.mark.len == 0 || echo_mark(ev) == s.mark)) ==> fails_with(out, Fault::NotOffered)
+    &&& (s.phase is Confirming && s.flow is Start && s.pty_open && is_started_frame(ev) && !echo_pty(ev)
         && echo_mark(ev).len > 0 && (s.mark.len == 0 || echo_mark(ev) == s.mark)) ==> fails_with(out, Fault::NotOffered)
     &&& (s.phase is Confirming && s.kept && s.flow is Start && s2.phase is Done && fails_with(out, Fault::NotOffered))
         ==> (out.len() == 3 && out[1] is Kill)
@@ -1548,7 +1562,7 @@ fn step_confirming(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<
                     (t, out)
                 }
             },
-            Frame::Started { mark, stdin } => {
+            Frame::Started { mark, stdin, pty } => {
                 if mark.len == 0 {
                     unoffered(s)
                 } else if s.mark.len > 0 && !mark_eq(&mark, &s.mark) && !cfg!(feature = "mut_echo_mark_unchecked") {
@@ -1557,10 +1571,12 @@ fn step_confirming(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<
                     unoffered(s)
                 } else if s.stdin_open && !stdin && !cfg!(feature = "mut_stdin_unchecked") {
                     unoffered(s)
+                } else if s.pty_open && !pty && !cfg!(feature = "mut_pty_unchecked") {
+                    unoffered(s)
                 } else {
                     let t = streaming(s, mark, 0);
                     let mut out = Vec::new();
-                    out.push(Action::Started { mark, stdin });
+                    out.push(Action::Started { mark, stdin, pty });
                     (t, out)
                 }
             },
@@ -1864,6 +1880,7 @@ impl State {
         remove_on_exit: bool,
         beat_s: u32,
         stdin_open: bool,
+        pty_open: bool,
         kept: bool,
     ) -> State {
         State {
@@ -1872,6 +1889,7 @@ impl State {
             mode,
             remove_on_exit,
             stdin_open,
+            pty_open,
             kept,
             announced: false,
             key,
@@ -1899,6 +1917,7 @@ impl State {
             mode,
             remove_on_exit,
             stdin_open: false,
+            pty_open: false,
             kept: false,
             announced: false,
             key: 0,

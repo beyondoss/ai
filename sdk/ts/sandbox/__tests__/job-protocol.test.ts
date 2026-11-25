@@ -54,6 +54,7 @@ describe("job frames keep their stream", () => {
       t: "started",
       mark: "00ff",
       stdin: false,
+      pty: false,
     });
     for (
       const v of [{ error: "boom" }, { gap: -1 }, { exit_code: 1.5 }, {
@@ -466,5 +467,172 @@ describe("the mark on the wire", () => {
       kind: "not_offered",
     });
     expect(await jobs.remove("s", [])).toEqual({ running: [], mismatch: [] });
+  });
+});
+
+describe("job terminals", () => {
+  async function jobs(answer: (body: any) => [number, unknown]) {
+    const seen: any[] = [];
+    const e = await fakeEndpoint((r, res) => {
+      const b = r.body as any;
+      seen.push(b);
+      const [status, v] = answer(b);
+      json(res, status, v);
+    });
+    closers.push(e.close);
+    return { t: new HttpTransport({ url: e.url }), seen };
+  }
+  const fail = (p: Promise<unknown>) => p.then(() => undefined, (e) => e);
+
+  it("sends pty on start and accepts the echo", async () => {
+    const { t, seen } = await jobs(() => [
+      200,
+      { started: 5, mark: "ab", stdin: true, pty: { cols: 80, rows: 24 } },
+    ]);
+    expect(
+      await new Jobs(t).start("s", "aa", {
+        command: "sh",
+        pty: { cols: 80, rows: 24 },
+      }),
+    ).toEqual({ pgid: 5, mark: "ab" });
+    expect(seen[0].job.pty).toEqual({ cols: 80, rows: 24 });
+  });
+
+  it("fails closed and stops the job when the endpoint does not echo pty", async () => {
+    const { t, seen } = await jobs((b) =>
+      b.job.op === "start"
+        ? [200, { started: 5, mark: "ab" }]
+        : [200, { survivors: [] }]
+    );
+    await expect(
+      new Jobs(t).start("s", "aa", {
+        command: "sh",
+        pty: { cols: 80, rows: 24 },
+      }),
+    ).rejects.toMatchObject({ kind: "not_offered" });
+    expect(seen.map((b) => b.job.op)).toEqual(["start", "kill"]);
+  });
+
+  it("sends no pty member for a job without a terminal", async () => {
+    const { t, seen } = await jobs(() => [200, { started: 5, mark: "ab" }]);
+    await new Jobs(t).start("s", "aa", { command: "true" });
+    expect("pty" in seen[0].job).toBe(false);
+  });
+
+  it("refuses a bad size before sending anything", async () => {
+    const { t, seen } = await jobs(() => [200, { cols: 1, rows: 1 }]);
+    const jobs2 = new Jobs(t);
+    for (const [c, r] of [[0, 24], [1025, 24], [80, 0], [80.5, 24]]) {
+      expect(await fail(jobs2.resize("s", "aa", c!, r!))).toMatchObject({
+        kind: "invalid_request",
+      });
+    }
+    expect(
+      await fail(
+        jobs2.start("s", "aa", { command: "sh", pty: { cols: 0, rows: 1 } }),
+      ),
+    ).toMatchObject({ kind: "invalid_request" });
+    expect(seen).toHaveLength(0);
+  });
+
+  it("resizes and types the refusals", async () => {
+    const { t, seen } = await jobs((b) =>
+      b.job.id === "aa"
+        ? [200, { cols: b.job.cols, rows: b.job.rows }]
+        : b.job.id === "bb"
+        ? [404, { error: "no such job" }]
+        : b.job.id === "cc"
+        ? [409, { error: "the job has no terminal" }]
+        : [400, { error: "pty: cols and rows are integers from 1 to 1024" }]
+    );
+    expect(await t.jobs.resize("s", "aa", 120, 40)).toEqual({
+      cols: 120,
+      rows: 40,
+    });
+    expect(seen[0].job).toMatchObject({
+      op: "resize",
+      id: "aa",
+      cols: 120,
+      rows: 40,
+    });
+    expect(await fail(t.jobs.resize("s", "bb", 1, 1))).toBeInstanceOf(
+      JobGoneError,
+    );
+    const conflict = await fail(t.jobs.resize("s", "cc", 1, 1));
+    expect(conflict).toBeInstanceOf(ConflictError);
+    expect(await fail(t.jobs.resize("s", "dd", 1, 1))).toMatchObject({
+      kind: "invalid_request",
+    });
+  });
+
+  it("maps a terminal's write refusals: eof is invalid, a hangup is stdin closed with written", async () => {
+    const { t } = await jobs((b) =>
+      b.job.eof === true
+        ? [400, {
+          error: "a terminal has no end of input: write 0x04 (Ctrl-D)",
+        }]
+        : [409, { error: "the terminal hung up", written: 4 }]
+    );
+    expect(await fail(t.jobs.writeStdin("s", "aa", 0, utf8("x"), true)))
+      .toMatchObject({
+        kind: "invalid_request",
+      });
+    const e = await fail(t.jobs.writeStdin("s", "aa", 4, utf8("x"), false));
+    expect(e).toBeInstanceOf(StdinClosedError);
+    expect(e.reason).toBe("hung_up");
+    expect(e.written).toBe(4);
+  });
+
+  it("reads pty on list and read entries, and on the started frame", async () => {
+    const base = {
+      mark: "ab",
+      command: "sh",
+      args: [],
+      outputStart: 0,
+      outputEnd: 0,
+    };
+    const { t } = await jobs((b) =>
+      b.job.op === "list"
+        ? [200, {
+          jobs: [
+            {
+              ...base,
+              id: "aa",
+              state: "running",
+              pty: { cols: 120, rows: 40, open: true },
+            },
+            { ...base, id: "bb", state: "running" },
+          ],
+        }]
+        : [200, {
+          state: "running",
+          offset: 0,
+          end: 0,
+          data: "",
+          pty: { cols: 80, rows: 24, open: false },
+        }]
+    );
+    const list = await t.jobs.list("s");
+    expect(list[0]!.pty).toEqual({ cols: 120, rows: 40, open: true });
+    expect("pty" in list[1]!).toBe(false);
+    expect((await t.jobs.read("s", "aa", 0, 10)).pty).toEqual({
+      cols: 80,
+      rows: 24,
+      open: false,
+    });
+    expect(
+      decodeJobLine(
+        line({
+          started: 7,
+          mark: "ab",
+          stdin: true,
+          pty: { cols: 80, rows: 24 },
+        }),
+      ),
+    ).toMatchObject({
+      frame: { t: "started", mark: "ab", stdin: true, pty: true },
+      pgid: 7,
+      pty: { cols: 80, rows: 24 },
+    });
   });
 });

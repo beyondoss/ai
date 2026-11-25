@@ -40,7 +40,7 @@ from .errors import (
     StdinGapError,
 )
 from .files import CapsOverride
-from .models import JobRead, JobStart, JobStarted, Stat
+from .models import JobRead, JobStart, JobStarted, Pty, PtyInfo, Stat
 from .transport import HttpTransport
 
 Result = dict[str, Any]
@@ -56,13 +56,13 @@ class _Unsupported(SandboxError):
 # raw stream, so it has all of them.
 FEATURES = [
     "frames", "unbounded_stream", "exit_signal", "exec_env", "job_streams", "job_stdin",
-    "job_signal_op", "job_errors", "job_options", "job_marks",
+    "job_signal_op", "job_errors", "job_options", "job_marks", "job_pty",
 ]  # fmt: skip
 
 OPS = [
     "hello", "capabilities", "exec", "exec_stream",
     "job_start", "job_start_held", "job_keep", "job_seen", "job_list", "job_read", "job_attach",
-    "job_kill", "job_remove", "job_wipe", "job_write", "job_signal",
+    "job_kill", "job_remove", "job_wipe", "job_write", "job_signal", "job_resize",
     "stat", "read", "write", "write_if_unchanged", "mkdir", "list", "search",
     "upload", "download", "extract",
 ]  # fmt: skip
@@ -214,6 +214,7 @@ def plan(op: str, req: dict[str, Any]) -> Plan:
         "job_wipe",
         "job_write",
         "job_signal",
+        "job_resize",
     ):
         return _job_plan(op, req)
     if op == "stat":
@@ -296,6 +297,7 @@ def _job_plan(op: str, req: dict[str, Any]) -> Plan:
                         "args": list(j.args), "output_start": j.output_start,
                         "output_end": j.output_end,
                         **({} if j.signal is None else {"signal": j.signal}),
+                        **_pty_json(j.pty),
                     }
                     for j in js
                 ]
@@ -318,6 +320,12 @@ def _job_plan(op: str, req: dict[str, Any]) -> Plan:
             lambda ss: {"survivors": [{"id": s.id, "detail": s.detail} for s in ss]},
         )
     job = _str(req, "job")
+    if op == "job_resize":
+        cols, rows = _wire_int(req, "cols"), _wire_int(req, "rows")
+        return (
+            lambda sb: sb.jobs.resize(scope, job, cols, rows),
+            lambda p: {"cols": p.cols, "rows": p.rows},
+        )
     if op == "job_write":
         at = _count(req, "at")
         if at is None:
@@ -338,22 +346,32 @@ def _job_plan(op: str, req: dict[str, Any]) -> Plan:
         command, args = _str(req, "command"), _strings(req, "args")
         cwd, label = _opt_str(req, "cwd"), _opt_str(req, "label") or ""
         env, stdin_open, keep = _env(req), _flag(req, "stdin_open"), _flag(req, "keep")
-        beat = _count(req, "heartbeat_seconds")
+        beat, pty = _count(req, "heartbeat_seconds"), _pty(req)
         return (
             lambda sb: _start_held(
-                sb, scope, job, command, args, cwd, label, env, stdin_open, keep, beat
+                sb, scope, job, command, args, cwd, label, env, stdin_open, keep, beat, pty
             ),
-            lambda st: {"pgid": st.pgid, "mark": st.mark},
+            lambda st: {"pgid": st.pgid, "mark": st.mark, **_echo(pty)},
         )
     if op == "job_start":
         command, args = _str(req, "command"), _strings(req, "args")
         cwd, label = _opt_str(req, "cwd"), _opt_str(req, "label") or ""
-        env, stdin_open = _env(req), _flag(req, "stdin_open")
+        env, stdin_open, pty = _env(req), _flag(req, "stdin_open"), _pty(req)
         return (
             lambda sb: sb.jobs.start(
-                scope, job, command, args, cwd=cwd, label=label, env=env, stdin_open=stdin_open
+                scope,
+                job,
+                command,
+                args,
+                cwd=cwd,
+                label=label,
+                env=env,
+                stdin_open=stdin_open,
+                pty=pty,
             ),
-            lambda st: {"pgid": st.pgid, "mark": st.mark},
+            # The client refused (`not_offered`) an endpoint that did not echo `pty`, so a start
+            # that came back echoed it.
+            lambda st: {"pgid": st.pgid, "mark": st.mark, **_echo(pty)},
         )
     offset = _count(req, "offset") or 0
     if op == "job_read":
@@ -367,6 +385,7 @@ def _job_plan(op: str, req: dict[str, Any]) -> Plan:
                 "data_b64": _b64(r.data),
                 **({} if r.signal is None else {"signal": r.signal}),
                 **({"stderr_ranges": [list(p) for p in r.stderr_ranges]} if r.stderr_ranges else {}),
+                **_pty_json(r.pty),
             },
         )  # fmt: skip
     return (  # job_attach
@@ -443,6 +462,39 @@ def _read(
         return absorb(e)
 
 
+def _pty(req: dict[str, Any]) -> Pty | None:
+    """``pty``: ``{cols, rows}`` or nothing. The client checks the range."""
+    v = req.get("pty")
+    if v is None:
+        return None
+    if not isinstance(v, dict):
+        raise InvalidRequestError("`pty` must be an object")
+    cols, rows = v.get("cols"), v.get("rows")
+    if (
+        not isinstance(cols, int)
+        or isinstance(cols, bool)
+        or not isinstance(rows, int)
+        or isinstance(rows, bool)
+    ):
+        raise InvalidRequestError("`pty` needs integer `cols` and `rows`")
+    return Pty(cols, rows)
+
+
+def _wire_int(req: dict[str, Any], key: str) -> int:
+    v = req.get(key)
+    if isinstance(v, bool) or not isinstance(v, int):
+        raise InvalidRequestError(f"`{key}` must be an integer")
+    return v
+
+
+def _echo(p: Pty | None) -> dict[str, Any]:
+    return {} if p is None else {"pty": {"cols": p.cols, "rows": p.rows}}
+
+
+def _pty_json(p: PtyInfo | None) -> dict[str, Any]:
+    return {} if p is None else {"pty": {"cols": p.cols, "rows": p.rows, "open": p.open}}
+
+
 def _start_held(
     sb: Any,
     scope: str,
@@ -455,11 +507,13 @@ def _start_held(
     stdin_open: bool,
     keep: bool,
     beat: int | None,
+    pty: Pty | None,
 ) -> Any:
     """``job_start_held``: start held, learn the pgid from the first frame, optionally ``keep``, then
     drop the stream: a job nobody kept dies with it (wire ``hold: true``)."""
     kw: dict[str, Any] = {
         "cwd": cwd, "label": label, "env": env, "stdin_open": stdin_open, "heartbeat_seconds": beat,
+        "pty": pty,
     }  # fmt: skip
     if isinstance(sb, AsyncSandbox):
 
@@ -793,12 +847,14 @@ def _code(e: SandboxError) -> str | None:
 def _fail(id_: Any, e: BaseException) -> Result:
     if isinstance(e, SandboxError):
         code = _code(e)
+        written = e.written if isinstance(e, (StdinClosedError, StdinGapError)) else None
         return {
             "id": id_,
             "error": {
                 "kind": e.kind,
                 "detail": e.detail,
                 **({} if code is None else {"code": code}),
+                **({} if written is None else {"written": written}),
             },
         }
     traceback.print_exception(e, file=sys.stderr)

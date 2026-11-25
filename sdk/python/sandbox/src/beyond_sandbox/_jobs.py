@@ -14,6 +14,7 @@ from typing import Any, Sequence
 from . import _wire
 from ._drive import Call, Follow, Op
 from .errors import (
+    ConflictError,
     DiskFullError,
     InvalidRequestError,
     IoError,
@@ -25,7 +26,7 @@ from .errors import (
     StdinClosedError,
     StdinGapError,
 )
-from .models import JobEnd, JobInfo, JobRead, JobRemoved, JobStart, StdinWritten, Survivor
+from .models import JobEnd, JobInfo, JobRead, JobRemoved, JobStart, Pty, StdinWritten, Survivor
 
 #: The most one ``read`` returns by default: its base64 fits the smallest answer a runner keeps whole.
 READ_MAX = 128 * 1024
@@ -50,6 +51,10 @@ def check_scope(scope: str) -> str:
     if not _SCOPE.fullmatch(scope):
         raise InvalidRequestError(f"bad job scope {scope!r}: 1 to 64 characters of [0-9a-z-]")
     return scope
+
+
+#: The error for an endpoint that ran a job without the terminal it was asked for.
+NO_PTY = "the endpoint predates job terminals: it ran the job without one"
 
 
 def _written_in(detail: str) -> int | None:
@@ -86,13 +91,43 @@ def _stdin_failure(e: SandboxError, job: str) -> SandboxError:
         return StdinClosedError(detail, reason="never_opened", status=409)
     if e.status == 409 and '"gap"' in d:
         return StdinGapError(detail, written=_written_in(d), status=409)
+    if e.status == 409 and "the terminal hung up" in d:
+        return StdinClosedError(detail, reason="hung_up", written=_written_in(d), status=409)
     if e.status == 409:
         return StdinClosedError(detail, reason="closed", written=_written_in(d), status=409)
     if e.status == 429:
         return StdinBusyError(detail, status=429)
-    if e.status == 413:
-        return InvalidRequestError(detail, status=413)
+    if e.status in (400, 413):  # 400: a terminal has no end of input (``eof``)
+        return InvalidRequestError(detail, status=e.status)
     return e
+
+
+def _resize_failure(e: SandboxError, job: str) -> SandboxError:
+    """A refused ``resize``: 400 a size out of bounds, 404 no such job, 409 no terminal, ended or
+    hung up."""
+    if e.status == 400:
+        return InvalidRequestError(e.detail, status=400)
+    if e.status == 404:
+        return JobGoneError(f"job {job}: {e.detail}", id=job, status=404)
+    if e.status == 409:
+        return ConflictError(f"job {job}: {e.detail}", status=409)
+    return e
+
+
+def check_pty(pty: Pty) -> dict[str, int]:
+    """The wire's ``pty`` member; ``cols`` and ``rows`` are integers from 1 to 1024."""
+    if not (_wire._pty_dim(pty.cols) and _wire._pty_dim(pty.rows)):
+        raise InvalidRequestError("pty: cols and rows are integers from 1 to 1024")
+    return {"cols": pty.cols, "rows": pty.rows}
+
+
+def _job_start_op(
+    scope: str, job: str, hold: bool, label: str, stdin_open: bool, pty: Pty | None
+) -> dict[str, Any]:
+    extra: dict[str, Any] = {} if pty is None else {"pty": check_pty(pty)}
+    return _wire.job_op(
+        "start", scope, id=job, hold=hold, label=label, stdin_open=stdin_open, **extra
+    )
 
 
 def start(
@@ -105,12 +140,13 @@ def start(
     env: dict[str, str] | None = None,
     stdin_open: bool = False,
     heartbeat_seconds: int | None = None,
+    pty: Pty | None = None,
 ) -> Op[JobStart]:
     check_scope(scope)
     check_id(job)
     try:
         v = yield Call(
-            _wire.job_op("start", scope, id=job, hold=False, label=label, stdin_open=stdin_open),
+            _job_start_op(scope, job, False, label, stdin_open, pty),
             command,
             args,
             cwd,
@@ -127,6 +163,11 @@ def start(
         with contextlib.suppress(SandboxError):
             yield Call(_wire.job_op("kill", scope, ids=[job], remove=True, grace_ms=KILL_GRACE_MS))
         raise NotOfferedError("the endpoint predates job stdin: it ran the job without it")
+    if pty is not None and _wire.parse_pty(v.get("pty")) is None:
+        # Started without its terminal: stop it, so no program runs that expects one.
+        with contextlib.suppress(SandboxError):
+            yield Call(_wire.job_op("kill", scope, ids=[job], remove=True, grace_ms=KILL_GRACE_MS))
+        raise NotOfferedError(NO_PTY)
     mark = v.get("mark")
     if not isinstance(mark, str) or not mark:
         raise NotOfferedError("the endpoint predates the job mark: its start did not name one")
@@ -143,6 +184,7 @@ def start_held(
     env: dict[str, str] | None = None,
     stdin_open: bool = False,
     heartbeat_seconds: int | None = None,
+    pty: Pty | None = None,
 ) -> Op[JobEnd]:
     """Start a job held by this stream (wire ``hold: true``). Emits the job's events, the first a
     :class:`~beyond_sandbox.JobStarted`; returns how it ended. If the stream stops before the end and
@@ -151,7 +193,7 @@ def start_held(
     check_id(job)
     try:
         end: JobEnd = yield Follow(
-            _wire.job_op("start", scope, id=job, hold=True, label=label, stdin_open=stdin_open),
+            _job_start_op(scope, job, True, label, stdin_open, pty),
             command,
             args,
             cwd,
@@ -334,3 +376,20 @@ def signal(scope: str, ids: Sequence[str], signal_name: str) -> Op[list[str]]:
     if not isinstance(sent, list):
         raise IoError(f"unreadable job signal: {v!r}"[:300])
     return [i for i in sent if _wire._is_job_id(i)]
+
+
+def resize(scope: str, job: str, cols: int, rows: int) -> Op[Pty]:
+    """Set a terminal job's size (wire ``resize``): absolute, so a retry changes nothing. A size
+    outside 1 to 1024 is ``InvalidRequestError`` and nothing is sent; no such job is ``JobGoneError``;
+    a job with no terminal, an ended one or one whose terminal hung up is ``ConflictError``."""
+    check_scope(scope)
+    check_id(job)
+    check_pty(Pty(cols, rows))
+    try:
+        v = yield Call(_wire.job_op("resize", scope, id=job, cols=cols, rows=rows))
+    except SandboxError as e:
+        raise _resize_failure(e, job) from None
+    size = _wire.parse_pty(v)
+    if size is None:
+        raise IoError(f"unreadable job resize: {v!r}"[:300])
+    return size
