@@ -183,6 +183,9 @@ pub enum Fault {
     Protocol,
     /// The credential is refused.
     Auth,
+    /// The sandbox no longer exists, and the answer that said so was the backend's (`gone`). The only way
+    /// an unreachable endpoint ends a handle.
+    SandboxGone,
 }
 
 /// What a request is, for classifying its answer.
@@ -257,7 +260,10 @@ pub enum Event {
     /// Send the first request.
     Go,
     /// The request was answered with this status (and `Retry-After` in whole seconds, 0 if none).
-    Answered { status: u16, retry_after_s: u32 },
+    /// `gone`: the answer says, authoritatively, that the sandbox no longer exists (the backend's own
+    /// "sandbox not found", a deleted-sandbox answer). Silence, a refused connect and a timeout are never
+    /// `gone`: they are `Broke`.
+    Answered { status: u16, retry_after_s: u32, gone: bool },
     /// A frame arrived.
     Frame(Frame),
     /// The stream broke: reset, silence for the limit, EOF or a truncated line before the final frame.
@@ -359,8 +365,10 @@ pub open spec fn op_of(p: Phase) -> Op {
 }
 
 /// The table of answers, as a spec.
-pub open spec fn class_of(op: Op, status: int) -> Class {
-    if 200 <= status && status <= 299 {
+pub open spec fn class_of(op: Op, status: int, gone: bool) -> Class {
+    if gone {
+        Class::Terminal(Fault::SandboxGone)
+    } else if 200 <= status && status <= 299 {
         Class::Ok
     } else if op is Remove && status == 404 {
         Class::Ok
@@ -385,6 +393,13 @@ pub open spec fn ev_status(ev: Event) -> int {
     match ev {
         Event::Answered { status, .. } => status as int,
         _ => -1,
+    }
+}
+
+pub open spec fn ev_gone(ev: Event) -> bool {
+    match ev {
+        Event::Answered { gone, .. } => gone,
+        _ => false,
     }
 }
 
@@ -529,10 +544,10 @@ pub open spec fn fair(s: State, ev: Event, now: u64) -> bool {
     match s.phase {
         Phase::Idle => ev is Go,
         Phase::Backoff => ev is Tick && now >= s.until_ms,
-        Phase::Starting => 200 <= ev_status(ev) && ev_status(ev) <= 299,
-        Phase::Opening => 200 <= ev_status(ev) && ev_status(ev) <= 299,
+        Phase::Starting => 200 <= ev_status(ev) && ev_status(ev) <= 299 && !ev_gone(ev),
+        Phase::Opening => 200 <= ev_status(ev) && ev_status(ev) <= 299 && !ev_gone(ev),
         Phase::Confirming => good_echo(s, ev),
-        Phase::Removing => 200 <= ev_status(ev) && ev_status(ev) <= 299,
+        Phase::Removing => 200 <= ev_status(ev) && ev_status(ev) <= 299 && !ev_gone(ev),
         Phase::ExitHeld => ev is ExitTaken,
         _ => false,
     }
@@ -685,7 +700,7 @@ pub open spec fn post_remove(s: State, ev: Event, now: u64, s2: State, out: Seq<
 /// goes on.
 pub open spec fn post_classify(s: State, ev: Event, s2: State, out: Seq<Action>) -> bool {
     (s.phase is Starting || s.phase is Opening || s.phase is Removing) && ev is Answered ==> {
-        match class_of(op_of(s.phase), ev_status(ev)) {
+        match class_of(op_of(s.phase), ev_status(ev), ev_gone(ev)) {
             Class::Ok => {
                 &&& s2.misses == s.misses
                 &&& s.phase is Removing ==> (s2.phase is Done && out == seq![Action::Finish])
@@ -714,7 +729,7 @@ pub open spec fn post_backoff(s: State, ev: Event, now: u64, s2: State, out: Seq
         _ => true,
     }
     &&& ((s.phase is Starting || s.phase is Opening || s.phase is Removing) && ev is Answered
-        && class_of(op_of(s.phase), ev_status(ev)) is Retry) ==> {
+        && class_of(op_of(s.phase), ev_status(ev), ev_gone(ev)) is Retry) ==> {
         &&& s2.phase is Backoff
         &&& s2.until_ms as int >= min_int(
             now as int + min_int(ev_retry_after_ms(ev), BACKOFF_CAP_MS as int),
@@ -828,12 +843,12 @@ pub open spec fn post_only_these_end(s: State, ev: Event, s2: State, out: Seq<Ac
         && !s.remove_on_exit)
     &&& (ev is Answered && s2.phase is Done && !(s.phase is Done)) ==> {
         &&& s.phase is Starting || s.phase is Opening || s.phase is Removing
-        &&& (class_of(op_of(s.phase), ev_status(ev)) is Terminal || (s.phase is Removing
-            && class_of(op_of(s.phase), ev_status(ev)) is Ok))
+        &&& (class_of(op_of(s.phase), ev_status(ev), ev_gone(ev)) is Terminal || (s.phase is Removing
+            && class_of(op_of(s.phase), ev_status(ev), ev_gone(ev)) is Ok))
     }
     &&& ((s.phase is Starting || s.phase is Opening || s.phase is Removing) && ev is Answered
-        && !(class_of(op_of(s.phase), ev_status(ev)) is Terminal)
-        && !(s.phase is Removing && class_of(op_of(s.phase), ev_status(ev)) is Ok)) ==> !(s2.phase is Done)
+        && !(class_of(op_of(s.phase), ev_status(ev), ev_gone(ev)) is Terminal)
+        && !(s.phase is Removing && class_of(op_of(s.phase), ev_status(ev), ev_gone(ev)) is Ok)) ==> !(s2.phase is Done)
     &&& (s.phase is Streaming && ev is Frame && ev->Frame_0 is Heartbeat) ==> !(s2.phase is Done)
     &&& (s.phase is Streaming && is_output(ev) && s.offset as int + s.pending as int + output_len(ev)
         <= u64::MAX as int) ==> !(s2.phase is Done)
@@ -844,7 +859,11 @@ pub open spec fn post_only_these_end(s: State, ev: Event, s2: State, out: Seq<Ac
     &&& (s.phase is Confirming && good_echo(s, ev)) ==> !(s2.phase is Done)
     &&& ((ev is Broke || ev is Tick) && !(s.phase is Done)) ==> !(s2.phase is Done)
     &&& forall|i: int| 0 <= i < out.len() ==> match #[trigger] out[i] {
-        Action::Fail { fault, .. } => (fault is Deadline) == (ev is Deadline),
+        Action::Fail { fault, .. } => {
+            &&& (fault is Deadline) == (ev is Deadline)
+            // SG: an unreachable endpoint ends nothing; only an authoritative answer does.
+            &&& (fault is SandboxGone) ==> (ev is Answered && ev_gone(ev))
+        },
         _ => true,
     }
 }
@@ -897,31 +916,37 @@ pub fn silence_ms(beat_s: u32) -> (r: u64)
 }
 
 /// What an answer to `op` with `status` means.
-pub fn classify(op: Op, status: u16) -> (c: Class)
+pub fn classify(op: Op, status: u16, gone: bool) -> (c: Class)
     ensures
+        // (j) the sandbox is gone exactly when the answer says so (`gone`): that, and only that, ends the
+        // handle as `SandboxGone`, whatever the status (E2B says it with a 502).
+        gone ==> c == Class::Terminal(Fault::SandboxGone),
+        c == Class::Terminal(Fault::SandboxGone) ==> gone,
         // (a) any 2xx goes on.
-        200 <= status <= 299 ==> c == Class::Ok,
+        (!gone && 200 <= status <= 299) ==> c == Class::Ok,
         // (b) 500 is terminal, whatever the request: a retry would not change it.
-        status == 500 ==> c == Class::Terminal(Fault::Protocol),
+        (!gone && status == 500) ==> c == Class::Terminal(Fault::Protocol),
         // (c) 503 on a start means no pseudo-terminal is free: terminal.
-        (matches!(op, Op::Start) && status == 503) ==> c == Class::Terminal(Fault::NoPty),
+        (!gone && matches!(op, Op::Start) && status == 503) ==> c == Class::Terminal(Fault::NoPty),
         // (d) the busy answers are retried (completeness: a retry class is never terminal).
-        (status == 429 || status == 502 || status == 504 || (status == 503 && !(matches!(op, Op::Start))))
+        (!gone && (status == 429 || status == 502 || status == 504 || (status == 503 && !(matches!(op, Op::Start)))))
             ==> c == Class::Retry,
         // (e) an attach of a job that is gone is `JobGone`.
-        (matches!(op, Op::Attach) && status == 404) ==> c == Class::Terminal(Fault::JobGone),
+        (!gone && matches!(op, Op::Attach) && status == 404) ==> c == Class::Terminal(Fault::JobGone),
         // (f) the start answers that name a cause.
-        (matches!(op, Op::Start) && status == 409) ==> c == Class::Terminal(Fault::JobExists),
-        (matches!(op, Op::Start) && status == 507) ==> c == Class::Terminal(Fault::DiskFull),
+        (!gone && matches!(op, Op::Start) && status == 409) ==> c == Class::Terminal(Fault::JobExists),
+        (!gone && matches!(op, Op::Start) && status == 507) ==> c == Class::Terminal(Fault::DiskFull),
         // (g) the credential is refused.
-        (status == 401 || status == 403) ==> c == Class::Terminal(Fault::Auth),
+        (!gone && (status == 401 || status == 403)) ==> c == Class::Terminal(Fault::Auth),
         // (h) a remove of a job already gone is done.
-        (matches!(op, Op::Remove) && status == 404) ==> c == Class::Ok,
+        (!gone && matches!(op, Op::Remove) && status == 404) ==> c == Class::Ok,
         // (i) nothing else is retried: only the four busy statuses are.
         c is Retry ==> (status == 429 || status == 502 || status == 503 || status == 504),
-        c == class_of(op, status as int),
+        c == class_of(op, status as int, gone),
 {
-    if 200 <= status && status <= 299 {
+    if gone && !cfg!(feature = "mut_gone_ignored") {
+        Class::Terminal(Fault::SandboxGone)
+    } else if 200 <= status && status <= 299 {
         Class::Ok
     } else if matches!(op, Op::Remove) && status == 404 {
         Class::Ok
@@ -1325,7 +1350,7 @@ fn step_request(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<Act
         post_only_these_end(s, ev, r.0, r.1@),
 {
     match ev {
-        Event::Answered { status, retry_after_s } => {
+        Event::Answered { status, retry_after_s, gone } => {
             let op = if matches!(s.phase, Phase::Starting) {
                 Op::Start
             } else if matches!(s.phase, Phase::Removing) {
@@ -1333,7 +1358,7 @@ fn step_request(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<Act
             } else {
                 Op::Attach
             };
-            match classify(op, status) {
+            match classify(op, status, gone) {
                 Class::Ok => {
                     if matches!(s.phase, Phase::Removing) {
                         let mut t = s;
@@ -1359,6 +1384,9 @@ fn step_request(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<Act
             }
         },
         Event::Broke => {
+            if cfg!(feature = "mut_gone_on_silence") {
+                return fail(s, Fault::SandboxGone, 0, true);
+            }
             if cfg!(feature = "mut_start_lost_gives_up") && matches!(s.phase, Phase::Starting) {
                 return fail(s, Fault::Protocol, 0, true);
             }
@@ -1690,6 +1718,36 @@ pub proof fn lemma_exit_progress(s: State, ev: Event, now: u64, s2: State, out: 
     ensures
         s2.phase is ExitHeld,
         rank(s2) <= 2,
+{
+}
+
+/// SG-live (the liveness partner of the refusals that end a handle on an answer): the first authoritative
+/// answer that the sandbox is gone ends the handle in that one step, with `SandboxGone`, whatever the
+/// status. The fairness assumption: the backend answers (`gone` is the answer the shell decoded).
+pub proof fn lemma_gone_ends_in_one_step(s: State, ev: Event, now: u64, s2: State, out: Seq<Action>)
+    requires
+        wf(s),
+        s.phase is Starting || s.phase is Opening || s.phase is Removing,
+        ev is Answered,
+        ev_gone(ev),
+        step_post(s, ev, now, s2, out),
+    ensures
+        s2.phase is Done,
+        fails_with(out, Fault::SandboxGone),
+{
+}
+
+/// SG-silent: an endpoint that cannot be reached ends nothing. A cut, a refused connect and a timeout are
+/// `Broke`, and a tick is the wait ending: neither ever finishes a handle, however many came before.
+pub proof fn lemma_unreachable_never_ends(s: State, ev: Event, now: u64, s2: State, out: Seq<Action>)
+    requires
+        wf(s),
+        !(s.phase is Done),
+        ev is Broke || ev is Tick,
+        step_post(s, ev, now, s2, out),
+    ensures
+        !(s2.phase is Done),
+        forall|i: int| 0 <= i < out.len() ==> !is_fail(#[trigger] out[i]),
 {
 }
 

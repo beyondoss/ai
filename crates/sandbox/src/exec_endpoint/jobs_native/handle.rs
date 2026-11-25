@@ -291,6 +291,7 @@ async fn open(
             Ok(Ev::Answered {
                 status: 200,
                 retry_after_s: 0,
+                gone: false,
             })
         }
         Err(e) => {
@@ -304,6 +305,7 @@ async fn open(
                 return Ok(Ev::Answered {
                     status: st.status,
                     retry_after_s: st.retry_after_s,
+                    gone: says_sandbox_gone(st.status, &st.body),
                 });
             }
             // A request that cannot be made (a heartbeat out of range, an endpoint that does not
@@ -317,6 +319,19 @@ async fn open(
             Ok(Ev::Broke)
         }
     }
+}
+
+/// Whether an answer says, authoritatively, that the sandbox no longer exists: the backend's own refusal,
+/// never silence. E2B answers a request for a sandbox it no longer has with a 502 whose body says the
+/// sandbox "was not found"; a deleted sandbox answers the same way on a 404 or 410. A backend that says it
+/// another way is added here, as a row, with the answer it gives. A connect that is refused, a stream that
+/// is cut and a timeout are never this: they are `Broke`, and the handle waits and tries again.
+fn says_sandbox_gone(status: u16, body: &str) -> bool {
+    if !matches!(status, 404 | 410 | 502) {
+        return false;
+    }
+    let body = body.to_ascii_lowercase();
+    body.contains("sandbox") && (body.contains("not found") || body.contains("deleted"))
 }
 
 /// The next kernel event from the open stream: a frame, or `Broke` when it ended or went quiet.
@@ -398,6 +413,19 @@ fn fault_error(fault: Fault, status: u16, refusal: Option<Refusal>, p: &Payload)
         Fault::JobExists => JobError::Exists { text: body }.into_io(),
         Fault::DiskFull => JobError::DiskFull { text: body }.into_io(),
         Fault::NotOffered => predates("job marks"),
+        // The backend said the sandbox is gone: the same error the unreachable sandbox has always ended in
+        // ("failed after ..."), now only on that answer.
+        Fault::SandboxGone => std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "job stream: the sandbox no longer exists{}",
+                if body.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({body})")
+                }
+            ),
+        ),
         // No caller sends it: a Rust caller's deadline is a dropped future.
         Fault::Deadline => {
             std::io::Error::new(std::io::ErrorKind::TimedOut, "job stream: deadline")

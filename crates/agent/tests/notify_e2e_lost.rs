@@ -122,7 +122,7 @@ async fn a_dead_sandbox_is_noticed_at_the_next_use(mode: Mode) {
     let model_before = f.model_requests();
     f.front
         .set_policy(Some(Arc::new(|_: &SeenCallback| Verdict::Drop)));
-    f.meter.go_down();
+    f.meter.go_dead();
     tokio::time::sleep(Duration::from_secs(5)).await;
     assert_eq!(
         f.model_requests(),
@@ -150,7 +150,7 @@ async fn a_dead_sandbox_is_noticed_at_the_next_use(mode: Mode) {
     let _ws = today.start_job(&unique("today"), command).await;
     today.stream(command).await;
     tokio::time::sleep(Duration::from_millis(1500)).await;
-    today.meter.go_down();
+    today.meter.go_dead();
     let held = today
         .wake_with("failed after", Duration::from_secs(90))
         .await

@@ -235,7 +235,7 @@ impl JobError {
         // A start and an attach are classified by the job client kernel (`job_client::step::classify`,
         // proven in Verus), the one table every SDK shares. A stdin write is not the kernel's: its 409
         // is told apart by the body.
-        let kernel = |op| match job_client::step::classify(op, status) {
+        let kernel = |op| match job_client::step::classify(op, status, false) {
             job_client::step::Class::Terminal(f) => Some(f),
             _ => None,
         };

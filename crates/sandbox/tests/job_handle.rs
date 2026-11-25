@@ -174,3 +174,34 @@ async fn a_front_that_is_down_for_minutes_does_not_end_the_handle() {
     assert_eq!(r.unwrap(), JobEnd::Exit(0));
     assert_eq!(lines, ["started", "out:hello", "attached", "out:world"]);
 }
+
+/// The backend, which is up, says the sandbox is not there (E2B: a 502 whose body says so): that is
+/// the one answer that ends a handle for an unreachable sandbox, on its first sight.
+#[tokio::test]
+async fn an_answer_that_the_sandbox_is_gone_ends_the_handle_at_once() {
+    let front = JobFront::start(script(|i, _| match i {
+        0 => Reply::Stream(vec![started(), out("hello")]),
+        _ => Reply::Status(502, r#"{"message":"The sandbox was not found"}"#.into()),
+    }))
+    .await;
+    let (r, lines) = run(&front, 1000).await;
+    let e = r.unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "{e}");
+    assert!(e.to_string().contains("sandbox no longer exists"), "{e}");
+    assert_eq!(lines, ["started", "out:hello"]);
+    assert_eq!(front.seen.lock().unwrap().len(), 2, "never asked again");
+}
+
+/// A 502 that does not say so is a busy front, however many times it comes: the handle waits.
+#[tokio::test]
+async fn a_bare_502_is_a_busy_front_not_a_gone_sandbox() {
+    let front = JobFront::start(script(|i, _| match i {
+        0 => Reply::Stream(vec![started(), out("hello")]),
+        1..=30 => Reply::Status(502, "bad gateway".into()),
+        _ => Reply::Stream(vec![attached(5), out("world"), r#"{"exit_code":0}"#.into()]),
+    }))
+    .await;
+    let (r, lines) = run(&front, 2000).await;
+    assert_eq!(r.unwrap(), JobEnd::Exit(0));
+    assert_eq!(lines, ["started", "out:hello", "attached", "out:world"]);
+}

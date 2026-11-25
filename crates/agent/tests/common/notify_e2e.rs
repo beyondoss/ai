@@ -128,6 +128,7 @@ pub struct Meter {
     pub url: String,
     chunks: Arc<Mutex<Vec<(Instant, usize)>>>,
     down: Arc<AtomicBool>,
+    dead: Arc<AtomicBool>,
     pumps: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
     opened: Arc<AtomicUsize>,
 }
@@ -143,6 +144,7 @@ impl Meter {
             url: format!("http://{addr}/{path}"),
             chunks: Arc::default(),
             down: Arc::default(),
+            dead: Arc::default(),
             pumps: Arc::default(),
             opened: Arc::default(),
         };
@@ -151,6 +153,10 @@ impl Meter {
             while let Ok((inbound, _)) = listener.accept().await {
                 if m.down.load(Ordering::SeqCst) {
                     drop(inbound);
+                    continue;
+                }
+                if m.dead.load(Ordering::SeqCst) {
+                    tokio::spawn(sandbox_not_found(inbound));
                     continue;
                 }
                 m.opened.fetch_add(1, Ordering::SeqCst);
@@ -194,13 +200,63 @@ impl Meter {
         self.opened.load(Ordering::SeqCst)
     }
 
-    /// The sandbox dies: every open connection is cut and every new one refused.
+    /// The sandbox is gone, and its provider says so: every open connection is cut and every new
+    /// one is answered as a provider's forwarding answers for a sandbox that does not exist (a
+    /// `502` whose JSON body says it was not found). Silence is never this: see [`Self::go_down`].
+    pub fn go_dead(&self) {
+        self.dead.store(true, Ordering::SeqCst);
+        for p in self.pumps.lock().unwrap().drain(..) {
+            p.abort();
+        }
+    }
+
+    /// The front is down: every open connection is cut and every new one refused. Nothing says the
+    /// sandbox is gone.
     pub fn go_down(&self) {
         self.down.store(true, Ordering::SeqCst);
         for p in self.pumps.lock().unwrap().drain(..) {
             p.abort();
         }
     }
+}
+
+/// Answer one request as a provider does for a sandbox that does not exist.
+async fn sandbox_not_found(mut inbound: TcpStream) {
+    let mut seen = Vec::new();
+    let mut buf = vec![0u8; 16 * 1024];
+    // Read the request through its body, so closing does not reset the answer away.
+    loop {
+        let Ok(n) = inbound.read(&mut buf).await else {
+            return;
+        };
+        if n == 0 {
+            return;
+        }
+        seen.extend_from_slice(&buf[..n]);
+        let Some(end) = seen.windows(4).position(|w| w == b"\r\n\r\n") else {
+            continue;
+        };
+        let head = String::from_utf8_lossy(&seen[..end]).to_ascii_lowercase();
+        let len = head
+            .lines()
+            .find_map(|l| {
+                l.strip_prefix("content-length:")?
+                    .trim()
+                    .parse::<usize>()
+                    .ok()
+            })
+            .unwrap_or(0);
+        if seen.len() >= end + 4 + len {
+            break;
+        }
+    }
+    let body = r#"{"message":"The sandbox was not found"}"#;
+    let resp = format!(
+        "HTTP/1.1 502 Bad Gateway\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = inbound.write_all(resp.as_bytes()).await;
+    let _ = inbound.shutdown().await;
 }
 
 async fn pump(
