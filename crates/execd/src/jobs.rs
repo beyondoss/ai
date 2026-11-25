@@ -1130,14 +1130,15 @@ async fn launch_term(
     dir: &Path,
 ) -> Result<TermLead, (u16, &'static str)> {
     // A cap on open terminals (a test's way to the 503 without filling the machine's ptys).
-    if let Some(max) = ctx.opts.terminals_max {
+    let max = ctx.opts.terminals_max.map(|m| m as u64);
+    if max.is_some() {
+        // The start itself is in the table already.
         let open = locked(&ctx.jobs.map)
             .all()
             .into_iter()
             .filter(|(_, c)| matches!(locked(c).k.term, Term::Open { .. }))
-            .count();
-        // The start itself is in the table already.
-        if open > max {
+            .count() as u64;
+        if kernel::pty_cap(open, max) == kernel::Begin::NoPty {
             return Err((503, "no pseudo-terminal is free"));
         }
     }
@@ -1171,7 +1172,11 @@ async fn launch_term(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let (stream, said, frames) = loop {
         let d = dir.to_path_buf();
-        let mut attempt = Box::pin(proc::off_runtime(move || term::connect_sync(&d, pid).ok()));
+        let mut attempt = Box::pin(proc::off_runtime(move || {
+            term::connect_sync(&d, pid)
+                .ok()
+                .and_then(term::Met::answered)
+        }));
         let answered = tokio::select! {
             r = &mut attempt => r,
             st = keeper.wait() => {
@@ -1182,10 +1187,12 @@ async fn launch_term(
                     ctx.groups.remove(keeper.pg());
                     crate::log_warn!("a terminal's keeper ended before it answered: {st:?}");
                     // 124: no pseudo-terminal is free (the table is full, or the kernel is out of memory for one).
-                    return Err(match st {
-                        Ok(s) if s.code() == Some(124) => (503, "no pseudo-terminal is free"),
-                        _ => (500, "cannot start the terminal"),
-                    });
+                    return Err(
+                        match kernel::keeper_ended(st.as_ref().ok().and_then(|s| s.code())) {
+                            kernel::Begin::NoPty => (503, "no pseudo-terminal is free"),
+                            _ => (500, "cannot start the terminal"),
+                        },
+                    );
                 }
                 late
             }
@@ -1676,24 +1683,21 @@ pub(crate) fn recover(ctx: &Arc<Ctx>) {
         // execd must trust: its pid and uid are checked) or it is gone, and it may have left the
         // shell's status.
         let mut conn = None;
-        let keeper = match (&e.term, e.spool.as_deref().map(Path::new)) {
-            (None, _) => Keeper::NotTerminal,
-            (Some(t), Some(dir)) => {
-                let asked = (alive && t.open && e.phase != Saved::Ended)
-                    .then(|| term::connect_sync(dir, t.keeper_pid).ok())
-                    .flatten();
-                match asked {
-                    Some((stream, term::Said::Ready { written, size, .. }, frames)) => {
-                        conn = Some((stream, written, frames, t.keeper_pid));
-                        Keeper::Answered { size }
-                    }
-                    _ => Keeper::Silent {
-                        status: term::read_status(dir),
-                    },
-                }
+        let dir = e.spool.as_deref().map(Path::new);
+        let met = match (&e.term, dir) {
+            (Some(t), Some(dir)) if alive && t.open && e.phase != Saved::Ended => {
+                term::connect_sync(dir, t.keeper_pid).ok()
             }
-            (Some(_), None) => Keeper::Silent { status: None },
+            _ => None,
         };
+        let status = dir.filter(|_| e.term.is_some()).and_then(term::read_status);
+        let keeper =
+            kernel::keeper_of(e.term.is_some(), met.as_ref().map(term::Met::reply), status);
+        if let (Keeper::Answered { .. }, Some(t), Some(m)) = (keeper, &e.term, met)
+            && let Some((stream, term::Said::Ready { written, .. }, frames)) = m.ready
+        {
+            conn = Some((stream, written, frames, t.keeper_pid));
+        }
         let (mut state, how) = kernel::recover(e.state(), alive, keeper, epoch());
         if how == Recovery::Drop {
             continue;

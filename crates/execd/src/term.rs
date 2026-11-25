@@ -30,8 +30,10 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};
 
-use execd_jobs::Size;
-use execd_jobs::keeper::{K, KAct, KEv, Shell, start, step};
+use execd_jobs::keeper::{K, KAct, KEv, Shell, exit_status, start, step};
+use execd_jobs::{
+    Expected, KEEPER_VERSION, Keeper, Peer, PeerCred, Reply, Size, admit_peer, keeper_of,
+};
 
 /// The helper modes this module serves (the `HELPER_FLAG`'s first argument).
 pub(crate) const KEEP: &str = "keep";
@@ -40,8 +42,6 @@ pub(crate) const SESSION: &str = "session";
 pub(crate) const TERM_ENV: &str = "EXECD_TERM_ENV";
 pub(crate) const SOCK: &str = "term.sock";
 pub(crate) const STATUS: &str = "status";
-/// The version of the socket's frames; `Ready` carries it.
-pub(crate) const VERSION: u8 = 1;
 /// The largest frame the keeper takes: a write of at most 128 KiB plus its position.
 const FRAME_MAX: usize = 128 * 1024 + 64;
 
@@ -148,7 +148,7 @@ pub(crate) fn parse_said(tag: u8, p: &[u8]) -> Option<Said> {
 }
 
 fn ready_frame(pgid: i32, k: &K) -> Vec<u8> {
-    let mut p = vec![VERSION];
+    let mut p = vec![KEEPER_VERSION];
     p.extend_from_slice(&pgid.to_le_bytes());
     p.extend_from_slice(&k.written.to_le_bytes());
     p.extend_from_slice(&k.size.cols.to_le_bytes());
@@ -190,7 +190,14 @@ pub(crate) fn keeper_main(args: &[OsString]) -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("execd keeper: {e}");
-            ExitCode::from(if no_pty(&e) { 124 } else { 125 })
+            ExitCode::from(
+                u8::try_from(if no_pty(&e) {
+                    execd_jobs::NO_PTY_EXIT
+                } else {
+                    125
+                })
+                .unwrap_or(u8::MAX),
+            )
         }
     }
 }
@@ -291,8 +298,15 @@ fn keeper(args: &[OsString]) -> io::Result<()> {
                     pending = Some((slice.to_vec(), 0));
                 }
             }
+            if act.kill_shell {
+                eprintln!("execd keeper: the output cannot be written; ending the terminal");
+                let _ = rustix::process::kill_process_group(
+                    rustix::process::Pid::from_raw(pgid).unwrap_or(rustix::process::Pid::INIT),
+                    rustix::process::Signal::KILL,
+                );
+            }
             if act.write_status
-                && let Shell::Reaped { code, signal } = k.shell
+                && let Some((code, signal)) = exit_status(&k)
             {
                 write_status(code, signal);
             }
@@ -304,7 +318,7 @@ fn keeper(args: &[OsString]) -> io::Result<()> {
                 send(&mut conn, &ready_frame(pgid, &k));
             }
             if act.send_exit
-                && let Shell::Reaped { code, signal } = k.shell
+                && let Some((code, signal)) = exit_status(&k)
             {
                 send(&mut conn, &exit_frame(code, signal));
             }
@@ -445,11 +459,18 @@ fn keeper(args: &[OsString]) -> io::Result<()> {
                     }
                     Ok(n) => {
                         let mut off = 0;
-                        while off < n {
+                        while off < n && !k.failed {
                             match rustix::io::write(out, &buf[off..n]) {
                                 Ok(w) => off += w,
                                 Err(Errno::INTR) => {}
-                                Err(_) => break,
+                                Err(_) => {
+                                    // Fail closed (M6): the kernel ends the terminal; what is left to
+                                    // read is dropped, not kept past a gap.
+                                    if event!(KEv::SpoolFailed, &[]) {
+                                        return finish();
+                                    }
+                                    break;
+                                }
                             }
                         }
                     }
@@ -472,8 +493,15 @@ fn keeper(args: &[OsString]) -> io::Result<()> {
         // A new execd (the first, or a restarted one) connects.
         if !r_listen.is_empty() {
             while let Ok((s, _)) = listener.accept() {
-                let ok = rustix::net::sockopt::socket_peercred(&s).is_ok_and(|c| c.uid == me);
-                if !ok {
+                // Execd's uid, any of its processes: the keeper cannot know which one restarted.
+                if admit_peer(
+                    peer_cred(&s),
+                    Expected {
+                        uid: me.as_raw(),
+                        pid: None,
+                    },
+                ) == Peer::Refuse
+                {
                     continue;
                 }
                 if conn.take().is_some() && event!(KEv::ConnLost, &[]) {
@@ -763,19 +791,65 @@ impl Link {
     }
 }
 
-/// Connect to the keeper of the terminal whose spool is `dir`, and read its `Ready`. `Err`: nothing
-/// answered, or what answered is not the keeper this execd started or adopted (`SO_PEERCRED`: its
-/// pid is `keeper_pid`, its uid is ours; the version is known).
-pub(crate) fn connect_sync(dir: &Path, keeper_pid: i32) -> io::Result<(UnixStream, Said, Frames)> {
+/// A socket peer's credentials, as `SO_PEERCRED` read them (`None`: they could not be read).
+fn peer_cred(s: &UnixStream) -> Option<PeerCred> {
+    let c = rustix::net::sockopt::socket_peercred(s).ok()?;
+    Some(PeerCred {
+        uid: c.uid.as_raw(),
+        pid: c.pid.as_raw_nonzero().get(),
+    })
+}
+
+/// What connecting to a keeper found: whom [`execd_jobs::admit_peer`] said the peer was, and, if it
+/// was admitted, its first frame (`Ready`).
+pub(crate) struct Met {
+    pub peer: Peer,
+    pub ready: Option<(UnixStream, Said, Frames)>,
+}
+
+impl Met {
+    /// What answered, as [`keeper_of`] reads it.
+    pub fn reply(&self) -> Reply {
+        Reply {
+            peer: self.peer,
+            ready: match &self.ready {
+                Some((_, Said::Ready { version, size, .. }, _)) => Some((*version, *size)),
+                _ => None,
+            },
+        }
+    }
+
+    /// The connection, if [`keeper_of`] takes the answer as the keeper's.
+    pub fn answered(self) -> Option<(UnixStream, Said, Frames)> {
+        match keeper_of(true, Some(self.reply()), None) {
+            Keeper::Answered { .. } => self.ready,
+            _ => None,
+        }
+    }
+}
+
+/// Connect to the keeper of the terminal whose spool is `dir`, and read its `Ready` if its peer is the
+/// keeper this execd started or adopted ([`execd_jobs::admit_peer`]: its uid is ours and its pid is
+/// `keeper_pid`; nothing is read from any other). `Err`: nothing answered, or what did spoke no `Ready`.
+pub(crate) fn connect_sync(dir: &Path, keeper_pid: i32) -> io::Result<Met> {
     let d = std::fs::File::open(dir)?;
     let path = format!("/proc/self/fd/{}/{SOCK}", d.as_raw_fd());
     let s = UnixStream::connect(path)?;
     drop(d);
-    let cred = rustix::net::sockopt::socket_peercred(&s)?;
-    if cred.uid != rustix::process::getuid() || cred.pid.as_raw_nonzero().get() != keeper_pid {
-        return Err(io::Error::other(
-            "the socket's peer is not this terminal's keeper",
-        ));
+    connect_checked(
+        s,
+        Expected {
+            uid: rustix::process::getuid().as_raw(),
+            pid: Some(keeper_pid),
+        },
+    )
+}
+
+/// [`connect_sync`] over a connected socket and the peer it expects.
+pub(crate) fn connect_checked(s: UnixStream, expected: Expected) -> io::Result<Met> {
+    let peer = admit_peer(peer_cred(&s), expected);
+    if peer == Peer::Refuse {
+        return Ok(Met { peer, ready: None });
     }
     s.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
     let mut frames = Frames::default();
@@ -783,17 +857,16 @@ pub(crate) fn connect_sync(dir: &Path, keeper_pid: i32) -> io::Result<(UnixStrea
     let mut b = [0u8; 64];
     loop {
         if let Some((tag, p)) = frames.next()? {
-            match parse_said(tag, &p) {
-                Some(r @ Said::Ready { version, .. }) if version == VERSION => {
+            return match parse_said(tag, &p) {
+                Some(r @ Said::Ready { .. }) => {
                     s.set_read_timeout(None)?;
-                    return Ok((s, r, frames));
+                    Ok(Met {
+                        peer,
+                        ready: Some((s, r, frames)),
+                    })
                 }
-                _ => {
-                    return Err(io::Error::other(
-                        "the keeper's first frame is not a known Ready",
-                    ));
-                }
-            }
+                _ => Err(io::Error::other("the keeper's first frame is not a Ready")),
+            };
         }
         let n = s2.read(&mut b)?;
         if n == 0 {
@@ -807,6 +880,79 @@ pub(crate) fn connect_sync(dir: &Path, keeper_pid: i32) -> io::Result<(UnixStrea
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    fn pair_with(frame: &[u8]) -> UnixStream {
+        let (a, mut b) = UnixStream::pair().unwrap();
+        b.write_all(frame).unwrap();
+        // `b` stays open until the test ends.
+        std::mem::forget(b);
+        a
+    }
+
+    fn ready(version: u8) -> Vec<u8> {
+        let mut f = ready_frame(7, &start(Size { cols: 80, rows: 24 }));
+        f[5] = version;
+        f
+    }
+
+    /// P1: a peer whose uid or pid is not the expected one is refused and nothing it says is read; the
+    /// expected one is admitted and its `Ready` taken as the keeper's answer. A socket pair's peer is
+    /// this very process, so the credentials are ours: a different uid or pid is an impostor.
+    #[test]
+    fn a_peer_of_another_uid_or_pid_is_refused_and_the_expected_one_is_admitted() {
+        let (uid, pid) = (
+            rustix::process::getuid().as_raw(),
+            i32::try_from(std::process::id()).unwrap(),
+        );
+        let ok = Expected {
+            uid,
+            pid: Some(pid),
+        };
+        let met = connect_checked(pair_with(&ready(KEEPER_VERSION)), ok).unwrap();
+        assert_eq!(met.peer, Peer::Admit);
+        assert!(met.answered().is_some(), "the expected peer was not taken");
+        // Any pid of the uid (the keeper's side).
+        let any = Expected { uid, pid: None };
+        let met = connect_checked(pair_with(&ready(KEEPER_VERSION)), any).unwrap();
+        assert_eq!(met.peer, Peer::Admit);
+        for wrong in [
+            Expected {
+                uid: uid.wrapping_add(1),
+                pid: Some(pid),
+            },
+            Expected {
+                uid: uid.wrapping_add(1),
+                pid: None,
+            },
+            Expected {
+                uid,
+                pid: Some(pid + 1),
+            },
+        ] {
+            let met = connect_checked(pair_with(&ready(KEEPER_VERSION)), wrong).unwrap();
+            assert_eq!(met.peer, Peer::Refuse, "{wrong:?}");
+            assert!(met.ready.is_none(), "a refused peer was read: {wrong:?}");
+            assert!(met.answered().is_none());
+        }
+    }
+
+    /// T6a: a peer that is admitted but speaks a version this execd does not know is not the keeper's
+    /// answer: the terminal is hung up, not adopted.
+    #[test]
+    fn an_unknown_version_is_not_an_answer() {
+        let uid = rustix::process::getuid().as_raw();
+        let pid = i32::try_from(std::process::id()).unwrap();
+        let met = connect_checked(
+            pair_with(&ready(KEEPER_VERSION + 1)),
+            Expected {
+                uid,
+                pid: Some(pid),
+            },
+        )
+        .unwrap();
+        assert_eq!(met.peer, Peer::Admit);
+        assert!(met.answered().is_none());
+    }
 
     #[test]
     fn frames_round_trip_across_any_split() {
@@ -833,7 +979,7 @@ mod tests {
         assert_eq!(
             parse_said(tag, &p),
             Some(Said::Ready {
-                version: VERSION,
+                version: KEEPER_VERSION,
                 pgid: 1234,
                 written: 0,
                 size: Size { cols: 80, rows: 24 }

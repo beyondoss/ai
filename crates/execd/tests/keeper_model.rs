@@ -16,13 +16,15 @@
 //! - K1 the shell's exit is told only after everything it printed before exiting was copied to the
 //!   output.
 //! - K2 once the shell is reaped and the master reads `EIO`, the keeper ends in that very step.
+//! - M6 a spool that cannot be written ends the terminal: the shell is killed once, and the status told
+//!   is the failure's, whatever the shell did.
 //!
 //! Each `mut_*` of the keeper kernel (`the_mutation_turns_its_property_red`) turns one red.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use execd::job_kernel::Size;
-use execd::job_kernel::keeper::{K, KAct, KEv, Shell, start, step};
+use execd::job_kernel::keeper::{K, KAct, KEv, SPOOL_FAILED_CODE, Shell, exit_status, start, step};
 use stateright::{Checker, Model, Property};
 
 /// The stream execd means to write: byte `i` is the value `i`, so a replay or a skip is visible.
@@ -52,6 +54,10 @@ struct St {
     pending: Vec<u8>,
     /// Connections execd made, so far.
     conns: u8,
+    /// How many times the kernel told the keeper to kill the shell.
+    kills: u8,
+    /// A write to the spool failed (the environment's fact; the kernel is told by `SpoolFailed`).
+    broke: bool,
     bad: u8,
 }
 
@@ -70,6 +76,8 @@ enum A {
     /// execd sends the stream's bytes `[at, at + len)`.
     Send(u8, u8),
     Land,
+    /// A write of the output to the spool fails.
+    SpoolFails,
 }
 
 struct M;
@@ -82,6 +90,9 @@ impl St {
         }
         if act.exit {
             self.gone = true;
+        }
+        if act.kill_shell {
+            self.kills += 1;
         }
         act
     }
@@ -104,6 +115,8 @@ impl Model for M {
             delivered: Vec::new(),
             pending: Vec::new(),
             conns: 0,
+            kills: 0,
+            broke: false,
             bad: 0,
         }]
     }
@@ -138,6 +151,9 @@ impl Model for M {
         }
         if !s.pending.is_empty() && !s.k.eio {
             out.push(A::Land);
+        }
+        if !s.k.failed {
+            out.push(A::SpoolFails);
         }
     }
 
@@ -192,6 +208,17 @@ impl Model for M {
                     s.pending = (from..from + take).map(|b| b as u8).collect();
                 }
             }
+            A::SpoolFails => {
+                s.broke = true;
+                // The keeper performs the kill the kernel names: the shell dies by `SIGKILL`.
+                if s.run(KEv::SpoolFailed).kill_shell && s.shell_alive {
+                    s.shell_alive = false;
+                    s.run(KEv::ChildExit {
+                        code: 137,
+                        signal: Some(9),
+                    });
+                }
+            }
             A::Land => {
                 let byte = s.pending.remove(0);
                 s.delivered.push(byte);
@@ -228,6 +255,15 @@ impl Model for M {
                         && s.k.eio
                         && (s.k.seen || s.k.orphan))
                         || s.gone
+                },
+            ),
+            Property::always(
+                "M6: a failed spool kills the shell once and ends with the failure's code",
+                |_, s: &St| {
+                    s.kills <= 1
+                        && (!s.broke || (s.k.failed && !s.shell_alive))
+                        && (!(s.broke && matches!(s.k.shell, Shell::Reaped { .. }))
+                            || exit_status(&s.k) == Some((SPOOL_FAILED_CODE, None)))
                 },
             ),
             // T5-live, bounded: whenever a write could still be sent and the keeper is up, the bytes
@@ -271,6 +307,8 @@ fn faithful_keeper() {
     feature = "mut_keeper_waits_forever",
     feature = "mut_keeper_exits_unasked",
     feature = "mut_keeper_reconnect_resets_written",
+    feature = "mut_spool_failure_silent",
+    feature = "mut_spool_failure_keeps_code",
     feature = "mut_stdin_replays",
     feature = "mut_stdin_apply_off_start"
 ))]
@@ -282,6 +320,10 @@ fn the_mutation_turns_its_property_red() {
         "K2: "
     } else if cfg!(feature = "mut_keeper_exits_unasked") {
         "K2b: "
+    } else if cfg!(feature = "mut_spool_failure_silent")
+        || cfg!(feature = "mut_spool_failure_keeps_code")
+    {
+        "M6: "
     } else {
         "T5: "
     };
@@ -322,6 +364,11 @@ fn the_keeper_calls_the_kernel() {
         "KEv::Conn",
         "KEv::ConnLost",
         "KEv::ParentGone",
+        "KEv::SpoolFailed",
+        "admit_peer(",
+        "keeper_of(",
+        "act.kill_shell",
+        "exit_status(&k)",
         "act.apply",
         "act.set_size",
         "act.write_status",
@@ -338,6 +385,7 @@ fn the_keeper_calls_the_kernel() {
         "k.drained =",
         "k.status_written =",
         "k.exit_sent =",
+        "k.failed =",
     ] {
         assert!(
             !prod.contains(banned),

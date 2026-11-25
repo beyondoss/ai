@@ -44,6 +44,8 @@ pub struct K {
     /// retried across a restart of execd is still applied once.
     pub written: u64,
     pub size: Size,
+    /// The spool could not be written: the output is no longer kept, so the terminal ends (M6).
+    pub failed: bool,
 }
 
 /// What the keeper learns.
@@ -68,6 +70,8 @@ pub enum KEv {
     ConnLost,
     /// The process that started the keeper ended.
     ParentGone,
+    /// A write of the terminal's output to the spool failed (no space, no device).
+    SpoolFailed,
 }
 
 /// What the keeper does, all of it in this order: apply, size, status, exit frame, ready, end.
@@ -84,8 +88,34 @@ pub struct KAct {
     pub send_exit: bool,
     /// Tell execd the keeper's state (`Ready`).
     pub send_ready: bool,
+    /// `SIGKILL` the shell's session: its output has nowhere to go.
+    pub kill_shell: bool,
     /// The keeper ends.
     pub exit: bool,
+}
+
+/// The code a terminal ends with when its output could not be kept: `EX_IOERR`, never a shell's own
+/// status, so the reader sees why.
+pub const SPOOL_FAILED_CODE: i32 = 74;
+
+/// M6: the status the keeper writes and tells (`(code, signal)`), once the shell is reaped: the shell's
+/// own, or [`SPOOL_FAILED_CODE`] with no signal if the spool failed, whatever the shell did.
+pub fn exit_status(k: &K) -> (r: Option<(i32, Option<i32>)>)
+    ensures
+        k.shell is Running ==> r is None,
+        k.shell is Reaped && k.failed ==> r == Some((SPOOL_FAILED_CODE, None::<i32>)),
+        k.shell is Reaped && !k.failed ==> r == Some((k.shell->Reaped_code, k.shell->Reaped_signal)),
+{
+    match k.shell {
+        Shell::Running => None,
+        Shell::Reaped { code, signal } => {
+            if k.failed && !cfg!(feature = "mut_spool_failure_keeps_code") {
+                Some((SPOOL_FAILED_CODE, None))
+            } else {
+                Some((code, signal))
+            }
+        },
+    }
 }
 
 /// The state's own invariant, which every step keeps.
@@ -104,7 +134,7 @@ pub fn start(size: Size) -> (k: K)
         k.size == size,
         !k.conn,
 {
-    K { shell: Shell::Running, eio: false, drained: false, status_written: false, exit_sent: false, conn: false, seen: false, orphan: false, written: 0, size }
+    K { shell: Shell::Running, eio: false, drained: false, status_written: false, exit_sent: false, conn: false, seen: false, orphan: false, written: 0, size, failed: false }
 }
 
 /// K1, K2, T5: what one event does to a keeper.
@@ -142,6 +172,12 @@ pub fn step(k: &mut K, ev: KEv) -> (act: KAct)
             && act.set_size == Some(ev->Resize_size)),
         !(ev is Resize) ==> final(k).size == old(k).size,
         act.set_size is Some ==> (ev is Resize && crate::in_bounds(ev->Resize_size)),
+        // M6: a spool that failed is final, and the shell it fed is killed, once, in that very step.
+        ev is SpoolFailed ==> final(k).failed,
+        old(k).failed ==> final(k).failed,
+        !(ev is SpoolFailed) ==> final(k).failed == old(k).failed,
+        act.kill_shell ==> (ev is SpoolFailed && !old(k).failed && old(k).shell is Running),
+        ev is SpoolFailed && !old(k).failed && old(k).shell is Running ==> act.kill_shell,
         // K1.
         act.write_status ==> (final(k).shell is Reaped && final(k).drained && final(k).status_written
             && !old(k).status_written
@@ -164,6 +200,7 @@ pub fn step(k: &mut K, ev: KEv) -> (act: KAct)
     let mut apply: Option<(u64, u64)> = None;
     let mut set_size: Option<Size> = None;
     let mut send_ready = false;
+    let mut kill_shell = false;
     match ev {
         KEv::ChildExit { code, signal } => {
             if let Shell::Running = k.shell {
@@ -216,6 +253,15 @@ pub fn step(k: &mut K, ev: KEv) -> (act: KAct)
         KEv::ConnLost => {
             k.conn = false;
         },
+        KEv::SpoolFailed => {
+            if !cfg!(feature = "mut_spool_failure_silent") {
+                kill_shell = !k.failed && match k.shell {
+                    Shell::Running => true,
+                    Shell::Reaped { .. } => false,
+                };
+                k.failed = true;
+            }
+        },
     }
     let drained = if cfg!(feature = "mut_exit_before_drain") {
         match k.shell {
@@ -241,7 +287,7 @@ pub fn step(k: &mut K, ev: KEv) -> (act: KAct)
         && k.status_written
         && (k.exit_sent || !k.conn)
         && (k.seen || k.orphan || cfg!(feature = "mut_keeper_exits_unasked"));
-    KAct { apply, set_size, write_status, send_exit, send_ready, exit }
+    KAct { apply, set_size, write_status, send_exit, send_ready, kill_shell, exit }
 }
 
 } // verus!

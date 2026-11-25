@@ -570,12 +570,43 @@ pub open spec fn post_act(old: State, ev: Ev, act: Act) -> bool {
         ==> act is Nothing)
 }
 
+/// T14: what a `resize` to `z` does to a job, as a spec: an open terminal of a job that has not ended
+/// takes a size inside the bounds, applied at once if the job runs; any other resize changes nothing.
+pub open spec fn resized(old: State, z: Size) -> State {
+    if old.term is Open && !(old.phase is Ended) && in_bounds(z) {
+        State { term: Term::Open { size: z, applied: !(old.phase is Spawning) }, ..old }
+    } else {
+        old
+    }
+}
+
+/// T14: what the shell does for that resize: set the size on the keeper, once the job runs.
+pub open spec fn resize_act(old: State, z: Size) -> Act {
+    if old.term is Open && !(old.phase is Ended) && in_bounds(z) && !(old.phase is Spawning) {
+        Act::Resize { size: z }
+    } else {
+        Act::Nothing
+    }
+}
+
+/// T14, idempotence: a resize asked twice is a resize asked once: the second leaves the job exactly as
+/// the first did, and tells the shell the very same thing (the size, again: it is the terminal's own
+/// `TIOCSWINSZ`, so a program that changed its own window size is put back).
+pub proof fn lemma_resize_idempotent(s: State, z: Size)
+    ensures
+        resized(resized(s, z), z) == resized(s, z),
+        resize_act(resized(s, z), z) == resize_act(s, z),
+{
+}
+
 /// Apply `ev` to `s` and say what to do. Total: an event that does not fit the phase changes
 /// nothing. Time arrives in the event.
 pub fn step(s: &mut State, ev: Ev) -> (act: Act)
     ensures
         post_life(*old(s), ev, *final(s)),
         post_act(*old(s), ev, act),
+        ev is Resize ==> (*final(s) == resized(*old(s), ev->Resize_size)
+            && act == resize_act(*old(s), ev->Resize_size)),
 {
     match ev {
         Ev::Spawned { pgid } => {
@@ -703,7 +734,12 @@ pub fn step(s: &mut State, ev: Ev) -> (act: Act)
                     if cfg!(feature = "mut_resize_lost_while_spawning") && !running {
                         return Act::Nothing;
                     }
-                    s.term = Term::Open { size, applied: running };
+                    let again = match s.term {
+                        Term::Open { size: z, applied } => applied && z.cols == size.cols && z.rows == size.rows,
+                        _ => false,
+                    };
+                    // `mut_resize_not_idempotent`: a size the terminal already has is recorded as not applied.
+                    s.term = Term::Open { size, applied: running && !(cfg!(feature = "mut_resize_not_idempotent") && again) };
                     return if running { Act::Resize { size } } else { Act::Nothing };
                 }
             }
@@ -1032,6 +1068,177 @@ pub proof fn lemma_recover_idempotent(s: State, alive: bool, keeper: Keeper, now
     ensures
         recover_spec(recover_spec(s, alive, keeper, now).0, alive2, keeper2, now2) == recover_spec(s, alive, keeper, now),
 {
+}
+
+// ---------------------------------------------------------------------------------------------
+// A terminal's keeper: who may talk to it, who answered, and what a start that cannot have one says.
+// ---------------------------------------------------------------------------------------------
+
+/// A socket peer's credentials, as `SO_PEERCRED` read them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PeerCred {
+    pub uid: u32,
+    pub pid: i32,
+}
+
+/// Who a socket's peer must be: this `uid`, and this `pid` if one is expected (`None`: any process of
+/// that uid; the keeper knows its execd's uid, execd knows its keeper's pid too).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Expected {
+    pub uid: u32,
+    pub pid: Option<i32>,
+}
+
+/// Whether to talk to a socket's peer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Peer {
+    Admit,
+    Refuse,
+}
+
+/// The property of [`admit_peer`], as a spec.
+pub open spec fn peer_ok(cred: Option<PeerCred>, e: Expected) -> bool {
+    cred is Some && cred.unwrap().uid == e.uid && (e.pid is None || e.pid.unwrap() == cred.unwrap().pid)
+}
+
+/// P1: a peer is admitted exactly when its credentials were read, its uid is the expected one and, where
+/// a pid is expected, it is that pid. Whatever else (a failed read, another uid, another pid) is
+/// refused: fail closed. The keeper (accepting execd) and execd (connecting to its keeper) both ask.
+/// P1-live (completeness, the partner of every refusal): a peer that is the expected one is always
+/// admitted ([`lemma_admit_peer_complete`]), so a refusal of an impostor never turns the right peer away.
+pub fn admit_peer(cred: Option<PeerCred>, expected: Expected) -> (r: Peer)
+    ensures
+        r is Admit <==> peer_ok(cred, expected),
+{
+    if cfg!(feature = "mut_admit_any_peer") {
+        return Peer::Admit;
+    }
+    match cred {
+        Some(c) => {
+            if c.uid == expected.uid && match expected.pid {
+                Some(p) => p == c.pid,
+                None => true,
+            } {
+                Peer::Admit
+            } else {
+                Peer::Refuse
+            }
+        },
+        None => Peer::Refuse,
+    }
+}
+
+/// P1-live: the expected peer satisfies [`peer_ok`] (so [`admit_peer`] admits it).
+pub proof fn lemma_admit_peer_complete(cred: PeerCred, e: Expected)
+    requires
+        cred.uid == e.uid,
+        e.pid is None || e.pid.unwrap() == cred.pid,
+    ensures
+        peer_ok(Some(cred), e),
+{
+}
+
+/// The keeper protocol's version, which the keeper's `Ready` says and execd knows.
+pub const KEEPER_VERSION: u8 = 1;
+
+/// What answered execd's connect to a terminal's keeper: whom it was (`peer`) and, if it was admitted
+/// and spoke, its `Ready` (protocol version and size).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Reply {
+    pub peer: Peer,
+    pub ready: Option<(u8, Size)>,
+}
+
+/// T6a: what a restarted execd learns of a saved job's terminal. A job with none is `NotTerminal`; one
+/// with a terminal is `Answered` (at the size its keeper said) exactly when its keeper answered, as the
+/// peer execd expected (admitted) and in a version execd knows; every other case is `Silent`, with the
+/// status the dead keeper left (`status`). So [`recover`]'s T6 (an adopted terminal is open only if its
+/// keeper answered) is a statement about the peer's answer, not about the shell's reading of it.
+pub fn keeper_of(has_term: bool, reply: Option<Reply>, status: Option<(i32, Option<i32>)>) -> (r: Keeper)
+    ensures
+        !has_term ==> r is NotTerminal,
+        has_term ==> (r is Answered <==> (reply is Some && reply.unwrap().peer is Admit
+            && reply.unwrap().ready is Some && reply.unwrap().ready.unwrap().0 == KEEPER_VERSION)),
+        r is Answered ==> r->Answered_size == reply.unwrap().ready.unwrap().1,
+        has_term && !(r is Answered) ==> r == (Keeper::Silent { status }),
+{
+    if !has_term {
+        return Keeper::NotTerminal;
+    }
+    if let Some(Reply { peer, ready: Some((version, size)) }) = reply {
+        let admitted = match peer {
+            Peer::Admit => true,
+            Peer::Refuse => false,
+        };
+        if (admitted && version == KEEPER_VERSION) || cfg!(feature = "mut_keeper_answer_unchecked") {
+            return Keeper::Answered { size };
+        }
+    }
+    Keeper::Silent { status }
+}
+
+/// Why a start of a terminal does not go on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Begin {
+    /// It goes on.
+    Go,
+    /// No pseudo-terminal is free (503): retry once one is.
+    NoPty,
+    /// The terminal could not be started (500).
+    Failed,
+}
+
+/// The exit status of a keeper that found no pseudo-terminal to open.
+pub const NO_PTY_EXIT: i32 = 124;
+
+/// The property of [`pty_cap`], as a spec.
+pub open spec fn cap_refuses(open: u64, max: Option<u64>) -> bool {
+    max is Some && open > max.unwrap()
+}
+
+/// M1: a start is refused `NoPty` (503) exactly when a cap on open terminals is set and the terminals
+/// open, the start's own included, are more than it. Never `Failed`.
+pub fn pty_cap(open: u64, max: Option<u64>) -> (r: Begin)
+    ensures
+        r is NoPty <==> cap_refuses(open, max),
+        r is Go <==> !cap_refuses(open, max),
+{
+    match max {
+        Some(m) => if open > m && !cfg!(feature = "mut_pty_cap_ignored") { Begin::NoPty } else { Begin::Go },
+        None => Begin::Go,
+    }
+}
+
+/// M1-live: each open terminal's end lowers the refusal's rank until it is zero, which is exactly no
+/// refusal: a retried start is admitted once enough terminals have ended (F4: an open terminal ends,
+/// by its job's end or its hangup; the ranking function is how many must).
+pub open spec fn cap_rank(open: u64, max: u64) -> int {
+    if open > max { open as int - max as int } else { 0int }
+}
+
+pub proof fn lemma_pty_cap_progress(open: u64, max: u64)
+    requires
+        cap_refuses(open, Some(max)),
+    ensures
+        cap_rank(open, max) > 0,
+        cap_rank((open - 1) as u64, max) < cap_rank(open, max),
+        cap_rank((open - 1) as u64, max) == 0 ==> !cap_refuses((open - 1) as u64, Some(max)),
+{
+}
+
+/// M1: a keeper that ended before it answered, with this exit code, is `NoPty` (503) when the code is
+/// [`NO_PTY_EXIT`] (it found no pseudo-terminal to open) and `Failed` (500) otherwise; never `Go`. The
+/// completeness half: the code that means "no pty" is always 503 (`code == Some(124)`).
+pub fn keeper_ended(code: Option<i32>) -> (r: Begin)
+    ensures
+        r is NoPty <==> code == Some(NO_PTY_EXIT),
+        r is Failed <==> code != Some(NO_PTY_EXIT),
+{
+    if code == Some(NO_PTY_EXIT) && !cfg!(feature = "mut_keeper_no_pty_is_500") {
+        Begin::NoPty
+    } else {
+        Begin::Failed
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

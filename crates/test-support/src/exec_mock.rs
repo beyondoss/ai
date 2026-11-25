@@ -448,7 +448,7 @@ impl ExecMock {
         };
         let addr = listener.local_addr().expect("addr");
         let handle = execd::serve(listener, make()).expect("execd serves");
-        let mock = Self {
+        Self {
             url,
             requests,
             streams,
@@ -459,8 +459,7 @@ impl ExecMock {
                 make,
                 dirs,
             }))),
-        };
-        mock
+        }
     }
 
     /// execd behind a filter that takes away the job-protocol additions `opts` turns off, so that
@@ -539,13 +538,14 @@ impl ExecMock {
                 continue;
             };
             let text = String::from_utf8_lossy(&raw).replace('\0', " ");
-            if text.contains("--execd-run-as-helper keep ") && text.contains(&needle) {
-                if let Ok(pid) = e.file_name().to_string_lossy().parse::<i32>() {
-                    let _ = std::process::Command::new("kill")
-                        .args(["-KILL", &pid.to_string()])
-                        .status();
-                    n += 1;
-                }
+            if text.contains("--execd-run-as-helper keep ")
+                && text.contains(&needle)
+                && let Ok(pid) = e.file_name().to_string_lossy().parse::<i32>()
+            {
+                let _ = std::process::Command::new("kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .status();
+                n += 1;
             }
         }
         Ok(n)

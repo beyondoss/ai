@@ -55,8 +55,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use execd::job_kernel::{
-    self as kernel, Act, Admit, Alive, Ev, Follow, Gate, Keeper, Key, Phase, Pick, Recovery,
-    Resizable, Size, State, Term,
+    self as kernel, Act, Admit, Alive, Ev, Follow, Gate, Key, Phase, Pick, Recovery, Resizable,
+    Size, State, Term,
 };
 use stateright::{Checker, Model, Property};
 
@@ -902,15 +902,13 @@ impl Model for Jobs {
                 let alive = sim.alive();
                 let answered =
                     sim.term && sim.keeper && alive && matches!(sim.k.term, Term::Open { .. });
-                let keeper = if !sim.term {
-                    Keeper::NotTerminal
-                } else if answered {
-                    Keeper::Answered {
-                        size: sim.applied.unwrap_or(START),
-                    }
-                } else {
-                    Keeper::Silent { status: None }
-                };
+                // The kernel reads what answered (the production adoption's own function): a keeper
+                // that is up answers as the peer execd expects, in the version it knows.
+                let reply = answered.then(|| kernel::Reply {
+                    peer: kernel::Peer::Admit,
+                    ready: Some((kernel::KEEPER_VERSION, sim.applied.unwrap_or(START))),
+                });
+                let keeper = kernel::keeper_of(sim.term, reply, None);
                 let before = sim.k.clone();
                 let (after, how) = kernel::recover(before.clone(), alive, keeper, 2);
                 sim.k = after;
@@ -1414,6 +1412,9 @@ fn production_calls_the_kernel() {
         "kernel::resizable(",
         "kernel::size_ok(",
         "kernel::sinks(",
+        "kernel::keeper_of(",
+        "kernel::pty_cap(",
+        "kernel::keeper_ended(",
         "Ev::Resize {",
         "Ev::Hangup",
         "Pick::",

@@ -184,6 +184,15 @@ once. On the shell's exit the keeper drains the master, writes `<spool>/status` 
 when the master reads `EIO` (no slave open anywhere). A restarted execd asks each saved terminal's keeper (`recover`: the
 ledger entry has the keeper's pid and the size): an answer is adopted open at the keeper's size; none is hung up
 (`pty.open: false`; input and resize 409), and a dead keeper's `status` is the shell's real code where a plain job's is lost.
+Who may talk to whom is the kernel's `admit_peer` (P1), asked at both ends: the keeper admits a peer of execd's uid, execd a
+peer of its uid whose pid is the keeper's (the ledger's `keeper_pid`); a failed credential read, another uid or another pid is
+refused, and nothing is read from a refused peer. Which answer counts as the keeper's is `keeper_of` (T6a): an admitted peer's
+`Ready` in a version execd knows (`KEEPER_VERSION`). Adoption and the start's own wait for `Ready` both call it. A keeper
+whose spool cannot be written (no space, no device) fails closed (M6): the kernel kills the shell's session once, and the
+status the keeper writes and tells is `SPOOL_FAILED_CODE` (74, no signal), so the reader sees an end with that code instead
+of a terminal that looks alive with its output gone. A start refused for want of a pty is `pty_cap` / `keeper_ended` (M1: 503
+when a keeper exits 124 or the test cap is passed, else 500). A resize is idempotent (T14): asked twice at one size it leaves
+the job as asked once.
 A hung-up terminal is still a job: it ends when its processes do. A held terminal nobody kept dies with its client, every
 process of its session included (`Kill{marked}`).
 
@@ -311,6 +320,13 @@ cargo test -p beyond-execd --features <mut> --test job_model the_mutation   # ea
 | `mut_exit_before_drain`               | K1 (Verus on `keeper::step`; `keeper_model`)                          |
 | `mut_keeper_waits_forever`            | K2 (Verus on `keeper::step`; `keeper_model`)                          |
 | `mut_keeper_reconnect_resets_written` | T5b (Verus on `keeper::step`; `keeper_model`)                         |
+| `mut_admit_any_peer`                  | P1 (Verus on `admit_peer`)                                            |
+| `mut_pty_cap_ignored`                 | M1 (Verus on `pty_cap`)                                               |
+| `mut_keeper_no_pty_is_500`            | M1 (Verus on `keeper_ended`)                                          |
+| `mut_keeper_answer_unchecked`         | T6a (Verus on `keeper_of`)                                            |
+| `mut_resize_not_idempotent`           | T14 (Verus on `step`, `resized`)                                      |
+| `mut_spool_failure_silent`            | M6 (Verus on `keeper::step`; `keeper_model`; `tests/pty.rs`)          |
+| `mut_spool_failure_keeps_code`        | M6 (Verus on `keeper::exit_status`; `keeper_model`; `tests/pty.rs`)   |
 
 ### The OS boundary (J11)
 

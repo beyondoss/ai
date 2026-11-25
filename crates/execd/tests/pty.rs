@@ -312,6 +312,17 @@ async fn a_resize_reaches_the_program_and_its_bounds_are_enforced() {
 /// the output continues at the same offsets.
 #[tokio::test]
 async fn a_terminal_survives_a_restart_of_execd_with_its_offsets_and_its_shell() {
+    survives(nix::sys::signal::Signal::SIGHUP).await;
+}
+
+/// The same, when execd is killed (`SIGKILL`, a crash: it records and signals nothing on the way
+/// out): the ledger it saved at each change is what the next one adopts from.
+#[tokio::test]
+async fn a_terminal_survives_a_crash_of_execd_and_is_adopted() {
+    survives(nix::sys::signal::Signal::SIGKILL).await;
+}
+
+async fn survives(sig: nix::sys::signal::Signal) {
     let state = tempfile::tempdir().unwrap();
     let ledger = state.path().join("ledger");
     let (mut first, jobs) = start_execd(&[("EXECD_STATE_DIR", ledger.to_str().unwrap())]);
@@ -324,7 +335,7 @@ async fn a_terminal_survives_a_restart_of_execd_with_its_offsets_and_its_shell()
     let end_before = v["end"].as_u64().unwrap();
     nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(i32::try_from(first.child.id()).unwrap()),
-        nix::sys::signal::Signal::SIGHUP,
+        sig,
     )
     .unwrap();
     first.child.wait().unwrap();
@@ -428,6 +439,213 @@ async fn a_terminal_whose_keeper_died_is_hung_up() {
     // The partner: a new terminal opens.
     term(a, "h2", "echo again", 80, 24).await;
     read_until(a, "h2", "again").await;
+}
+
+/// M6: a keeper whose spool cannot be written fails closed: it kills the shell, and the end it writes
+/// and tells execd is the failure's (code 74, no signal), not the shell's own `SIGKILL` and not a
+/// terminal that looks alive with its output silently gone. The spool here is `/dev/full`.
+#[tokio::test]
+async fn a_keeper_whose_spool_cannot_be_written_ends_the_terminal_with_the_failures_code() {
+    use std::io::Read as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .unwrap();
+    /// Ends the keeper however the test ends (its master closing hangs the shell up).
+    struct Reap(std::process::Child);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut keeper = std::process::Command::new(support::BIN)
+        .args(["--execd-run-as-helper", "keep"])
+        .arg(dir.path())
+        .args([
+            "80",
+            "24",
+            "-",
+            "-",
+            "-",
+            "/bin/sh",
+            "-c",
+            "echo hi; sleep 300",
+        ])
+        // The shell's environment, as execd hands it over (hex of a JSON list of pairs).
+        .env(
+            "EXECD_TERM_ENV",
+            r#"[["PATH","/usr/bin:/bin"]]"#.bytes().map(|b| format!("{b:02x}")).collect::<String>(),
+        )
+        .stdin(std::process::Stdio::null())
+        .stdout(full)
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(Reap)
+        .unwrap();
+    // Execd's part: connect (this process started the keeper) and read frames until `Exit`.
+    let sock = dir.path().join("term.sock");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut s = loop {
+        match std::os::unix::net::UnixStream::connect(&sock) {
+            Ok(s) => break s,
+            Err(e) => {
+                assert!(Instant::now() < deadline, "the keeper never listened: {e}");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    };
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut bytes = Vec::new();
+    let mut buf = [0u8; 256];
+    let exit = loop {
+        let mut at = 0;
+        let mut found = None;
+        while bytes.len() >= at + 5 {
+            let len = u32::from_le_bytes(bytes[at + 1..at + 5].try_into().unwrap()) as usize;
+            if bytes.len() < at + 5 + len {
+                break;
+            }
+            if bytes[at] == 3 {
+                found = Some(bytes[at + 5..at + 5 + len].to_vec());
+            }
+            at += 5 + len;
+        }
+        if let Some(p) = found {
+            break p;
+        }
+        let n = s.read(&mut buf).expect("the keeper told no exit");
+        assert!(n > 0, "the keeper closed without an exit");
+        bytes.extend_from_slice(&buf[..n]);
+    };
+    let code = i32::from_le_bytes(exit[..4].try_into().unwrap());
+    let signal = i32::from_le_bytes(exit[4..8].try_into().unwrap());
+    assert_eq!(
+        (code, signal),
+        (74, 0),
+        "the failure's end, not the shell's"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("status")).unwrap(),
+        "74 0\n"
+    );
+    // The keeper ends (the master read EIO once the shell was gone).
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while keeper.0.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "the keeper never ended");
+        std::thread::sleep(Duration::from_millis(30));
+    }
+}
+
+/// T7, R3: execd restarts while its terminal's keeper is already dead (killed while no execd ran, so
+/// nothing watched it): the shell hung up with the master, the group is gone, and the new execd
+/// reports an end, not a terminal that looks alive: ended, `pty.open` false, input and resize
+/// refused, and what it said stays said. The partner: a new terminal opens.
+#[tokio::test]
+async fn execd_restarts_with_its_keeper_already_dead_and_the_terminal_ends_cleanly() {
+    let state = tempfile::tempdir().unwrap();
+    let ledger = state.path().join("ledger");
+    let (mut first, jobs) = start_execd(&[("EXECD_STATE_DIR", ledger.to_str().unwrap())]);
+    let a1 = SocketAddr::V4(first.addr);
+    term(a1, "d", "echo pid=$$; exec sleep 300", 80, 24).await;
+    let text = read_until(a1, "d", "pid=").await;
+    let shell: i32 = text
+        .split("pid=")
+        .nth(1)
+        .and_then(|t| t.split_whitespace().next())
+        .and_then(|n| n.parse().ok())
+        .unwrap();
+    let ks = keepers(jobs.path());
+    assert_eq!(ks.len(), 1, "{ks:?}");
+    // Execd goes first (a restart), then the keeper dies with no execd to see it.
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(i32::try_from(first.child.id()).unwrap()),
+        nix::sys::signal::Signal::SIGHUP,
+    )
+    .unwrap();
+    first.child.wait().unwrap();
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(ks[0]),
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .unwrap();
+    // The master closed, so the kernel hung the session up: the shell is gone.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while std::path::Path::new(&format!("/proc/{shell}")).exists() {
+        assert!(Instant::now() < deadline, "the shell outlived its master");
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    let second = Execd::start(
+        &[
+            ("EXECD_STATE_DIR", ledger.to_str().unwrap()),
+            ("EXECD_JOBS_DIR", jobs.path().to_str().unwrap()),
+        ],
+        &[],
+    );
+    let a2 = SocketAddr::V4(second.addr);
+    let v = ended(a2, "d").await;
+    assert_eq!(v["pty"]["open"], json!(false), "{v}");
+    assert!(v["code"].is_number(), "an end has a status: {v}");
+    let (st, b) = write(a2, "d", 0, b"x", false).await;
+    assert_eq!(st, 409, "{b}");
+    let (st, b) = raw(
+        a2,
+        json!({"op":"resize","scope":"s","id":"d","cols":90,"rows":30}),
+    )
+    .await;
+    assert_eq!(st, 409, "{b}");
+    // What it said stays said: the same end, twice.
+    let again = ended(a2, "d").await;
+    assert_eq!(
+        (&v["code"], &v["signal"]),
+        (&again["code"], &again["signal"])
+    );
+    term(a2, "n", "echo fresh", 80, 24).await;
+    read_until(a2, "n", "fresh").await;
+}
+
+/// M5: the shell holds nothing of execd's or the keeper's: its descriptors are 0, 1 and 2, all the
+/// terminal. A leaked socket, pipe, spool or master would be a way into execd's state from a program
+/// the sandbox runs.
+#[tokio::test]
+async fn the_shell_holds_no_descriptor_of_execd_or_the_keeper() {
+    let (e, _jobs) = start_execd(&[]);
+    let a = SocketAddr::V4(e.addr);
+    term(a, "f", "echo pid=$$; exec sleep 300", 80, 24).await;
+    let text = read_until(a, "f", "pid=").await;
+    let shell: u32 = text
+        .split("pid=")
+        .nth(1)
+        .and_then(|t| t.split_whitespace().next())
+        .and_then(|n| n.parse().ok())
+        .unwrap();
+    let mut open: Vec<(String, String)> = std::fs::read_dir(format!("/proc/{shell}/fd"))
+        .unwrap()
+        .flatten()
+        .map(|d| {
+            (
+                d.file_name().to_string_lossy().to_string(),
+                std::fs::read_link(d.path())
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+            )
+        })
+        .collect();
+    open.sort();
+    let names: Vec<&str> = open.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, ["0", "1", "2"], "the shell's descriptors: {open:?}");
+    assert!(
+        open.iter().all(|(_, t)| t.starts_with("/dev/pts/")),
+        "a standard descriptor is not the terminal: {open:?}"
+    );
+    job(
+        a,
+        json!({"op":"kill","scope":"s","ids":["f"],"grace_ms":100}),
+    )
+    .await;
 }
 
 fn rss_kib(pid: i32, field: &str) -> u64 {
