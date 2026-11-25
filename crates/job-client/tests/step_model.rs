@@ -495,7 +495,7 @@ impl Model for Cfg {
                     Event::Answered {
                         status,
                         retry_after_s: if status == 503 { 1 } else { 0 },
-                        gone: false,
+                        authority: job_client::step::Authority::NotAuthoritative,
                     },
                     0,
                     0,

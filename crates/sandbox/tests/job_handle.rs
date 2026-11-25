@@ -68,8 +68,9 @@ impl Sink {
 
 async fn run(front: &JobFront, div: u64) -> (std::io::Result<JobEnd>, Vec<String>) {
     // The endpoint's URL names the sandbox, as E2B's does (`https://8081-<id>.e2b.app/exec`).
-    let runner = HttpExecRunner::new(format!("{}abc123", front.url))
+    let runner = HttpExecRunner::new(&front.url)
         .unwrap()
+        .with_sandbox_id("abc123")
         .with_time_divisor(div);
     let jobs = NativeJobs::over(&runner);
     let sink = Sink::default();
@@ -244,5 +245,5 @@ async fn a_session_that_has_ended_ends_the_handle_as_gone() {
     let (r, _) = run(&front, 1000).await;
     let e = r.unwrap_err();
     assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "{e}");
-    assert!(e.to_string().contains("sandbox no longer exists"), "{e}");
+    assert!(e.to_string().contains("session has ended"), "{e}");
 }

@@ -102,4 +102,9 @@ async fn deleting_the_sandbox_mid_follow_ends_the_handle_with_the_backends_answe
     assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "{e}");
     assert!(e.to_string().contains("sandbox no longer exists"), "{e}");
     assert!(JobError::of(&e).is_none(), "{e}");
+    assert_eq!(
+        runner.sandbox_id(),
+        Some(id.as_str()),
+        "the endpoint's id comes from its host"
+    );
 }

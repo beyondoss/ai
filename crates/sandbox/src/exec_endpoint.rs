@@ -1016,6 +1016,26 @@ pub struct HttpExecRunner {
     /// Test only: how many times faster than the wall clock a job handle's waits run (its
     /// reconnect backoff). 1 in production; read in one place, `jobs_native::handle::Clock`.
     time_divisor: u64,
+    /// The sandbox this endpoint is configured for, when the endpoint names one: what an answer that
+    /// "the sandbox was not found" must name to be about this sandbox (`job_client::step::authority`).
+    /// Derived from an E2B URL's host by [`e2b_sandbox_id`]; [`Self::with_sandbox_id`] sets it for any other
+    /// endpoint. None: no answer can say this sandbox is gone.
+    sandbox_id: Option<String>,
+}
+
+/// The sandbox id an E2B endpoint URL names: its host is exactly `<port>-<id>.e2b.app`, the port digits and
+/// the id lowercase letters and digits. Any other host names none.
+pub fn e2b_sandbox_id(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let label = parsed.host_str()?.strip_suffix(".e2b.app")?;
+    let (port, id) = label.split_once('-')?;
+    let ok = !port.is_empty()
+        && port.bytes().all(|b| b.is_ascii_digit())
+        && !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase());
+    ok.then(|| id.to_string())
 }
 
 impl HttpExecRunner {
@@ -1032,6 +1052,7 @@ impl HttpExecRunner {
                 parsed.scheme()
             ));
         }
+        let sandbox_id = e2b_sandbox_id(&url);
         Ok(Self {
             url,
             client: {
@@ -1050,7 +1071,20 @@ impl HttpExecRunner {
             suspect: None,
             env_proved: std::sync::atomic::AtomicBool::new(false),
             time_divisor: 1,
+            sandbox_id,
         })
+    }
+
+    /// The sandbox this endpoint is for, for an endpoint whose URL does not name it: the id an answer that
+    /// the sandbox was not found must carry (see the field).
+    pub fn with_sandbox_id(mut self, id: impl Into<String>) -> Self {
+        self.sandbox_id = Some(id.into());
+        self
+    }
+
+    /// The sandbox id this endpoint is configured for, if any.
+    pub fn sandbox_id(&self) -> Option<&str> {
+        self.sandbox_id.as_deref()
     }
 
     /// Test only: run a job handle's waits `divisor` times faster than the wall clock, so a test of

@@ -129,8 +129,6 @@ pub struct Meter {
     chunks: Arc<Mutex<Vec<(Instant, usize)>>>,
     down: Arc<AtomicBool>,
     dead: Arc<AtomicBool>,
-    /// The sandbox id the dead sandbox's answer names: a segment of this meter's own URL, as E2B's is.
-    id: String,
     pumps: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
     opened: Arc<AtomicUsize>,
 }
@@ -147,7 +145,6 @@ impl Meter {
             chunks: Arc::default(),
             down: Arc::default(),
             dead: Arc::default(),
-            id: path.trim_matches('/').to_string(),
             pumps: Arc::default(),
             opened: Arc::default(),
         };
@@ -159,7 +156,7 @@ impl Meter {
                     continue;
                 }
                 if m.dead.load(Ordering::SeqCst) {
-                    tokio::spawn(sandbox_not_found(inbound, m.id.clone()));
+                    tokio::spawn(session_ended(inbound));
                     continue;
                 }
                 m.opened.fetch_add(1, Ordering::SeqCst);
@@ -203,9 +200,9 @@ impl Meter {
         self.opened.load(Ordering::SeqCst)
     }
 
-    /// The sandbox is gone, and its provider says so: every open connection is cut and every new
-    /// one is answered as a provider's forwarding answers for a sandbox that does not exist (a
-    /// `502` whose JSON body says it was not found). Silence is never this: see [`Self::go_down`].
+    /// The sandbox is gone, and the front says so: every open connection is cut and every new one is
+    /// answered as Beyond's front answers for a session that has ended (a `401` whose JSON code is
+    /// `session_ended`). Silence is never this: see [`Self::go_down`].
     pub fn go_dead(&self) {
         self.dead.store(true, Ordering::SeqCst);
         for p in self.pumps.lock().unwrap().drain(..) {
@@ -223,8 +220,8 @@ impl Meter {
     }
 }
 
-/// Answer one request as a provider does for a sandbox that does not exist.
-async fn sandbox_not_found(mut inbound: TcpStream, id: String) {
+/// Answer one request as Beyond's front does for a session that has ended.
+async fn session_ended(mut inbound: TcpStream) {
     let mut seen = Vec::new();
     let mut buf = vec![0u8; 16 * 1024];
     // Read the request through its body, so closing does not reset the answer away.
@@ -253,10 +250,9 @@ async fn sandbox_not_found(mut inbound: TcpStream, id: String) {
             break;
         }
     }
-    let body =
-        format!(r#"{{"sandboxId":"{id}","message":"The sandbox was not found","code":502}}"#);
+    let body = r#"{"code":"session_ended","message":"session ended"}"#;
     let resp = format!(
-        "HTTP/1.1 502 Bad Gateway\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
         body.len()
     );
     let _ = inbound.write_all(resp.as_bytes()).await;
