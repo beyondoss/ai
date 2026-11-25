@@ -12,12 +12,13 @@ emit) and the sync and async drivers do them.
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 from typing import Any, Callable, Sequence
 
 from . import _kernel as K
 from . import _wire
-from ._drive import Emit, NextLine, Op, Open, Release, Sleep
+from ._drive import Call, Emit, NextLine, Op, Open, Release, Sleep
 from .errors import (
     AuthError,
     DiskFullError,
@@ -101,6 +102,7 @@ def held(
     policy = K.Policy(
         watch=isinstance(what, Attach) and not what.output,
         stdin_open=isinstance(what, Start) and what.stdin_open,
+        kept=isinstance(what, Start) and not what.hold,
         beat_s=heartbeat_seconds or 0,
     )
     try:
@@ -140,6 +142,13 @@ def held(
                 yield Emit(JobAttached(a.mark, a.from_offset))
             elif isinstance(a, K.ShellExit):
                 yield Emit(JobShellExit(a.code))
+            elif isinstance(a, K.Kill):
+                with contextlib.suppress(SandboxError):
+                    yield Call(
+                        _wire.job_op(
+                            "kill", scope, ids=[job], remove=True, grace_ms=_wire.KILL_GRACE_MS
+                        )
+                    )
             elif isinstance(a, K.CloseStream):
                 yield Release()
             elif isinstance(a, K.Deliver):
@@ -150,7 +159,7 @@ def held(
             elif isinstance(a, K.DeliverExit):
                 if a.dropped:
                     yield Emit(JobGap(a.dropped))
-                yield Emit(JobEnd.of(a.code, a.signal))
+                yield Emit(JobEnd.of(a.code, a.signal, a.killed))
                 event = K.Event.EXIT_TAKEN
             elif isinstance(a, K.Sleep):
                 yield Sleep(a.until_ms)

@@ -36,6 +36,8 @@ from .models import (
     TimedOut,
 )
 
+#: The SIGTERM grace a kill gives a job before SIGKILL.
+KILL_GRACE_MS = 300
 #: The response body cap (FILES-OVER-EXEC.md section 2).
 DEFAULT_MAX_RESPONSE = 16 * 1024 * 1024
 #: Grace added to ``timeout_ms`` for the whole exchange, so the endpoint's own timeout report wins.

@@ -854,6 +854,9 @@ class Driver:
         self.sb: Any = None
 
     def _ensure_sync(self) -> Any:
+        # A job handle keeps trying while the endpoint is unreachable (the kernel's rule: reconnecting is a
+        # status, never an end), so the driver probes once before a job op, which is what makes an endpoint
+        # nobody answers `transport` for a job op as for every other.
         # Construct without probing: plan()/Jobs validate client-side first, so a bad job id
         # stays invalid_request instead of racing a transport error. Public Sandbox.connect still probes.
         if self.sb is None:
@@ -905,7 +908,10 @@ class Driver:
                 return {"id": id_, "ok": _bulk_sync(op, req, self._ensure_sync())}
             # Validate the request before connecting so a bad payload is never a transport error.
             call, shape = plan(op, req)
-            return {"id": id_, "ok": shape(call(self._ensure_sync()))}
+            sb = self._ensure_sync()
+            if op.startswith("job_"):
+                sb.capabilities()  # an endpoint nobody answers is `transport` here, as for every other op
+            return {"id": id_, "ok": shape(call(sb))}
         except Exception as e:
             return _fail(id_, e)
 
@@ -925,6 +931,8 @@ class Driver:
                 return {"id": id_, "ok": await _bulk_async(op, req, sb)}
             call, shape = plan(op, req)
             sb = await self._ensure_async()
+            if op.startswith("job_"):
+                await sb.capabilities()  # as in `handle`
             result = call(sb)
             if inspect.isawaitable(result):
                 result = await result

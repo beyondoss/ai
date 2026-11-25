@@ -173,8 +173,9 @@ def test_a_start_without_a_mark_is_not_offered_and_the_job_it_started_is_stopped
     r = rig(Script("abc", echo=None))
     with pytest.raises(NotOfferedError):
         r.jobs.start("s", "aa", "true")
-    # The kill that follows is the only other request the endpoint saw.
+    # The kernel names the kill: the job that was started and cannot be told from another is stopped.
     assert [j["op"] for j in r.server.starts] == ["start"]
+    assert [(k["ids"], k["remove"]) for k in r.server.kills] == [(["aa"], True)]
 
 
 def test_a_reattach_answered_by_another_incarnation_is_job_gone_before_any_of_its_bytes(

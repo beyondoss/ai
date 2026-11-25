@@ -25,10 +25,10 @@ from typing import Union
 from .errors import ProtocolError
 
 #: The ABI ``codec.rs`` lays out. A change to a layout there bumps ``ABI_VERSION`` in ``abi.rs``.
-ABI_VERSION = 3
-#: Room for any one call's input or answer: a state (87 B) and an event (45 B at most), or a cursor.
+ABI_VERSION = 4
+#: Room for any one call's input or answer: a state (88 B) and an event (45 B at most), or a cursor.
 _BUF = 1024
-_STATE = 87
+_STATE = 88
 
 #: The one vocabulary of typed failures: the kernel's ``Fault``, in its declared order.
 FAULTS = (
@@ -117,6 +117,8 @@ class Policy:
     remove_on_exit: bool = False
     #: A start that needs the job's stdin opened: an echo that says it was not is refused.
     stdin_open: bool = False
+    #: A start of a kept job (``hold: false``): a refused echo stops the job.
+    kept: bool = False
     #: The heartbeat the request chose, whole seconds; 0 for the default.
     beat_s: int = 0
 
@@ -140,6 +142,11 @@ class OpenAttach:
 @dataclass(frozen=True, slots=True)
 class CloseStream:
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class Kill:
+    """A kept start whose echo was refused: nothing else can name the job, so stop it."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,6 +184,8 @@ class DeliverExit:
     code: int
     signal: int
     dropped: int
+    #: A signal killed the shell: the end is ``signal``, not an exit with ``code``.
+    killed: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,6 +219,7 @@ Action = Union[
     Start,
     OpenAttach,
     CloseStream,
+    Kill,
     Started,
     Attached,
     ShellExit,
@@ -268,7 +278,7 @@ def _action(r: _Rd) -> Action:
     if tag == 3:
         return Deliver(r.take("<Q"), r.take("<Q"), r.take("<Q"))
     if tag == 4:
-        return DeliverExit(r.take("<i"), r.take("<i"), r.take("<Q"))
+        return DeliverExit(r.take("<i"), r.take("<i"), r.take("<Q"), bool(r.u8()))
     if tag == 5:
         return Sleep(r.take("<Q"))
     if tag == 6:
@@ -290,6 +300,8 @@ def _action(r: _Rd) -> Action:
         return Attached(r.mark(), r.take("<Q"))
     if tag == 13:
         return ShellExit(r.take("<i"))
+    if tag == 14:
+        return Kill()
     raise ProtocolError(f"kernel: unknown action {tag}")
 
 
@@ -333,7 +345,7 @@ class Kernel:
     def state_for_start(self, key: int, p: Policy) -> bytes:
         return self._call(
             "jc_state_for_start",
-            struct.pack("<QBBIB", key, p.watch, p.remove_on_exit, p.beat_s, p.stdin_open),
+            struct.pack("<QBBIBB", key, p.watch, p.remove_on_exit, p.beat_s, p.stdin_open, p.kept),
         )
 
     def state_for_attach(self, mark: str, offset: int, p: Policy) -> bytes:
@@ -357,7 +369,8 @@ class Kernel:
     def classify(self, op: str, status: int) -> Class:
         r = _Rd(
             self._call(
-                "jc_classify", struct.pack("<BH", ("start", "attach", "remove").index(op), status)
+                "jc_classify",
+                struct.pack("<BH", ("start", "attach", "remove", "other").index(op), status),
             )
         )
         tag = r.u8()

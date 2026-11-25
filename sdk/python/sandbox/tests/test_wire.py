@@ -155,7 +155,7 @@ def test_the_v13_job_stream_vectors() -> None:
                 shell.append(struct.unpack("<i", body)[0])
             elif tag == 5:  # the end
                 code, signal = struct.unpack("<ii", body)
-                e = JobEnd.of(code, signal)
+                e = JobEnd.of(code, signal, signal != 0)
                 end, end_signal = e.code, e.signal
         if want.get("error"):
             assert error and want["error"] in error, name

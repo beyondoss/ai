@@ -226,9 +226,9 @@ class JobEnd:
     signal: int | None = None
 
     @classmethod
-    def of(cls, code: int, signal: int) -> JobEnd:
-        """The end the kernel delivered: ``signal`` 0 is an exit with ``code``, else a signal killed the shell."""
-        return cls(code) if signal == 0 else cls(128 + signal, signal)
+    def of(cls, code: int, signal: int, killed: bool) -> JobEnd:
+        """The end the kernel delivered: an exit with ``code``, or (``killed``) ``signal`` killed the shell."""
+        return cls(128 + signal, signal) if killed else cls(code)
 
 
 @dataclass(frozen=True, slots=True)

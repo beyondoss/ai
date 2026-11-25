@@ -53,6 +53,7 @@ class Server:
         self.script = script
         self.attaches: list[dict[str, Any]] = []
         self.starts: list[dict[str, Any]] = []
+        self.kills: list[dict[str, Any]] = []
         self.beats: list[str | None] = []
         self._cuts = list(script.cut_after)
         self._refuse = list(script.refuse)
@@ -94,6 +95,9 @@ class Server:
                 }
                 return self._json(h, 200, echo)
             return self._stream(h, 0, True)
+        if job["op"] == "kill":
+            self.kills.append(job)
+            return self._json(h, 200, {"survivors": []})
         self.attaches.append(job)
         if self._refuse:
             status, headers = self._refuse.pop(0)

@@ -8,18 +8,16 @@ kernel steers.
 
 from __future__ import annotations
 
-import contextlib
 import re
 from typing import Any, Callable, Sequence
 
-from . import _wire
+from . import _kernel, _wire
 from ._drive import Call, Emit, Op
 from ._held import Attach, Start, held
 from .errors import (
     InvalidRequestError,
     IoError,
     JobGoneError,
-    NotOfferedError,
     ProtocolError,
     SandboxError,
     StdinBusyError,
@@ -40,7 +38,7 @@ from .models import (
 #: The most one ``read`` returns by default: its base64 fits the smallest answer a runner keeps whole.
 READ_MAX = 128 * 1024
 #: The SIGTERM grace a kill gives a job before SIGKILL.
-KILL_GRACE_MS = 300
+KILL_GRACE_MS = _wire.KILL_GRACE_MS
 #: The most decoded bytes one ``write`` carries.
 WRITE_MAX = 128 * 1024
 #: The signals ``signal`` sends: names only.
@@ -67,10 +65,17 @@ def _written_in(detail: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
+def _is_gone(e: SandboxError) -> bool:
+    """What an op on one job's refusal means is the client kernel's table: gone, or not."""
+    return e.status is not None and _kernel.load().classify("other", e.status) == _kernel.Class(
+        "terminal", "job_gone"
+    )
+
+
 def _gone_failure(e: SandboxError, job: str) -> SandboxError:
-    """404 from an op on a job: it does not exist, or was removed."""
-    if e.status == 404:
-        return JobGoneError(f"job {job}: {e.detail}", id=job, status=404)
+    """An op on a job that does not exist, or was removed."""
+    if _is_gone(e):
+        return JobGoneError(f"job {job}: {e.detail}", id=job, status=e.status)
     return e
 
 
@@ -81,8 +86,8 @@ def _stdin_failure(e: SandboxError, job: str) -> SandboxError:
     (closed); 429 too many waiting writes; 413 too large."""
     d = e.detail
     detail = f"job stdin: {d}"
-    if e.status == 404:
-        return JobGoneError(detail, id=job, status=404)
+    if _is_gone(e):
+        return JobGoneError(detail, id=job, status=e.status)
     if e.status == 409 and "has no stdin" in d:
         return StdinClosedError(detail, reason="never_opened", status=409)
     if e.status == 409 and '"gap"' in d:
@@ -109,18 +114,11 @@ def start(
 ) -> Op[JobStart]:
     """Start a job the sandbox keeps from the start (wire ``hold: false``): its process group and mark.
     The handle (``_held.py``) does the request and the checks of its answer; an endpoint that lacks the
-    mark or the stdin echo is ``NotOfferedError``, and the job it started is stopped."""
+    mark or the stdin echo is ``NotOfferedError``, and the kernel has the job it started stopped."""
     check_scope(scope)
     check_id(job)
     what = Start(command, args, cwd, label, env, stdin_open, hold=False)
-    try:
-        started = yield from _first_started(held(scope, job, what, heartbeat_seconds))
-    except NotOfferedError:
-        # The job was started and kept, and cannot be told from another: stop it, so nothing runs
-        # that the caller has no name for.
-        with contextlib.suppress(SandboxError):
-            yield Call(_wire.job_op("kill", scope, ids=[job], remove=True, grace_ms=KILL_GRACE_MS))
-        raise
+    started = yield from _first_started(held(scope, job, what, heartbeat_seconds))
     return JobStart(started.pgid, started.mark)
 
 

@@ -95,7 +95,8 @@ byte arrives once and a reopen can never read another job that reused the id; a 
 `504`, `Retry-After`) is waited out; a refusal that will not change (`404`, `409`, `507`, `401`, `403`, `500`, a bad
 frame) is one typed error. When the endpoint stays unreachable the handle keeps trying and says so through
 `on_reconnecting(Reconnecting(attempts, since_ms))`; it ends only when the job does, the endpoint refuses for
-good, or you stop iterating. An endpoint that does not name the job's mark is `NotOfferedError`, before any byte.
+good, or you stop iterating. That includes a `start` whose endpoint nobody answers: it keeps trying and says so, so bound it yourself
+(stop iterating, or run it in a thread or task you can cancel). An endpoint that does not name the job's mark is `NotOfferedError`, before any byte.
 
 Python holds none of that. `_held.py` makes the request the kernel names, reads the answer, and does what the
 kernel's actions say; `tests/test_no_decision.py` fails if it grows a status code, an offset sum, a retry counter
