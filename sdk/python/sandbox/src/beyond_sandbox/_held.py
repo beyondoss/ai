@@ -40,6 +40,7 @@ from .models import (
     JobOutput,
     JobShellExit,
     JobStarted,
+    Pty,
     Reconnecting,
 )
 
@@ -55,6 +56,8 @@ class Start:
     env: dict[str, str] | None = None
     stdin_open: bool = False
     hold: bool = False
+    #: Run the command on a terminal of this size.
+    pty: Pty | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +109,7 @@ def held(
     policy = K.Policy(
         watch=isinstance(what, Attach) and not what.output,
         stdin_open=isinstance(what, Start) and what.stdin_open,
+        pty_open=isinstance(what, Start) and what.pty is not None,
         kept=isinstance(what, Start) and not what.hold,
         beat_s=heartbeat_seconds or 0,
     )
@@ -145,7 +149,11 @@ def held(
                 if on_reconnecting is not None:
                     on_reconnecting(Reconnecting(a.attempts, K.elapsed_ms(a.since_ms)))
             elif isinstance(a, K.Started):
-                yield Emit(JobStarted(line.pgid if line else 0, a.stdin, a.mark))
+                yield Emit(
+                    JobStarted(
+                        line.pgid if line else 0, a.stdin, a.mark, line.pty if line else None
+                    )
+                )
             elif isinstance(a, K.Attached):
                 yield Emit(JobAttached(a.mark, a.from_offset))
             elif isinstance(a, K.ShellExit):
@@ -186,7 +194,7 @@ def _start_open(
     scope: str, job: str, s: Start, heartbeat_seconds: int | None, silence_ms: int
 ) -> Open:
     return Open(
-        _wire.job_op("start", scope, id=job, hold=s.hold, label=s.label, stdin_open=s.stdin_open),
+        _wire.job_start_op(scope, job, s.hold, s.label, s.stdin_open, s.pty),
         silence_ms,
         s.command,
         s.args,

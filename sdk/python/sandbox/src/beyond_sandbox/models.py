@@ -119,6 +119,24 @@ class Capabilities:
 
 
 @dataclass(frozen=True, slots=True)
+class Pty:
+    """A terminal's size: ``cols`` and ``rows`` are integers from 1 to 1024."""
+
+    cols: int
+    rows: int
+
+
+@dataclass(frozen=True, slots=True)
+class PtyInfo:
+    """A terminal job's size and whether its terminal is still held (``open`` is False once its
+    keeper is gone). ``list`` and ``read`` carry it for terminal jobs only."""
+
+    cols: int
+    rows: int
+    open: bool
+
+
+@dataclass(frozen=True, slots=True)
 class JobInfo:
     id: str
     state: str  # running | exited | ended | lost | gone
@@ -136,6 +154,7 @@ class JobInfo:
     output_start: int  # the offset of the oldest byte of output the sandbox holds
     output_end: int  # the offset of the next byte of output
     signal: int | None = None  # the signal that killed the shell; None for a shell that exited
+    pty: PtyInfo | None = None  # a terminal job only
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,6 +168,7 @@ class JobRead:
     #: Absolute ``(from, len)`` offsets of the bytes of ``data`` that came from stderr (the rest is
     #: stdout); empty when the window holds none.
     stderr_ranges: tuple[tuple[int, int], ...] = ()
+    pty: PtyInfo | None = None  # a terminal job only; its output is one stream (no stderr_ranges)
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,6 +202,7 @@ class JobStarted:
     pgid: int
     stdin: bool = False  # the job was started with its stdin open (the echo of ``stdin_open``)
     mark: str = ""  # names this incarnation of the id; empty only from an endpoint that predates it
+    pty: Pty | None = None  # the terminal's size (the echo of ``pty``); None: no terminal
 
 
 @dataclass(frozen=True, slots=True)

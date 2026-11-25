@@ -15,6 +15,7 @@ from . import _kernel, _wire
 from ._drive import Call, Emit, Op
 from ._held import Attach, Start, held
 from .errors import (
+    ConflictError,
     InvalidRequestError,
     IoError,
     JobGoneError,
@@ -30,6 +31,7 @@ from .models import (
     JobRemoved,
     JobStart,
     JobStarted,
+    Pty,
     Reconnecting,
     StdinWritten,
     Survivor,
@@ -68,6 +70,10 @@ def check_scope(scope: str) -> str:
     return scope
 
 
+#: The error for an endpoint that ran a job without the terminal it was asked for.
+NO_PTY = "the endpoint predates job terminals: it ran the job without one"
+
+
 def _written_in(detail: str) -> int | None:
     m = re.search(r'"written"\s*:\s*(\d+)', detail)
     return int(m.group(1)) if m else None
@@ -100,12 +106,26 @@ def _stdin_failure(e: SandboxError, job: str) -> SandboxError:
         return StdinClosedError(detail, reason="never_opened", status=409)
     if e.status == 409 and '"gap"' in d:
         return StdinGapError(detail, written=_written_in(d), status=409)
+    if e.status == 409 and "the terminal hung up" in d:
+        return StdinClosedError(detail, reason="hung_up", written=_written_in(d), status=409)
     if e.status == 409:
         return StdinClosedError(detail, reason="closed", written=_written_in(d), status=409)
     if e.status == 429:
         return StdinBusyError(detail, status=429)
-    if e.status == 413:
-        return InvalidRequestError(detail, status=413)
+    if e.status in (400, 413):  # 400: a terminal has no end of input (``eof``)
+        return InvalidRequestError(detail, status=e.status)
+    return e
+
+
+def _resize_failure(e: SandboxError, job: str) -> SandboxError:
+    """A refused ``resize``: 400 a size out of bounds, 404 no such job, 409 no terminal, ended or
+    hung up."""
+    if e.status == 400:
+        return InvalidRequestError(e.detail, status=400)
+    if _is_gone(e):
+        return JobGoneError(f"job {job}: {e.detail}", id=job, status=e.status)
+    if e.status == 409:
+        return ConflictError(f"job {job}: {e.detail}", status=409)
     return e
 
 
@@ -120,6 +140,7 @@ def start(
     stdin_open: bool = False,
     heartbeat_seconds: int | None = None,
     timeout: float | None = None,
+    pty: Pty | None = None,
 ) -> Op[JobStart]:
     """Start a job the sandbox keeps from the start (wire ``hold: false``): its process group and mark.
     The handle (``_held.py``) does the request and the checks of its answer; an endpoint that lacks the
@@ -127,7 +148,7 @@ def start(
     check_scope(scope)
     check_id(job)
     check_timeout(timeout)
-    what = Start(command, args, cwd, label, env, stdin_open, hold=False)
+    what = Start(command, args, cwd, label, env, stdin_open, hold=False, pty=pty)
     started = yield from _first_started(held(scope, job, what, heartbeat_seconds, timeout=timeout))
     return JobStart(started.pgid, started.mark)
 
@@ -163,6 +184,7 @@ def start_held(
     heartbeat_seconds: int | None = None,
     on_reconnecting: Callable[[Reconnecting], None] | None = None,
     timeout: float | None = None,
+    pty: Pty | None = None,
 ) -> Op[None]:
     """Start a job held by this stream (wire ``hold: true``). Emits the job's events, the first a
     :class:`~beyond_sandbox.JobStarted` and the last a :class:`~beyond_sandbox.JobEnd`. If the stream
@@ -170,8 +192,8 @@ def start_held(
     check_scope(scope)
     check_id(job)
     check_timeout(timeout)
-    what = Start(command, args, cwd, label, env, stdin_open, hold=True)
-    return held(scope, job, what, heartbeat_seconds, on_reconnecting)
+    what = Start(command, args, cwd, label, env, stdin_open, hold=True, pty=pty)
+    return held(scope, job, what, heartbeat_seconds, on_reconnecting, timeout)
 
 
 def read(scope: str, job: str, offset: int = 0, max_bytes: int = READ_MAX) -> Op[JobRead]:
@@ -336,3 +358,20 @@ def signal(scope: str, ids: Sequence[str], signal_name: str) -> Op[list[str]]:
     if not isinstance(sent, list):
         raise IoError(f"unreadable job signal: {v!r}"[:300])
     return [i for i in sent if _wire._is_job_id(i)]
+
+
+def resize(scope: str, job: str, cols: int, rows: int) -> Op[Pty]:
+    """Set a terminal job's size (wire ``resize``): absolute, so a retry changes nothing. A size
+    outside 1 to 1024 is ``InvalidRequestError`` and nothing is sent; no such job is ``JobGoneError``;
+    a job with no terminal, an ended one or one whose terminal hung up is ``ConflictError``."""
+    check_scope(scope)
+    check_id(job)
+    _wire.check_pty(Pty(cols, rows))
+    try:
+        v = yield Call(_wire.job_op("resize", scope, id=job, cols=cols, rows=rows))
+    except SandboxError as e:
+        raise _resize_failure(e, job) from None
+    size = _wire.parse_pty(v)
+    if size is None:
+        raise IoError(f"unreadable job resize: {v!r}"[:300])
+    return size

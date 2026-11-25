@@ -103,6 +103,7 @@ export async function* held(
     beatS: req.heartbeatSeconds ?? 0,
     watch: req.output === false,
     stdinOpen: init.flow === "start" && init.spec.stdinOpen === true,
+    ptyOpen: init.flow === "start" && init.spec.pty !== undefined,
     kept: init.flow === "start" && !init.hold,
   };
   let st: KState;
@@ -212,6 +213,7 @@ export async function* held(
               pgid: line?.pgid ?? 0,
               mark: a.mark,
               ...(a.stdin ? { stdin: true } : {}),
+              ...(line?.pty === undefined ? {} : { pty: line.pty }),
             };
             break;
           case "attached":

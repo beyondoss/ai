@@ -3,7 +3,7 @@
 //! `tests/no_decision.rs` fails on a branch, a loop or a comparison in this file.
 //!
 //! Layout. All integers little-endian. A mark is 33 bytes: its length, then 32 bytes. A state is the
-//! 89 bytes `[phase, flow, mode, remove_on_exit, stdin_open, kept, announced, reached, key u64, mark, offset u64, pending u64, misses u32,
+//! 90 bytes `[phase, flow, mode, remove_on_exit, stdin_open, pty_open, kept, announced, reached, key u64, mark, offset u64, pending u64, misses u32,
 //! since_ms u64, until_ms u64, beat_s u32]`. Tags are the order the variants are declared in `job_client::step`, except the actions `Reconnecting` (10), `Started` (11), `Attached` (12), `ShellExit` (13) and `Kill` (14), and the event `Unreached` (8).
 
 use job_client::step::{
@@ -93,6 +93,7 @@ impl Rd<'_> {
             mode: self.mode()?,
             remove_on_exit: self.flag()?,
             stdin_open: self.flag()?,
+            pty_open: self.flag()?,
             kept: self.flag()?,
             announced: self.flag()?,
             reached: self.flag()?,
@@ -115,6 +116,7 @@ impl Rd<'_> {
             1 => Ok(Frame::Started {
                 mark: self.mark()?,
                 stdin: self.flag()?,
+                pty: self.flag()?,
             }),
             2 => Ok(Frame::Output { len: self.u64()? }),
             3 => Ok(Frame::Gap { n: self.u64()? }),
@@ -158,6 +160,7 @@ fn put_state(v: &mut Vec<u8>, s: &State) {
     v.push(s.mode as u8);
     v.push(u8::from(s.remove_on_exit));
     v.push(u8::from(s.stdin_open));
+    v.push(u8::from(s.pty_open));
     v.push(u8::from(s.kept));
     v.push(u8::from(s.announced));
     v.push(u8::from(s.reached));
@@ -228,10 +231,11 @@ fn put_action(v: &mut Vec<u8>, a: &Action) {
         Action::Finish => v.push(8),
         Action::Detached => v.push(9),
         Action::Kill => v.push(14),
-        Action::Started { mark, stdin } => {
+        Action::Started { mark, stdin, pty } => {
             v.push(11);
             put_mark(v, mark);
             v.push(u8::from(*stdin));
+            v.push(u8::from(*pty));
         }
         Action::Attached { mark, from } => {
             v.push(12);
@@ -258,7 +262,7 @@ fn finish(out: &mut [u8], answer: &[u8]) -> R<usize> {
     Ok(answer.len())
 }
 
-/// `State::for_start`: `[key u64, mode, remove_on_exit, beat_s u32, stdin_open, kept]` -> a state.
+/// `State::for_start`: `[key u64, mode, remove_on_exit, beat_s u32, stdin_open, pty_open, kept]` -> a state.
 pub fn state_for_start(input: &[u8], out: &mut [u8]) -> R<usize> {
     let mut r = Rd(input);
     let s = State::for_start(
@@ -266,6 +270,7 @@ pub fn state_for_start(input: &[u8], out: &mut [u8]) -> R<usize> {
         r.mode()?,
         r.flag()?,
         r.u32()?,
+        r.flag()?,
         r.flag()?,
         r.flag()?,
     );

@@ -360,6 +360,32 @@ def test_once_anything_answered_a_failure_to_connect_never_ends_the_handle(rig: 
     assert len(r.server.starts) >= 1
 
 
+def test_a_start_held_deadline_ends_the_handle_once_it_was_answered(rig: Any) -> None:
+    import threading
+    import time
+
+    r = rig(Script("abc", start_status=429))
+    threading.Timer(0.15, r.server.close).start()  # answered once, then the endpoint goes away
+    t0 = time.monotonic()
+    with pytest.raises(TimeoutError):
+        list(r.jobs.start_held("s", "aa", "true", timeout=1.0))
+    assert 0.9 < time.monotonic() - t0 < 6
+
+
+def test_async_a_start_held_deadline_ends_the_handle_once_it_was_answered(rig: Any) -> None:
+    import threading
+
+    r = rig(Script("abc", start_status=429))
+    threading.Timer(0.15, r.server.close).start()
+
+    async def main() -> None:
+        jobs = AsyncJobs(AsyncHttpTransport(r.server.url))
+        with pytest.raises(TimeoutError):
+            [f async for f in jobs.start_held("s", "aa", "true", timeout=1.0)]
+
+    asyncio.run(main())
+
+
 def test_the_callers_deadline_ends_a_follow_that_cannot_connect() -> None:
     import time
 

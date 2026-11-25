@@ -528,3 +528,110 @@ async fn activity_changed_fires_for_each_transition() {
     assert!(bumped(&mut rx).await, "job removed");
     server.shutdown().await;
 }
+
+/// A host that lets idle machines sleep reads each kept terminal from `activity()`: its group, its
+/// slave's device number, whether anyone is attached, and the job's members (its group plus the marked
+/// processes that left it, the set `kill` signals).
+#[tokio::test]
+async fn activity_lists_each_kept_terminal_with_its_slave_attachment_and_members() {
+    use std::os::unix::fs::MetadataExt as _;
+    let (server, _dir) = start(|o| {
+        o.helper_exe = Some(env!("CARGO_BIN_EXE_execd").into());
+    })
+    .await;
+    let addr = server.local_addr();
+    // A shell whose background command is in a group of its own (`set -m`), so a member has left the group.
+    let start = json!({
+        "command": "sh", "args": ["-c", "set -m; sleep 300 & echo up; wait"],
+        "job": { "op": "start", "scope": "s", "id": "t", "hold": false, "pty": { "cols": 80, "rows": 24 } },
+    });
+    let a = post(addr, &[], &start).await;
+    assert_eq!(a.status, 200, "{}", String::from_utf8_lossy(&a.body));
+    let pgid = i32::try_from(a.json()["started"].as_i64().unwrap()).unwrap();
+    // A plain kept job is not a terminal.
+    let plain = job_req(
+        json!({ "op": "start", "scope": "s", "id": "p", "hold": false }),
+        Some(("sleep", &["300"])),
+    );
+    assert_eq!(post(addr, &[], &plain).await.status, 200);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let t = loop {
+        let acts = server.activity();
+        assert!(acts.terminals.len() <= 1, "{:?}", acts.terminals);
+        if let Some(t) = acts.terminals.first().filter(|t| t.members.len() >= 2) {
+            break t.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no terminal with two members: {acts:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!((t.scope.as_str(), t.id.as_str(), t.pgid), ("s", "t", pgid));
+    assert!(!t.attached);
+    assert!(t.members.contains(&u32::try_from(pgid).unwrap()));
+    // The slave's device number is a /dev/pts node's.
+    assert_ne!((t.pts_rdev, t.pts_fs), (0, 0));
+    let pts = std::fs::read_dir("/dev/pts")
+        .unwrap()
+        .flatten()
+        .filter_map(|e| e.metadata().ok())
+        .any(|m| m.rdev() == t.pts_rdev && m.dev() == t.pts_fs);
+    assert!(pts, "{} is no pts", t.pts_rdev);
+
+    // An attach makes it attached while the stream is open, and only then.
+    let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let body = job_req(
+        json!({ "op": "attach", "scope": "s", "id": "t", "offset": 0 }),
+        None,
+    )
+    .to_string();
+    sock.write_all(
+        format!(
+            "POST /exec HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !server
+        .activity()
+        .terminals
+        .first()
+        .is_some_and(|t| t.attached)
+    {
+        assert!(Instant::now() < deadline, "never attached");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    drop(sock);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while server
+        .activity()
+        .terminals
+        .first()
+        .is_some_and(|t| t.attached)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "still attached after the client left"
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    // Once it ends it is no longer listed.
+    let kill = job_req(
+        json!({ "op": "kill", "scope": "s", "ids": ["t", "p"], "grace_ms": 100 }),
+        None,
+    );
+    assert_eq!(post(addr, &[], &kill).await.status, 200);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !server.activity().terminals.is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "an ended terminal is still listed"
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+}

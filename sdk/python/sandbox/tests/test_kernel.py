@@ -158,4 +158,5 @@ def test_a_step_costs_microseconds_not_milliseconds() -> None:
 def test_the_frame_encodings_are_the_codec_layout() -> None:
     assert K.Frame.output(5) == b"\2" + struct.pack("<Q", 5)
     assert K.Frame.exit(-1, 9) == b"\5" + struct.pack("<ii", -1, 9)
-    assert K.Frame.started("ab", True) == b"\1\2ab" + b"\0" * 30 + b"\1"
+    assert K.Frame.started("ab", True) == b"\1\2ab" + b"\0" * 30 + b"\1\0"
+    assert K.Frame.started("ab", False, True) == b"\1\2ab" + b"\0" * 30 + b"\0\1"

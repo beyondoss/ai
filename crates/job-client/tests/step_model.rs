@@ -174,7 +174,7 @@ impl Cfg {
     fn init(&self) -> St {
         let (c, slot, held, incs) = match self.flow {
             Flow::Start => (
-                State::for_start(KEY, self.mode, self.remove_on_exit, 0, false, false),
+                State::for_start(KEY, self.mode, self.remove_on_exit, 0, false, false, false),
                 None,
                 None,
                 0,
@@ -688,6 +688,7 @@ impl Cfg {
                 Req::Start { .. } => Event::Frame(Frame::Started {
                     mark: mark_of(k.inc),
                     stdin: false,
+                    pty: false,
                 }),
                 _ => Event::Frame(Frame::Attached {
                     mark: mark_of(k.inc),

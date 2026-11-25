@@ -26,9 +26,9 @@ from .errors import ProtocolError
 
 #: The ABI ``codec.rs`` lays out. A change to a layout there bumps ``ABI_VERSION`` in ``abi.rs``.
 ABI_VERSION = 5
-#: Room for any one call's input or answer: a state (89 B) and an event (45 B at most), or a cursor.
+#: Room for any one call's input or answer: a state (90 B) and an event (45 B at most), or a cursor.
 _BUF = 1024
-_STATE = 89
+_STATE = 90
 
 #: The one vocabulary of typed failures: the kernel's ``Fault``, in its declared order.
 FAULTS = (
@@ -68,8 +68,8 @@ class Frame:
         return b"\0" + _mark(mark) + struct.pack("<Q", from_)
 
     @staticmethod
-    def started(mark: str, stdin: bool) -> bytes:
-        return b"\1" + _mark(mark) + bytes([stdin])
+    def started(mark: str, stdin: bool, pty: bool = False) -> bytes:
+        return b"\1" + _mark(mark) + bytes([stdin, pty])
 
     @staticmethod
     def output(length: int) -> bytes:
@@ -120,6 +120,8 @@ class Policy:
     remove_on_exit: bool = False
     #: A start that needs the job's stdin opened: an echo that says it was not is refused.
     stdin_open: bool = False
+    #: A start on a terminal: an echo that says none was opened is refused.
+    pty_open: bool = False
     #: A start of a kept job (``hold: false``): a refused echo stops the job.
     kept: bool = False
     #: The heartbeat the request chose, whole seconds; 0 for the default.
@@ -156,6 +158,7 @@ class Kill:
 class Started:
     mark: str
     stdin: bool
+    pty: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -298,7 +301,7 @@ def _action(r: _Rd) -> Action:
     if tag == 10:
         return Reconnecting(r.take("<I"), r.take("<Q"))
     if tag == 11:
-        return Started(r.mark(), bool(r.u8()))
+        return Started(r.mark(), bool(r.u8()), bool(r.u8()))
     if tag == 12:
         return Attached(r.mark(), r.take("<Q"))
     if tag == 13:
@@ -348,7 +351,16 @@ class Kernel:
     def state_for_start(self, key: int, p: Policy) -> bytes:
         return self._call(
             "jc_state_for_start",
-            struct.pack("<QBBIBB", key, p.watch, p.remove_on_exit, p.beat_s, p.stdin_open, p.kept),
+            struct.pack(
+                "<QBBIBBB",
+                key,
+                p.watch,
+                p.remove_on_exit,
+                p.beat_s,
+                p.stdin_open,
+                p.pty_open,
+                p.kept,
+            ),
         )
 
     def state_for_attach(self, mark: str, offset: int, p: Policy) -> bytes:

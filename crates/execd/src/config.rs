@@ -22,6 +22,8 @@ pub struct Config {
     pub max_response_bytes: usize,
     pub jobs_dir: Option<PathBuf>,
     pub state_dir: Option<PathBuf>,
+    /// `EXECD_TERMINALS_MAX`: a cap on open terminals, for tests (see `Options::terminals_max`).
+    pub terminals_max: Option<usize>,
     pub log_level: Level,
     pub worker_threads: usize,
     pub idle_timeout: Option<Duration>,
@@ -77,6 +79,7 @@ pub fn parse<E: Fn(&str) -> Option<String>>(env: E) -> Result<Config, String> {
             .unwrap_or(execd::MAX_RESPONSE_BYTES),
         jobs_dir: get("EXECD_JOBS_DIR").map(PathBuf::from),
         state_dir: get("EXECD_STATE_DIR").map(PathBuf::from),
+        terminals_max: get("EXECD_TERMINALS_MAX").and_then(|v| v.parse().ok()),
         log_level: match get("EXECD_LOG") {
             None => Level::Info,
             Some(s) => Level::parse(&s).ok_or_else(|| {

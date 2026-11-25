@@ -80,6 +80,13 @@ only as long as its event stream unless you `jobs.keep(scope, id, num=, kind=, s
 seconds of silence, never under 30 s). `keep`'s `notify` is not offered: it carries a bearer token, which this client does
 not hold. `jobs.collect` follows a job to its end and returns everything (it was `attach`).
 
+A terminal is a job: `jobs.start(scope, id, command, pty=Pty(80, 24))` (1 to 1024 each) runs the command on a
+pseudo-terminal, `jobs.resize(scope, id, cols, rows)` sets its size (absolute, so a retry changes nothing), and `list` and
+`read` carry `pty` (`PtyInfo(cols, rows, open)`) for terminal jobs only. A terminal's output is one stream, its stdin is open,
+and `write_stdin` takes no `eof` (`InvalidRequestError`; write `0x04` for Ctrl-D). An endpoint that does not echo the terminal
+is `NotOfferedError`, and the job it started is stopped. A resize of an ended terminal, one with no terminal or one whose
+keeper is gone is `ConflictError`; a write to a hung-up terminal is `StdinClosedError` with `written`.
+
 Job failures are typed, each a subclass of the kind it was before (`except NotFoundError` keeps working): `JobGoneError`
 (a `NotFoundError`: `follow` or `collect` of a job that is not there, or a `read` whose job was removed), `JobExistsError`
 (a `ConflictError`: `start` of an id that exists), `DiskFullError` (an `IoError`: `start` on a full disk, 507), and for

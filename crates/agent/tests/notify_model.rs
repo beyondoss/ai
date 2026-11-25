@@ -670,7 +670,7 @@ impl Notify {
         let Some(cell) = s.cell[c].as_mut() else {
             return;
         };
-        if jk::step(&mut cell.st, jk::Ev::Taken) != jk::Act::Release {
+        if jk::step(&mut cell.st, jk::Ev::Taken) != (jk::Act::Release { close_term: false }) {
             return;
         }
         if self.mutation != Mutation::AnswerByKey {
@@ -1472,7 +1472,7 @@ impl Model for Notify {
                 if self.table(&s).admit(&Self::key(j)) != jk::Admit::Fresh {
                     return None;
                 }
-                let mut st = jk::State::new(0, true);
+                let mut st = jk::State::new(0, true, None);
                 jk::step(&mut st, jk::Ev::Spawned { pgid: 1 });
                 s.cell[j] = Some(Cell {
                     st,
@@ -1519,7 +1519,7 @@ impl Model for Notify {
                     signal: None,
                     now: 0,
                 };
-                if let jk::Act::Ended { notify } = jk::step(&mut cell.st, ev) {
+                if let jk::Act::Ended { notify, .. } = jk::step(&mut cell.st, ev) {
                     if notify {
                         self.notifier(&mut s, c, nk::Event::Change);
                     }
@@ -1576,7 +1576,7 @@ impl Model for Notify {
                 if self.table(&s).admit(&Self::key(j)) != jk::Admit::Fresh {
                     return None;
                 }
-                let mut st = jk::State::new(0, false);
+                let mut st = jk::State::new(0, false, None);
                 jk::step(&mut st, jk::Ev::Spawned { pgid: 2 });
                 let c = j + self.jobs;
                 if s.net.iter().any(|m| m.job as usize == j) {

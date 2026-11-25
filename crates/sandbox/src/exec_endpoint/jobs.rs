@@ -146,6 +146,39 @@ pub struct JobSpec {
     /// Keep the job's stdin open for [`SandboxJobs::write_stdin`] (default: empty, so a job that
     /// reads its stdin sees EOF at once).
     pub stdin_open: bool,
+    /// Run the command on a pseudo-terminal of this size (wire `pty`). The job's stdin is open,
+    /// its output is one stream (stdout only) and a stdin write takes no `eof`. An endpoint that
+    /// does not echo the terminal is `ErrorKind::Unsupported` and the job is stopped.
+    pub pty: Option<PtySize>,
+}
+
+/// A terminal's size: both are integers from 1 to 1024 ([`PtySize::MAX`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PtySize {
+    pub cols: u16,
+    pub rows: u16,
+}
+
+impl PtySize {
+    /// The most columns or rows a terminal has.
+    pub const MAX: u64 = 1024;
+
+    /// `cols` by `rows`, if both are from 1 to [`Self::MAX`].
+    pub fn new(cols: u64, rows: u64) -> Option<Self> {
+        let ok = |n: u64| (1..=Self::MAX).contains(&n);
+        (ok(cols) && ok(rows)).then_some(Self {
+            cols: cols as u16,
+            rows: rows as u16,
+        })
+    }
+}
+
+/// A terminal job's size as `list` and `read` report it, and whether its terminal is still held
+/// (`open` is false once its keeper is gone).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PtyInfo {
+    pub size: PtySize,
+    pub open: bool,
 }
 
 /// The output stream a piece of a job's output came from.
@@ -190,6 +223,8 @@ pub enum JobOp {
     Other,
     /// A stdin `write`: `404`, `409` (no stdin, closed, or a gap), `429`.
     Write,
+    /// A `resize`: `404`, `409` (no terminal, ended, or hung up).
+    Resize,
 }
 
 /// Why a stdin was closed to a write.
@@ -199,6 +234,8 @@ pub enum StdinClosedReason {
     NeverOpened,
     /// EOF was sent, the job ended or its reader left. Retrying cannot succeed.
     Closed,
+    /// A terminal's keeper is gone or its job ended: nothing can be typed into it any more.
+    HungUp,
 }
 
 /// A job condition the endpoint refuses with, told apart as the TypeScript and Python SDKs tell
@@ -222,6 +259,8 @@ pub enum JobError {
     StdinGap { text: String },
     /// A stdin write while 16 others wait (`429`): the same write, later, is safe.
     StdinBusy { text: String },
+    /// A `resize` of a job with no terminal, an ended one or one whose terminal hung up (`409`).
+    Conflict { text: String },
 }
 
 impl JobError {
@@ -235,12 +274,17 @@ impl JobError {
         Some(match (op, status) {
             (JobOp::Start, 409) => Self::Exists { text },
             (JobOp::Start, 507) => Self::DiskFull { text },
-            (JobOp::Other | JobOp::Write, 404) => Self::Gone { text },
+            (JobOp::Other | JobOp::Write | JobOp::Resize, 404) => Self::Gone { text },
+            (JobOp::Resize, 409) => Self::Conflict { text },
             (JobOp::Write, 409) if body.contains("has no stdin") => Self::StdinClosed {
                 reason: StdinClosedReason::NeverOpened,
                 text,
             },
             (JobOp::Write, 409) if body.contains("\"gap\"") => Self::StdinGap { text },
+            (JobOp::Write, 409) if body.contains("the terminal hung up") => Self::StdinClosed {
+                reason: StdinClosedReason::HungUp,
+                text,
+            },
             (JobOp::Write, 409) => Self::StdinClosed {
                 reason: StdinClosedReason::Closed,
                 text,
@@ -273,6 +317,7 @@ impl JobError {
             Self::StdinClosed { .. } => "stdin_closed",
             Self::StdinGap { .. } => "stdin_gap",
             Self::StdinBusy { .. } => "stdin_busy",
+            Self::Conflict { .. } => "conflict",
         }
     }
 
@@ -300,7 +345,7 @@ impl JobError {
                 ..
             } => InvalidInput,
             Self::StdinGap { .. } => TimedOut,
-            Self::StdinClosed { .. } | Self::StdinBusy { .. } => BrokenPipe,
+            Self::StdinClosed { .. } | Self::StdinBusy { .. } | Self::Conflict { .. } => BrokenPipe,
         }
     }
 
@@ -316,7 +361,8 @@ impl JobError {
             | Self::DiskFull { text }
             | Self::StdinClosed { text, .. }
             | Self::StdinGap { text }
-            | Self::StdinBusy { text } => text,
+            | Self::StdinBusy { text }
+            | Self::Conflict { text } => text,
         }
     }
 }
@@ -381,6 +427,8 @@ pub struct JobInfo {
     /// Epoch seconds when it ended; 0 while it runs.
     pub ended: u64,
     pub label: String,
+    /// Present on a terminal job only.
+    pub pty: Option<PtyInfo>,
 }
 
 /// One `read`: the job's status, the offset `data` starts at (past the one asked for when the
@@ -397,6 +445,8 @@ pub struct ReadChunk {
     /// as `offset`: ascending, disjoint, inside the window. The rest is stdout. Empty when the
     /// window holds no stderr, and for an endpoint that keeps the two apart no further than frames.
     pub stderr: Vec<(u64, u64)>,
+    /// Present on a terminal job only. A terminal's output is one stream: `stderr` is empty.
+    pub pty: Option<PtyInfo>,
 }
 
 /// How a job ended, as a stream's final frame says it: the shell exited with a code, or a signal
@@ -570,6 +620,12 @@ pub trait SandboxJobs: Send + Sync {
         data: &[u8],
         eof: bool,
     ) -> std::io::Result<StdinWritten>;
+
+    /// Set a terminal job's size (wire `resize`). Absolute, so a retry changes nothing. `Err` of
+    /// kind `NotFound` is a job that is not there; `BrokenPipe` a job with no terminal, an ended
+    /// one or one whose terminal hung up ([`JobError::Conflict`]).
+    async fn resize(&self, scope: &JobScope, id: &JobId, size: PtySize)
+    -> std::io::Result<PtySize>;
 
     /// Send `signal` (one of [`JOB_SIGNALS`]) to the jobs' process groups, with no grace and no
     /// wait. The ids that were running and were signalled; an ended or unknown job is absent.

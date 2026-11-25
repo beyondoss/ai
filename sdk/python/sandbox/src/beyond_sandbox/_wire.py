@@ -27,6 +27,8 @@ from .models import (
     JobInfo,
     JobRead,
     JobRemoved,
+    Pty,
+    PtyInfo,
     ShellExit,
     Signal,
     Stderr,
@@ -244,6 +246,20 @@ def job_op(op: str, scope: str, **extra: Any) -> dict[str, Any]:
     return {"op": op, "scope": scope, **extra}
 
 
+def check_pty(pty: Pty) -> dict[str, int]:
+    """The wire's ``pty`` member; ``cols`` and ``rows`` are integers from 1 to 1024."""
+    if not (_pty_dim(pty.cols) and _pty_dim(pty.rows)):
+        raise InvalidRequestError("pty: cols and rows are integers from 1 to 1024")
+    return {"cols": pty.cols, "rows": pty.rows}
+
+
+def job_start_op(
+    scope: str, job: str, hold: bool, label: str, stdin_open: bool, pty: Pty | None
+) -> dict[str, Any]:
+    extra: dict[str, Any] = {} if pty is None else {"pty": check_pty(pty)}
+    return job_op("start", scope, id=job, hold=hold, label=label, stdin_open=stdin_open, **extra)
+
+
 @dataclass(frozen=True, slots=True)
 class JobLine:
     """What one line of a job stream said: the frame the kernel is told of, and what the shell keeps of it."""
@@ -255,6 +271,8 @@ class JobLine:
     stderr: bool = False
     #: A ``started`` frame's process group.
     pgid: int = 0
+    #: A ``started`` frame's terminal, as the endpoint echoed it.
+    pty: Pty | None = None
     #: Why the frame is ``bad``.
     note: str = ""
 
@@ -309,9 +327,13 @@ def _line_of(obj: dict[str, Any]) -> JobLine:
     started = obj.get("started")
     if _num(started):
         mark = obj.get("mark")
+        pty = parse_pty(obj.get("pty"))
         return JobLine(
-            K.Frame.started(mark if isinstance(mark, str) else "", obj.get("stdin") is True),
+            K.Frame.started(
+                mark if isinstance(mark, str) else "", obj.get("stdin") is True, pty is not None
+            ),
             pgid=int(started),
+            pty=pty,
         )
     for key in ("stdout", "stderr"):
         if isinstance(obj.get(key), str):
@@ -375,6 +397,22 @@ def _signal(v: dict[str, Any], state: str) -> int | None:
     return _int(v, "signal") if state in ("exited", "ended") else None
 
 
+def _pty_dim(n: Any) -> bool:
+    return isinstance(n, int) and not isinstance(n, bool) and 1 <= n <= 1024
+
+
+def parse_pty(v: Any) -> Pty | None:
+    """A terminal's size as the wire echoes it; None when absent or not two integers from 1 to 1024."""
+    if isinstance(v, dict) and _pty_dim(v.get("cols")) and _pty_dim(v.get("rows")):
+        return Pty(v["cols"], v["rows"])
+    return None
+
+
+def parse_pty_info(v: Any) -> PtyInfo | None:
+    p = parse_pty(v)
+    return None if p is None else PtyInfo(p.cols, p.rows, v.get("open") is True)
+
+
 def parse_read(v: Any) -> JobRead:
     st = _state(v.get("state"), v.get("code")) if isinstance(v, dict) else None
     if st is None:
@@ -387,6 +425,7 @@ def parse_read(v: Any) -> JobRead:
         _b64("data", v.get("data", "")),
         _signal(v, st[0]),
         _ranges(v),
+        parse_pty_info(v.get("pty")),
     )
 
 
@@ -450,6 +489,7 @@ def parse_list(v: Any) -> list[JobInfo]:
                 output_start=_int(j, "outputStart") or 0,
                 output_end=_int(j, "outputEnd") or 0,
                 signal=_signal(j, st[0]),
+                pty=parse_pty_info(j.get("pty")),
             )
         )
     return out

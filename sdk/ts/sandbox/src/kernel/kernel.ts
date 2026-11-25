@@ -34,7 +34,7 @@ const FAULTS: readonly Fault[] = [
 /** What the stream's frames said; the payload bytes stay in the shell. `mark` is hex, "" for none. */
 export type KFrame =
   | { t: "attached"; mark: string; from: number }
-  | { t: "started"; mark: string; stdin: boolean }
+  | { t: "started"; mark: string; stdin: boolean; pty: boolean }
   | { t: "output"; len: number }
   | { t: "gap"; n: number }
   | { t: "heartbeat" }
@@ -60,7 +60,7 @@ export type KAction =
   | { t: "openAttach"; offset: number; mark: string; silenceMs: number }
   | { t: "closeStream" }
   | { t: "kill" }
-  | { t: "started"; mark: string; stdin: boolean }
+  | { t: "started"; mark: string; stdin: boolean; pty: boolean }
   | { t: "attached"; mark: string; from: number }
   | { t: "shellExit"; code: number }
   | { t: "reconnecting"; attempts: number; sinceMs: number }
@@ -91,6 +91,8 @@ export interface Policy {
   removeOnExit?: boolean;
   /** A start that needs the job's stdin opened: an echo that says it was not is refused. */
   stdinOpen?: boolean;
+  /** A start on a terminal: an echo that says none was opened is refused. */
+  ptyOpen?: boolean;
   /** A start of a kept job (`hold: false`): a refused echo stops the job. */
   kept?: boolean;
   /** The heartbeat the request chose, whole seconds; 0 for the default. */
@@ -113,9 +115,9 @@ type Call = (inp: number, n: number, out: number, cap: number) => number;
 
 /** The ABI `codec.rs` lays out. A change to a layout there bumps `ABI_VERSION`, and this must follow. */
 const ABI_VERSION = 5;
-/** Room for any one call's input or answer: a state (89 B) and an event (45 B at most), or a cursor. */
+/** Room for any one call's input or answer: a state (90 B) and an event (45 B at most), or a cursor. */
 const BUF = 1024;
-const STATE = 89;
+const STATE = 90;
 
 const MAX_SAFE = BigInt(Number.MAX_SAFE_INTEGER);
 
@@ -216,7 +218,7 @@ function frameBytes(w: Wr, f: KFrame): void {
       w.u8(0).mark(f.mark).u64(f.from);
       return;
     case "started":
-      w.u8(1).mark(f.mark).u8(f.stdin ? 1 : 0);
+      w.u8(1).mark(f.mark).u8(f.stdin ? 1 : 0).u8(f.pty ? 1 : 0);
       return;
     case "output":
       w.u8(2).u64(f.len);
@@ -315,7 +317,12 @@ function readAction(r: Rd): KAction {
     case 9:
       return { t: "detached" };
     case 11:
-      return { t: "started", mark: r.mark(), stdin: r.u8() === 1 };
+      return {
+        t: "started",
+        mark: r.mark(),
+        stdin: r.u8() === 1,
+        pty: r.u8() === 1,
+      };
     case 12:
       return { t: "attached", mark: r.mark(), from: r.u64("offset") };
     case 14:
@@ -389,7 +396,8 @@ export class Kernel {
   /** A handle that starts a job. `key` is the shell's handle for the idempotency key it holds. */
   stateForStart(key: bigint, p: Policy = {}): KState {
     const w = new Wr().u64(key).u8(p.watch ? 1 : 0).u8(p.removeOnExit ? 1 : 0)
-      .u32(p.beatS ?? 0).u8(p.stdinOpen ? 1 : 0).u8(p.kept ? 1 : 0);
+      .u32(p.beatS ?? 0).u8(p.stdinOpen ? 1 : 0).u8(p.ptyOpen ? 1 : 0)
+      .u8(p.kept ? 1 : 0);
     return this.state(
       this.call(this.x.jc_state_for_start, Uint8Array.from(w.b)),
     );
