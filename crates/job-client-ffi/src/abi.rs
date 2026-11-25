@@ -12,12 +12,22 @@ use std::ptr::NonNull;
 use crate::codec;
 
 /// The ABI's version: the layout of every record in `codec.rs`. A change to a layout bumps it.
-pub const ABI_VERSION: u32 = 2;
+pub const ABI_VERSION: u32 = 3;
+
+/// The most input one call takes. A host that passes more has a wrong length: no record here is near it.
+const MAX_IN: usize = 0x1_0000;
 
 type Call = fn(&[u8], &mut [u8]) -> Result<usize, i32>;
 
-/// Runs `call` on the buffers `(inp, n)` and `(out, cap)`.
+/// Runs `call` on the buffers `(inp, n)` and `(out, cap)`. A length past [`MAX_IN`] is `BAD_INPUT`,
+/// before any byte is read.
 fn io(inp: *const u8, n: usize, out: *mut u8, cap: usize, call: Call) -> i32 {
+    MAX_IN
+        .checked_sub(n)
+        .map_or(codec::BAD_INPUT, |_| run(inp, n, out, cap, call))
+}
+
+fn run(inp: *const u8, n: usize, out: *mut u8, cap: usize, call: Call) -> i32 {
     // A null pointer is an empty buffer: the slice is then the empty one, never a null slice.
     let input = NonNull::new(inp.cast_mut()).map_or(&[][..], |p| {
         // SAFETY: the caller promises `n` readable bytes at `inp` for this call.

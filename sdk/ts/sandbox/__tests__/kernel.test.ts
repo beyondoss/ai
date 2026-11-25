@@ -15,6 +15,7 @@ describe("the inlined kernel is the one the sources build", () => {
       readdirSync(join(crates, dir, "src")).filter((f) => f.endsWith(".rs"))
         .map((f) => `${dir}/src/${f}`);
     const files = [
+      "job-client-ffi/toolchain",
       "job-client-ffi/Cargo.toml",
       "job-client/Cargo.toml",
       ...[...rs("job-client-ffi"), ...rs("job-client")].sort(),
@@ -85,6 +86,22 @@ describe("the kernel's ABI from TypeScript", () => {
     }]);
     expect(() => k.stateForCursor(cursor.slice(0, -1))).toThrow(/refused/);
     expect(() => k.stateForAttach("not hex", 0)).toThrow(/refused/);
+  });
+
+  it("an input longer than the module's block is a typed refusal, and the module is unharmed", async () => {
+    const k = await Kernel.load();
+    for (const n of [1024 - 5, 1024 - 4, 5000, 70_000]) {
+      const long = "j1." + "a".repeat(n);
+      // Past the block it is the shell's refusal (nothing was copied); within it, the kernel's (not a cursor).
+      expect(() => k.stateForCursor(long)).toThrow(
+        n + 3 + 6 > 1024 ? /past the 1024/ : /refused/,
+      );
+    }
+    // Whatever was refused, the next call is right.
+    const s = k.stateForAttach("00ff1a", 7);
+    expect(k.step(s, { t: "go" }, 0, 0).actions).toEqual([
+      { t: "openAttach", offset: 7, mark: "00ff1a", silenceMs: 30_000 },
+    ]);
   });
 
   it("leaks nothing across 20 000 calls", async () => {

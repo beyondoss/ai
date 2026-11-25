@@ -215,6 +215,10 @@ pub struct State {
     pub remove_on_exit: bool,
     /// The idempotency key's handle (the shell holds the key itself). Never changes.
     pub key: u64,
+    /// The job is started with its stdin open: the `started` echo must say it was honoured. Never changes.
+    pub stdin_open: bool,
+    /// The consumer has been told the echo (`Started` or the first `Attached`): a reattach's is not told again.
+    pub announced: bool,
     /// The incarnation this handle holds; length 0 until the echo names it (a start, or a `get`).
     pub mark: Mark,
     /// The next output byte the consumer has not been given.
@@ -238,13 +242,16 @@ pub enum Frame {
     /// `{"attached": {"mark", "from"}}`: the first frame of an attach.
     Attached { mark: Mark, from: u64 },
     /// `{"started": {"mark"}}`: the first frame of a start.
-    Started { mark: Mark },
+    /// `stdin` is whether the endpoint says the job's stdin was opened.
+    Started { mark: Mark, stdin: bool },
     /// An output frame of `len` decoded bytes.
     Output { len: u64 },
     /// `{"gap": n}`: `n` bytes are no longer kept.
     Gap { n: u64 },
     /// A heartbeat.
     Heartbeat,
+    /// The job's shell exited with `code`; the job is not over (its group runs on). Not final.
+    ShellExit { code: i32 },
     /// The final frame.
     Exit { code: i32, signal: i32 },
     /// An error frame, an unparseable line, a frame out of range.
@@ -281,6 +288,12 @@ pub enum Action {
     OpenAttach { offset: u64, mark: Mark, silence_ms: u64 },
     /// Release the connection, if one is open.
     CloseStream,
+    /// Tell the consumer the job started (the `started` echo was accepted): `mark` names the incarnation.
+    Started { mark: Mark, stdin: bool },
+    /// Tell the consumer, once, where an attach began: the first accepted `attached` echo.
+    Attached { mark: Mark, from: u64 },
+    /// Tell the consumer the job's shell exited with `code` (not final).
+    ShellExit { code: i32 },
     /// Status, not an end: `attempts` failed opens in a row since `since_ms`, and the handle keeps trying.
     Reconnecting { attempts: u32, since_ms: u64 },
     /// Hand the consumer `len` bytes (the frame just decoded) at offset `at`, with `dropped` bytes lost
@@ -411,7 +424,7 @@ pub open spec fn no_mark() -> Mark {
 pub open spec fn echo_mark(ev: Event) -> Mark {
     match ev {
         Event::Frame(Frame::Attached { mark, .. }) => mark,
-        Event::Frame(Frame::Started { mark }) => mark,
+        Event::Frame(Frame::Started { mark, .. }) => mark,
         _ => no_mark(),
     }
 }
@@ -522,6 +535,7 @@ pub open spec fn good_echo(s: State, ev: Event) -> bool {
     &&& (s.flow is Start) == (ev is Frame && ev->Frame_0 is Started)
     &&& (s.flow is Attach) == (ev is Frame && ev->Frame_0 is Attached)
     &&& echo_from(ev) >= s.offset as int
+    &&& (s.flow is Start && s.stdin_open) ==> echo_stdin(ev)
 }
 
 /// Fairness: the server is reachable and answers as it should. A step under it is a fair step.
@@ -644,6 +658,70 @@ pub open spec fn post_incarnation(s: State, ev: Event, s2: State, out: Seq<Actio
     &&& (s.phase is Confirming && ev is Frame && !is_echo(ev) && !(ev->Frame_0 is Bad)) ==> {
         &&& s2.phase is Done
         &&& fails_with(out, Fault::NotOffered)
+    }
+}
+
+pub open spec fn echo_stdin(ev: Event) -> bool {
+    match ev {
+        Event::Frame(Frame::Started { stdin, .. }) => stdin,
+        _ => false,
+    }
+}
+
+pub open spec fn is_started_frame(ev: Event) -> bool {
+    match ev {
+        Event::Frame(Frame::Started { .. }) => true,
+        _ => false,
+    }
+}
+
+pub open spec fn is_attached_frame(ev: Event) -> bool {
+    match ev {
+        Event::Frame(Frame::Attached { .. }) => true,
+        _ => false,
+    }
+}
+
+pub open spec fn is_shell_exit_frame(ev: Event) -> bool {
+    match ev {
+        Event::Frame(Frame::ShellExit { .. }) => true,
+        _ => false,
+    }
+}
+
+/// U: what the consumer is told. The accepted `started` echo is told, with whether the job's stdin was
+/// opened, and a start that asked for stdin is refused (`NotOffered`) when the echo says it was not; the
+/// first accepted `attached` echo is told, once, and a reattach's never; the shell's exit is told when it
+/// arrives and changes nothing else. Each telling comes from exactly the step it names.
+pub open spec fn post_surface(s: State, ev: Event, s2: State, out: Seq<Action>) -> bool {
+    &&& forall|i: int| 0 <= i < out.len() ==> match #[trigger] out[i] {
+        Action::Started { mark, stdin } => {
+            &&& s.phase is Confirming && s.flow is Start
+            &&& ev == Event::Frame(Frame::Started { mark, stdin })
+            &&& s2.phase is Streaming
+            &&& s.stdin_open ==> stdin
+        },
+        Action::Attached { mark, from } => {
+            &&& s.phase is Confirming && s.flow is Attach && !s.announced
+            &&& ev == Event::Frame(Frame::Attached { mark, from })
+            &&& s2.phase is Streaming
+        },
+        Action::ShellExit { code } => {
+            &&& s.phase is Streaming
+            &&& ev == Event::Frame(Frame::ShellExit { code })
+        },
+        _ => true,
+    }
+    &&& (s.phase is Confirming && s.flow is Start && s2.phase is Streaming) ==> (out.len() == 1 && out[0] is Started)
+    &&& (s.phase is Confirming && s.flow is Attach && s2.phase is Streaming) ==> {
+        &&& s.announced ==> out.len() == 0
+        &&& !s.announced ==> (out.len() == 1 && out[0] is Attached)
+    }
+    &&& (s.phase is Confirming && s.flow is Start && s.stdin_open && is_started_frame(ev) && !echo_stdin(ev)
+        && echo_mark(ev).len > 0 && (s.mark.len == 0 || echo_mark(ev) == s.mark)) ==> fails_with(out, Fault::NotOffered)
+    &&& (s.phase is Streaming && is_shell_exit_frame(ev)) ==> {
+        &&& s2 == s
+        &&& out.len() == 1 && out[0] is ShellExit
     }
 }
 
@@ -1131,6 +1209,7 @@ fn streaming(s: State, echo: Mark, gap: u64) -> (r: State)
             mark: echo,
             pending: gap,
             misses: 0,
+            announced: true,
             ..s
         }),
 {
@@ -1139,6 +1218,7 @@ fn streaming(s: State, echo: Mark, gap: u64) -> (r: State)
     t.flow = Flow::Attach;
     t.mark = echo;
     t.pending = gap;
+    t.announced = true;
     if !cfg!(feature = "mut_budget_not_reset_on_echo") {
         t.misses = 0;
     }
@@ -1215,6 +1295,7 @@ fn step_close(s: State, ev: Event, now: u64) -> (r: (State, Vec<Action>))
         post_watch(s, r.0, r.1@),
         post_end(s, ev, r.0, r.1@),
         post_only_these_end(s, ev, r.0, r.1@),
+        post_surface(s, ev, r.0, r.1@),
 {
     let open = matches!(s.phase, Phase::Starting) || matches!(s.phase, Phase::Opening)
         || matches!(s.phase, Phase::Confirming) || matches!(s.phase, Phase::Streaming)
@@ -1254,6 +1335,7 @@ fn step_idle(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<Action
         post_watch(s, r.0, r.1@),
         post_end(s, ev, r.0, r.1@),
         post_only_these_end(s, ev, r.0, r.1@),
+        post_surface(s, ev, r.0, r.1@),
 {
     if matches!(ev, Event::Go) {
         return open_action(s, draw as u64);
@@ -1284,6 +1366,7 @@ fn step_backoff(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<Act
         post_watch(s, r.0, r.1@),
         post_end(s, ev, r.0, r.1@),
         post_only_these_end(s, ev, r.0, r.1@),
+        post_surface(s, ev, r.0, r.1@),
 {
     if matches!(ev, Event::Tick) {
         if now >= s.until_ms {
@@ -1323,6 +1406,7 @@ fn step_request(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<Act
         post_watch(s, r.0, r.1@),
         post_end(s, ev, r.0, r.1@),
         post_only_these_end(s, ev, r.0, r.1@),
+        post_surface(s, ev, r.0, r.1@),
 {
     match ev {
         Event::Answered { status, retry_after_s } => {
@@ -1392,6 +1476,7 @@ fn step_confirming(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<
         post_watch(s, r.0, r.1@),
         post_end(s, ev, r.0, r.1@),
         post_only_these_end(s, ev, r.0, r.1@),
+        post_surface(s, ev, r.0, r.1@),
 {
     match ev {
         Event::Frame(f) => match f {
@@ -1406,19 +1491,29 @@ fn step_confirming(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<
                     fail(s, Fault::Protocol, 0, true)
                 } else {
                     let t = streaming(s, mark, from - s.offset);
-                    (t, Vec::new())
+                    let mut out = Vec::new();
+                    if !s.announced || cfg!(feature = "mut_attached_repeated") {
+                        if !cfg!(feature = "mut_attached_not_told") {
+                            out.push(Action::Attached { mark, from });
+                        }
+                    }
+                    (t, out)
                 }
             },
-            Frame::Started { mark } => {
+            Frame::Started { mark, stdin } => {
                 if mark.len == 0 {
                     fail(s, Fault::NotOffered, 0, true)
                 } else if s.mark.len > 0 && !mark_eq(&mark, &s.mark) && !cfg!(feature = "mut_echo_mark_unchecked") {
                     fail(s, Fault::JobGone, 0, true)
                 } else if matches!(s.flow, Flow::Attach) {
                     fail(s, Fault::NotOffered, 0, true)
+                } else if s.stdin_open && !stdin && !cfg!(feature = "mut_stdin_unchecked") {
+                    fail(s, Fault::NotOffered, 0, true)
                 } else {
                     let t = streaming(s, mark, 0);
-                    (t, Vec::new())
+                    let mut out = Vec::new();
+                    out.push(Action::Started { mark, stdin });
+                    (t, out)
                 }
             },
             Frame::Bad => fail(s, Fault::Protocol, 0, true),
@@ -1453,6 +1548,7 @@ fn step_streaming(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<A
         post_watch(s, r.0, r.1@),
         post_end(s, ev, r.0, r.1@),
         post_only_these_end(s, ev, r.0, r.1@),
+        post_surface(s, ev, r.0, r.1@),
 {
     match ev {
         Event::Frame(f) => match f {
@@ -1490,6 +1586,13 @@ fn step_streaming(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<A
                 (t, Vec::new())
             },
             Frame::Heartbeat => (s, Vec::new()),
+            Frame::ShellExit { code } => {
+                let mut out = Vec::new();
+                if !cfg!(feature = "mut_shell_exit_not_told") {
+                    out.push(Action::ShellExit { code });
+                }
+                (s, out)
+            },
             Frame::Exit { code, signal } => {
                 if s.pending > u64::MAX - s.offset {
                     return fail(s, Fault::Protocol, 0, true);
@@ -1518,7 +1621,7 @@ fn step_streaming(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<A
                     fail(s, Fault::Protocol, 0, true)
                 }
             },
-            Frame::Started { mark } => {
+            Frame::Started { mark, .. } => {
                 if mark.len > 0 && !mark_eq(&mark, &s.mark) {
                     fail(s, Fault::JobGone, 0, true)
                 } else {
@@ -1556,6 +1659,7 @@ fn step_exit_held(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<A
         post_watch(s, r.0, r.1@),
         post_end(s, ev, r.0, r.1@),
         post_only_these_end(s, ev, r.0, r.1@),
+        post_surface(s, ev, r.0, r.1@),
 {
     match ev {
         Event::ExitTaken => {
@@ -1612,6 +1716,7 @@ pub fn step(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<Action>
         post_watch(s, r.0, r.1@),
         post_end(s, ev, r.0, r.1@),
         post_only_these_end(s, ev, r.0, r.1@),
+        post_surface(s, ev, r.0, r.1@),
 {
     if matches!(s.phase, Phase::Done) {
         return (s, Vec::new());
@@ -1704,12 +1809,20 @@ impl Mark {
 
 impl State {
     /// A handle that starts a job. `key` is the shell's handle for the idempotency key it holds.
-    pub fn for_start(key: u64, mode: Mode, remove_on_exit: bool, beat_s: u32) -> State {
+    pub fn for_start(
+        key: u64,
+        mode: Mode,
+        remove_on_exit: bool,
+        beat_s: u32,
+        stdin_open: bool,
+    ) -> State {
         State {
             phase: Phase::Idle,
             flow: Flow::Start,
             mode,
             remove_on_exit,
+            stdin_open,
+            announced: false,
             key,
             mark: Mark { len: 0, b: [0; 32] },
             offset: 0,
@@ -1734,6 +1847,8 @@ impl State {
             flow: Flow::Attach,
             mode,
             remove_on_exit,
+            stdin_open: false,
+            announced: false,
             key: 0,
             mark,
             offset,

@@ -12,10 +12,14 @@ export interface Script {
   refuse?: Array<[number, Record<string, string>?]>;
   /** The first stream sends this many bytes of output and then drops the connection. */
   cutAfter?: number[];
-  /** Echo this mark instead of the held one. */
+  /** Echo this mark instead of the held one (`null`: none). */
   echo?: string | null;
+  /** Echo this mark on a reattach only: another incarnation answers it. */
+  reattachEcho?: string;
   /** Bytes of the front of the output the server no longer keeps. */
   base?: number;
+  /** The shell's exit, sent before the final frame. */
+  shellExit?: number;
   /** A held start's answer. */
   startStatus?: number;
 }
@@ -62,7 +66,11 @@ export async function markServer(script: Script) {
     res.writeHead(200, { "content-type": "application/x-ndjson" });
     const base = script.base ?? 0;
     const at = Math.max(from, base);
-    const mark = script.echo === undefined ? MARK : script.echo;
+    const mark = !start && script.reattachEcho !== undefined
+      ? script.reattachEcho
+      : script.echo === undefined
+      ? MARK
+      : script.echo;
     if (start) {
       res.write(
         JSON.stringify({ started: 42, ...(mark === null ? {} : { mark }) })
@@ -83,6 +91,9 @@ export async function markServer(script: Script) {
       return;
     }
     if (piece !== "") res.write(JSON.stringify({ stdout: b64(piece) }) + "\n");
+    if (script.shellExit !== undefined) {
+      res.write(JSON.stringify({ shell_exit: script.shellExit }) + "\n");
+    }
     res.end(JSON.stringify({ exit_code: 0 }) + "\n");
   }
   return { ...e, attaches, starts };

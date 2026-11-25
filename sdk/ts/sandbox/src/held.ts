@@ -33,7 +33,7 @@ import type {
  * cap is `bad`).
  */
 export type HeldInit =
-  | { flow: "start"; scope: string; id: string; spec: JobSpec }
+  | { flow: "start"; scope: string; id: string; spec: JobSpec; hold: boolean }
   | {
     flow: "attach";
     scope: string;
@@ -98,6 +98,7 @@ export async function* held(
   const policy = {
     beatS: req.heartbeatSeconds ?? 0,
     watch: req.output === false,
+    stdinOpen: init.flow === "start" && init.spec.stdinOpen === true,
   };
   let st: KState;
   try {
@@ -115,8 +116,6 @@ export async function* held(
   let line: JobLine | undefined;
   let refused = "";
   let ev: KEvent | undefined = { t: "go" };
-  /** The first `attached` frame is the consumer's; a reattach's is the kernel's. */
-  let told = init.flow === "start";
 
   /** Send `open` and report its answer as an event. */
   const send = async (open: Parameters<JobOps["open"]>[0]): Promise<KEvent> => {
@@ -170,6 +169,7 @@ export async function* held(
                 scope: init.scope,
                 id: init.id,
                 spec: init.spec,
+                hold: init.hold,
                 silenceMs: a.silenceMs,
                 ...(req.heartbeatSeconds === undefined
                   ? {}
@@ -196,6 +196,20 @@ export async function* held(
               attempts: a.attempts,
               sinceMs: Date.now() - a.sinceMs,
             });
+            break;
+          case "started":
+            yield {
+              type: "started",
+              pgid: line?.pgid ?? 0,
+              mark: a.mark,
+              ...(a.stdin ? { stdin: true } : {}),
+            };
+            break;
+          case "attached":
+            yield { type: "attached", mark: a.mark, from: a.from };
+            break;
+          case "shellExit":
+            yield { type: "shell_exit", code: a.code };
             break;
           case "closeStream":
             conn?.close();
@@ -235,32 +249,6 @@ export async function* held(
               "the kernel asked for a remove that was not requested",
             );
         }
-      }
-      if (wasFrame && r.actions.length === 0 && line !== undefined) {
-        const f = line;
-        const fr = f.frame;
-        if (fr.t === "started") {
-          if (
-            init.flow === "start" && init.spec.stdinOpen === true
-            && f.stdin !== true
-          ) {
-            throw new NotOfferedError(
-              "the endpoint predates job stdin: it ran the job without it",
-            );
-          }
-          yield {
-            type: "started",
-            pgid: f.pgid ?? 0,
-            mark: fr.mark,
-            ...(f.stdin === true ? { stdin: true } : {}),
-          };
-        } else if (fr.t === "attached" && !told) {
-          told = true;
-          yield { type: "attached", mark: fr.mark, from: fr.from };
-        } else if (f.shellExit !== undefined) {
-          yield { type: "shell_exit", code: f.shellExit };
-        }
-        line = undefined;
       }
     }
   } finally {

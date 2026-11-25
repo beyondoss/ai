@@ -153,7 +153,7 @@ export type JobFrame =
 export type JobOpen =
   & { scope: string; id: string; heartbeatSeconds?: number; silenceMs: number }
   & (
-    | { op: "start"; spec: JobSpec }
+    | { op: "start"; spec: JobSpec; hold: boolean }
     | { op: "attach"; offset: number; mark: string; output?: boolean }
   );
 
@@ -268,13 +268,6 @@ export interface KeepFields {
  * takes. An op never reconnects and never retries.
  */
 export interface JobOps {
-  /** Start a job that the sandbox keeps from the start (`hold: false`); its process group. */
-  start(
-    scope: string,
-    id: string,
-    spec: JobSpec,
-    req?: ReqOptions,
-  ): Promise<JobStarted>;
   /**
    * One request of a held job, answered with the status the endpoint gave: a held start (`hold: true`,
    * the stream's first frame is `started`; if it closes before the job's final frame and no `keep`

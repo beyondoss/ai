@@ -1,10 +1,8 @@
 import { concat, fromBase64, text, toBase64 } from "./bytes.js";
 import {
   AuthError,
-  DiskFullError,
   EndpointError,
   InvalidRequestError,
-  JobExistsError,
   JobGoneError,
   NotOfferedError,
   ProtocolError,
@@ -18,7 +16,6 @@ import {
 } from "./errors.js";
 import type { KFrame } from "./kernel/kernel.js";
 import {
-  DEFAULT_KILL_GRACE_MS,
   type Frame,
   HEARTBEAT_MAX_S,
   HEARTBEAT_MIN_S,
@@ -30,7 +27,6 @@ import {
   type JobOpened,
   type JobOps,
   type JobSpec,
-  type JobStarted,
   type JobState,
   type KeepFields,
   type RemoveOptions,
@@ -819,19 +815,13 @@ function writtenIn(detail: string): number | undefined {
 function jobFailure(
   e: unknown,
   id: string,
-  op: "start" | "attach" | "write" | "other",
+  op: "write" | "other",
 ): unknown {
   if (!(e instanceof EndpointError)) return e;
   const { status, detail } = e;
   const cause = { cause: e };
-  if (status === 404 && op !== "start") {
+  if (status === 404) {
     return new JobGoneError(`job ${id}: ${detail}`, id, cause);
-  }
-  if (op === "start" && status === 409) {
-    return new JobExistsError(`job ${id} exists: ${detail}`, id, cause);
-  }
-  if (op === "start" && status === 507) {
-    return new DiskFullError(detail, cause);
   }
   if (op === "write") {
     if (status === 409 && detail.includes("has no stdin")) {
@@ -879,7 +869,7 @@ class HttpJobs implements JobOps {
   /** One non-stream job op: its JSON answer, a refusal typed. */
   private async call(
     id: string,
-    kind: "attach" | "write" | "other",
+    kind: "write" | "other",
     job: Record<string, unknown>,
     req?: ReqOptions,
   ): Promise<Record<string, unknown>> {
@@ -914,61 +904,6 @@ class HttpJobs implements JobOps {
     };
   }
 
-  async start(
-    scope: string,
-    id: string,
-    spec: JobSpec,
-    req: ReqOptions = {},
-  ): Promise<JobStarted> {
-    await this.t.proveEnv(spec.env);
-    let ex: Exchange;
-    try {
-      ex = await this.t.post(this.startBody(scope, id, spec, false, req));
-    } catch (e) {
-      throw jobFailure(e, id, "start");
-    }
-    try {
-      const { body, over } = await this.t.readCapped(ex);
-      if (over) {
-        throw new TooLargeError("a job answer exceeded the response cap");
-      }
-      let started: unknown;
-      let mark: unknown;
-      let echoed = false;
-      try {
-        const v: unknown = JSON.parse(text(body));
-        started = isRecord(v) ? v.started : undefined;
-        mark = isRecord(v) ? v.mark : undefined;
-        echoed = isRecord(v) && v.stdin === true;
-      } catch {
-        started = undefined;
-      }
-      if (spec.stdinOpen === true && !echoed) {
-        // Started without its stdin: stop it, so nothing is left running that reads EOF.
-        await this.kill(scope, [id], {
-          remove: true,
-          graceMs: DEFAULT_KILL_GRACE_MS,
-        }).catch(() => {});
-        throw new NotOfferedError(
-          "the endpoint predates job stdin: it ran the job without it",
-        );
-      }
-      if (typeof started !== "number") {
-        throw new ProtocolError(
-          `the endpoint did not report the job's start: ${excerpt(body)}`,
-        );
-      }
-      if (typeof mark !== "string" || mark === "") {
-        throw new NotOfferedError(
-          "the endpoint predates job marks: it did not name the job's incarnation",
-        );
-      }
-      return { pgid: started, mark };
-    } finally {
-      ex.close();
-    }
-  }
-
   async open(o: JobOpen): Promise<JobOpened> {
     const hb = o.heartbeatSeconds;
     let body: Body;
@@ -978,7 +913,7 @@ class HttpJobs implements JobOps {
         o.scope,
         o.id,
         o.spec,
-        true,
+        o.hold,
         hb === undefined ? {} : { heartbeatSeconds: hb },
       );
     } else {
@@ -1007,6 +942,26 @@ class HttpJobs implements JobOps {
             Number.parseInt(ex.res.headers.get("retry-after") ?? "", 10) || 0,
           detail: excerpt(r.body),
           lines: (async function*() {})(),
+          close: () => {},
+        };
+      } finally {
+        ex.close();
+      }
+    }
+    if (o.op === "start" && !o.hold) {
+      // A kept job's start is one JSON answer, the same record a held start's first frame is.
+      try {
+        const r = await this.t.readCapped(ex);
+        if (r.over) {
+          throw new TooLargeError("a job answer exceeded the response cap");
+        }
+        return {
+          status,
+          retryAfterS: 0,
+          detail: "",
+          lines: (async function*() {
+            yield r.body;
+          })(),
           close: () => {},
         };
       } finally {
@@ -1236,11 +1191,8 @@ export interface JobLine {
   /** An output frame's bytes: they stay here, and the kernel is told only their length. */
   data?: Uint8Array;
   stream?: "stdout" | "stderr";
-  /** A `started` frame's process group and whether it says the job's stdin is open. */
+  /** A `started` frame's process group (the shell keeps it; the kernel is told the mark and the stdin echo). */
   pgid?: number;
-  stdin?: boolean;
-  /** A `shell_exit` frame's code: not final, and not the kernel's business. */
-  shellExit?: number;
   /** Why the frame is `bad`. */
   note?: string;
 }
@@ -1276,9 +1228,12 @@ export function decodeJobLine(line: Uint8Array): JobLine {
   }
   if (typeof v.started === "number") {
     return {
-      frame: { t: "started", mark: typeof v.mark === "string" ? v.mark : "" },
+      frame: {
+        t: "started",
+        mark: typeof v.mark === "string" ? v.mark : "",
+        stdin: v.stdin === true,
+      },
       pgid: v.started,
-      stdin: v.stdin === true,
     };
   }
   const stream = typeof v.stdout === "string"
@@ -1298,7 +1253,7 @@ export function decodeJobLine(line: Uint8Array): JobLine {
   }
   if (typeof v.shell_exit === "number") {
     return int32(v.shell_exit)
-      ? { frame: { t: "heartbeat" }, shellExit: v.shell_exit }
+      ? { frame: { t: "shellExit", code: v.shell_exit } }
       : bad("a shell_exit that is not an integer");
   }
   if (typeof v.exit_code === "number") {

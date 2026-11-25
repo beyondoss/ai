@@ -24,7 +24,6 @@ const refuse = (what: string) => (): never => {
 class LocalTransport implements Transport {
   calls = 0;
   readonly jobs: JobOps = {
-    start: refuse("jobs"),
     open: refuse("jobs"),
     keep: refuse("jobs"),
     seen: refuse("jobs"),

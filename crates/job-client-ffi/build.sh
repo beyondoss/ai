@@ -17,7 +17,11 @@ check=0
 [[ ${1:-} == --check ]] && check=1
 
 # The sources the module is built from: this crate and the kernel, by content (the paths are not hashed).
-src_hash=$(cd "$root/crates" && cat job-client-ffi/Cargo.toml job-client/Cargo.toml $(LC_ALL=C ls job-client-ffi/src/*.rs job-client/src/*.rs) | sha256sum | cut -d' ' -f1)
+# The compiler is part of the bytes: it is pinned in `toolchain` (an exact release) and hashed with the sources,
+# so a rustc bump is a visible change here and never a surprise red in CI.
+toolchain=$(tr -d '[:space:]' <"$here/toolchain")
+export RUSTUP_TOOLCHAIN=$toolchain
+src_hash=$(cd "$root/crates" && cat job-client-ffi/toolchain job-client-ffi/Cargo.toml job-client/Cargo.toml $(LC_ALL=C ls job-client-ffi/src/*.rs job-client/src/*.rs) | sha256sum | cut -d' ' -f1)
 if [[ $check == 0 && -f $out/wasm.ts && "$(cat "$out/kernel.src.sha256" 2>/dev/null)" == "$src_hash" ]]; then exit 0; fi
 
 target=${CARGO_TARGET_DIR:-$HOME/.cache/job-client-ffi-target}

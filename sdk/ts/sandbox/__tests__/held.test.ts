@@ -78,6 +78,25 @@ describe("a followed job survives cuts", () => {
     expect(bytes(fs)).toBe("56789");
   });
 
+  it("tells the consumer the started echo with its stdin, the shell's exit, and the first attached only", async () => {
+    const { jobs } = await rig({ output: "ab", shellExit: 3, cutAfter: [1] });
+    const fs = await drain(jobs.follow("s", "aa", 0));
+    // One `attached` for the follow, though the cut made a second echo; the shell's exit is passed on.
+    expect(fs.map((f) => f.type)).toEqual([
+      "attached",
+      "output",
+      "output",
+      "shell_exit",
+      "exit",
+    ]);
+    expect(fs.find((f) => f.type === "shell_exit")).toEqual({
+      type: "shell_exit",
+      code: 3,
+    });
+    const started = await drain(jobs.startHeld("s", "aa", { command: "true" }));
+    expect(started[0]).toEqual({ type: "started", pgid: 42, mark: MARK });
+  });
+
   it("waits out a busy answer and tries again (429 with Retry-After)", async () => {
     const { s, jobs } = await rig({
       output: "abc",
@@ -134,13 +153,21 @@ describe("a refusal is one typed error, from the kernel's table", () => {
     expect(err).toBeInstanceOf(NotOfferedError);
     expect(got).toEqual([]);
   });
-  it("an echo of another mark is JobGoneError, before any byte", async () => {
-    const { jobs } = await rig({ output: "abc", echo: "ffff" });
-    const err = await drain(jobs.startHeld("s", "aa", { command: "true" }))
-      .then(() => null, (e: unknown) => e);
-    // The start's echo names the mark the handle holds only once it has one; a later reattach
-    // that is answered by another job is the gone case.
-    expect(err === null || err instanceof JobGoneError).toBe(true);
+  it("a reattach answered by another incarnation is JobGoneError, before any of its bytes", async () => {
+    const { jobs } = await rig({
+      output: "0123456789",
+      cutAfter: [2],
+      reattachEcho: "ffff",
+    });
+    const got: JobFrame[] = [];
+    const err = await (async () => {
+      for await (const f of jobs.startHeld("s", "aa", { command: "true" })) {
+        got.push(f);
+      }
+    })().then(() => null, (e: unknown) => e);
+    expect(err).toBeInstanceOf(JobGoneError);
+    // Only what the first incarnation sent before the cut: nothing of the other's 2..9.
+    expect(bytes(got)).toBe("01");
   });
 });
 

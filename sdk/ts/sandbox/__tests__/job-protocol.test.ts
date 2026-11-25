@@ -35,9 +35,15 @@ describe("job frames keep their stream", () => {
     });
     expect(decodeJobLine(line({ started: 7, stdin: true }))).toMatchObject({
       pgid: 7,
-      stdin: true,
+      frame: { t: "started", stdin: true },
     });
-    expect(decodeJobLine(line({ started: 7 }))).toMatchObject({ stdin: false });
+    expect(decodeJobLine(line({ started: 7 }))).toMatchObject({
+      frame: { t: "started", stdin: false },
+    });
+    expect(decodeJobLine(line({ shell_exit: 3 })).frame).toEqual({
+      t: "shellExit",
+      code: 3,
+    });
   });
 
   it("reads the mark an endpoint echoes, and says `bad` for what is not a frame", () => {
@@ -47,6 +53,7 @@ describe("job frames keep their stream", () => {
     expect(decodeJobLine(line({ started: 7, mark: "00ff" })).frame).toEqual({
       t: "started",
       mark: "00ff",
+      stdin: false,
     });
     for (
       const v of [{ error: "boom" }, { gap: -1 }, { exit_code: 1.5 }, {
@@ -134,10 +141,12 @@ describe("job ops over HTTP", () => {
 
   it("kills a job whose stdin_open was ignored", async () => {
     const { t, seen } = await jobs((b) =>
-      b.job.op === "start" ? [200, { started: 5 }] : [200, { survivors: [] }]
+      b.job.op === "start"
+        ? [200, { started: 5, mark: "0a1b" }]
+        : [200, { survivors: [] }]
     );
     await expect(
-      t.jobs.start("s", "aa", { command: "cat", stdinOpen: true }),
+      new Jobs(t).start("s", "aa", { command: "cat", stdinOpen: true }),
     ).rejects.toMatchObject({ kind: "not_offered" });
     expect(seen.map((b) => b.job.op)).toEqual(["start", "kill"]);
   });
@@ -153,19 +162,24 @@ describe("typed job errors (each a subclass of today's kind)", () => {
 
   it("start: 409 is JobExistsError, 507 is DiskFullError", async () => {
     const exists = await fail(
-      (await failing(409, { error: "the job exists" })).jobs.start("s", "aa", {
-        command: "true",
-      }),
+      new Jobs(await failing(409, { error: "the job exists" })).start(
+        "s",
+        "aa",
+        {
+          command: "true",
+        },
+      ),
     );
     expect(exists).toBeInstanceOf(JobExistsError);
     expect(exists).toBeInstanceOf(ConflictError);
     expect(exists).toMatchObject({ kind: "conflict", id: "aa" });
     const full = await fail(
-      (await failing(507, { error: "the sandbox's disk is full" })).jobs.start(
-        "s",
-        "aa",
-        { command: "true" },
-      ),
+      new Jobs(await failing(507, { error: "the sandbox's disk is full" }))
+        .start(
+          "s",
+          "aa",
+          { command: "true" },
+        ),
     );
     expect(full).toBeInstanceOf(DiskFullError);
     expect(full).toBeInstanceOf(IoError);
@@ -317,12 +331,12 @@ describe("the mark on the wire", () => {
   }
 
   it("a job id may hold `-` and `_` and be 64 long, and no more", async () => {
-    const { t } = await answering(() => [200, { started: 5, mark: "m" }]);
+    const { t } = await answering(() => [200, { started: 5, mark: "0a" }]);
     const jobs = new Jobs(t);
     for (const ok of ["a-b_c", "-", "_", "z".repeat(64)]) {
       expect(await jobs.start("s", ok, { command: "true" })).toEqual({
         pgid: 5,
-        mark: "m",
+        mark: "0a",
       });
     }
     for (const bad of ["", "A", "a.b", "a/b", "z".repeat(65)]) {
@@ -333,7 +347,7 @@ describe("the mark on the wire", () => {
 
   it("start without a mark is not_offered; held start too", async () => {
     const { t } = await answering(() => [200, { started: 5 }]);
-    await expect(t.jobs.start("s", "aa", { command: "true" })).rejects
+    await expect(new Jobs(t).start("s", "aa", { command: "true" })).rejects
       .toMatchObject({ kind: "not_offered" });
     const e = await fakeEndpoint((_r, res) => {
       res.writeHead(200, { "content-type": "application/x-ndjson" });

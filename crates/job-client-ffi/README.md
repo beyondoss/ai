@@ -31,7 +31,7 @@ Events, frames and actions are tagged in the order `job_client::step` declares t
 
 ## Build
 
-`build.sh` builds `wasm32-unknown-unknown` (release, `opt-level = s`, LTO, `panic = abort`, paths remapped) and writes
+`build.sh` builds `wasm32-unknown-unknown` (release, the compiler pinned in `toolchain`, `opt-level = s`, LTO, `panic = abort`, paths remapped) and writes
 `sdk/ts/sandbox/src/kernel/wasm.ts` and `kernel.src.sha256` (the hash of this crate's and the kernel's sources). The
 TypeScript test `kernel.test.ts` fails when a source changed and `build.sh` did not run; CI runs `build.sh --check`, which
 rebuilds and fails when the committed bytes differ. Python's wheel build uses `cargo build --release` of the same crate

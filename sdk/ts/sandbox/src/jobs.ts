@@ -1,5 +1,10 @@
 import { concat } from "./bytes.js";
-import { InvalidRequestError, JobGoneError, ProtocolError } from "./errors.js";
+import {
+  InvalidRequestError,
+  JobGoneError,
+  NotOfferedError,
+  ProtocolError,
+} from "./errors.js";
 import { held } from "./held.js";
 import { DEFAULT_KILL_GRACE_MS, isJobId } from "./transport.js";
 import type {
@@ -102,7 +107,24 @@ export class Jobs {
   ): Promise<JobStarted> {
     validScope(scope);
     validId(id);
-    return this.transport.jobs.start(scope, id, spec, req);
+    const frames = held(
+      this.transport.jobs,
+      { flow: "start", scope, id, spec, hold: false },
+      req,
+    );
+    try {
+      for await (const f of frames) {
+        if (f.type === "started") return { pgid: f.pgid, mark: f.mark };
+      }
+    } catch (e) {
+      if (e instanceof NotOfferedError) {
+        // The job was started and kept, and cannot be told from another: stop it, so nothing runs
+        // that the caller has no name for.
+        await this.kill(scope, [id], { remove: true }).catch(() => {});
+      }
+      throw e;
+    }
+    throw new ProtocolError("the endpoint did not report the job's start");
   }
 
   /**
@@ -118,7 +140,11 @@ export class Jobs {
   ): AsyncGenerator<JobFrame> {
     validScope(scope);
     validId(id);
-    yield* held(this.transport.jobs, { flow: "start", scope, id, spec }, req);
+    yield* held(
+      this.transport.jobs,
+      { flow: "start", scope, id, spec, hold: true },
+      req,
+    );
   }
 
   /** Every job in the scope. */

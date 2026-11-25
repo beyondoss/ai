@@ -1,5 +1,5 @@
 import { fromBase64 } from "../bytes.js";
-import { ProtocolError } from "../errors.js";
+import { InvalidRequestError, ProtocolError } from "../errors.js";
 import { KERNEL_WASM_BASE64 } from "./wasm.js";
 
 /**
@@ -32,10 +32,11 @@ const FAULTS: readonly Fault[] = [
 /** What the stream's frames said; the payload bytes stay in the shell. `mark` is hex, "" for none. */
 export type KFrame =
   | { t: "attached"; mark: string; from: number }
-  | { t: "started"; mark: string }
+  | { t: "started"; mark: string; stdin: boolean }
   | { t: "output"; len: number }
   | { t: "gap"; n: number }
   | { t: "heartbeat" }
+  | { t: "shellExit"; code: number }
   | { t: "exit"; code: number; signal: number }
   | { t: "bad" };
 
@@ -55,6 +56,9 @@ export type KAction =
   | { t: "start"; key: bigint; silenceMs: number }
   | { t: "openAttach"; offset: number; mark: string; silenceMs: number }
   | { t: "closeStream" }
+  | { t: "started"; mark: string; stdin: boolean }
+  | { t: "attached"; mark: string; from: number }
+  | { t: "shellExit"; code: number }
   | { t: "reconnecting"; attempts: number; sinceMs: number }
   | { t: "deliver"; at: number; len: number; dropped: number }
   | { t: "deliverExit"; code: number; signal: number; dropped: number }
@@ -75,6 +79,8 @@ export type Class =
 export interface Policy {
   watch?: boolean;
   removeOnExit?: boolean;
+  /** A start that needs the job's stdin opened: an echo that says it was not is refused. */
+  stdinOpen?: boolean;
   /** The heartbeat the request chose, whole seconds; 0 for the default. */
   beatS?: number;
 }
@@ -94,10 +100,10 @@ interface Exports {
 type Call = (inp: number, n: number, out: number, cap: number) => number;
 
 /** The ABI `codec.rs` lays out. A change to a layout there bumps `ABI_VERSION`, and this must follow. */
-const ABI_VERSION = 2;
-/** Room for any one call's input or answer: a state (85 B) and an event (45 B at most), or a cursor. */
+const ABI_VERSION = 3;
+/** Room for any one call's input or answer: a state (87 B) and an event (45 B at most), or a cursor. */
 const BUF = 1024;
-const STATE = 85;
+const STATE = 87;
 
 const MAX_SAFE = BigInt(Number.MAX_SAFE_INTEGER);
 
@@ -198,7 +204,7 @@ function frameBytes(w: Wr, f: KFrame): void {
       w.u8(0).mark(f.mark).u64(f.from);
       return;
     case "started":
-      w.u8(1).mark(f.mark);
+      w.u8(1).mark(f.mark).u8(f.stdin ? 1 : 0);
       return;
     case "output":
       w.u8(2).u64(f.len);
@@ -214,6 +220,9 @@ function frameBytes(w: Wr, f: KFrame): void {
       return;
     case "bad":
       w.u8(6);
+      return;
+    case "shellExit":
+      w.u8(7).i32(f.code);
       return;
   }
 }
@@ -289,6 +298,12 @@ function readAction(r: Rd): KAction {
       return { t: "finish" };
     case 9:
       return { t: "detached" };
+    case 11:
+      return { t: "started", mark: r.mark(), stdin: r.u8() === 1 };
+    case 12:
+      return { t: "attached", mark: r.mark(), from: r.u64("offset") };
+    case 13:
+      return { t: "shellExit", code: r.i32() };
     case 10:
       return { t: "reconnecting", attempts: r.u32(), sinceMs: r.u64("time") };
     default:
@@ -335,6 +350,13 @@ export class Kernel {
 
   /** One call: `input` into the module's memory, the answer out of it. */
   private call(fn: Call, input: Uint8Array): Uint8Array {
+    // The block this call's input is copied into holds `BUF` bytes: a longer one would run into the
+    // module's own memory.
+    if (input.length > BUF) {
+      throw new InvalidRequestError(
+        `kernel: an input of ${input.length} bytes is past the ${BUF} the module takes`,
+      );
+    }
     const mem = new Uint8Array(this.x.memory.buffer);
     mem.set(input, this.inp);
     const n = fn(this.inp, input.length, this.out, BUF);
@@ -349,7 +371,7 @@ export class Kernel {
   /** A handle that starts a job. `key` is the shell's handle for the idempotency key it holds. */
   stateForStart(key: bigint, p: Policy = {}): KState {
     const w = new Wr().u64(key).u8(p.watch ? 1 : 0).u8(p.removeOnExit ? 1 : 0)
-      .u32(p.beatS ?? 0);
+      .u32(p.beatS ?? 0).u8(p.stdinOpen ? 1 : 0);
     return this.state(
       this.call(this.x.jc_state_for_start, Uint8Array.from(w.b)),
     );

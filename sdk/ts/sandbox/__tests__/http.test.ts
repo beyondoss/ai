@@ -457,7 +457,9 @@ describe("HttpTransport.jobs", () => {
       res.write("{");
     });
     const t = new HttpTransport({ url: e.url, maxResponseBytes: 10 });
-    expect(await kindOf(t.jobs.start("scope-1", "job1", { command: "true" })))
+    expect(
+      await kindOf(new Jobs(t).start("scope-1", "job1", { command: "true" })),
+    )
       .toBe("too_large");
   });
 
