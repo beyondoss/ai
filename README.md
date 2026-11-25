@@ -38,25 +38,25 @@ curl localhost:8080/v1/chat/completions \
 
 ## Packages
 
-| Path                                       | Package               | What it is                                                                              |
-| ------------------------------------------ | --------------------- | --------------------------------------------------------------------------------------- |
-| [`crates/gateway`](crates/gateway)         | `beyond-gateway`      | The LLM egress proxy (binary `gateway`).                                                |
-| [`crates/agent`](crates/agent)             | `beyond-agent`        | The agent: `run`, `serve`, `serve --service` (binary `agent`).                          |
-| [`crates/agent-core`](crates/agent-core)   | `beyond-agent-core`   | The agent loop as a library: messages, tool dispatch, compaction, three provider wires. |
-| [`crates/providers`](crates/providers)     | `beyond-providers`    | Provider table, model catalog and the pricing contract. No dependencies.                |
-| [`crates/exec-notify`](crates/exec-notify) | `beyond-exec-notify`  | Exec protocol job-end callback rules as a pure function. No dependencies.               |
-| [`crates/execd`](crates/execd)             | `beyond-execd`        | The exec endpoint for a sandbox: the whole exec protocol in one static binary.          |
-| [`crates/execd-jobs`](crates/execd-jobs)   | `beyond-execd-jobs`   | execd's job-table decisions as pure functions, proven in Verus.                         |
-| [`crates/execd-wire`](crates/execd-wire)   | `beyond-execd-wire`   | execd's heartbeat, one-shot first answer and job signal scope, proven in Verus.         |
-| [`crates/bash-gate`](crates/bash-gate)     | `beyond-bash-gate`    | The agent's bash running-command limit and hand-back, proven in Verus.                  |
-| [`crates/job-client`](crates/job-client)   | `beyond-job-client`   | The job cursor (one job incarnation at one output offset), proven in Verus.             |
-| [`crates/execd-ring`](crates/execd-ring)   | `beyond-execd-ring`   | execd's job-output ring decisions (offsets, retention, stderr ranges), proven in Verus. |
-| [`crates/sandbox-mcp`](crates/sandbox-mcp) | `beyond-sandbox-mcp`  | An MCP server that gives any agent exec, files, search and jobs in a sandbox.           |
-| `crates/demo`                              | `beyond-demo`         | Sandbox exec endpoint, key and grant minters, chat client for `deploy/demo`.            |
-| `crates/fleet-sim`                         | `beyond-fleet-sim`    | Runs a replica set against a shared filesystem and checks the fleet design's claims.    |
-| `crates/test-support`                      | `beyond-test-support` | Test doubles shared by the agent's tests and the simulator.                             |
-| `crates/verify`                            | `beyond-verify`       | Claim registry and defect ledger for the gateway ([`verify/`](verify/README.md)).       |
-| `crates/rates-sync`                        | `beyond-rates-sync`   | Fetches vendors' pricing sources and generates the rate table.                          |
+| Path                                       | Package               | What it is                                                                                  |
+| ------------------------------------------ | --------------------- | ------------------------------------------------------------------------------------------- |
+| [`crates/gateway`](crates/gateway)         | `beyond-gateway`      | The LLM egress proxy (binary `gateway`).                                                    |
+| [`crates/agent`](crates/agent)             | `beyond-agent`        | The agent: `run`, `serve`, `serve --service` (binary `agent`).                              |
+| [`crates/agent-core`](crates/agent-core)   | `beyond-agent-core`   | The agent loop as a library: messages, tool dispatch, compaction, three provider wires.     |
+| [`crates/providers`](crates/providers)     | `beyond-providers`    | Provider table, model catalog and the pricing contract. No dependencies.                    |
+| [`crates/exec-notify`](crates/exec-notify) | `beyond-exec-notify`  | Exec protocol job-end callback rules as a pure function. No dependencies.                   |
+| [`crates/execd`](crates/execd)             | `beyond-execd`        | The exec endpoint for a sandbox: the whole exec protocol in one static binary.              |
+| [`crates/execd-jobs`](crates/execd-jobs)   | `beyond-execd-jobs`   | execd's job-table decisions as pure functions, proven in Verus.                             |
+| [`crates/execd-wire`](crates/execd-wire)   | `beyond-execd-wire`   | execd's heartbeat, one-shot first answer and job signal scope, proven in Verus.             |
+| [`crates/bash-gate`](crates/bash-gate)     | `beyond-bash-gate`    | The agent's bash running-command limit and hand-back, proven in Verus.                      |
+| [`crates/job-client`](crates/job-client)   | `beyond-job-client`   | The job cursor and the handle's `step` function (reconnect, exit, remove), proven in Verus. |
+| [`crates/execd-ring`](crates/execd-ring)   | `beyond-execd-ring`   | execd's job-output ring decisions (offsets, retention, stderr ranges), proven in Verus.     |
+| [`crates/sandbox-mcp`](crates/sandbox-mcp) | `beyond-sandbox-mcp`  | An MCP server that gives any agent exec, files, search and jobs in a sandbox.               |
+| `crates/demo`                              | `beyond-demo`         | Sandbox exec endpoint, key and grant minters, chat client for `deploy/demo`.                |
+| `crates/fleet-sim`                         | `beyond-fleet-sim`    | Runs a replica set against a shared filesystem and checks the fleet design's claims.        |
+| `crates/test-support`                      | `beyond-test-support` | Test doubles shared by the agent's tests and the simulator.                                 |
+| `crates/verify`                            | `beyond-verify`       | Claim registry and defect ledger for the gateway ([`verify/`](verify/README.md)).           |
+| `crates/rates-sync`                        | `beyond-rates-sync`   | Fetches vendors' pricing sources and generates the rate table.                              |
 
 The last five are not published.
 
