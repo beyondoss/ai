@@ -23,8 +23,8 @@ import {
 import {
   DiskFullError,
   JobExistsError,
-  KeyConflictError,
   JobGoneError,
+  KeyConflictError,
   SandboxError,
   StdinBusyError,
   StdinClosedError,
