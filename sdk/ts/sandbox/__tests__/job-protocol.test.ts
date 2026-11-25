@@ -5,6 +5,7 @@ import {
   DiskFullError,
   IoError,
   JobExistsError,
+  KeyConflictError,
   JobGoneError,
   NotFoundError,
   StdinBusyError,
@@ -156,6 +157,18 @@ describe("typed job errors (each a subclass of today's kind)", () => {
     return new HttpTransport({ url: e.url });
   }
   const fail = (p: Promise<unknown>) => p.then(() => undefined, (e) => e);
+
+  it("start: a 409 key_conflict is KeyConflictError, a ConflictError that is not JobExistsError", async () => {
+    const e = await fail(
+      (await failing(409, {
+        error: "the key was used for a different command or id",
+        code: "key_conflict",
+      })).jobs.start("s", "aa", { command: "true" }),
+    );
+    expect(e).toBeInstanceOf(KeyConflictError);
+    expect(e).toBeInstanceOf(ConflictError);
+    expect(e).not.toBeInstanceOf(JobExistsError);
+  });
 
   it("start: 409 is JobExistsError, 507 is DiskFullError", async () => {
     const exists = await fail(

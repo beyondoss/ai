@@ -23,6 +23,7 @@ from beyond_sandbox import (
     JobExistsError,
     JobGoneError,
     Jobs,
+    KeyConflictError,
     NotFoundError,
     StdinBusyError,
     StdinClosedError,
@@ -38,6 +39,20 @@ def jobs_over(handler: Any) -> tuple[Jobs, Endpoint]:
     e = Endpoint()
     e.handler = handler
     return Jobs(HttpTransport(e.url)), e
+
+
+def test_start_409_key_conflict_is_its_own_conflict() -> None:
+    sb, _ = jobs_over(
+        lambda h, b: reply(
+            h,
+            409,
+            {"error": "the key was used for a different command or id", "code": "key_conflict"},
+        )
+    )
+    with pytest.raises(KeyConflictError) as e:
+        sb.start("s", "aa", "true")
+    assert isinstance(e.value, ConflictError) and not isinstance(e.value, JobExistsError)
+    assert e.value.id == "aa"
 
 
 def test_start_409_and_507_are_typed() -> None:

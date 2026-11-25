@@ -44,7 +44,7 @@ use crate::job_kernel::{
     self as kernel, Act, Admit, Alive, Begin, Ev, Follow, Kind, Pick, Rec, Recovery, Refusal,
     Sink as Dest,
 };
-use crate::ledger::{Entry, Idem, Ledger};
+use crate::ledger::{Entry, Idem, Ledger, Saved};
 use crate::notify::{self, Notifier, NotifyTarget};
 use crate::proc::{self, locked};
 use crate::ring::Ring;
@@ -852,9 +852,12 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
             Begin::Refuse(Refusal::IdExists) => {
                 Gate::Answer(http::error_response(409, "the job exists"))
             }
-            Begin::Refuse(Refusal::KeyReused) => Gate::Answer(http::error_response(
+            Begin::Refuse(Refusal::KeyReused) => Gate::Answer(http::json_response(
                 409,
-                "the key was used for a different command",
+                &json!({
+                    "error": "the key was used for a different command or id",
+                    "code": "key_conflict",
+                }),
             )),
             Begin::Replay(id) => {
                 let replayed = (job.scope.clone(), id);
@@ -899,6 +902,11 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
         }
         Gate::Replay(_, None) => return http::error_response(500, "the job did not start"),
     };
+    // A keyed start's claim is on disk before anything is spawned (K9): a crash from here to the group's save leaves
+    // an intent a restart answers as lost, never a start to run again.
+    if idem.is_some() {
+        ctx.jobs.save();
+    }
     let mut cmd = exec::command_for(ctx, req, Kind::Job);
     cmd.stdin(if job.stdin_open {
         Stdio::piped()
@@ -1060,11 +1068,12 @@ fn spec_digest(req: &Request, job: &JobReq) -> String {
 async fn replay_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq, key: Key, cell: JobCell) -> Resp {
     let mut waited = 0;
     let pgid = loop {
-        let (pgid, removed) = {
+        let (pgid, removed, ended) = {
             let j = locked(&cell);
-            (j.k.pgid(), j.k.removed)
+            (j.k.pgid(), j.k.removed, j.k.ended())
         };
-        if pgid != 0 {
+        // A job a restart found claimed and never spawned is ended with no group: its answer is that.
+        if pgid != 0 || ended {
             break pgid;
         }
         if removed || waited >= 1000 {
@@ -1279,9 +1288,19 @@ pub(crate) fn recover(ctx: &Arc<Ctx>) {
     let mut adopted: Vec<std::path::PathBuf> = Vec::new();
     for e in ctx.jobs.ledger.load() {
         let alive = !proc::job_members(saved_pgid(&e), &e.mark).is_empty();
-        let (mut state, how) = kernel::recover(e.state(), alive, epoch());
+        let (mut state, how) = kernel::recover(e.state(), alive, epoch(), e.idem.is_some());
         if how == Recovery::Drop {
             continue;
+        }
+        if e.phase == Saved::Spawning && alive {
+            // The spawn happened and its save did not: nobody can find this job's processes but by its mark, and its
+            // answer is lost. Never leave them running unseen.
+            for pid in proc::job_members(0, &e.mark) {
+                if let Ok(raw) = i32::try_from(pid) {
+                    let _ =
+                        nix::sys::signal::kill(nix::unistd::Pid::from_raw(raw), Signal::SIGKILL);
+                }
+            }
         }
         let key = (e.scope.clone(), e.id.clone());
         let pgid = state.pgid();

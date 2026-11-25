@@ -20,6 +20,7 @@ from .errors import (
     IoError,
     JobExistsError,
     JobGoneError,
+    KeyConflictError,
     NotOfferedError,
     SandboxError,
     StdinBusyError,
@@ -75,6 +76,8 @@ def _written_in(detail: str) -> int | None:
 
 def _start_failure(e: SandboxError, job: str) -> SandboxError:
     """A refused ``start``: 409 is an id that exists, 507 a full disk (execd's ``spool_failure``)."""
+    if e.status == 409 and "key_conflict" in e.detail:
+        return KeyConflictError(f"job {job}: {e.detail}", id=job, status=409)
     if e.status == 409:
         return JobExistsError(f"job {job} exists: {e.detail}", id=job, status=409)
     if e.status == 507:

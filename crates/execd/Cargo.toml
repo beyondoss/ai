@@ -71,6 +71,12 @@ mut_key_record_clears = [
 mut_key_take_forgets_none = [
   "beyond-execd-jobs/mut_key_take_forgets_none",
 ] # taking a job leaves its key's record behind (K8)
+mut_intent_respawns = [
+  "beyond-execd-jobs/mut_intent_respawns",
+] # a keyed start claimed but never spawned is dropped by a restart, so its retry spawns (K9)
+mut_key_id_ignored = [
+  "beyond-execd-jobs/mut_key_id_ignored",
+] # a key used under another id replays that job (K1, K2)
 mut_take_by_key = [
   "beyond-execd-jobs/mut_take_by_key",
 ]

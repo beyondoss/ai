@@ -5,7 +5,7 @@
   "scenarios": [
     {
       "id": "jobs-key.a-retried-start-answers-the-first-job-and-runs-nothing",
-      "description": "A start whose answer was lost, sent again with its key, answers the job the first send started (the same process group) and runs nothing: the command ran once, and one job is listed. The same key under another id replays that job too.",
+      "description": "A start whose answer was lost, sent again with its key, answers the job the first send started (the same process group) and runs nothing: the command ran once, and one job is listed. The same key under another id is refused: the id is part of what the call asked for.",
       "requires": {
         "features": [
           "job_start_key"
@@ -66,8 +66,10 @@
           "label": "",
           "idempotency_key": "retry-${SCOPE}",
           "expect": {
-            "ok": {
-              "pgid": "${pg}"
+            "error": {
+              "detail": {
+                "$contains": "different command"
+              }
             }
           }
         },
@@ -231,6 +233,108 @@
           "scope": "${SCOPE}",
           "jobs": [
             "kb01"
+          ],
+          "expect": {
+            "ok": {
+              "survivors": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs-key.a-conflicting-key-is-a-typed-key-conflict",
+      "description": "The same key with another command, or under another id, is a conflict of its own type (key_conflict), not a job that exists: nothing started and the first job still runs.",
+      "requires": {
+        "features": [
+          "job_start_key",
+          "job_errors"
+        ]
+      },
+      "steps": [
+        {
+          "id": "first",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "kd01",
+          "command": "sh",
+          "args": [
+            "-c",
+            "sleep 30"
+          ],
+          "label": "",
+          "idempotency_key": "typed-${SCOPE}",
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              }
+            }
+          }
+        },
+        {
+          "id": "other-command",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "kd01",
+          "command": "sh",
+          "args": [
+            "-c",
+            "sleep 31"
+          ],
+          "label": "",
+          "idempotency_key": "typed-${SCOPE}",
+          "expect": {
+            "error": {
+              "kind": "conflict",
+              "code": "key_conflict"
+            }
+          }
+        },
+        {
+          "id": "other-id",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "kd02",
+          "command": "sh",
+          "args": [
+            "-c",
+            "sleep 30"
+          ],
+          "label": "",
+          "idempotency_key": "typed-${SCOPE}",
+          "expect": {
+            "error": {
+              "kind": "conflict",
+              "code": "key_conflict"
+            }
+          }
+        },
+        {
+          "id": "id-taken",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "kd01",
+          "command": "sh",
+          "args": [
+            "-c",
+            "sleep 33"
+          ],
+          "label": "",
+          "idempotency_key": "another-${SCOPE}",
+          "expect": {
+            "error": {
+              "kind": "conflict",
+              "code": "job_exists"
+            }
+          }
+        },
+        {
+          "id": "kill",
+          "op": "job_kill",
+          "scope": "${SCOPE}",
+          "jobs": [
+            "kd01"
           ],
           "expect": {
             "ok": {

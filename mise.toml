@@ -95,10 +95,10 @@ done
 '''
 
 [tasks."verify:start-key-mutants"]
-description = "crates/execd-jobs under each of the start key's seven mut_* features (K1-K8): every proof must go red (a Verus verification failure, not a build error). The execd tests (crates/execd/tests/startkey.rs) go red under the same features. Pairs with `verify:kernels`, which must be green without a feature."
+description = "crates/execd-jobs under each of the start key's nine mut_* features (K1-K9): every proof must go red (a Verus verification failure, not a build error). The execd tests (crates/execd/tests/startkey.rs) go red under the same features. Pairs with `verify:kernels`, which must be green without a feature."
 run = '''
 set -u
-for m in mut_key_replay_starts mut_key_digest_ignored mut_key_fresh_refused mut_unkeyed_replays mut_key_forgotten_on_restart mut_key_record_clears mut_key_take_forgets_none; do
+for m in mut_key_replay_starts mut_key_digest_ignored mut_key_fresh_refused mut_unkeyed_replays mut_key_forgotten_on_restart mut_key_record_clears mut_key_take_forgets_none mut_intent_respawns mut_key_id_ignored; do
   out=$(KERNEL_CRATES=crates/execd-jobs .github/scripts/verify-kernels.sh --features "$m" 2>&1) && { echo "proof stayed green under $m" >&2; exit 1; }
   line=$(grep -E "verification results:: .* [1-9][0-9]* errors" <<<"$out") || { echo "$m: failed without a Verus verification result (build error?)" >&2; exit 1; }
   echo "red under $m: $line"

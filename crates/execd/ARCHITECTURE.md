@@ -151,10 +151,9 @@ killed its shell (15, or 9 after the grace). Nothing is persisted: a job lives i
 after its answer was lost never runs a second job. What `start` does is `Table::begin`'s decision (`start_decision`, K1 to K5, proven in
 `crates/execd-jobs`): a key already used for this command, by a job still in the table, answers that job (`200`, its process group, `stdin`
 as the first answer had it; a held start streams the job from its first byte) and runs nothing; the same key for another command is `409`
-"the key was used for a different command"; an id in the table with no key that names it (no key, or another) is `409` "the job exists".
+"the key was used for a different command or id" (`"code": "key_conflict"`; the id is part of what the client asked for); an id in the table with no key that names it (no key, or another) is `409` "the job exists".
 "The same command" is a SHA-256 digest of command, args, cwd, env (as a set), `stdin_open` and `hold` (`jobs::spec_digest`); only the
-digest is kept, never the env, which can hold secrets, and the label and the id are not in it. A start with the key of a job under another id
-answers that job: the key names the job, not the id.
+digest is kept, never the env, which can hold secrets, and the label and the id are not in it.
 
 _Where the record lives, and how long._ The key's record (`Rec`: scope, key, id, digest) is the table's, written under its lock with the entry
 (K7), saved in the job's ledger entry (`Idem`, `execd-jobs.json`, a field the version-1 file already ignores) and put back by `recover` for
@@ -163,9 +162,11 @@ every job it brings back (K6, `keeps_record`), so a retry after a restart of exe
 (see Bounds), so a keyed record is never dropped before its job's output: a job that ended, even one whose group the restart found gone, is
 still answered by its key until it is removed. If a retention budget is ever added, a keyed job must not be evicted by it.
 
-_One window._ The ledger entry is written after the spawn (a job with no group is never saved, R4). A crash between the spawn and the save
-loses the record of a job whose process runs on; its retry starts a second job. The window is the time of one file write; closing it needs the
-claim written before the spawn, and a restart that can tell a spawned job from one that never was.
+_The claim comes first (K9)._ A keyed start's ledger entry is written as an intent (phase `spawning`, the key, digest and id) before
+anything is spawned, then rewritten with the group. A restart that finds an intent with no group (a crash between the two) asks
+`recover(.., keyed = true)`: the job comes back ended with the lost status (`-1`, no group), in the table, its record kept, and the
+processes carrying its mark, if the spawn did happen, are killed. The retry replays it (`started` is `0`: there is no group), and no
+restart sequence runs the command twice. An unkeyed start with no group is still not saved (R4).
 
 **Output streams.** (`src/ring.rs` does the I/O; which offsets are held, where a read starts, which chunks retention drops and which bytes are stderr are the Verus-proven kernel `crates/execd-ring`, R1 to R6 in its docs, and `ring.rs`'s tests hold the whole to a plain `Vec` under random pushes, reads and refused chunks.) The ring keeps which pipe each byte came from, one bit per byte: an in-memory bitmap for the unfinished tail,
 allocated at the job's first stderr byte, and a `<chunk>.e` sidecar (8 KiB, same `0600`, `O_EXCL|O_NOFOLLOW`) beside each full

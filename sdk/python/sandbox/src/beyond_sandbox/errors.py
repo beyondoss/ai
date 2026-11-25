@@ -101,6 +101,15 @@ class JobExistsError(ConflictError):
         self.id = id
 
 
+class KeyConflictError(ConflictError):
+    """``start`` whose idempotency key was already used for another command or under another id (409
+    ``key_conflict``): the id is part of what the call asked for. Nothing started."""
+
+    def __init__(self, detail: str = "", *, id: str = "", status: int | None = None) -> None:  # noqa: A002
+        super().__init__(detail, status=status)
+        self.id = id
+
+
 class DiskFullError(IoError):
     """``start`` refused because the sandbox's disk is full (507): no room for the job's output."""
 

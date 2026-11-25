@@ -203,6 +203,8 @@ pub enum JobError {
     Gone { text: String },
     /// `start` of an id that exists (`409`); the first job is left alone.
     Exists { text: String },
+    /// `start` whose idempotency key was used for another command or under another id (`409` `key_conflict`).
+    KeyConflict { text: String },
     /// `start` on a full disk (`507`).
     DiskFull { text: String },
     /// A stdin write the job cannot take (`409`).
@@ -225,6 +227,7 @@ impl JobError {
             _ => body.to_string(),
         };
         Some(match (op, status) {
+            (JobOp::Start, 409) if body.contains("key_conflict") => Self::KeyConflict { text },
             (JobOp::Start, 409) => Self::Exists { text },
             (JobOp::Start, 507) => Self::DiskFull { text },
             (JobOp::Other | JobOp::Write, 404) => Self::Gone { text },
@@ -257,6 +260,7 @@ impl JobError {
         match self {
             Self::Gone { .. } => "job_gone",
             Self::Exists { .. } => "job_exists",
+            Self::KeyConflict { .. } => "key_conflict",
             Self::DiskFull { .. } => "disk_full",
             Self::StdinClosed {
                 reason: StdinClosedReason::NeverOpened,
@@ -285,7 +289,7 @@ impl JobError {
         };
         match self {
             Self::Gone { .. } => NotFound,
-            Self::Exists { .. } => AlreadyExists,
+            Self::Exists { .. } | Self::KeyConflict { .. } => AlreadyExists,
             Self::DiskFull { .. } => StorageFull,
             Self::StdinClosed {
                 reason: StdinClosedReason::NeverOpened,
@@ -305,6 +309,7 @@ impl JobError {
         match self {
             Self::Gone { text }
             | Self::Exists { text }
+            | Self::KeyConflict { text }
             | Self::DiskFull { text }
             | Self::StdinClosed { text, .. }
             | Self::StdinGap { text }

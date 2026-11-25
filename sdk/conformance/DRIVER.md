@@ -147,6 +147,7 @@ reports `code` only for these, and a scenario may expect it:
 | -------------------- | ----------- | --------------------------------------------------------------------------------------------------------------- |
 | `job_gone`           | `not_found` | `job_attach`, `job_write`, `job_keep` or `job_seen` of no job; `job_read` of a removed job with `gone_as_error` |
 | `job_exists`         | `conflict`  | `job_start` of an id that exists (409)                                                                          |
+| `key_conflict`       | `conflict`  | `job_start` with a key used for another command or under another id (409)                                       |
 | `disk_full`          | `io`        | `job_start` on a full disk (507)                                                                                |
 | `stdin_never_opened` | `conflict`  | `job_write` to a job started without `stdin_open`                                                               |
 | `stdin_closed`       | `conflict`  | `job_write` after EOF, or to a job that ended: retrying cannot succeed                                          |

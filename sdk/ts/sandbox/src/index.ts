@@ -74,6 +74,7 @@ export {
   IoError,
   IsDirectoryError,
   JobExistsError,
+  KeyConflictError,
   JobGoneError,
   NotADirectoryError,
   NotFoundError,

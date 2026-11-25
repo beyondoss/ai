@@ -5,6 +5,7 @@ import {
   EndpointError,
   InvalidRequestError,
   JobExistsError,
+  KeyConflictError,
   JobGoneError,
   NotOfferedError,
   ProtocolError,
@@ -811,6 +812,9 @@ function jobFailure(
   const cause = { cause: e };
   if (status === 404 && op !== "start") {
     return new JobGoneError(`job ${id}: ${detail}`, id, cause);
+  }
+  if (op === "start" && status === 409 && detail.includes("key_conflict")) {
+    return new KeyConflictError(`job ${id}: ${detail}`, id, cause);
   }
   if (op === "start" && status === 409) {
     return new JobExistsError(`job ${id} exists: ${detail}`, id, cause);

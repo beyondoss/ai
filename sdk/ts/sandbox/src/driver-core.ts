@@ -23,6 +23,7 @@ import {
 import {
   DiskFullError,
   JobExistsError,
+  KeyConflictError,
   JobGoneError,
   SandboxError,
   StdinBusyError,
@@ -615,6 +616,7 @@ function heartbeat(req: Json): { heartbeatSeconds?: number } {
 function codeOf(e: SandboxError): string | undefined {
   if (e instanceof JobGoneError) return "job_gone";
   if (e instanceof JobExistsError) return "job_exists";
+  if (e instanceof KeyConflictError) return "key_conflict";
   if (e instanceof DiskFullError) return "disk_full";
   if (e instanceof StdinClosedError) {
     return e.reason === "never_opened" ? "stdin_never_opened" : "stdin_closed";

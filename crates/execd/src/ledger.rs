@@ -78,6 +78,8 @@ pub(crate) struct Kept {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Saved {
+    /// A keyed start's claim, written before its spawn (`idem` is set, `pgid` is 0).
+    Spawning,
     Running,
     Exited,
     Ended,
@@ -104,6 +106,9 @@ impl Entry {
             return None;
         }
         let (phase, pgid, code, signal, at, told) = match k.phase {
+            // A keyed start's intent is saved before the spawn, so a crash before the group's save leaves a claim a
+            // restart can answer (K9). An unkeyed start with no group is not saved (R4).
+            Phase::Spawning if idem.is_some() => (Saved::Spawning, 0, None, None, None, None),
             Phase::Spawning => return None,
             Phase::Running { pgid } => (Saved::Running, pgid, None, None, None, None),
             Phase::Exited { pgid, code, signal } => {
@@ -154,6 +159,7 @@ impl Entry {
     pub fn state(&self) -> State {
         let (pgid, code, signal) = (self.pgid, self.code.unwrap_or(0), self.signal);
         let phase = match self.phase {
+            Saved::Spawning => Phase::Spawning,
             Saved::Running => Phase::Running { pgid },
             Saved::Exited => Phase::Exited { pgid, code, signal },
             Saved::Ended => Phase::Ended {

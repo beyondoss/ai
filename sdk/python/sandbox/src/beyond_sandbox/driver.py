@@ -34,6 +34,7 @@ from .errors import (
     IoError,
     JobExistsError,
     JobGoneError,
+    KeyConflictError,
     ProtocolError,
     StdinBusyError,
     StdinClosedError,
@@ -761,6 +762,8 @@ def _code(e: SandboxError) -> str | None:
         return "job_gone"
     if isinstance(e, JobExistsError):
         return "job_exists"
+    if isinstance(e, KeyConflictError):
+        return "key_conflict"
     if isinstance(e, DiskFullError):
         return "disk_full"
     if isinstance(e, StdinClosedError):

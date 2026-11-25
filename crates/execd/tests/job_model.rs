@@ -123,6 +123,9 @@ struct Sim {
     was_kept: bool,
     /// The start's key and spec (the model's own record of what the client sent), `None` for an unkeyed start.
     idem: Option<(u8, u8)>,
+    /// A restart dropped this keyed job's claim while its process may have been spawned: whatever starts for its key
+    /// next would be a second spawn (K9). The model's own fact, never the kernel's.
+    orphan: bool,
 }
 
 impl Sim {
@@ -196,6 +199,8 @@ enum A {
     },
     /// execd restarts: its table is gone and the ledger's jobs come back as `recover` decides.
     Restart,
+    /// A keyed job's process is spawned and execd restarts before the group's save: only the intent is on disk (K9).
+    SpawnCrash(usize),
     SpawnOk(usize),
     SpawnFail(usize),
     ShellDies(usize),
@@ -339,6 +344,68 @@ fn digest(spec: u8) -> String {
 }
 
 impl St {
+    /// execd restarts: its table is gone; every job the ledger saved comes back as `recover` decides
+    /// (`jobs::recover`): the table is rebuilt, with each job's key record when the kernel keeps it.
+    fn restart(&mut self) {
+        let old = self.table.all();
+        self.table = kernel::Table::default();
+        self.pending.clear();
+        for cl in &mut self.clients {
+            cl.st = Cl::Done;
+        }
+        for ((sc, idn), h) in old {
+            let sim = &mut self.sims[h];
+            let (mut state, how) =
+                kernel::recover(sim.k.clone(), sim.alive(), 0, sim.idem.is_some());
+            if how == Recovery::Drop {
+                // Never saved (it was spawning): the spawn died with the process. A keyed one's process may
+                // exist: the claim is gone, so the next start of its key would spawn it again.
+                sim.orphan = sim.idem.is_some() && sim.alive();
+                kernel::step(&mut sim.k, Ev::Taken);
+                continue;
+            }
+            if how == Recovery::Restore && matches!(sim.k.phase, Phase::Spawning) {
+                // A claim with no group: the answer is lost, and the shell kills what carries the mark.
+                sim.shell = false;
+                sim.desc = false;
+            }
+            if how == Recovery::Adopt {
+                sim.sup = if sim.shell {
+                    Sup::Wait
+                } else if sim.desc {
+                    Sup::Reported
+                } else {
+                    Sup::Reaping
+                };
+                if let Act::Kill { .. } = kernel::step(&mut state, Ev::Disconnect { hold: true }) {
+                    sim.shell = false;
+                    sim.desc = false;
+                }
+            } else {
+                sim.pumps = false;
+                sim.sup = Sup::Done;
+                if let Phase::Ended { code, signal, .. } = state.phase
+                    && sim.snap.is_none()
+                {
+                    sim.snap = Some((code, signal, sim.end));
+                }
+            }
+            sim.k = state;
+            let idem = sim.idem;
+            self.table.insert((sc.clone(), idn.clone()), h);
+            if let Some((kk, spec)) = idem
+                && kernel::keeps_record(how)
+            {
+                self.table.record(Rec {
+                    scope: sc,
+                    key: key_name(kk),
+                    id: idn,
+                    digest: digest(spec),
+                });
+            }
+        }
+    }
+
     /// The job a lookup in `scope` resolved to, judged against the facts: J2 and J3.
     fn resolved(&mut self, scope: u8, h: usize) {
         if self.sims[h].scope != scope {
@@ -530,6 +597,9 @@ impl Model for Jobs {
             if sim.k.phase == Phase::Spawning && !sim.k.removed {
                 out.push(A::SpawnOk(i));
                 out.push(A::SpawnFail(i));
+                if self.restart && sim.idem.is_some() {
+                    out.push(A::SpawnCrash(i));
+                }
             }
             if sim.shell {
                 out.push(A::ShellDies(i));
@@ -629,6 +699,7 @@ impl Model for Jobs {
                     snap: None,
                     was_kept: client.is_none(),
                     idem: None,
+                    orphan: false,
                 });
                 s.table.insert(k, h);
                 if let Some(c) = client {
@@ -668,6 +739,7 @@ impl Model for Jobs {
                         match s.table.get(&(sc.clone(), rid)) {
                             Some(h)
                                 if s.sims[h].idem == Some((kk, spec))
+                                    && s.sims[h].id == id
                                     && s.sims[h].scope == scope =>
                             {
                                 s.resolved(scope, h);
@@ -678,7 +750,11 @@ impl Model for Jobs {
                     Begin::Start => {
                         // K1: no job of this key and spec is in the table. K2: no job of this key and
                         // another spec is either (the key was used for another command).
-                        if in_table(&s, &|x| x.idem == Some((kk, spec))) {
+                        if s.sims
+                            .iter()
+                            .any(|x| x.idem == Some((kk, spec)) && x.scope == scope && x.orphan)
+                            || in_table(&s, &|x| x.idem == Some((kk, spec)))
+                        {
                             s.bad |= V_K1;
                         }
                         if in_table(&s, &|x| {
@@ -703,6 +779,7 @@ impl Model for Jobs {
                             snap: None,
                             was_kept: true,
                             idem: Some((kk, spec)),
+                            orphan: false,
                         });
                         if let Some(old) = s.table.get(&key(scope, id))
                             && !s.sims[old].k.removed
@@ -719,60 +796,13 @@ impl Model for Jobs {
                     }
                 }
             }
-            A::Restart => {
-                // execd's table is gone; every job the ledger saved comes back as `recover` decides
-                // (`jobs::recover`): the table is rebuilt, with each job's key record when the kernel keeps it.
-                let old = s.table.all();
-                s.table = kernel::Table::default();
-                s.pending.clear();
-                for cl in &mut s.clients {
-                    cl.st = Cl::Done;
-                }
-                for ((sc, idn), h) in old {
-                    let sim = &mut s.sims[h];
-                    let (mut state, how) = kernel::recover(sim.k.clone(), sim.alive(), 0);
-                    if how == Recovery::Drop {
-                        // Never saved (it was spawning): the spawn died with the process.
-                        kernel::step(&mut sim.k, Ev::Taken);
-                        continue;
-                    }
-                    if how == Recovery::Adopt {
-                        sim.sup = if sim.shell {
-                            Sup::Wait
-                        } else if sim.desc {
-                            Sup::Reported
-                        } else {
-                            Sup::Reaping
-                        };
-                        if let Act::Kill { .. } =
-                            kernel::step(&mut state, Ev::Disconnect { hold: true })
-                        {
-                            sim.shell = false;
-                            sim.desc = false;
-                        }
-                    } else {
-                        sim.pumps = false;
-                        sim.sup = Sup::Done;
-                        if let Phase::Ended { code, signal, .. } = state.phase
-                            && sim.snap.is_none()
-                        {
-                            sim.snap = Some((code, signal, sim.end));
-                        }
-                    }
-                    sim.k = state;
-                    let idem = sim.idem;
-                    s.table.insert((sc.clone(), idn.clone()), h);
-                    if let Some((kk, spec)) = idem
-                        && kernel::keeps_record(how)
-                    {
-                        s.table.record(Rec {
-                            scope: sc,
-                            key: key_name(kk),
-                            id: idn,
-                            digest: digest(spec),
-                        });
-                    }
-                }
+            A::Restart => s.restart(),
+            A::SpawnCrash(i) => {
+                let sim = &mut s.sims[i];
+                sim.shell = true;
+                sim.desc = true;
+                sim.pumps = true;
+                s.restart();
             }
             A::SpawnOk(i) => {
                 let sim = &mut s.sims[i];
@@ -1296,7 +1326,9 @@ fn ended_is_final() {
     feature = "mut_unkeyed_replays",
     feature = "mut_key_forgotten_on_restart",
     feature = "mut_key_record_clears",
-    feature = "mut_key_take_forgets_none"
+    feature = "mut_key_take_forgets_none",
+    feature = "mut_intent_respawns",
+    feature = "mut_key_id_ignored"
 ))]
 #[test]
 fn the_mutation_turns_its_property_red() {
@@ -1324,7 +1356,7 @@ fn the_mutation_turns_its_property_red() {
         "J10: "
     } else if cfg!(feature = "mut_ended_not_removable") {
         "L1: "
-    } else if cfg!(feature = "mut_key_replay_starts") {
+    } else if cfg!(feature = "mut_key_replay_starts") || cfg!(feature = "mut_intent_respawns") {
         "K1: "
     } else if cfg!(feature = "mut_key_digest_ignored")
         || cfg!(feature = "mut_key_take_forgets_none")
@@ -1422,6 +1454,12 @@ fn production_calls_the_kernel() {
     ] {
         assert!(prod.contains(needle), "jobs.rs no longer calls {needle}");
     }
+    // K9: a keyed start's claim is on disk before anything is spawned.
+    let intent = prod
+        .find("if idem.is_some() {\n        ctx.jobs.save();")
+        .expect("the keyed start saves its claim");
+    let spawn = prod.find("proc::spawn(&mut cmd)").expect("the spawn");
+    assert!(intent < spawn, "the claim is saved after the spawn");
     // The table is the kernel's verified storage, not a map of the shell's.
     assert!(!prod.contains("HashMap<Key"), "jobs.rs keeps its own map");
     // No decision of the job's life is made outside the kernel: its state is only written there.

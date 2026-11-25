@@ -80,9 +80,9 @@ async fn kill(addr: SocketAddr, ids: &[&str]) {
     .await;
 }
 
-/// K1: the retry of a start whose answer was lost answers the first job, and nothing runs twice. A retry
-/// that names another id (a client that picked one per send) gets the first job's group too.
-/// Red under `mut_key_replay_starts` (a second job starts) and on a binary that ignores the key.
+/// K1: the retry of a start whose answer was lost answers the first job, and nothing runs twice. The same key under
+/// another id is `409` `key_conflict` (K2). Red under `mut_key_replay_starts` (a second job starts),
+/// `mut_key_id_ignored` and on a binary that ignores the key.
 #[tokio::test]
 async fn a_start_retried_with_its_key_answers_the_first_job_and_runs_nothing() {
     let execd = Execd::start(&[], &[]);
@@ -94,12 +94,10 @@ async fn a_start_retried_with_its_key_answers_the_first_job_and_runs_nothing() {
     assert_eq!(s1, 200, "{first}");
     let (s2, again) = start(a, "j1", Some("deploy-1"), &sc, json!({})).await;
     assert_eq!((s2, &again), (200, &first), "the same id and key replays");
+    // The id is part of what the client asked for: another id under the key is a conflict, not a job named otherwise.
     let (s3, other_id) = start(a, "j2", Some("deploy-1"), &sc, json!({})).await;
-    assert_eq!(
-        (s3, &other_id),
-        (200, &first),
-        "the same key under another id replays the first job"
-    );
+    assert_eq!(s3, 409, "{other_id}");
+    assert_eq!(other_id["code"], "key_conflict");
     until("the job ran", async || runs(&mark) >= 1).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(runs(&mark), 1, "the command ran once");
@@ -160,7 +158,7 @@ async fn a_key_used_for_another_command_is_a_409_for_every_field_of_the_spec() {
         let (s, v) = start(a, "j9", Some("k"), script, extra).await;
         assert_eq!(s, 409, "{what}: {v}");
         assert_eq!(
-            v["error"], "the key was used for a different command",
+            v["error"], "the key was used for a different command or id",
             "{what}"
         );
     }
@@ -313,7 +311,7 @@ async fn a_keyed_start_retried_after_a_restart_of_execd_replays() {
     let (s, v) = start(a2, "live", Some("deploy"), &sc, json!({})).await;
     assert_eq!(
         (s, v["error"].as_str()),
-        (409, Some("the key was used for a different command"))
+        (409, Some("the key was used for a different command or id"))
     );
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(runs(&mark), 1, "the command ran once, across the restart");
@@ -364,4 +362,62 @@ async fn a_held_start_retried_with_its_key_streams_the_first_job() {
     let text = String::from_utf8_lossy(&again.body);
     assert!(text.contains("started"), "{text}");
     assert_eq!(runs(&mark), 1);
+}
+
+/// K9: a keyed start whose claim was written and whose spawn was never saved (execd crashed in between) comes back
+/// as a job that ended lost; its retry answers it and runs nothing. A ledger holding only that intent stands for
+/// the crash. Red under `mut_intent_respawns` (the intent is dropped, so the retry spawns).
+#[tokio::test]
+async fn a_keyed_start_claimed_and_never_saved_is_lost_and_its_retry_never_spawns() {
+    let state = tempfile::tempdir().unwrap();
+    let ledger = state.path().join("ledger");
+    std::fs::create_dir_all(&ledger).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let mark = dir.path().join("mark");
+    let sc = script(&mark);
+    // What execd's own digest of this spec is: the digest of a first send, read from a live execd's ledger.
+    let digest = {
+        let probe = tempfile::tempdir().unwrap();
+        let pl = probe.path().join("ledger");
+        let settings = [("EXECD_STATE_DIR", pl.to_str().unwrap())];
+        let e = Execd::start(&settings, &[]);
+        let a = SocketAddr::V4(e.addr);
+        let (s, _) = start(a, "lost", Some("intent"), &sc, json!({})).await;
+        assert_eq!(s, 200);
+        let saved: Value =
+            serde_json::from_slice(&std::fs::read(pl.join("execd-jobs.json")).unwrap()).unwrap();
+        let d = saved["jobs"][0]["idem"]["digest"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        kill(a, &["lost"]).await;
+        d
+    };
+    std::fs::remove_file(&mark).ok();
+    let file = json!({ "version": 1, "jobs": [{
+        "scope": "s", "id": "lost", "label": "", "mark": "EXECD_JOB_MARK_intent", "phase": "spawning",
+        "pgid": 0, "code": null, "signal": null, "at": null, "told": null, "kept": { "num": null, "kind": null },
+        "seen": 0, "started": 1, "spool": null,
+        "idem": { "key": "intent", "digest": digest },
+    }]});
+    std::fs::write(
+        ledger.join("execd-jobs.json"),
+        serde_json::to_vec(&file).unwrap(),
+    )
+    .unwrap();
+    let settings = [("EXECD_STATE_DIR", ledger.to_str().unwrap())];
+    let e = Execd::start(&settings, &[]);
+    let a = SocketAddr::V4(e.addr);
+    // The claim is a job that ended lost, not nothing.
+    let l = job(a, json!({"op":"list","scope":"s"})).await;
+    assert_eq!(l["jobs"][0]["id"], "lost", "{l}");
+    assert_eq!(l["jobs"][0]["state"], "ended");
+    assert_eq!(l["jobs"][0]["code"], -1);
+    // The retry is answered by it, however often it comes, and nothing runs.
+    for _ in 0..2 {
+        let (s, v) = start(a, "lost", Some("intent"), &sc, json!({})).await;
+        assert_eq!((s, &v["started"]), (200, &json!(0)), "{v}");
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(runs(&mark), 0, "the command never ran");
 }
