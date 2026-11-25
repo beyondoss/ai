@@ -265,8 +265,7 @@ async fn open(
                 .await
         }
         Opening::Attach { offset, mark } => {
-            let mut extra =
-                json!({ "id": h.id.as_str(), "offset": offset, "output": h.output });
+            let mut extra = json!({ "id": h.id.as_str(), "offset": offset, "output": h.output });
             if mark.len > 0 {
                 extra["mark"] = Value::String(mark_text(&mark).to_string());
             }
