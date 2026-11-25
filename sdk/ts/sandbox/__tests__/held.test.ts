@@ -1,3 +1,4 @@
+import { createServer } from "node:net";
 import { setTimeout as realSleep } from "node:timers/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { text } from "../src/bytes.js";
@@ -246,9 +247,15 @@ describe("a handle that cannot reach the endpoint keeps trying and says so", () 
 
 describe("a start nothing answers", () => {
   it("ends with a connect error (a TransportError), where an answered one would keep trying", async () => {
-    // Nothing listens on port 1: the connection is refused, so no request reached any server.
+    // Nothing listens on this port: the connection is refused, so no request reached any server.
+    const port = await new Promise<number>((resolve) => {
+      const s = createServer().listen(0, "127.0.0.1", () => {
+        const { port } = s.address() as { port: number };
+        s.close(() => resolve(port));
+      });
+    });
     const jobs = new Jobs(
-      new HttpTransport({ url: "http://127.0.0.1:1/exec" }),
+      new HttpTransport({ url: `http://127.0.0.1:${port}/exec` }),
     );
     const err = await jobs.start("s", "aa", { command: "true" }).then(
       () => null,

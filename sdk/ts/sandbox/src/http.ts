@@ -1230,12 +1230,19 @@ const NEVER_CONNECTED = new Set([
 
 function neverConnected(e: unknown, depth = 0): boolean {
   if (typeof e !== "object" || e === null || depth > 4) return false;
-  const { code, cause, errors } = e as {
+  const { code, cause, errors, message } = e as {
     code?: unknown;
     cause?: unknown;
     errors?: unknown;
+    message?: unknown;
   };
   if (typeof code === "string" && NEVER_CONNECTED.has(code)) return true;
+  // A runtime that names the code only in its message; `bad port` is fetch refusing a port it will not
+  // connect to (1, among others): nothing was sent.
+  if (
+    typeof message === "string"
+    && [...NEVER_CONNECTED, "bad port"].some((c) => message.includes(c))
+  ) return true;
   if (neverConnected(cause, depth + 1)) return true;
   return Array.isArray(errors)
     && errors.some((x) => neverConnected(x, depth + 1));
