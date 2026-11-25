@@ -906,6 +906,7 @@ mod notify_tests {
             label: "sleep 1".into(),
             env: Vec::new(),
             stdin_open: false,
+            pty: None,
         };
         let job = link.id.as_str().to_string();
         let task = {
@@ -973,6 +974,7 @@ mod front_tests {
         );
         let shared = Arc::new(JobShared::in_sandbox(link.clone(), 0, &jobs));
         let spec = JobSpec {
+            pty: None,
             program: "sh".into(),
             args: vec!["-c".into(), "true".into()],
             cwd: None,

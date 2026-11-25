@@ -104,8 +104,8 @@ Go -> Starting|Opening -> (2xx) Confirming -> (echo of the mark) Streaming -> (e
   Exit | Bad)`, `Broke` (reset, silence, EOF, truncated line), `Tick`, `ExitTaken`, `Close`, `Deadline`. A stale event (a
   frame after the cut, a tick when not waiting) changes nothing and asks for nothing.
 - **Actions:** `Start{key, silence_ms}`, `OpenAttach{offset, mark, silence_ms}`, `CloseStream`,
-  `Deliver{at, len, dropped}`, `DeliverExit{code, signal, dropped}`, `Sleep{until_ms}`, `Remove{mark}`,
-  `Reconnecting{attempts, since_ms}` (status only), `Fail{fault, status, offset}`, `Finish`, `Detached`. Every handle ends with exactly one of the last three.
+  `Deliver{at, len, dropped}`, `DeliverExit{code, signal, dropped, killed}`, `Sleep{until_ms}`, `Remove{mark}`,
+  `Reconnecting{attempts, since_ms}` (status only), `Started{mark, stdin}`, `Attached{mark, from}` and `ShellExit{code}` (told to the consumer), `Kill` (a kept start's refused echo), `Fail{fault, status, offset}`, `Finish`, `Detached`. Every handle ends with exactly one of the last three.
 - **Time and randomness are inputs:** `now` (the shell's clock) and `draw` (a uniform `u32` for the jitter).
 - **A mark** is `Mark::from_bytes` of 1 to 32 bytes of `[0-9a-f]`, or the empty mark ("whatever holds the id
   now", for a start or a `get`).

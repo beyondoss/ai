@@ -32,6 +32,8 @@ from .models import (
     JobRemoved,
     JobShellExit,
     JobStarted,
+    Pty,
+    PtyInfo,
     ShellExit,
     Signal,
     Stderr,
@@ -262,7 +264,10 @@ def decode_job_line(line: bytes) -> list[JobFrame]:
         mark = obj.get("mark")
         return [
             JobStarted(
-                obj["started"], obj.get("stdin") is True, mark if isinstance(mark, str) else ""
+                obj["started"],
+                obj.get("stdin") is True,
+                mark if isinstance(mark, str) else "",
+                parse_pty(obj.get("pty")),
             )
         ]
     att = obj.get("attached")
@@ -312,6 +317,22 @@ def _signal(v: dict[str, Any], state: str) -> int | None:
     return _int(v, "signal") if state in ("exited", "ended") else None
 
 
+def _pty_dim(n: Any) -> bool:
+    return isinstance(n, int) and not isinstance(n, bool) and 1 <= n <= 1024
+
+
+def parse_pty(v: Any) -> Pty | None:
+    """A terminal's size as the wire echoes it; None when absent or not two integers from 1 to 1024."""
+    if isinstance(v, dict) and _pty_dim(v.get("cols")) and _pty_dim(v.get("rows")):
+        return Pty(v["cols"], v["rows"])
+    return None
+
+
+def parse_pty_info(v: Any) -> PtyInfo | None:
+    p = parse_pty(v)
+    return None if p is None else PtyInfo(p.cols, p.rows, v.get("open") is True)
+
+
 def parse_read(v: Any) -> JobRead:
     st = _state(v.get("state"), v.get("code")) if isinstance(v, dict) else None
     if st is None:
@@ -324,6 +345,7 @@ def parse_read(v: Any) -> JobRead:
         _b64("data", v.get("data", "")),
         _signal(v, st[0]),
         _ranges(v),
+        parse_pty_info(v.get("pty")),
     )
 
 
@@ -387,6 +409,7 @@ def parse_list(v: Any) -> list[JobInfo]:
                 output_start=_int(j, "outputStart") or 0,
                 output_end=_int(j, "outputEnd") or 0,
                 signal=_signal(j, st[0]),
+                pty=parse_pty_info(j.get("pty")),
             )
         )
     return out

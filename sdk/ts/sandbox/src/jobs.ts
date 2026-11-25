@@ -1,14 +1,17 @@
 import { concat } from "./bytes.js";
 import { InvalidRequestError, JobGoneError, ProtocolError } from "./errors.js";
+import { held } from "./held.js";
 import { DEFAULT_KILL_GRACE_MS, isJobId } from "./transport.js";
 import type {
   AttachOptions,
+  HeldOptions,
   JobChunk,
   JobFrame,
   JobInfo,
   JobSpec,
   JobStarted,
   KeepFields,
+  PtySize,
   RemoveOptions,
   RemoveResult,
   ReqOptions,
@@ -68,6 +71,17 @@ function validId(id: string): void {
   }
 }
 
+/** A terminal's cols and rows are integers from 1 to 1024. */
+export function checkPtySize(p: PtySize): void {
+  for (const n of [p.cols, p.rows]) {
+    if (!Number.isInteger(n) || n < 1 || n > 1024) {
+      throw new InvalidRequestError(
+        "pty: cols and rows are integers from 1 to 1024",
+      );
+    }
+  }
+}
+
 function count(name: string, v: number | undefined, dflt: number): number {
   if (v === undefined) return dflt;
   if (!Number.isInteger(v) || v < 0) {
@@ -100,7 +114,16 @@ export class Jobs {
   ): Promise<JobStarted> {
     validScope(scope);
     validId(id);
-    return this.transport.jobs.start(scope, id, spec, req);
+    if (spec.pty !== undefined) checkPtySize(spec.pty);
+    const frames = held(
+      this.transport.jobs,
+      { flow: "start", scope, id, spec, hold: false },
+      req,
+    );
+    for await (const f of frames) {
+      if (f.type === "started") return { pgid: f.pgid, mark: f.mark };
+    }
+    throw new ProtocolError("the endpoint did not report the job's start");
   }
 
   /**
@@ -112,11 +135,16 @@ export class Jobs {
     scope: string,
     id: string,
     spec: JobSpec,
-    req: ReqOptions = {},
+    req: HeldOptions = {},
   ): AsyncGenerator<JobFrame> {
     validScope(scope);
     validId(id);
-    yield* this.transport.jobs.startHeld(scope, id, spec, req);
+    if (spec.pty !== undefined) checkPtySize(spec.pty);
+    yield* held(
+      this.transport.jobs,
+      { flow: "start", scope, id, spec, hold: true },
+      req,
+    );
   }
 
   /** Every job in the scope. */
@@ -157,8 +185,9 @@ export class Jobs {
    * Follow a job's output from `offset` to its end: frames in order, the last one `exit` or
    * `signal`. Stopping early detaches and never kills the job. (The transport wire call is
    * {@link Transport.jobs}.attach; this surface names the stream `follow` so it is not confused
-   * with {@link Jobs.collect}.) A job that does not exist is {@link JobGoneError}. A stream that
-   * asked for a `heartbeatSeconds` is presumed dead only after silence longer than two beats.
+   * with {@link Jobs.collect}.) A job that does not exist is {@link JobGoneError}. A cut or silent
+   * stream is reopened at the offset reached, by the client kernel (`crates/job-client`); a handle that
+   * cannot reopen says so through `onReconnecting` and keeps trying.
    */
   async *follow(
     scope: string,
@@ -169,7 +198,11 @@ export class Jobs {
     validScope(scope);
     validId(id);
     count("offset", offset, 0);
-    yield* this.transport.jobs.attach(scope, id, offset, req);
+    yield* held(
+      this.transport.jobs,
+      { flow: "attach", scope, id, offset },
+      req,
+    );
   }
 
   /** {@link Jobs.follow} to the end, collected into one {@link JobOutput}. */
@@ -299,6 +332,25 @@ export class Jobs {
     validId(id);
     count("at", at, 0);
     return this.transport.jobs.writeStdin(scope, id, at, data, eof, req);
+  }
+
+  /**
+   * Set a terminal job's size (wire `resize`; `cols` and `rows` are integers from 1 to 1024, else
+   * {@link InvalidRequestError} and nothing is sent). Absolute: a retry changes nothing. No such job
+   * is {@link JobGoneError}; a job with no terminal, an ended one or one whose terminal hung up is
+   * {@link ConflictError}.
+   */
+  async resize(
+    scope: string,
+    id: string,
+    cols: number,
+    rows: number,
+    req: ReqOptions = {},
+  ): Promise<PtySize> {
+    validScope(scope);
+    validId(id);
+    checkPtySize({ cols, rows });
+    return this.transport.jobs.resize(scope, id, cols, rows, req);
   }
 
   /**

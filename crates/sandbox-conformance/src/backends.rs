@@ -100,6 +100,8 @@ pub struct Started {
     /// Called before each cell: renews the backend's lifetime and returns how long the cell may take.
     /// `None` for a backend that cannot expire.
     pub lease: Option<Lease>,
+    /// What a `host` step may do to this backend's machine; `None` when the harness cannot.
+    pub host: Option<std::sync::Arc<dyn crate::run::Host>>,
     pub(crate) _guard: Box<dyn Any + Send + Sync>,
 }
 
@@ -216,9 +218,130 @@ pub async fn start(name: &str, bins: &Binaries) -> Result<Started, String> {
 // ---- local execd -------------------------------------------------------------------------------
 
 struct Local {
-    _leader: Option<crate::reaper::Leader>,
-    _child: tokio::process::Child,
-    _dir: tempfile::TempDir,
+    _host: std::sync::Arc<LocalHost>,
+    _dirs: (tempfile::TempDir, tempfile::TempDir, tempfile::TempDir),
+}
+
+/// The local execd, as a process the harness may kill and start again (the `host` step).
+struct LocalHost {
+    execd: PathBuf,
+    root: PathBuf,
+    jobs: PathBuf,
+    /// `EXECD_STATE_DIR`: the jobs ledger, which a restarted execd reads to find its jobs.
+    state: PathBuf,
+    bearer: bool,
+    /// `127.0.0.1:PORT` the first execd bound; a restarted one binds the same, so the URL holds.
+    addr: String,
+    proc: tokio::sync::Mutex<(tokio::process::Child, Option<crate::reaper::Leader>)>,
+}
+
+impl LocalHost {
+    /// Start execd on `listen` (`127.0.0.1:0` the first time): its job directory is private to this
+    /// backend, so its terminal keepers can be told from every other backend's.
+    async fn spawn(
+        execd: &Path,
+        root: &Path,
+        (jobs, state): (&Path, &Path),
+        bearer: bool,
+        listen: &str,
+    ) -> Result<(tokio::process::Child, Option<crate::reaper::Leader>, String), String> {
+        let mut c = Command::new(execd);
+        c.env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("EXECD_LISTEN", listen)
+            .env("EXECD_ROOT", root)
+            .env("EXECD_JOBS_DIR", jobs)
+            .env("EXECD_STATE_DIR", state)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .process_group(0);
+        if bearer {
+            c.env("EXECD_BEARER", BEARER);
+        }
+        let mut child = c.spawn().map_err(|e| format!("start execd: {e}"))?;
+        let leader = crate::reaper::Leader::new(&child);
+        let addr = listening(child.stderr.take().expect("piped")).await?;
+        Ok((child, leader, addr))
+    }
+
+    /// The terminal keepers (`execd --execd-run-as-helper keep <spool> ..`) of spools under this
+    /// backend's job directory.
+    fn keepers(&self) -> Vec<String> {
+        let needle = self.jobs.to_string_lossy().into_owned();
+        let Ok(dir) = std::fs::read_dir("/proc") else {
+            return Vec::new();
+        };
+        dir.flatten()
+            .filter_map(|e| {
+                let raw = std::fs::read(e.path().join("cmdline")).ok()?;
+                let text = String::from_utf8_lossy(&raw).replace('\0', " ");
+                (text.contains("--execd-run-as-helper keep ") && text.contains(&needle))
+                    .then(|| e.file_name().to_string_lossy().into_owned())
+                    .filter(|p| p.bytes().all(|b| b.is_ascii_digit()))
+            })
+            .collect()
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::run::Host for LocalHost {
+    fn actions(&self) -> &'static [&'static str] {
+        &["restart_execd", "crash_execd", "kill_keepers"]
+    }
+
+    async fn act(&self, action: &str) -> Result<Value, String> {
+        match action {
+            "restart_execd" | "crash_execd" => {
+                let signal = if action == "crash_execd" {
+                    "-KILL"
+                } else {
+                    "-HUP"
+                };
+                let mut p = self.proc.lock().await;
+                // SIGHUP is execd's restart: it exits and leaves its jobs running (a stop, SIGTERM,
+                // ends them). A keeper is in a group of its own, so it outlives execd, as it would an
+                // upgrade or a restore. The old group's leader entry goes with it (its drop kills a
+                // group that now holds nothing).
+                let pid = p.0.id().ok_or("execd already exited")?;
+                let sent = Command::new("kill")
+                    .args([signal, &pid.to_string()])
+                    .status()
+                    .await
+                    .map_err(|e| format!("kill -HUP: {e}"))?;
+                if !sent.success() {
+                    return Err(format!("kill {signal} {pid} failed"));
+                }
+                tokio::time::timeout(READY_WITHIN, p.0.wait())
+                    .await
+                    .map_err(|_| format!("execd did not exit on {signal}"))?
+                    .map_err(|e| format!("wait for execd: {e}"))?;
+                drop(p.1.take());
+                let (child, leader, addr) = Self::spawn(
+                    &self.execd,
+                    &self.root,
+                    (&self.jobs, &self.state),
+                    self.bearer,
+                    &self.addr,
+                )
+                .await?;
+                if addr != self.addr {
+                    return Err(format!("execd came back on {addr}, not {}", self.addr));
+                }
+                *p = (child, leader);
+                Ok(json!({}))
+            }
+            "kill_keepers" => {
+                let pids = self.keepers();
+                for pid in &pids {
+                    let _ = Command::new("kill").args(["-KILL", pid]).status().await;
+                }
+                Ok(json!({ "killed": pids.len() }))
+            }
+            other => Err(format!("no host action {other:?}")),
+        }
+    }
 }
 
 async fn local(
@@ -230,23 +353,28 @@ async fn local(
     let execd = bins.host()?;
     let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
     let work = dir.path().canonicalize().map_err(|e| e.to_string())?;
-    let mut c = Command::new(execd);
-    c.env_clear()
-        .env("PATH", std::env::var("PATH").unwrap_or_default())
+    let jobs_dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let jobs = jobs_dir.path().canonicalize().map_err(|e| e.to_string())?;
+    let state_dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let state = state_dir.path().canonicalize().map_err(|e| e.to_string())?;
+    let (child, leader, addr) = LocalHost::spawn(
+        &execd,
+        &work,
+        (&jobs, &state),
+        bearer,
         // port-0: execd binds it, keeps it, and announces the port it got (read by `listening`).
-        .env("EXECD_LISTEN", "127.0.0.1:0")
-        .env("EXECD_ROOT", &work)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .process_group(0);
-    if bearer {
-        c.env("EXECD_BEARER", BEARER);
-    }
-    let mut child = c.spawn().map_err(|e| format!("start execd: {e}"))?;
-    let leader = crate::reaper::Leader::new(&child);
-    let addr = listening(child.stderr.take().expect("piped")).await?;
+        "127.0.0.1:0",
+    )
+    .await?;
+    let host = std::sync::Arc::new(LocalHost {
+        execd,
+        root: work.clone(),
+        jobs,
+        state,
+        bearer,
+        addr: addr.clone(),
+        proc: tokio::sync::Mutex::new((child, leader)),
+    });
     Ok(Started {
         name: name.into(),
         url: format!("http://{addr}/exec"),
@@ -256,10 +384,10 @@ async fn local(
         suites: None,
         vars: BTreeMap::new(),
         lease: None,
+        host: Some(host.clone()),
         _guard: Box::new(Local {
-            _leader: leader,
-            _child: child,
-            _dir: dir,
+            _host: host,
+            _dirs: (dir, jobs_dir, state_dir),
         }),
     })
 }
@@ -301,6 +429,7 @@ async fn embedded(name: &str) -> Result<Started, String> {
         suites: None,
         vars: BTreeMap::new(),
         lease: None,
+        host: None,
         _guard: Box::new((mock, dir)),
     })
 }
@@ -472,6 +601,7 @@ async fn docker(name: &str, bins: &Binaries, image: &str, c: Container) -> Resul
         suites: None,
         vars: c.vars,
         lease: None,
+        host: None,
         _guard: Box::new(guard),
     })
 }

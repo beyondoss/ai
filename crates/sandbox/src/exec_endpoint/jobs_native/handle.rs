@@ -15,7 +15,9 @@ use job_client::step::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::super::jobs::{EventSink, JobEnd, JobError, JobEvent, JobId, JobScope, JobSpec, Stream};
+use super::super::jobs::{
+    EventSink, JobEnd, JobError, JobEvent, JobId, JobScope, JobSpec, SandboxJobs, Stream,
+};
 use super::super::stream::FrameReader;
 use super::super::{EndpointStatus, HttpExecRunner, STREAM_DEADLINE, endpoint_status};
 use super::{Event, INERT, JobFrame, NativeJobs, decode_job_frame, predates};
@@ -74,7 +76,6 @@ struct Payload {
     bytes: Vec<u8>,
     stream: Option<Stream>,
     pgid: u32,
-    stdin: bool,
     /// The text of an error frame.
     error: Option<String>,
 }
@@ -114,28 +115,8 @@ pub(super) async fn drive(
     let mut ev = Ev::Go;
     let mut limit = silence(silence_limit_ms(h.beat));
     loop {
-        let confirming = matches!(s.phase, step::Phase::Confirming);
         let (next_state, actions) = step::step(s, ev, clock.now(), draw());
         s = next_state;
-        // The kernel took the first frame: the sink hears of the incarnation, and a stdin the
-        // endpoint did not open is refused (an endpoint that predates job stdin says nothing).
-        if confirming && matches!(s.phase, step::Phase::Streaming) {
-            match ev {
-                Ev::Frame(KFrame::Started { mark }) => {
-                    if h.spec.is_some_and(|sp| sp.stdin_open) && !payload.stdin {
-                        return Err(predates("job stdin"));
-                    }
-                    events(JobEvent::Started(payload.pgid, mark_text(&mark)));
-                }
-                Ev::Frame(KFrame::Attached { mark, from }) => {
-                    events(JobEvent::Attached {
-                        mark: mark_text(&mark),
-                        from,
-                    });
-                }
-                _ => {}
-            }
-        }
         // The event the last I/O action produced, if it did.
         let mut next: Option<Ev> = None;
         for action in actions {
@@ -152,6 +133,25 @@ pub(super) async fn drive(
                     limit = silence(silence_ms);
                     let o = Opening::Attach { offset, mark };
                     next = Some(open(h, o, &mut reader, &mut refusal).await?);
+                }
+                // The kernel took the first frame: the sink hears of the incarnation.
+                Action::Started { mark, .. } => {
+                    events(JobEvent::Started(payload.pgid, mark_text(&mark)));
+                }
+                Action::Attached { mark, from } => {
+                    events(JobEvent::Attached {
+                        mark: mark_text(&mark),
+                        from,
+                    });
+                }
+                // Not an end: the shell left processes running, and the sink hears of it.
+                Action::ShellExit { code } => events(JobEvent::ShellExit(code)),
+                // A kept start whose echo was refused: stop it, so nothing can name it and nothing
+                // is left running that expects its stdin or terminal. Best effort, as the refusal is.
+                Action::Kill => {
+                    let _ = NativeJobs::over(h.runner)
+                        .kill(h.scope, std::slice::from_ref(h.id), true)
+                        .await;
                 }
                 Action::CloseStream => {
                     // After the final frame the body is let end, so the endpoint sees a stream that
@@ -174,6 +174,7 @@ pub(super) async fn drive(
                     code,
                     signal,
                     dropped,
+                    ..
                 } => {
                     if dropped > 0 {
                         events(JobEvent::Gap(dropped));
@@ -215,7 +216,7 @@ pub(super) async fn drive(
             Some(e) => e,
             None => match s.phase {
                 step::Phase::Confirming | step::Phase::Streaming => {
-                    read(&mut reader, limit, &mut payload, events).await
+                    read(&mut reader, limit, &mut payload).await
                 }
                 // The exit was handed over and nobody holds it back.
                 step::Phase::ExitHeld => Ev::ExitTaken,
@@ -251,6 +252,14 @@ async fn open(
                     "stdin_open": spec.stdin_open, "idempotency_key": key,
                 }),
             );
+            let job = match spec.pty {
+                Some(p) => {
+                    let mut job = job;
+                    job["pty"] = json!({ "cols": p.cols, "rows": p.rows });
+                    job
+                }
+                None => job,
+            };
             h.runner
                 .send_env_beat(
                     &spec.program,
@@ -362,7 +371,6 @@ async fn read(
     reader: &mut Option<FrameReader>,
     limit: Duration,
     p: &mut Payload,
-    events: EventSink<'_>,
 ) -> Ev {
     loop {
         let Some(r) = reader.as_mut() else {
@@ -384,11 +392,12 @@ async fn read(
             }
             Ok(JobFrame::End(JobEnd::Exit(code))) => KFrame::Exit { code, signal: 0 },
             Ok(JobFrame::End(JobEnd::Signal(signal))) => KFrame::Exit { code: 0, signal },
-            Ok(JobFrame::Event(Event::Started(pgid, mark, stdin))) => {
+            Ok(JobFrame::Event(Event::Started(pgid, mark, stdin, echoed))) => {
                 p.pgid = pgid;
-                p.stdin = stdin;
                 KFrame::Started {
                     mark: as_mark(mark.as_deref(), p),
+                    stdin,
+                    pty: echoed.is_some(),
                 }
             }
             Ok(JobFrame::Event(Event::Attached(mark, from))) => KFrame::Attached {
@@ -402,11 +411,7 @@ async fn read(
                 KFrame::Output { len }
             }
             Ok(JobFrame::Event(Event::Gap(n))) => KFrame::Gap { n },
-            Ok(JobFrame::Event(Event::ShellExit(code))) => {
-                // Not a decision: the shell left processes running, and the sink hears of it.
-                events(JobEvent::ShellExit(code));
-                continue;
-            }
+            Ok(JobFrame::Event(Event::ShellExit(code))) => KFrame::ShellExit { code },
         });
     }
 }

@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use base64::Engine as _;
 use beyond_test_support::exec_mock::{ExecMock, MockOptions};
-use sandbox_conformance::{Backend, Connector, Link, Status, Tally, run_scenario};
+use sandbox_conformance::{Backend, Connector, Host, Link, Status, Tally, run_scenario};
 use serde_json::{Value, json};
 
 #[path = "sdk_conformance/driver.rs"]
@@ -167,7 +167,7 @@ fn scenario_files_are_well_formed() {
                     .unwrap_or_else(|| panic!("{id}: step without id"));
                 assert!(step_ids.insert(sid), "{id}: duplicate step id {sid}");
                 assert!(
-                    s["op"].is_string() || s.get("edge").is_some(),
+                    s["op"].is_string() || s.get("edge").is_some() || s.get("host").is_some(),
                     "{id}/{sid}: no op"
                 );
             }
@@ -175,6 +175,27 @@ fn scenario_files_are_well_formed() {
                 !sc["steps"].as_array().unwrap().is_empty(),
                 "{id}: no steps"
             );
+        }
+    }
+}
+
+/// What a `host` step does to the in-process execd: restart it as `SIGHUP` does, kill it with no
+/// shutdown (its jobs and keepers outlive it either way), or kill its terminal keepers.
+struct MockHost(ExecMock);
+
+#[async_trait]
+impl Host for MockHost {
+    fn actions(&self) -> &'static [&'static str] {
+        &["restart_execd", "crash_execd", "kill_keepers"]
+    }
+
+    async fn act(&self, action: &str) -> Result<Value, String> {
+        match action {
+            // In one process a crash and a restart both end the server and leave the ledger: the
+            // difference (no shutdown at all) is the binary-level scenario of the `local-*` matrix.
+            "restart_execd" | "crash_execd" => self.0.restart_execd().await.map(|()| json!({})),
+            "kill_keepers" => self.0.kill_keepers().await.map(|n| json!({ "killed": n })),
+            other => Err(format!("no host action {other:?}")),
         }
     }
 }
@@ -211,6 +232,10 @@ async fn reference_agent_passes_every_scenario() {
         )
         .await;
         be.work = work.to_string_lossy().into_owned();
+        // The in-process endpoint is execd itself: the harness restarts it and kills its keepers.
+        if let Some(m) = &mock {
+            be.host = Some(std::sync::Arc::new(MockHost(m.clone())));
+        }
         let mut tally = Tally::default();
         for (_, file) in &files {
             let suite = file["suite"].as_str().unwrap();

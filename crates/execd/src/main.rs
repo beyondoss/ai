@@ -204,6 +204,7 @@ async fn run(cli: Config, inherited: Option<String>) -> Result<(), Box<dyn std::
     opts.max_response_bytes = cli.max_response_bytes;
     opts.jobs_dir = cli.jobs_dir.clone();
     opts.state_dir = cli.state_dir.clone();
+    opts.terminals_max = cli.terminals_max;
     let secured = bearer.is_some();
     opts.bearer = bearer;
     opts.insecure_no_auth = cli.insecure_no_auth;

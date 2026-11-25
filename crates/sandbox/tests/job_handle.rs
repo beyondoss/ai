@@ -38,6 +38,7 @@ fn attached(from: u64) -> String {
 
 fn spec() -> JobSpec {
     JobSpec {
+        pty: None,
         program: "sh".into(),
         args: vec!["-c".into(), "true".into()],
         cwd: None,
@@ -98,7 +99,7 @@ async fn a_cut_stream_is_reattached_at_its_offset_with_its_mark() {
     .await;
     let (r, lines) = run(&front, 1000).await;
     assert_eq!(r.unwrap(), JobEnd::Exit(0));
-    assert_eq!(lines, ["started", "out:hello", "attached", "out:world"]);
+    assert_eq!(lines, ["started", "out:hello", "out:world"]);
     let seen = front.seen.lock().unwrap();
     assert_eq!(seen[1]["op"], "attach");
     assert_eq!(seen[1]["offset"], 5);
@@ -116,7 +117,7 @@ async fn bytes_the_endpoint_no_longer_holds_are_a_gap_before_the_next_output() {
     assert_eq!(r.unwrap(), JobEnd::Exit(3));
     assert_eq!(
         lines,
-        ["started", "out:hello", "attached", "gap:3", "out:x"]
+        ["started", "out:hello", "gap:3", "out:x"]
     );
 }
 
@@ -177,7 +178,7 @@ async fn a_front_that_is_down_for_minutes_does_not_end_the_handle() {
     .await;
     let (r, lines) = run(&front, 2000).await;
     assert_eq!(r.unwrap(), JobEnd::Exit(0));
-    assert_eq!(lines, ["started", "out:hello", "attached", "out:world"]);
+    assert_eq!(lines, ["started", "out:hello", "out:world"]);
 }
 
 /// The backend, which is up, says the sandbox is not there (E2B: a 502 whose body says so): that is
@@ -208,7 +209,7 @@ async fn a_bare_502_is_a_busy_front_not_a_gone_sandbox() {
     .await;
     let (r, lines) = run(&front, 2000).await;
     assert_eq!(r.unwrap(), JobEnd::Exit(0));
-    assert_eq!(lines, ["started", "out:hello", "attached", "out:world"]);
+    assert_eq!(lines, ["started", "out:hello", "out:world"]);
 }
 
 /// The front is down but the sandbox is alive: a proxy answers 502 with some other body, or with E2B's
@@ -227,7 +228,7 @@ async fn a_502_that_is_not_the_backends_gone_answer_keeps_the_handle_waiting() {
     .await;
     let (r, lines) = run(&front, 2000).await;
     assert_eq!(r.unwrap(), JobEnd::Exit(0));
-    assert_eq!(lines, ["started", "out:hello", "attached", "out:world"]);
+    assert_eq!(lines, ["started", "out:hello", "out:world"]);
 }
 
 /// Beyond's front says a session has ended with a 401 whose code says so: the job's sandbox is gone. A

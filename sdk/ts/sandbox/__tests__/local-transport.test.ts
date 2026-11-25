@@ -24,17 +24,16 @@ const refuse = (what: string) => (): never => {
 class LocalTransport implements Transport {
   calls = 0;
   readonly jobs: JobOps = {
-    start: refuse("jobs"),
-    startHeld: refuse("jobs"),
+    open: refuse("jobs"),
     keep: refuse("jobs"),
     seen: refuse("jobs"),
     list: refuse("jobs"),
     read: refuse("jobs"),
-    attach: refuse("jobs"),
     kill: refuse("jobs"),
     remove: refuse("jobs"),
     wipe: refuse("jobs"),
     writeStdin: refuse("jobs"),
+    resize: refuse("jobs"),
     signal: refuse("jobs"),
   };
 

@@ -26,6 +26,7 @@ from .models import (
     JobShellExit,
     JobStart,
     JobStarted,
+    Pty,
     StdinWritten,
     Survivor,
 )
@@ -34,13 +35,15 @@ from .transport import JobTransport
 READ_MAX = _jobs.READ_MAX
 
 
-def _held_refusal(ev: JobFrame, stdin_open: bool) -> str | None:
+def _held_refusal(ev: JobFrame, stdin_open: bool, pty: Pty | None = None) -> str | None:
     """Why a held start's first frame shows an endpoint that lacks a feature asked for, if it does:
-    no stdin echo for ``stdin_open``, or no mark."""
+    no stdin echo for ``stdin_open``, no terminal echo for ``pty``, or no mark."""
     if not isinstance(ev, JobStarted):
         return None
     if stdin_open and not ev.stdin:
         return "the endpoint predates job stdin: it ran the job without it"
+    if pty is not None and ev.pty is None:
+        return _jobs.NO_PTY
     if not ev.mark:
         return "the endpoint predates the job mark: its started frame did not name one"
     return None
@@ -85,13 +88,19 @@ class Jobs:
         env: dict[str, str] | None = None,
         stdin_open: bool = False,
         heartbeat_seconds: int | None = None,
+        pty: Pty | None = None,
     ) -> JobStart:
         """Start a job the sandbox keeps from the start; returns its process group and mark. ``env`` is the
         command's own environment; ``stdin_open`` keeps its stdin open for :meth:`write_stdin`
-        (an endpoint that predates it is a ``NotOfferedError`` and the job is stopped). An id that
+        (an endpoint that predates it is a ``NotOfferedError`` and the job is stopped); ``pty``
+        runs it on a terminal of that size (:class:`~beyond_sandbox.Pty`; the same ``NotOfferedError``
+        when the endpoint does not echo it; ``stdin_open`` is implied, and ``write_stdin`` takes no
+        ``eof``). An id that
         exists is :class:`~beyond_sandbox.JobExistsError`; a full disk is
         :class:`~beyond_sandbox.DiskFullError`."""
-        op = _jobs.start(scope, job, command, args, cwd, label, env, stdin_open, heartbeat_seconds)
+        op = _jobs.start(
+            scope, job, command, args, cwd, label, env, stdin_open, heartbeat_seconds, pty
+        )
         return drive(op, self._t)
 
     def start_held(
@@ -106,12 +115,13 @@ class Jobs:
         env: dict[str, str] | None = None,
         stdin_open: bool = False,
         heartbeat_seconds: int | None = None,
+        pty: Pty | None = None,
     ) -> Generator[JobFrame, None, None]:
         """Start a job held by the returned stream (wire ``hold: true``): events, the first a
         :class:`JobStarted`, ending with a :class:`JobEnd`. If you stop before the end and did not
         :meth:`keep` the job, the sandbox kills its group."""
         op = _jobs.start_held(
-            scope, job, command, args, cwd, label, env, stdin_open, heartbeat_seconds
+            scope, job, command, args, cwd, label, env, stdin_open, heartbeat_seconds, pty
         )
         items = drive_iter(op, self._t)
         try:
@@ -119,7 +129,7 @@ class Jobs:
                 if isinstance(item, tuple) and item and item[0] is _DONE:
                     yield item[1]
                 else:
-                    if (why := _held_refusal(item, stdin_open)) is not None:
+                    if (why := _held_refusal(item, stdin_open, pty)) is not None:
                         raise NotOfferedError(why)
                     yield item
         finally:
@@ -147,6 +157,12 @@ class Jobs:
     ) -> StdinWritten:
         """Write ``data`` at position ``at`` of the job's stdin; ``eof`` closes it after."""
         return drive(_jobs.write_stdin(scope, job, at, data, eof), self._t)
+
+    def resize(self, scope: str, job: str, cols: int, rows: int) -> Pty:
+        """Set a terminal job's size (wire ``resize``), absolute and idempotent. A size outside 1 to
+        1024 is ``InvalidRequestError`` (nothing is sent); no such job is ``JobGoneError``; a job with
+        no terminal, an ended one or one whose terminal hung up is ``ConflictError``."""
+        return drive(_jobs.resize(scope, job, cols, rows), self._t)
 
     def signal(self, scope: str, jobs: Sequence[str], signal: str) -> builtins.list[str]:
         """Send a named signal to the running jobs' groups; the ids that were running."""
@@ -251,8 +267,11 @@ class AsyncJobs:
         env: dict[str, str] | None = None,
         stdin_open: bool = False,
         heartbeat_seconds: int | None = None,
+        pty: Pty | None = None,
     ) -> JobStart:
-        op = _jobs.start(scope, job, command, args, cwd, label, env, stdin_open, heartbeat_seconds)
+        op = _jobs.start(
+            scope, job, command, args, cwd, label, env, stdin_open, heartbeat_seconds, pty
+        )
         return await adrive(op, self._t)
 
     async def start_held(
@@ -267,10 +286,11 @@ class AsyncJobs:
         env: dict[str, str] | None = None,
         stdin_open: bool = False,
         heartbeat_seconds: int | None = None,
+        pty: Pty | None = None,
     ) -> AsyncGenerator[JobFrame, None]:
         """As :meth:`Jobs.start_held`."""
         op = _jobs.start_held(
-            scope, job, command, args, cwd, label, env, stdin_open, heartbeat_seconds
+            scope, job, command, args, cwd, label, env, stdin_open, heartbeat_seconds, pty
         )
         events = aiter_events(op, self._t)
         try:
@@ -278,7 +298,7 @@ class AsyncJobs:
                 if isinstance(item, tuple) and item and item[0] is _DONE:
                     yield item[1]
                 else:
-                    if (why := _held_refusal(item, stdin_open)) is not None:
+                    if (why := _held_refusal(item, stdin_open, pty)) is not None:
                         raise NotOfferedError(why)
                     yield item
         finally:
@@ -302,6 +322,9 @@ class AsyncJobs:
         self, scope: str, job: str, at: int, data: bytes, eof: bool = False
     ) -> StdinWritten:
         return await adrive(_jobs.write_stdin(scope, job, at, data, eof), self._t)
+
+    async def resize(self, scope: str, job: str, cols: int, rows: int) -> Pty:
+        return await adrive(_jobs.resize(scope, job, cols, rows), self._t)
 
     async def signal(self, scope: str, jobs: Sequence[str], signal: str) -> builtins.list[str]:
         return await adrive(_jobs.signal(scope, jobs, signal), self._t)

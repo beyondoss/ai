@@ -63,6 +63,7 @@ pub async fn start(name: &str) -> Result<Started, String> {
         suites: None,
         vars: BTreeMap::new(),
         lease: None,
+        host: None,
         _guard: Box::new(()),
     })
 }

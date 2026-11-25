@@ -33,6 +33,21 @@ pub trait Connector: Send + Sync {
     ) -> Box<dyn Link>;
 }
 
+/// What a harness step (`"host": "<action>"`) does to the machine under the backend, between driver
+/// operations. A backend offers the actions it can really perform; a scenario that `requires.host`
+/// one the backend lacks is **unsupported** there, never a pass.
+#[async_trait]
+pub trait Host: Send + Sync {
+    /// The actions this host performs: `restart_execd` (the endpoint's process is killed and a new one
+    /// serves the same URL, root and job directory, so a kept job's keeper outlives it), `crash_execd` (the
+    /// same with no shutdown at all: `SIGKILL`) and
+    /// `kill_keepers` (every terminal keeper process under this endpoint's job directory is killed).
+    fn actions(&self) -> &'static [&'static str];
+
+    /// Perform `action`; its answer is the step's `ok`.
+    async fn act(&self, action: &str) -> Result<Value, String>;
+}
+
 /// A started backend with its driver connected and probed.
 pub struct Backend {
     pub name: String,
@@ -55,6 +70,8 @@ pub struct Backend {
     /// Directories this environment provides beyond `${WORK}`, by variable name (`RO`, `TINY`):
     /// a scenario that `requires.vars` them is skipped where they are absent.
     pub vars: std::collections::BTreeMap<String, String>,
+    /// What a `host` step can do here; `None` for a backend whose machine the harness does not drive.
+    pub host: Option<std::sync::Arc<dyn Host>>,
 }
 
 impl Backend {
@@ -97,6 +114,7 @@ impl Backend {
             auth,
             work: work.to_string(),
             vars: Default::default(),
+            host: None,
         }
     }
 }
@@ -158,7 +176,7 @@ fn request(id: u64, step: &Value, vars: &Vars) -> Value {
     for (k, v) in step.as_object().unwrap() {
         if !matches!(
             k.as_str(),
-            "id" | "expect" | "save" | "poll" | "note" | "xfail" | "via" | "edge"
+            "id" | "expect" | "save" | "poll" | "note" | "xfail" | "via" | "edge" | "host"
         ) {
             req.insert(k.clone(), subst(v, vars));
         }
@@ -205,8 +223,9 @@ async fn unmet(req: &Value, be: &Backend) -> Option<String> {
                     return Some(format!("requires backend in {want}, this is {here}"));
                 }
             }
-            // Judged for the driver, not the backend (see `lacks_feature`).
-            "features" => {}
+            // Judged for the driver, not the backend (see `lacks_feature`), and for the host
+            // (`lacks_host`).
+            "features" | "host" => {}
             "vars" => {
                 for v in want.as_array().unwrap() {
                     let name = v.as_str().unwrap();
@@ -248,6 +267,18 @@ async fn unmet(req: &Value, be: &Backend) -> Option<String> {
     None
 }
 
+/// `requires.host` against what this backend's host can do: `Some(why)` for the first action it
+/// lacks.
+fn lacks_host(req: &Value, be: &Backend) -> Option<String> {
+    for a in req["host"].as_array().into_iter().flatten() {
+        let a = a.as_str()?;
+        if !be.host.as_ref().is_some_and(|h| h.actions().contains(&a)) {
+            return Some(format!("backend {} cannot do host action {a}", be.name));
+        }
+    }
+    None
+}
+
 /// `requires.features` against what the driver's `hello` listed: `Some(why)` for the first one it
 /// lacks, with the reason the driver gave in `hello.missing`.
 fn lacks_feature(req: &Value, be: &Backend) -> Option<String> {
@@ -273,6 +304,7 @@ fn decode_utf8(v: &Value) -> String {
 async fn run_step(
     link: &dyn Link,
     edge: Option<&crate::edge::Edge>,
+    host: Option<&dyn Host>,
     step: &Value,
     vars: &mut Vars,
     seq: &mut u64,
@@ -286,6 +318,17 @@ async fn run_step(
         *seq += 1;
         let req = request(*seq, step, vars);
         let mut resp = match (step.get("edge"), edge) {
+            _ if step.get("host").is_some() => {
+                let action = step["host"].as_str().unwrap_or("");
+                let out = match host.filter(|h| h.actions().contains(&action)) {
+                    Some(h) => h.act(action).await,
+                    None => Err(format!("this backend cannot do host action {action:?}")),
+                };
+                match out {
+                    Ok(v) => json!({"id": req["id"], "ok": v}),
+                    Err(why) => json!({"id": req["id"], "error": {"kind": "io", "detail": why}}),
+                }
+            }
             (Some(ctl), Some(edge)) => {
                 json!({"id": req["id"], "ok": edge.control(&subst(ctl, vars))})
             }
@@ -414,6 +457,11 @@ pub async fn run_scenario_via(sc: &Value, be: &Backend, peer: Option<&Backend>) 
         }
     }
     for b in std::iter::once(be).chain(peer) {
+        if let Some(why) = lacks_host(&sc["requires"], b) {
+            return all(sid, steps, Status::Unsupported, &why);
+        }
+    }
+    for b in std::iter::once(be).chain(peer) {
         if let Some(why) = unmet(&sc["requires"], b).await {
             return all(sid, steps, Status::Skipped, &why);
         }
@@ -481,7 +529,17 @@ pub async fn run_scenario_via(sc: &Value, be: &Backend, peer: Option<&Backend>) 
     let _ = exec(be, "rm", &["-rf", &root]).await;
     let mut seq = 0u64;
     let boot = json!({"op": "exec", "command": "mkdir", "args": ["-p", "${ROOT}"]});
-    if let Err(why) = run_step(be.link.as_ref(), None, &boot, &mut vars, &mut seq, true).await {
+    if let Err(why) = run_step(
+        be.link.as_ref(),
+        None,
+        None,
+        &boot,
+        &mut vars,
+        &mut seq,
+        true,
+    )
+    .await
+    {
         let mut out = vec![Check {
             id: format!("{sid}/boot"),
             status: Status::Fail,
@@ -493,7 +551,17 @@ pub async fn run_scenario_via(sc: &Value, be: &Backend, peer: Option<&Backend>) 
     for (i, s) in sc["setup"].as_array().into_iter().flatten().enumerate() {
         let l = crate::relay::side(s, be, peer).link.as_ref();
         let l = if peer.is_some() { l } else { link };
-        if let Err(why) = run_step(l, edge.as_ref(), s, &mut vars, &mut seq, true).await {
+        if let Err(why) = run_step(
+            l,
+            edge.as_ref(),
+            be.host.as_deref(),
+            s,
+            &mut vars,
+            &mut seq,
+            true,
+        )
+        .await
+        {
             let mut out = vec![Check {
                 id: format!("{sid}/setup[{i}]"),
                 status: Status::Fail,
@@ -537,6 +605,7 @@ pub async fn run_scenario_via(sc: &Value, be: &Backend, peer: Option<&Backend>) 
                     link
                 },
                 edge.as_ref(),
+                side.host.as_deref(),
                 step,
                 &mut vars,
                 &mut seq,
