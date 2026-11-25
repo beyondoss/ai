@@ -505,7 +505,10 @@ describe("job terminals", () => {
         : [200, { survivors: [] }]
     );
     await expect(
-      new Jobs(t).start("s", "aa", { command: "sh", pty: { cols: 80, rows: 24 } }),
+      new Jobs(t).start("s", "aa", {
+        command: "sh",
+        pty: { cols: 80, rows: 24 },
+      }),
     ).rejects.toMatchObject({ kind: "not_offered" });
     expect(seen.map((b) => b.job.op)).toEqual(["start", "kill"]);
   });
