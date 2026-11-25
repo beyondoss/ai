@@ -27,6 +27,10 @@
 //! - M7 an endpoint that does not echo marks is never streamed: the handle fails closed.
 //! - M9 reconnecting never ends the handle: a cut, a tick or a busy answer is never followed by an end,
 //!   however many failed opens came before.
+//! - M10 an answer the backend itself gave (`Authority::SandboxGone`, `Authority::SessionEnded`) ends the
+//!   handle in that one step, with that fault.
+//! - M11 nothing else ends the handle as `SandboxGone` or `SessionEnded`: not a cut, a tick, a busy
+//!   answer, silence, or any answer that is not authoritative.
 //! - Witnesses (`sometimes`): the handle finishes after delivering the exit and removing the job; the front
 //!   stays down past the notice threshold and the handle still streams again; the caller's deadline ends it;
 //!   it ends `JobGone` when the id was reused; a gap is delivered in a chunk and with the exit; it reattaches
@@ -38,7 +42,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use job_client::step::{
-    self, Action, Event, Fault, Flow, Frame, Mark, Mode, Phase, State, step as kernel_step,
+    self, Action, Authority, Event, Fault, Flow, Frame, Mark, Mode, Phase, State,
+    step as kernel_step,
 };
 use stateright::{Checker, Model, Property};
 
@@ -125,11 +130,17 @@ const B_KEY: u32 = 1 << 5;
 const B_ECHO: u32 = 1 << 6;
 const B_FRESH: u32 = 1 << 7;
 const B_GIVEUP: u32 = 1 << 8;
+const B_AUTH_ONE: u32 = 1 << 9;
+const B_AUTH_ONLY: u32 = 1 << 10;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum A {
     /// The server answers the request with this status.
     Answer(u16),
+    /// The backend answers the request with its own "the sandbox was not found".
+    AnswerGone,
+    /// The front answers the request with "the session has ended".
+    AnswerEnded,
     /// The server sends its next frame on the open connection.
     Frame,
     /// The stream breaks; or, with the request in flight, its answer is lost.
@@ -214,6 +225,7 @@ impl Cfg {
         let before = s.c;
         let conn_before = s.conn.clone();
         let req_before = s.req.clone();
+        let ended_before = s.ended;
         let (c2, acts) = kernel_step(s.c, ev, now, draw);
         s.c = c2;
         if before.phase != Phase::Streaming && c2.phase == Phase::Streaming && s.held.is_none() {
@@ -305,18 +317,39 @@ impl Cfg {
             }
         }
         s.peak = s.peak.max(s.c.misses);
+        // M10: the backend's own answer ends the handle in this one step, with its fault.
+        let authority = match ev {
+            Event::Answered { authority, .. } => authority,
+            _ => Authority::NotAuthoritative,
+        };
+        let expected = match authority {
+            Authority::SandboxGone => Some(Fault::SandboxGone),
+            Authority::SessionEnded => Some(Fault::SessionEnded),
+            Authority::NotAuthoritative => None,
+        };
+        if let Some(f) = expected
+            && s.ended != Some(Ended::Fault(f))
+        {
+            s.bad |= B_AUTH_ONE;
+        }
+        // M11: those two faults end the handle only through that answer.
+        if ended_before.is_none()
+            && let Some(Ended::Fault(f @ (Fault::SandboxGone | Fault::SessionEnded))) = s.ended
+            && expected != Some(f)
+        {
+            s.bad |= B_AUTH_ONLY;
+        }
         // Reconnecting is a status: a cut, a tick or a busy answer never ends the handle, however
         // many came before.
         let busy = matches!(ev, Event::Broke | Event::Tick)
-            || matches!(
-                ev,
-                Event::Answered {
-                    status: 429 | 502 | 504,
-                    ..
-                }
-            )
-            || (matches!(ev, Event::Answered { status: 503, .. })
-                && !matches!(req_before, Req::Start { .. }));
+            || (expected.is_none()
+                && match ev {
+                    Event::Answered { status, .. } => {
+                        matches!(status, 429 | 502 | 504)
+                            || (status == 503 && !matches!(req_before, Req::Start { .. }))
+                    }
+                    _ => false,
+                });
         if busy && s.ended.is_some() {
             s.bad |= B_GIVEUP;
         }
@@ -368,6 +401,8 @@ impl Model for Cfg {
                 out.push(A::Answer(st));
             }
             out.push(A::Cut);
+            out.push(A::AnswerGone);
+            out.push(A::AnswerEnded);
         }
         // A break reported late, after the exit: the handle must let it pass.
         if s.conn.is_none() && !s.in_flight && matches!(s.c.phase, Phase::ExitHeld) {
@@ -495,7 +530,27 @@ impl Model for Cfg {
                     Event::Answered {
                         status,
                         retry_after_s: if status == 503 { 1 } else { 0 },
-                        authority: job_client::step::Authority::NotAuthoritative,
+                        authority: Authority::NotAuthoritative,
+                    },
+                    0,
+                    0,
+                );
+            }
+            A::AnswerGone | A::AnswerEnded => {
+                if !(n.in_flight && n.conn.is_none()) {
+                    return None;
+                }
+                let (status, authority) = if a == A::AnswerGone {
+                    (502, Authority::SandboxGone)
+                } else {
+                    (401, Authority::SessionEnded)
+                };
+                self.feed(
+                    &mut n,
+                    Event::Answered {
+                        status,
+                        retry_after_s: 0,
+                        authority,
                     },
                     0,
                     0,
@@ -543,6 +598,14 @@ impl Model for Cfg {
             always!("M7 no echo, no stream", B_ECHO),
             always!("M8 a job is never created twice for one handle", B_FRESH),
             always!("M9 reconnecting never ends the handle", B_GIVEUP),
+            always!(
+                "M10 the backend's own answer ends the handle in one step",
+                B_AUTH_ONE
+            ),
+            always!(
+                "M11 nothing but that answer ends it as SandboxGone or SessionEnded",
+                B_AUTH_ONLY
+            ),
         ];
         if self.legacy {
             p.push(Property::<Self>::sometimes(
@@ -569,6 +632,14 @@ impl Model for Cfg {
                     && s.reattached
                     && s.c.phase == Phase::Streaming
             },
+        ));
+        p.push(Property::<Self>::sometimes(
+            "W11 the sandbox is gone: SandboxGone",
+            |_, s| s.ended == Some(Ended::Fault(Fault::SandboxGone)),
+        ));
+        p.push(Property::<Self>::sometimes(
+            "W12 the session has ended: SessionEnded",
+            |_, s| s.ended == Some(Ended::Fault(Fault::SessionEnded)),
         ));
         p.push(Property::<Self>::sometimes(
             "W10 the caller's deadline ends it",

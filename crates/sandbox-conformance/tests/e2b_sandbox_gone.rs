@@ -1,5 +1,9 @@
 //! A real E2B sandbox deleted while a job is followed: the handle ends with the backend's own answer
-//! (`SandboxGone`) and not before, and a front that is merely refusing stays `Reconnecting`.
+//! (`SandboxGone`) and not before. That a front that is merely refusing stays `Reconnecting` is not
+//! checked here: the hermetic `a_bare_502_is_a_busy_front_not_a_gone_sandbox`,
+//! `a_502_that_is_not_the_backends_gone_answer_keeps_the_handle_waiting` and
+//! `a_front_that_is_down_for_minutes_does_not_end_the_handle` (`crates/sandbox/tests/job_handle.rs`)
+//! cover it, and the model's M9 and M11 prove it for every state.
 //!
 //! Opt-in and billed (one VM, deleted by the test): needs `E2B_API_KEY` and `E2B_EXECD_BIN` (a static
 //! execd), and `cargo test -p beyond-sandbox-conformance --test e2b_sandbox_gone -- --ignored --nocapture`.

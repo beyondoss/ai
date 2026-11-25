@@ -149,7 +149,7 @@ Outside `verus!`: the constructors and `Mark::as_bytes`, which reshape a record,
 `tests/step_model.rs` is a Stateright model that drives `step` and carries out the actions it returns, as a
 shell does. It owns only the environment: the server's job slot (output, the ring dropping its oldest byte,
 the job ending, removal and reuse of the id by a new incarnation), cuts, restarts (503), a lost start answer, an
-endpoint that predates marks, and the consumer. It checks M1 to M9 (M9: reconnecting never ends the handle, including a front down for longer than the notice threshold) (the properties above, judged against the
+endpoint that predates marks, and the consumer. It checks M1 to M11 (M9: reconnecting never ends the handle, including a front down for longer than the notice threshold; M10: the backend's own answer, `SandboxGone` or `SessionEnded`, ends it in that one step; M11: nothing else ends it as either) (the properties above, judged against the
 environment's facts) and witnesses that each path is reachable.
 `mise run test:job-client-model-mutants` runs it under each mutant it can see and fails if one stays green. A
 property no model state can reach (`mut_offset_wraps` needs an offset near `u64::MAX`; the classification

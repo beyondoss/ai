@@ -42,9 +42,6 @@ use crate::grant::SandboxCommand;
 /// this is also how long a stuck server is waited on before the connection is given up.
 const WRITE_LIMIT: Duration = Duration::from_secs(60);
 
-/// Re-attempts at following a job whose stream broke while the job lived.
-const FOLLOW_RETRIES: u32 = 5;
-
 /// Starts the server: the fifo is made and held open read-write as fd 3 (the server's stdin), the
 /// server's stderr goes to `<fifo>.log`, and `env` (which runs `command` with the entry's variables
 /// set) is exec'd in place so the job's process is the server.
@@ -72,38 +69,12 @@ while [ ! -p "$1" ] && [ "$i" -lt 100 ]; do sleep 0.05; i=$((i + 1)); done
 [ -p "$1" ] || exit 3
 cat >> "$1""#;
 
-/// How long a connect waits for a sandbox that is still starting (the front answers 503 once its
-/// wake budget is spent while the VM is still being made) before it gives up and says so.
-pub(crate) const STARTING_WAIT: Duration = Duration::from_secs(60);
-
-/// The longest pause between two attempts.
-const STARTING_BACKOFF_CAP: Duration = Duration::from_secs(5);
-
-/// What to do with a failed start.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum StartStep {
-    /// Wait this long, then try again.
-    Retry(Duration),
-    /// Report the failure.
-    GiveUp,
-}
-
-/// The decision, with no I/O: `starting` is whether the failure is the sandbox still starting
-/// ([`crate::exec_endpoint::SANDBOX_STARTING`]), `attempt` counts failures so far (0 for the first),
-/// `waited` is the time already spent waiting. Backoff doubles from 1 s to a cap, and the last
-/// pause is cut so the total never passes [`STARTING_WAIT`].
-pub(crate) fn start_step(starting: bool, attempt: u32, waited: Duration) -> StartStep {
-    if !starting || waited >= STARTING_WAIT {
-        return StartStep::GiveUp;
-    }
-    let pause = Duration::from_secs(1)
-        .saturating_mul(1u32 << attempt.min(8))
-        .min(STARTING_BACKOFF_CAP);
-    StartStep::Retry(pause.min(STARTING_WAIT - waited))
-}
-
-/// Run `attempt` until it succeeds or [`start_step`] gives up, pausing with `pause`. The error is
-/// the last attempt's, with the wait it cost named when it was a starting sandbox.
+/// Run `attempt` until it succeeds, pausing between attempts while the failure is the sandbox
+/// still starting ([`crate::exec_endpoint::SANDBOX_STARTING`]). No timer ends the wait: a starting
+/// sandbox is waited for as long as the front says so, and any other failure is the end at once.
+/// The pause is the job client kernel's own backoff ([`job_client::step::wait_ms`]), so the
+/// wait is paced the way every reconnect is. The probe is not a job request, so `step` itself has
+/// no event for it.
 pub(crate) async fn start_waiting<T, F, Fut, P, PFut>(
     mut attempt: F,
     pause: P,
@@ -114,8 +85,7 @@ where
     P: Fn(Duration) -> PFut,
     PFut: std::future::Future<Output = ()>,
 {
-    let mut waited = Duration::ZERO;
-    let mut n = 0;
+    let mut n: u32 = 0;
     loop {
         let e = match attempt().await {
             Ok(v) => return Ok(v),
@@ -124,23 +94,21 @@ where
         // `contains`, not `starts_with`: the connect error reaches here wrapped by the session
         // (service.rs: "this session's sandbox is unreachable: the sandbox is starting: ..."), and a
         // prefix match never fired in production (I62 on AWS beyond, 11-22).
-        let starting = e
+        if !e
             .to_string()
-            .contains(crate::exec_endpoint::SANDBOX_STARTING);
-        match start_step(starting, n, waited) {
-            StartStep::Retry(d) => {
-                pause(d).await;
-                waited += d;
-                n += 1;
-            }
-            StartStep::GiveUp if starting => {
-                return Err(std::io::Error::other(format!(
-                    "{e} (still starting after {}s)",
-                    waited.as_secs()
-                )));
-            }
-            StartStep::GiveUp => return Err(e),
+            .contains(crate::exec_endpoint::SANDBOX_STARTING)
+        {
+            return Err(e);
         }
+        n = n.saturating_add(1);
+        let mut b = [0u8; 4];
+        let _ = getrandom::fill(&mut b);
+        pause(Duration::from_millis(job_client::step::wait_ms(
+            n,
+            0,
+            u32::from_le_bytes(b),
+        )))
+        .await;
     }
 }
 
@@ -229,8 +197,8 @@ pub(crate) async fn connect(
     Ok((rmcp_side, SandboxWriter { tx, caps }))
 }
 
-/// Follow the job's output into `out` until it ends. A stream that breaks while the job lives is
-/// followed again from the offset reached; a job that ended is the end.
+/// Follow the job's output into `out` until it ends. The handle follows again from the offset
+/// reached whenever the stream breaks while the job lives; what it returns is the end.
 async fn follow_to_end(
     store: &dyn SandboxJobs,
     scope: &JobScope,
@@ -248,21 +216,15 @@ async fn follow_to_end(
         }
         JobEvent::Started(..) | JobEvent::Attached { .. } | JobEvent::ShellExit(_) => {}
     };
-    let mut failures = 0;
-    loop {
-        match store
-            .follow(scope, id, offset.load(Ordering::Relaxed), &sink)
-            .await
-        {
-            Ok(JobEnd::Exit(_) | JobEnd::Signal(_)) => return,
-            Err(e) => {
-                failures += 1;
-                if failures > FOLLOW_RETRIES {
-                    tracing::warn!(error = %e, "an in-sandbox MCP server's output stream was lost");
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(100 << failures)).await;
-            }
+    // One follow: the handle reconnects and ends only on the kernel's terminal faults, so an `Err`
+    // here is already the end and is never retried.
+    match store
+        .follow(scope, id, offset.load(Ordering::Relaxed), &sink)
+        .await
+    {
+        Ok(JobEnd::Exit(_) | JobEnd::Signal(_)) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "an in-sandbox MCP server's output stream was lost");
         }
     }
 }
@@ -401,29 +363,6 @@ mod tests {
         assert_eq!(calls, 3);
     }
 
-    #[test]
-    fn a_starting_sandbox_is_retried_with_capped_backoff_then_given_up_on() {
-        let mut waited = Duration::ZERO;
-        let mut pauses = vec![];
-        for n in 0.. {
-            match start_step(true, n, waited) {
-                StartStep::Retry(d) => {
-                    assert!(d <= STARTING_BACKOFF_CAP);
-                    pauses.push(d.as_secs());
-                    waited += d;
-                }
-                StartStep::GiveUp => break,
-            }
-        }
-        assert_eq!(&pauses[..4], &[1, 2, 4, 5]);
-        assert_eq!(waited, STARTING_WAIT);
-    }
-
-    #[test]
-    fn any_other_failure_is_not_retried() {
-        assert_eq!(start_step(false, 0, Duration::ZERO), StartStep::GiveUp);
-    }
-
     #[tokio::test]
     async fn a_connect_that_finds_the_sandbox_starting_succeeds_once_it_is_up() {
         let calls = std::cell::Cell::new(0);
@@ -440,12 +379,32 @@ mod tests {
         assert_eq!(calls.get(), 4);
     }
 
+    /// The sandbox stays "starting" for far longer than the old 60 s cap (the test's clock is the
+    /// sum of the pauses asked for), and the connect still succeeds once it starts. The pause is
+    /// injected, so the default is unchanged and the test takes no real time.
     #[tokio::test]
-    async fn a_sandbox_that_never_starts_fails_with_the_wait_named_and_a_real_refusal_at_once() {
-        let e = start_waiting(|| async { Err::<(), _>(starting()) }, |_| async {})
-            .await
-            .unwrap_err();
-        assert!(e.to_string().contains("still starting after 60s"), "{e}");
+    async fn a_sandbox_starting_for_longer_than_a_minute_is_still_waited_for() {
+        let calls = std::cell::Cell::new(0u32);
+        let waited = std::cell::Cell::new(Duration::ZERO);
+        let r = start_waiting(
+            || {
+                calls.set(calls.get() + 1);
+                let up = waited.get() > Duration::from_secs(600);
+                async move { if up { Ok(7) } else { Err(starting()) } }
+            },
+            |d| {
+                waited.set(waited.get() + d);
+                async {}
+            },
+        )
+        .await;
+        assert_eq!(r.unwrap(), 7);
+        assert!(waited.get() > Duration::from_secs(600));
+        assert!(calls.get() > 20, "{}", calls.get());
+    }
+
+    #[tokio::test]
+    async fn a_real_refusal_fails_at_once() {
         let calls = std::cell::Cell::new(0);
         let e = start_waiting(
             || {
