@@ -3489,7 +3489,7 @@
     },
     {
       "id": "jobs.options.a-held-job-dies-with-its-stream",
-      "description": "hold: true ties the job to the stream that started it: closing the stream before the job ends and before keep kills its group.",
+      "description": "hold: true ties the job to the stream that started it: closing the stream before the job ends and before keep kills its group. The endpoint may learn of the close only at its next heartbeat write (a proxy between does not forward it), and the spec bounds that at two heartbeats; the start asks for a 1 s heartbeat so the bound is under the 8 s the check waits.",
       "requires": {
         "features": [
           "job_options"
@@ -3500,6 +3500,7 @@
           "id": "start",
           "op": "job_start_held",
           "scope": "${SCOPE}",
+          "heartbeat_seconds": 1,
           "job": "oo04",
           "command": "sh",
           "args": [
