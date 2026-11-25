@@ -4016,7 +4016,7 @@
           "scope": "${SCOPE}",
           "job": "pt04",
           "command": "sh",
-          "args": [],
+          "args": ["-c", "exec env PS1= sh"],
           "pty": {
             "cols": 80,
             "rows": 24
@@ -4838,7 +4838,7 @@
           "scope": "${SCOPE}",
           "job": "pt12",
           "command": "sh",
-          "args": [],
+          "args": ["-c", "exec env PS1= sh"],
           "pty": {
             "cols": 80,
             "rows": 24
@@ -5181,7 +5181,7 @@
           "scope": "${SCOPE}",
           "job": "pt15",
           "command": "sh",
-          "args": [],
+          "args": ["-c", "exec env PS1= sh"],
           "pty": {
             "cols": 80,
             "rows": 24
@@ -5359,7 +5359,7 @@
           "scope": "${SCOPE}",
           "job": "pt16",
           "command": "sh",
-          "args": [],
+          "args": ["-c", "exec env PS1= sh"],
           "pty": {
             "cols": 80,
             "rows": 24
