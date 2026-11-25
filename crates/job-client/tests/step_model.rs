@@ -168,7 +168,7 @@ impl Cfg {
     fn init(&self) -> St {
         let (c, slot, held, incs) = match self.flow {
             Flow::Start => (
-                State::for_start(KEY, self.mode, self.remove_on_exit, 0),
+                State::for_start(KEY, self.mode, self.remove_on_exit, 0, false, false, false),
                 None,
                 None,
                 0,
@@ -289,7 +289,13 @@ impl Cfg {
                     s.cover = end;
                 }
                 Action::Sleep { until_ms } => s.wake = Some(until_ms),
-                Action::Reconnecting { .. } => {}
+                // Told to the consumer only: the model has no consumer-side state to change.
+                Action::Reconnecting { .. }
+                | Action::Started { .. }
+                | Action::Attached { .. }
+                | Action::ShellExit { .. } => {}
+                // A kept start's refused echo: the model starts held jobs and kept ones alike and never refuses one.
+                Action::Kill => {}
                 Action::Remove { mark } => {
                     if !s.exit_taken || Some(mark) != s.held.map(mark_of) {
                         s.bad |= B_REMOVE;
@@ -648,6 +654,8 @@ impl Cfg {
             return Some(match n.req {
                 Req::Start { .. } => Event::Frame(Frame::Started {
                     mark: mark_of(k.inc),
+                    stdin: false,
+                    pty: false,
                 }),
                 _ => Event::Frame(Frame::Attached {
                     mark: mark_of(k.inc),

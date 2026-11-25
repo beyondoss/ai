@@ -191,6 +191,9 @@ pub enum Op {
     Start,
     Attach,
     Remove,
+    /// Any other op addressed to one job by its id (`keep`, `seen`, `kill`, a stdin `write`, `read`): no handle,
+    /// one request, its answer classified by the same table.
+    Other,
 }
 
 /// What an HTTP answer means.
@@ -215,6 +218,14 @@ pub struct State {
     pub remove_on_exit: bool,
     /// The idempotency key's handle (the shell holds the key itself). Never changes.
     pub key: u64,
+    /// The job is started with its stdin open: the `started` echo must say it was honoured. Never changes.
+    pub stdin_open: bool,
+    /// The job is started on a terminal: the `started` echo must say so. Never changes.
+    pub pty_open: bool,
+    /// The start is a kept job's (`hold: false`): no stream's close ends it, so a refused echo stops it.
+    pub kept: bool,
+    /// The consumer has been told the echo (`Started` or the first `Attached`): a reattach's is not told again.
+    pub announced: bool,
     /// The incarnation this handle holds; length 0 until the echo names it (a start, or a `get`).
     pub mark: Mark,
     /// The next output byte the consumer has not been given.
@@ -238,13 +249,17 @@ pub enum Frame {
     /// `{"attached": {"mark", "from"}}`: the first frame of an attach.
     Attached { mark: Mark, from: u64 },
     /// `{"started": {"mark"}}`: the first frame of a start.
-    Started { mark: Mark },
+    /// `stdin` is whether the endpoint says the job's stdin was opened.
+    /// `pty` is whether it says a terminal was opened.
+    Started { mark: Mark, stdin: bool, pty: bool },
     /// An output frame of `len` decoded bytes.
     Output { len: u64 },
     /// `{"gap": n}`: `n` bytes are no longer kept.
     Gap { n: u64 },
     /// A heartbeat.
     Heartbeat,
+    /// The job's shell exited with `code`; the job is not over (its group runs on). Not final.
+    ShellExit { code: i32 },
     /// The final frame.
     Exit { code: i32, signal: i32 },
     /// An error frame, an unparseable line, a frame out of range.
@@ -281,13 +296,21 @@ pub enum Action {
     OpenAttach { offset: u64, mark: Mark, silence_ms: u64 },
     /// Release the connection, if one is open.
     CloseStream,
+    /// Tell the consumer the job started (the `started` echo was accepted): `mark` names the incarnation.
+    Started { mark: Mark, stdin: bool, pty: bool },
+    /// Tell the consumer, once, where an attach began: the first accepted `attached` echo.
+    Attached { mark: Mark, from: u64 },
+    /// Tell the consumer the job's shell exited with `code` (not final).
+    ShellExit { code: i32 },
+    /// Stop the job and remove it: a kept start whose echo was refused leaves a job nothing can name.
+    Kill,
     /// Status, not an end: `attempts` failed opens in a row since `since_ms`, and the handle keeps trying.
     Reconnecting { attempts: u32, since_ms: u64 },
     /// Hand the consumer `len` bytes (the frame just decoded) at offset `at`, with `dropped` bytes lost
     /// just before them, at `[at - dropped, at)`.
     Deliver { at: u64, len: u64, dropped: u64 },
     /// Hand the consumer the exit, with the `dropped` bytes of output lost just before it.
-    DeliverExit { code: i32, signal: i32, dropped: u64 },
+    DeliverExit { code: i32, signal: i32, dropped: u64, killed: bool },
     /// Feed [`Event::Tick`] at this time.
     Sleep { until_ms: u64 },
     /// Send the remove, scoped to `mark`.
@@ -370,7 +393,7 @@ pub open spec fn class_of(op: Op, status: int) -> Class {
         if op is Start { Class::Terminal(Fault::NoPty) } else { Class::Retry }
     } else if status == 401 || status == 403 {
         Class::Terminal(Fault::Auth)
-    } else if status == 404 && op is Attach {
+    } else if status == 404 && (op is Attach || op is Other) {
         Class::Terminal(Fault::JobGone)
     } else if status == 409 && op is Start {
         Class::Terminal(Fault::JobExists)
@@ -411,7 +434,7 @@ pub open spec fn no_mark() -> Mark {
 pub open spec fn echo_mark(ev: Event) -> Mark {
     match ev {
         Event::Frame(Frame::Attached { mark, .. }) => mark,
-        Event::Frame(Frame::Started { mark }) => mark,
+        Event::Frame(Frame::Started { mark, .. }) => mark,
         _ => no_mark(),
     }
 }
@@ -461,7 +484,7 @@ pub open spec fn is_exit_frame(ev: Event) -> bool {
 pub open spec fn exit_frame_ok(ev: Event, out: Seq<Action>, dropped: int) -> bool {
     match ev {
         Event::Frame(Frame::Exit { code, signal }) => out.len() >= 2
-            && out[1] == (Action::DeliverExit { code, signal, dropped: dropped as u64 }),
+            && out[1] == (Action::DeliverExit { code, signal, dropped: dropped as u64, killed: signal != 0 }),
         _ => false,
     }
 }
@@ -522,6 +545,8 @@ pub open spec fn good_echo(s: State, ev: Event) -> bool {
     &&& (s.flow is Start) == (ev is Frame && ev->Frame_0 is Started)
     &&& (s.flow is Attach) == (ev is Frame && ev->Frame_0 is Attached)
     &&& echo_from(ev) >= s.offset as int
+    &&& (s.flow is Start && s.stdin_open) ==> echo_stdin(ev)
+    &&& (s.flow is Start && s.pty_open) ==> echo_pty(ev)
 }
 
 /// Fairness: the server is reachable and answers as it should. A step under it is a fair step.
@@ -644,6 +669,86 @@ pub open spec fn post_incarnation(s: State, ev: Event, s2: State, out: Seq<Actio
     &&& (s.phase is Confirming && ev is Frame && !is_echo(ev) && !(ev->Frame_0 is Bad)) ==> {
         &&& s2.phase is Done
         &&& fails_with(out, Fault::NotOffered)
+    }
+}
+
+pub open spec fn echo_stdin(ev: Event) -> bool {
+    match ev {
+        Event::Frame(Frame::Started { stdin, .. }) => stdin,
+        _ => false,
+    }
+}
+
+pub open spec fn echo_pty(ev: Event) -> bool {
+    match ev {
+        Event::Frame(Frame::Started { pty, .. }) => pty,
+        _ => false,
+    }
+}
+
+pub open spec fn is_started_frame(ev: Event) -> bool {
+    match ev {
+        Event::Frame(Frame::Started { .. }) => true,
+        _ => false,
+    }
+}
+
+pub open spec fn is_attached_frame(ev: Event) -> bool {
+    match ev {
+        Event::Frame(Frame::Attached { .. }) => true,
+        _ => false,
+    }
+}
+
+pub open spec fn is_shell_exit_frame(ev: Event) -> bool {
+    match ev {
+        Event::Frame(Frame::ShellExit { .. }) => true,
+        _ => false,
+    }
+}
+
+/// U: what the consumer is told. The accepted `started` echo is told, with whether the job's stdin was
+/// opened, and a start that asked for stdin is refused (`NotOffered`) when the echo says it was not; the
+/// first accepted `attached` echo is told, once, and a reattach's never; the shell's exit is told when it
+/// arrives and changes nothing else. Each telling comes from exactly the step it names.
+pub open spec fn post_surface(s: State, ev: Event, s2: State, out: Seq<Action>) -> bool {
+    &&& forall|i: int| 0 <= i < out.len() ==> match #[trigger] out[i] {
+        Action::Started { mark, stdin, pty } => {
+            &&& s.phase is Confirming && s.flow is Start
+            &&& ev == Event::Frame(Frame::Started { mark, stdin, pty })
+            &&& s2.phase is Streaming
+            &&& s.stdin_open ==> stdin
+            &&& s.pty_open ==> pty
+        },
+        Action::Attached { mark, from } => {
+            &&& s.phase is Confirming && s.flow is Attach && !s.announced
+            &&& ev == Event::Frame(Frame::Attached { mark, from })
+            &&& s2.phase is Streaming
+        },
+        Action::ShellExit { code } => {
+            &&& s.phase is Streaming
+            &&& ev == Event::Frame(Frame::ShellExit { code })
+        },
+        Action::Kill => {
+            &&& s.kept && s.flow is Start && s.phase is Confirming
+            &&& fails_with(out, Fault::NotOffered)
+        },
+        _ => true,
+    }
+    &&& (s.phase is Confirming && s.flow is Start && s2.phase is Streaming) ==> (out.len() == 1 && out[0] is Started)
+    &&& (s.phase is Confirming && s.flow is Attach && s2.phase is Streaming) ==> {
+        &&& s.announced ==> out.len() == 0
+        &&& !s.announced ==> (out.len() == 1 && out[0] is Attached)
+    }
+    &&& (s.phase is Confirming && s.flow is Start && s.stdin_open && is_started_frame(ev) && !echo_stdin(ev)
+        && echo_mark(ev).len > 0 && (s.mark.len == 0 || echo_mark(ev) == s.mark)) ==> fails_with(out, Fault::NotOffered)
+    &&& (s.phase is Confirming && s.flow is Start && s.pty_open && is_started_frame(ev) && !echo_pty(ev)
+        && echo_mark(ev).len > 0 && (s.mark.len == 0 || echo_mark(ev) == s.mark)) ==> fails_with(out, Fault::NotOffered)
+    &&& (s.phase is Confirming && s.kept && s.flow is Start && s2.phase is Done && fails_with(out, Fault::NotOffered))
+        ==> (out.len() == 3 && out[1] is Kill)
+    &&& (s.phase is Streaming && is_shell_exit_frame(ev)) ==> {
+        &&& s2 == s
+        &&& out.len() == 1 && out[0] is ShellExit
     }
 }
 
@@ -909,7 +1014,7 @@ pub fn classify(op: Op, status: u16) -> (c: Class)
         (status == 429 || status == 502 || status == 504 || (status == 503 && !(matches!(op, Op::Start))))
             ==> c == Class::Retry,
         // (e) an attach of a job that is gone is `JobGone`.
-        (matches!(op, Op::Attach) && status == 404) ==> c == Class::Terminal(Fault::JobGone),
+        ((matches!(op, Op::Attach) || matches!(op, Op::Other)) && status == 404) ==> c == Class::Terminal(Fault::JobGone),
         // (f) the start answers that name a cause.
         (matches!(op, Op::Start) && status == 409) ==> c == Class::Terminal(Fault::JobExists),
         (matches!(op, Op::Start) && status == 507) ==> c == Class::Terminal(Fault::DiskFull),
@@ -943,7 +1048,9 @@ pub fn classify(op: Op, status: u16) -> (c: Class)
         } else {
             Class::Terminal(Fault::Auth)
         }
-    } else if status == 404 && matches!(op, Op::Attach) {
+    } else if status == 404 && matches!(op, Op::Other) && cfg!(feature = "mut_other_404_unclassified") {
+        Class::Terminal(Fault::Protocol)
+    } else if status == 404 && (matches!(op, Op::Attach) || matches!(op, Op::Other)) {
         if cfg!(feature = "mut_404_retried") { Class::Retry } else { Class::Terminal(Fault::JobGone) }
     } else if status == 409 && matches!(op, Op::Start) {
         Class::Terminal(Fault::JobExists)
@@ -1045,6 +1152,39 @@ fn fail(s: State, fault: Fault, status: u16, close: bool) -> (r: (State, Vec<Act
     (t, out)
 }
 
+/// Finish `NotOffered` on a refused echo. A kept start also stops the job first: no stream's close ends it,
+/// and nothing else can name it.
+fn unoffered(s: State) -> (r: (State, Vec<Action>))
+    ensures
+        r.0 == (State { phase: Phase::Done, pending: 0, ..s }),
+        (s.kept && s.flow is Start) ==> r.1@ == seq![
+            Action::CloseStream,
+            Action::Kill,
+            Action::Fail { fault: Fault::NotOffered, status: 0, offset: s.offset },
+        ],
+        !(s.kept && s.flow is Start) ==> r.1@ == seq![
+            Action::CloseStream,
+            Action::Fail { fault: Fault::NotOffered, status: 0, offset: s.offset },
+        ],
+{
+    let (t, mut out) = fail(s, Fault::NotOffered, 0, true);
+    let kill = if cfg!(feature = "mut_kill_skipped") {
+        false
+    } else if cfg!(feature = "mut_kill_when_held") {
+        true
+    } else {
+        s.kept && matches!(s.flow, Flow::Start)
+    };
+    if kill {
+        let fail_action = out.pop();
+        out.push(Action::Kill);
+        if let Some(a) = fail_action {
+            out.push(a);
+        }
+    }
+    (t, out)
+}
+
 /// Finish: the consumer stopped.
 fn detach(s: State, close: bool) -> (r: (State, Vec<Action>))
     ensures
@@ -1131,6 +1271,7 @@ fn streaming(s: State, echo: Mark, gap: u64) -> (r: State)
             mark: echo,
             pending: gap,
             misses: 0,
+            announced: true,
             ..s
         }),
 {
@@ -1139,6 +1280,7 @@ fn streaming(s: State, echo: Mark, gap: u64) -> (r: State)
     t.flow = Flow::Attach;
     t.mark = echo;
     t.pending = gap;
+    t.announced = true;
     if !cfg!(feature = "mut_budget_not_reset_on_echo") {
         t.misses = 0;
     }
@@ -1215,6 +1357,7 @@ fn step_close(s: State, ev: Event, now: u64) -> (r: (State, Vec<Action>))
         post_watch(s, r.0, r.1@),
         post_end(s, ev, r.0, r.1@),
         post_only_these_end(s, ev, r.0, r.1@),
+        post_surface(s, ev, r.0, r.1@),
 {
     let open = matches!(s.phase, Phase::Starting) || matches!(s.phase, Phase::Opening)
         || matches!(s.phase, Phase::Confirming) || matches!(s.phase, Phase::Streaming)
@@ -1254,6 +1397,7 @@ fn step_idle(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<Action
         post_watch(s, r.0, r.1@),
         post_end(s, ev, r.0, r.1@),
         post_only_these_end(s, ev, r.0, r.1@),
+        post_surface(s, ev, r.0, r.1@),
 {
     if matches!(ev, Event::Go) {
         return open_action(s, draw as u64);
@@ -1284,6 +1428,7 @@ fn step_backoff(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<Act
         post_watch(s, r.0, r.1@),
         post_end(s, ev, r.0, r.1@),
         post_only_these_end(s, ev, r.0, r.1@),
+        post_surface(s, ev, r.0, r.1@),
 {
     if matches!(ev, Event::Tick) {
         if now >= s.until_ms {
@@ -1323,6 +1468,7 @@ fn step_request(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<Act
         post_watch(s, r.0, r.1@),
         post_end(s, ev, r.0, r.1@),
         post_only_these_end(s, ev, r.0, r.1@),
+        post_surface(s, ev, r.0, r.1@),
 {
     match ev {
         Event::Answered { status, retry_after_s } => {
@@ -1392,37 +1538,50 @@ fn step_confirming(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<
         post_watch(s, r.0, r.1@),
         post_end(s, ev, r.0, r.1@),
         post_only_these_end(s, ev, r.0, r.1@),
+        post_surface(s, ev, r.0, r.1@),
 {
     match ev {
         Event::Frame(f) => match f {
             Frame::Attached { mark, from } => {
                 if mark.len == 0 {
-                    fail(s, Fault::NotOffered, 0, true)
+                    unoffered(s)
                 } else if s.mark.len > 0 && !mark_eq(&mark, &s.mark) && !cfg!(feature = "mut_echo_mark_unchecked") {
                     fail(s, Fault::JobGone, 0, true)
                 } else if matches!(s.flow, Flow::Start) {
-                    fail(s, Fault::NotOffered, 0, true)
+                    unoffered(s)
                 } else if from < s.offset {
                     fail(s, Fault::Protocol, 0, true)
                 } else {
                     let t = streaming(s, mark, from - s.offset);
-                    (t, Vec::new())
+                    let mut out = Vec::new();
+                    if !s.announced || cfg!(feature = "mut_attached_repeated") {
+                        if !cfg!(feature = "mut_attached_not_told") {
+                            out.push(Action::Attached { mark, from });
+                        }
+                    }
+                    (t, out)
                 }
             },
-            Frame::Started { mark } => {
+            Frame::Started { mark, stdin, pty } => {
                 if mark.len == 0 {
-                    fail(s, Fault::NotOffered, 0, true)
+                    unoffered(s)
                 } else if s.mark.len > 0 && !mark_eq(&mark, &s.mark) && !cfg!(feature = "mut_echo_mark_unchecked") {
                     fail(s, Fault::JobGone, 0, true)
                 } else if matches!(s.flow, Flow::Attach) {
-                    fail(s, Fault::NotOffered, 0, true)
+                    unoffered(s)
+                } else if s.stdin_open && !stdin && !cfg!(feature = "mut_stdin_unchecked") {
+                    unoffered(s)
+                } else if s.pty_open && !pty && !cfg!(feature = "mut_pty_unchecked") {
+                    unoffered(s)
                 } else {
                     let t = streaming(s, mark, 0);
-                    (t, Vec::new())
+                    let mut out = Vec::new();
+                    out.push(Action::Started { mark, stdin, pty });
+                    (t, out)
                 }
             },
             Frame::Bad => fail(s, Fault::Protocol, 0, true),
-            _ => fail(s, Fault::NotOffered, 0, true),
+            _ => unoffered(s),
         },
         Event::Broke => backoff(s, 0, now, draw, true),
         _ => (s, Vec::new()),
@@ -1453,6 +1612,7 @@ fn step_streaming(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<A
         post_watch(s, r.0, r.1@),
         post_end(s, ev, r.0, r.1@),
         post_only_these_end(s, ev, r.0, r.1@),
+        post_surface(s, ev, r.0, r.1@),
 {
     match ev {
         Event::Frame(f) => match f {
@@ -1490,6 +1650,13 @@ fn step_streaming(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<A
                 (t, Vec::new())
             },
             Frame::Heartbeat => (s, Vec::new()),
+            Frame::ShellExit { code } => {
+                let mut out = Vec::new();
+                if !cfg!(feature = "mut_shell_exit_not_told") {
+                    out.push(Action::ShellExit { code });
+                }
+                (s, out)
+            },
             Frame::Exit { code, signal } => {
                 if s.pending > u64::MAX - s.offset {
                     return fail(s, Fault::Protocol, 0, true);
@@ -1505,7 +1672,8 @@ fn step_streaming(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<A
                 };
                 let mut out = Vec::new();
                 out.push(Action::CloseStream);
-                out.push(Action::DeliverExit { code, signal, dropped });
+                let killed = if cfg!(feature = "mut_signal_zero_kills") { signal == 0 } else { signal != 0 };
+                out.push(Action::DeliverExit { code, signal, dropped, killed });
                 if cfg!(feature = "mut_remove_on_exit_frame") {
                     out.push(Action::Remove { mark: s.mark });
                 }
@@ -1518,7 +1686,7 @@ fn step_streaming(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<A
                     fail(s, Fault::Protocol, 0, true)
                 }
             },
-            Frame::Started { mark } => {
+            Frame::Started { mark, .. } => {
                 if mark.len > 0 && !mark_eq(&mark, &s.mark) {
                     fail(s, Fault::JobGone, 0, true)
                 } else {
@@ -1556,6 +1724,7 @@ fn step_exit_held(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<A
         post_watch(s, r.0, r.1@),
         post_end(s, ev, r.0, r.1@),
         post_only_these_end(s, ev, r.0, r.1@),
+        post_surface(s, ev, r.0, r.1@),
 {
     match ev {
         Event::ExitTaken => {
@@ -1612,6 +1781,7 @@ pub fn step(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<Action>
         post_watch(s, r.0, r.1@),
         post_end(s, ev, r.0, r.1@),
         post_only_these_end(s, ev, r.0, r.1@),
+        post_surface(s, ev, r.0, r.1@),
 {
     if matches!(s.phase, Phase::Done) {
         return (s, Vec::new());
@@ -1704,12 +1874,24 @@ impl Mark {
 
 impl State {
     /// A handle that starts a job. `key` is the shell's handle for the idempotency key it holds.
-    pub fn for_start(key: u64, mode: Mode, remove_on_exit: bool, beat_s: u32) -> State {
+    pub fn for_start(
+        key: u64,
+        mode: Mode,
+        remove_on_exit: bool,
+        beat_s: u32,
+        stdin_open: bool,
+        pty_open: bool,
+        kept: bool,
+    ) -> State {
         State {
             phase: Phase::Idle,
             flow: Flow::Start,
             mode,
             remove_on_exit,
+            stdin_open,
+            pty_open,
+            kept,
+            announced: false,
             key,
             mark: Mark { len: 0, b: [0; 32] },
             offset: 0,
@@ -1734,6 +1916,10 @@ impl State {
             flow: Flow::Attach,
             mode,
             remove_on_exit,
+            stdin_open: false,
+            pty_open: false,
+            kept: false,
+            announced: false,
             key: 0,
             mark,
             offset,

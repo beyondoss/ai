@@ -47,7 +47,7 @@ Transport  run, stream, jobs                           raw exec; replace it with
 
 1. **Transport** is the whole interface a sandbox needs:
    `run(command, args, { cwd, timeoutMs, stdin }) -> { exitCode, stdout, stderr }` with bytes in and out, `stream` (frames), and
-   `jobs` (start, startHeld, list, read, attach, keep, seen, kill, remove, wipe, writeStdin, signal). One protocol, no versions: every endpoint is `execd`.
+   `jobs` (start, open, list, read, keep, seen, kill, remove, wipe, writeStdin, signal). One protocol, no versions: every endpoint is `execd`.
    `HttpTransport({ url, token })` is the default: `token` is a string, or `() => Promise<string>` which is called again once on
    a `401`, retrying that request once. That is the only retry the package makes.
 2. **`Files` and `Jobs`** take any `Transport`: `new Files(transport)`. They never touch anything but the transport, so a helper
@@ -124,6 +124,15 @@ open, and `writeStdin` takes no `eof` (`InvalidRequestError`; write `0x04` for C
 terminal is `NotOfferedError`, and the job it started is stopped. A resize of an ended terminal, one with no terminal or one
 whose keeper is gone is `ConflictError`; a write to a hung-up terminal is `StdinClosedError` with `written`.
 
+A held job (`startHeld`, `follow`, `collect`) reconnects itself. Every decision it makes (the status table, the offset it
+reopens at, the wait before each retry, the silence limit, when it gives up) is made by the job client kernel
+(`crates/job-client`, proven in Verus), compiled to WASM and inlined in the package (`src/kernel/wasm.ts`, about 14 KB
+gzipped; no fetch, no file, no dependency). `src/held.ts` only does the I/O the kernel names. A cut stream is reopened at
+the offset reached, asking for the mark the handle holds; a gap the server states is delivered as a `gap` frame; when the
+kernel's budget is spent it says so through `onReconnecting({ attempts, sinceMs })` and keeps trying until the job ends, the endpoint refuses for good, or you stop iterating. An endpoint that does not
+name the job's mark (it predates marks) is `NotOfferedError`: the handle fails closed rather than follow a job it cannot
+identify. `crates/job-client-ffi/build.sh` rebuilds the WASM; CI fails when the committed bytes are not what the sources build to.
+
 Job failures are typed, each a subclass of the kind it was before (so `catch (e) { if (e instanceof NotFoundError) ... }` keeps
 working): `JobGoneError` (a `NotFoundError`: `attach` of a job that is not there, or a `read` whose job was removed), `JobExistsError` (a
 `ConflictError`: `start` of an id that exists), `DiskFullError` (an `IoError`: `start` on a full disk, 507), and for `writeStdin`:
@@ -150,6 +159,7 @@ stream that kills the command, the same as stopping iteration. The failure is `t
 ### Breaking
 
 - `Jobs.attach` is gone: use `collect` (follow to the end, collected) or `follow` (frames).
+- `JobOps.startHeld` and `JobOps.attach` are one op, `JobOps.open`: one request, answered with its status, never retried. A custom transport implements it; the client kernel decides what the status means. A held job's `shell_exit` frame is passed on as before; a `follow` that ends in an error frame is a `ProtocolError`/`EndpointError`, no longer a `TransportError`.
 - `Jobs.read` of a removed or unknown job throws `JobGoneError` (a `NotFoundError`) instead of returning `state: "gone"`. `sb.transport.jobs.read` still returns the wire's `gone`.
 - `Transport.jobs` (`JobOps`) gains `startHeld`, `keep` and `seen`; `kill` takes `{ remove, graceMs }` and `wipe` takes `{ graceMs }`. A custom transport must implement them.
 - A start of an existing id is `JobExistsError`, a full disk `DiskFullError`, and a stdin write's 409 and 429 are `StdinClosedError`, `StdinGapError` and `StdinBusyError` (all still `ConflictError`s).

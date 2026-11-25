@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { text, utf8 } from "../src/bytes.js";
 import { decodeFrameLine, excerpt, HttpTransport } from "../src/http.js";
+import { Jobs } from "../src/jobs.js";
 import type { Frame } from "../src/transport.js";
 import { fakeEndpoint, json, ok } from "./fake-endpoint.js";
 
@@ -456,7 +457,9 @@ describe("HttpTransport.jobs", () => {
       res.write("{");
     });
     const t = new HttpTransport({ url: e.url, maxResponseBytes: 10 });
-    expect(await kindOf(t.jobs.start("scope-1", "job1", { command: "true" })))
+    expect(
+      await kindOf(new Jobs(t).start("scope-1", "job1", { command: "true" })),
+    )
       .toBe("too_large");
   });
 
@@ -464,7 +467,7 @@ describe("HttpTransport.jobs", () => {
     const e = await endpoint((_, res) => json(res, 200, { started: 1 }));
     const run = async () => {
       for await (
-        const f of new HttpTransport({ url: e.url }).jobs.attach(
+        const f of new Jobs(new HttpTransport({ url: e.url })).follow(
           "scope-1",
           "job1",
           0,

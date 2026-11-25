@@ -11,7 +11,7 @@ import {
   StdinClosedError,
   StdinGapError,
 } from "../src/errors.js";
-import { decodeJobFrame, HttpTransport } from "../src/http.js";
+import { decodeJobLine, HttpTransport } from "../src/http.js";
 import { Jobs } from "../src/jobs.js";
 import { silenceMs } from "../src/transport.js";
 import { fakeEndpoint, json } from "./fake-endpoint.js";
@@ -25,19 +25,45 @@ const line = (v: unknown) => utf8(JSON.stringify(v));
 
 describe("job frames keep their stream", () => {
   it("decodes stdout and stderr frames apart, and the stdin echo", () => {
-    expect(decodeJobFrame(line({ stdout: b64("a") }))).toMatchObject({
-      type: "output",
+    expect(decodeJobLine(line({ stdout: b64("a") }))).toMatchObject({
+      frame: { t: "output", len: 1 },
       stream: "stdout",
     });
-    const e = decodeJobFrame(line({ stderr: b64("b") }));
-    expect(e).toMatchObject({ type: "output", stream: "stderr" });
-    expect(decodeJobFrame(line({ started: 7, mark: "ab", stdin: true })))
-      .toEqual({ type: "started", pgid: 7, mark: "ab", stdin: true });
-    expect(decodeJobFrame(line({ attached: { mark: "ab", from: 3 } })))
-      .toEqual({ type: "attached", mark: "ab", from: 3 });
-    expect(decodeJobFrame(line({ started: 7 }))).toMatchObject({
-      stdin: false,
+    expect(decodeJobLine(line({ stderr: b64("b") }))).toMatchObject({
+      frame: { t: "output", len: 1 },
+      stream: "stderr",
     });
+    expect(decodeJobLine(line({ started: 7, stdin: true }))).toMatchObject({
+      pgid: 7,
+      frame: { t: "started", stdin: true },
+    });
+    expect(decodeJobLine(line({ started: 7 }))).toMatchObject({
+      frame: { t: "started", stdin: false },
+    });
+    expect(decodeJobLine(line({ shell_exit: 3 })).frame).toEqual({
+      t: "shellExit",
+      code: 3,
+    });
+  });
+
+  it("reads the mark an endpoint echoes, and says `bad` for what is not a frame", () => {
+    expect(
+      decodeJobLine(line({ attached: { mark: "00ff", from: 9 } })).frame,
+    ).toEqual({ t: "attached", mark: "00ff", from: 9 });
+    expect(decodeJobLine(line({ started: 7, mark: "00ff" })).frame).toEqual({
+      t: "started",
+      mark: "00ff",
+      stdin: false,
+      pty: false,
+    });
+    for (
+      const v of [{ error: "boom" }, { gap: -1 }, { exit_code: 1.5 }, {
+        timed_out: true,
+      }]
+    ) {
+      expect(decodeJobLine(line(v)).frame).toEqual({ t: "bad" });
+    }
+    expect(decodeJobLine(utf8("{nope")).frame).toEqual({ t: "bad" });
   });
 });
 
@@ -116,10 +142,12 @@ describe("job ops over HTTP", () => {
 
   it("kills a job whose stdin_open was ignored", async () => {
     const { t, seen } = await jobs((b) =>
-      b.job.op === "start" ? [200, { started: 5 }] : [200, { survivors: [] }]
+      b.job.op === "start"
+        ? [200, { started: 5, mark: "0a1b" }]
+        : [200, { survivors: [] }]
     );
     await expect(
-      t.jobs.start("s", "aa", { command: "cat", stdinOpen: true }),
+      new Jobs(t).start("s", "aa", { command: "cat", stdinOpen: true }),
     ).rejects.toMatchObject({ kind: "not_offered" });
     expect(seen.map((b) => b.job.op)).toEqual(["start", "kill"]);
   });
@@ -135,19 +163,24 @@ describe("typed job errors (each a subclass of today's kind)", () => {
 
   it("start: 409 is JobExistsError, 507 is DiskFullError", async () => {
     const exists = await fail(
-      (await failing(409, { error: "the job exists" })).jobs.start("s", "aa", {
-        command: "true",
-      }),
+      new Jobs(await failing(409, { error: "the job exists" })).start(
+        "s",
+        "aa",
+        {
+          command: "true",
+        },
+      ),
     );
     expect(exists).toBeInstanceOf(JobExistsError);
     expect(exists).toBeInstanceOf(ConflictError);
     expect(exists).toMatchObject({ kind: "conflict", id: "aa" });
     const full = await fail(
-      (await failing(507, { error: "the sandbox's disk is full" })).jobs.start(
-        "s",
-        "aa",
-        { command: "true" },
-      ),
+      new Jobs(await failing(507, { error: "the sandbox's disk is full" }))
+        .start(
+          "s",
+          "aa",
+          { command: "true" },
+        ),
     );
     expect(full).toBeInstanceOf(DiskFullError);
     expect(full).toBeInstanceOf(IoError);
@@ -158,7 +191,7 @@ describe("typed job errors (each a subclass of today's kind)", () => {
     const t = await failing(404, { error: "no such job" });
     const gone = await fail(
       (async () => {
-        for await (const _ of t.jobs.attach("s", "aa", 0)) { /* none */ }
+        for await (const _ of new Jobs(t).follow("s", "aa", 0)) { /* none */ }
       })(),
     );
     expect(gone).toBeInstanceOf(JobGoneError);
@@ -242,13 +275,13 @@ describe("the wire options, under their wire names", () => {
   it("a held start sends hold: true with stream, and the heartbeat header", async () => {
     const e = await fakeEndpoint((_r, res) => {
       res.writeHead(200, { "content-type": "application/x-ndjson" });
-      res.end("{\"started\":42,\"mark\":\"m1\"}\n{\"exit_code\":0}\n");
+      res.end("{\"started\":42,\"mark\":\"00ff\"}\n{\"exit_code\":0}\n");
     });
     closers.push(e.close);
     const t = new HttpTransport({ url: e.url });
     const frames = [];
     for await (
-      const f of t.jobs.startHeld("s", "aa", { command: "true" }, {
+      const f of new Jobs(t).startHeld("s", "aa", { command: "true" }, {
         heartbeatSeconds: 60,
       })
     ) frames.push(f);
@@ -299,12 +332,12 @@ describe("the mark on the wire", () => {
   }
 
   it("a job id may hold `-` and `_` and be 64 long, and no more", async () => {
-    const { t } = await answering(() => [200, { started: 5, mark: "m" }]);
+    const { t } = await answering(() => [200, { started: 5, mark: "0a" }]);
     const jobs = new Jobs(t);
     for (const ok of ["a-b_c", "-", "_", "z".repeat(64)]) {
       expect(await jobs.start("s", ok, { command: "true" })).toEqual({
         pgid: 5,
-        mark: "m",
+        mark: "0a",
       });
     }
     for (const bad of ["", "A", "a.b", "a/b", "z".repeat(65)]) {
@@ -315,7 +348,7 @@ describe("the mark on the wire", () => {
 
   it("start without a mark is not_offered; held start too", async () => {
     const { t } = await answering(() => [200, { started: 5 }]);
-    await expect(t.jobs.start("s", "aa", { command: "true" })).rejects
+    await expect(new Jobs(t).start("s", "aa", { command: "true" })).rejects
       .toMatchObject({ kind: "not_offered" });
     const e = await fakeEndpoint((_r, res) => {
       res.writeHead(200, { "content-type": "application/x-ndjson" });
@@ -324,7 +357,9 @@ describe("the mark on the wire", () => {
     closers.push(e.close);
     const h = new HttpTransport({ url: e.url });
     await expect((async () => {
-      for await (const _ of h.jobs.startHeld("s", "aa", { command: "true" })) {
+      for await (
+        const _ of new Jobs(h).startHeld("s", "aa", { command: "true" })
+      ) {
         /* none */
       }
     })()).rejects.toMatchObject({ kind: "not_offered" });
@@ -338,7 +373,7 @@ describe("the mark on the wire", () => {
           id: "aa",
           state: "running",
           code: null,
-          mark: "m1",
+          mark: "0a1b",
           command: "sh",
           args: ["-c", "x"],
           outputStart: 2,
@@ -347,7 +382,7 @@ describe("the mark on the wire", () => {
       },
     ]);
     expect((await t.jobs.list("s"))[0]).toMatchObject({
-      mark: "m1",
+      mark: "0a1b",
       command: "sh",
       args: ["-c", "x"],
       outputStart: 2,
@@ -386,19 +421,23 @@ describe("the mark on the wire", () => {
 
   it("attach sends mark and output, yields `attached` first, and collect exposes it", async () => {
     const { jobs, bodies } = await attaching(
-      "{\"attached\":{\"mark\":\"m1\",\"from\":4}}\n{\"exit_code\":0}\n",
+      "{\"attached\":{\"mark\":\"0a1b\",\"from\":4}}\n{\"exit_code\":0}\n",
     );
-    const out = await jobs.collect("s", "aa", 4, { mark: "m1", output: false });
-    expect(out.attached).toEqual({ mark: "m1", from: 4 });
+    const out = await jobs.collect("s", "aa", 4, {
+      mark: "0a1b",
+      output: false,
+    });
+    expect(out.attached).toEqual({ mark: "0a1b", from: 4 });
     expect(bodies[0]!.job).toMatchObject({
       op: "attach",
       offset: 4,
-      mark: "m1",
+      mark: "0a1b",
       output: false,
     });
     const frames = [];
     for await (const f of jobs.follow("s", "aa")) frames.push(f.type);
-    expect(frames).toEqual(["attached", "exit"]);
+    // The stream starts at 4 for a follow from 0: the kernel tells the consumer of the 4 bytes between.
+    expect(frames).toEqual(["attached", "gap", "exit"]);
     expect(bodies[1]!.job).not.toHaveProperty("mark");
   });
 
@@ -448,32 +487,32 @@ describe("job terminals", () => {
   it("sends pty on start and accepts the echo", async () => {
     const { t, seen } = await jobs(() => [
       200,
-      { started: 5, mark: "m", stdin: true, pty: { cols: 80, rows: 24 } },
+      { started: 5, mark: "ab", stdin: true, pty: { cols: 80, rows: 24 } },
     ]);
     expect(
-      await t.jobs.start("s", "aa", {
+      await new Jobs(t).start("s", "aa", {
         command: "sh",
         pty: { cols: 80, rows: 24 },
       }),
-    ).toEqual({ pgid: 5, mark: "m" });
+    ).toEqual({ pgid: 5, mark: "ab" });
     expect(seen[0].job.pty).toEqual({ cols: 80, rows: 24 });
   });
 
   it("fails closed and stops the job when the endpoint does not echo pty", async () => {
     const { t, seen } = await jobs((b) =>
       b.job.op === "start"
-        ? [200, { started: 5, mark: "m" }]
+        ? [200, { started: 5, mark: "ab" }]
         : [200, { survivors: [] }]
     );
     await expect(
-      t.jobs.start("s", "aa", { command: "sh", pty: { cols: 80, rows: 24 } }),
+      new Jobs(t).start("s", "aa", { command: "sh", pty: { cols: 80, rows: 24 } }),
     ).rejects.toMatchObject({ kind: "not_offered" });
     expect(seen.map((b) => b.job.op)).toEqual(["start", "kill"]);
   });
 
   it("sends no pty member for a job without a terminal", async () => {
-    const { t, seen } = await jobs(() => [200, { started: 5, mark: "m" }]);
-    await t.jobs.start("s", "aa", { command: "true" });
+    const { t, seen } = await jobs(() => [200, { started: 5, mark: "ab" }]);
+    await new Jobs(t).start("s", "aa", { command: "true" });
     expect("pty" in seen[0].job).toBe(false);
   });
 
@@ -543,7 +582,7 @@ describe("job terminals", () => {
 
   it("reads pty on list and read entries, and on the started frame", async () => {
     const base = {
-      mark: "m",
+      mark: "ab",
       command: "sh",
       args: [],
       outputStart: 0,
@@ -579,21 +618,18 @@ describe("job terminals", () => {
       open: false,
     });
     expect(
-      decodeJobFrame(
+      decodeJobLine(
         line({
           started: 7,
-          mark: "m",
+          mark: "ab",
           stdin: true,
           pty: { cols: 80, rows: 24 },
         }),
       ),
-    )
-      .toEqual({
-        type: "started",
-        pgid: 7,
-        mark: "m",
-        stdin: true,
-        pty: { cols: 80, rows: 24 },
-      });
+    ).toMatchObject({
+      frame: { t: "started", mark: "ab", stdin: true, pty: true },
+      pgid: 7,
+      pty: { cols: 80, rows: 24 },
+    });
   });
 });

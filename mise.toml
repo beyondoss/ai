@@ -373,6 +373,10 @@ description = "Install the TypeScript SDK's dependencies (npm ci in sdk/ts)."
 run = "npm ci"
 dir = "sdk/ts"
 
+[tasks."build:job-client-wasm"]
+description = "Rebuild the job client kernel as WASM and inline it into the TypeScript SDK (sdk/ts/sandbox/src/kernel/). `-- --check` rebuilds and fails if the committed bytes differ."
+run = "crates/job-client-ffi/build.sh"
+
 [tasks."build:ts"]
 description = "Build the TypeScript SDK (tsdown): sandbox + @beyond.dev/tools dist."
 run = "npm run build"
