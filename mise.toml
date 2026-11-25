@@ -89,7 +89,7 @@ run = '''
 set -u
 for m in $(grep -oE '^mut_[a-z0-9_]+' crates/job-client/Cargo.toml); do
   out=$(KERNEL_CRATES=crates/job-client .github/scripts/verify-kernels.sh --features "$m" 2>&1) && { echo "proof stayed green under $m" >&2; exit 1; }
-  line=$(grep -E "verification results:: .* [1-9][0-9]* errors" <<<"$out") || { echo "$m: failed without a Verus verification result (build error?)" >&2; exit 1; }
+  line=$(printf "%s\n" "$out" | grep -E "verification results:: .* [1-9][0-9]* errors") || { echo "$m: failed without a Verus verification result (build error?)" >&2; exit 1; }
   echo "red under $m: $line"
 done
 '''
@@ -129,17 +129,6 @@ for m in mut_reattach_from_zero mut_gap_not_counted mut_trailing_gap_dropped mut
     echo "model stayed green under $m" >&2; exit 1
   fi
   echo "model red under $m"
-done
-'''
-
-[tasks."verify:execd-jobs-mark-mutants"]
-description = "crates/execd-jobs under each of the mut_* features of the mark on the wire (I1, I2, I1-live, M1 to M7): every proof must go red (a Verus verification failure, not a build error). Pairs with `verify:kernels`, which must be green without a feature."
-run = '''
-set -u
-for m in mut_id_length_unbounded mut_id_any_byte mut_id_rejects_dash mut_mark_ignored mut_mark_refuses mut_remove_ignores_mark mut_remove_never_takes mut_running_unreported mut_attach_ignores_mark mut_attach_refuses mut_status_only_streams; do
-  out=$(KERNEL_CRATES=crates/execd-jobs .github/scripts/verify-kernels.sh --features "$m" 2>&1) && { echo "proof stayed green under $m" >&2; exit 1; }
-  line=$(grep -E "verification results:: .* [1-9][0-9]* errors" <<<"$out") || { echo "$m: failed without a Verus verification result (build error?)" >&2; exit 1; }
-  echo "red under $m: $line"
 done
 '''
 

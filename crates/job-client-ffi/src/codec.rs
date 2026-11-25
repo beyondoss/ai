@@ -7,8 +7,8 @@
 //! since_ms u64, until_ms u64, beat_s u32]`. Tags are the order the variants are declared in `job_client::step`, except the actions `Reconnecting` (10), `Started` (11), `Attached` (12), `ShellExit` (13) and `Kill` (14).
 
 use job_client::step::{
-    Action, Class, Event, Flow, Frame, Mark, Mode, Op, Phase, State, classify as k_classify,
-    silence_ms, step as k_step,
+    Action, Authority, Class, Event, Flow, Frame, Mark, Mode, Op, Phase, State,
+    classify as k_classify, silence_ms, step as k_step,
 };
 
 /// The input is cut short or has an unknown tag or an invalid mark.
@@ -132,9 +132,16 @@ impl Rd<'_> {
     fn event(&mut self) -> R<Event> {
         match self.u8()? {
             0 => Ok(Event::Go),
+            // An encoder that predates the authority sends tag 1: its answer is not the backend's own.
             1 => Ok(Event::Answered {
                 status: self.u16()?,
                 retry_after_s: self.u32()?,
+                authority: Authority::NotAuthoritative,
+            }),
+            8 => Ok(Event::Answered {
+                status: self.u16()?,
+                retry_after_s: self.u32()?,
+                authority: authority(self.u8()?)?,
             }),
             2 => Ok(Event::Frame(self.frame()?)),
             3 => Ok(Event::Broke),
@@ -308,7 +315,17 @@ pub fn step(input: &[u8], out: &mut [u8]) -> R<usize> {
     finish(out, &v)
 }
 
-/// `classify`: `[op, status u16]` -> `[class]` (0 go on, 1 retry, 2 + fault: terminal).
+/// An answer's authority: `0` not the backend's own, `1` the sandbox is gone, `2` the session has ended.
+fn authority(b: u8) -> R<Authority> {
+    match b {
+        0 => Ok(Authority::NotAuthoritative),
+        1 => Ok(Authority::SandboxGone),
+        2 => Ok(Authority::SessionEnded),
+        _ => Err(BAD_INPUT),
+    }
+}
+
+/// `classify`: `[op, status u16, authority u8 (optional)]` -> `[class]` (0 go on, 1 retry, 2 + fault: terminal).
 pub fn classify(input: &[u8], out: &mut [u8]) -> R<usize> {
     let mut r = Rd(input);
     let op = match r.u8()? {
@@ -318,7 +335,14 @@ pub fn classify(input: &[u8], out: &mut [u8]) -> R<usize> {
         3 => Op::Other,
         _ => return Err(BAD_INPUT),
     };
-    let v = match k_classify(op, r.u16()?) {
+    let status = r.u16()?;
+    // The authority is an optional trailing byte: without it the answer is not the backend's own.
+    let auth = match r.rest() {
+        [] => Authority::NotAuthoritative,
+        [b] => authority(*b)?,
+        _ => return Err(BAD_INPUT),
+    };
+    let v = match k_classify(op, status, auth) {
         Class::Ok => vec![0],
         Class::Retry => vec![1],
         Class::Terminal(f) => vec![2, f as u8],

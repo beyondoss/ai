@@ -20,6 +20,7 @@ use sandbox_conformance::e2b;
 
 fn sleeper() -> JobSpec {
     JobSpec {
+        pty: None,
         program: "sh".into(),
         args: vec!["-c".into(), "echo up; sleep 600".into()],
         cwd: None,

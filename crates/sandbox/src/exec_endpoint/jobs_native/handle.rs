@@ -367,53 +367,47 @@ fn authority_of(status: u16, body: &str, ours: Option<&str>) -> Authority {
 }
 
 /// The next kernel event from the open stream: a frame, or `Broke` when it ended or went quiet.
-async fn read(
-    reader: &mut Option<FrameReader>,
-    limit: Duration,
-    p: &mut Payload,
-) -> Ev {
-    loop {
-        let Some(r) = reader.as_mut() else {
-            return Ev::Broke;
-        };
-        let line = match r.next_line(limit).await {
-            Ok(Some(l)) => l,
-            Ok(None) | Err(_) => return Ev::Broke,
-        };
-        return Ev::Frame(match decode_job_frame(&line) {
-            Err(e) => {
-                p.error = Some(e);
-                KFrame::Bad
+async fn read(reader: &mut Option<FrameReader>, limit: Duration, p: &mut Payload) -> Ev {
+    let Some(r) = reader.as_mut() else {
+        return Ev::Broke;
+    };
+    let line = match r.next_line(limit).await {
+        Ok(Some(l)) => l,
+        Ok(None) | Err(_) => return Ev::Broke,
+    };
+    Ev::Frame(match decode_job_frame(&line) {
+        Err(e) => {
+            p.error = Some(e);
+            KFrame::Bad
+        }
+        Ok(JobFrame::Heartbeat) => KFrame::Heartbeat,
+        Ok(JobFrame::Error(e)) => {
+            p.error = Some(e);
+            KFrame::Bad
+        }
+        Ok(JobFrame::End(JobEnd::Exit(code))) => KFrame::Exit { code, signal: 0 },
+        Ok(JobFrame::End(JobEnd::Signal(signal))) => KFrame::Exit { code: 0, signal },
+        Ok(JobFrame::Event(Event::Started(pgid, mark, stdin, echoed))) => {
+            p.pgid = pgid;
+            KFrame::Started {
+                mark: as_mark(mark.as_deref(), p),
+                stdin,
+                pty: echoed.is_some(),
             }
-            Ok(JobFrame::Heartbeat) => KFrame::Heartbeat,
-            Ok(JobFrame::Error(e)) => {
-                p.error = Some(e);
-                KFrame::Bad
-            }
-            Ok(JobFrame::End(JobEnd::Exit(code))) => KFrame::Exit { code, signal: 0 },
-            Ok(JobFrame::End(JobEnd::Signal(signal))) => KFrame::Exit { code: 0, signal },
-            Ok(JobFrame::Event(Event::Started(pgid, mark, stdin, echoed))) => {
-                p.pgid = pgid;
-                KFrame::Started {
-                    mark: as_mark(mark.as_deref(), p),
-                    stdin,
-                    pty: echoed.is_some(),
-                }
-            }
-            Ok(JobFrame::Event(Event::Attached(mark, from))) => KFrame::Attached {
-                mark: as_mark(Some(&mark), p),
-                from,
-            },
-            Ok(JobFrame::Event(Event::Output(bytes, stream))) => {
-                let len = bytes.len() as u64;
-                p.bytes = bytes;
-                p.stream = Some(stream);
-                KFrame::Output { len }
-            }
-            Ok(JobFrame::Event(Event::Gap(n))) => KFrame::Gap { n },
-            Ok(JobFrame::Event(Event::ShellExit(code))) => KFrame::ShellExit { code },
-        });
-    }
+        }
+        Ok(JobFrame::Event(Event::Attached(mark, from))) => KFrame::Attached {
+            mark: as_mark(Some(&mark), p),
+            from,
+        },
+        Ok(JobFrame::Event(Event::Output(bytes, stream))) => {
+            let len = bytes.len() as u64;
+            p.bytes = bytes;
+            p.stream = Some(stream);
+            KFrame::Output { len }
+        }
+        Ok(JobFrame::Event(Event::Gap(n))) => KFrame::Gap { n },
+        Ok(JobFrame::Event(Event::ShellExit(code))) => KFrame::ShellExit { code },
+    })
 }
 
 /// A mark as the wire spelled it: no mark (an endpoint that predates marks) is the empty one, which

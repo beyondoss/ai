@@ -115,10 +115,7 @@ async fn bytes_the_endpoint_no_longer_holds_are_a_gap_before_the_next_output() {
     .await;
     let (r, lines) = run(&front, 1000).await;
     assert_eq!(r.unwrap(), JobEnd::Exit(3));
-    assert_eq!(
-        lines,
-        ["started", "out:hello", "gap:3", "out:x"]
-    );
+    assert_eq!(lines, ["started", "out:hello", "gap:3", "out:x"]);
 }
 
 #[tokio::test]
