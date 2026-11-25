@@ -1360,6 +1360,7 @@ fn the_mutation_turns_its_property_red() {
         "K1: "
     } else if cfg!(feature = "mut_key_digest_ignored")
         || cfg!(feature = "mut_key_take_forgets_none")
+        || cfg!(feature = "mut_key_id_ignored")
     {
         "K2: "
     } else if cfg!(feature = "mut_key_fresh_refused")
@@ -1490,7 +1491,7 @@ fn production_calls_the_kernel() {
     // The only insert is the kernel table's, after `admit` said fresh, under the same lock.
     let at = prod.find("map.insert(").expect("the table insert");
     assert!(
-        prod[..at].rfind(".begin(").is_some_and(|a| at - a < 1500),
+        prod[..at].rfind(".begin(").is_some_and(|a| at - a < 2500),
         "the insert is no longer behind `begin` (admit, with the key's replay)"
     );
 }

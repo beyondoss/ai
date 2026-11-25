@@ -1292,7 +1292,7 @@ pub(crate) fn recover(ctx: &Arc<Ctx>) {
         if how == Recovery::Drop {
             continue;
         }
-        if e.phase == Saved::Spawning && alive {
+        if matches!(e.phase, Saved::Spawning) && alive {
             // The spawn happened and its save did not: nobody can find this job's processes but by its mark, and its
             // answer is lost. Never leave them running unseen.
             for pid in proc::job_members(0, &e.mark) {
