@@ -27,6 +27,7 @@ describe("driver without an endpoint", () => {
           "job_signal_op",
           "job_errors",
           "job_options",
+          "job_start_key",
         ],
       },
     });
