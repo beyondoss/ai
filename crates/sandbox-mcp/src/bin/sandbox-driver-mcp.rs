@@ -164,6 +164,16 @@ fn command_line(req: &Value) -> Result<String, Value> {
     Ok(line)
 }
 
+/// The command line a job runs: the tool starts `sh -c <line>`, so a request that is already that
+/// (`sh -c <line>`) hands over its line, and the job's listed argv is the one the request named.
+fn job_line(req: &Value) -> Result<String, Value> {
+    let a = strings(req, "args")?;
+    if req["command"] == json!("sh") && a.len() == 2 && a[0] == "-c" {
+        return Ok(a[1].clone());
+    }
+    command_line(req)
+}
+
 /// A tool's arguments: the keys given, with `null`s left out.
 fn args(pairs: Vec<(&str, Value)>) -> Map<String, Value> {
     pairs
@@ -444,7 +454,7 @@ impl Mcp {
                         args(vec![
                             ("scope", json!(str_arg(req, "scope")?)),
                             ("id", json!(str_arg(req, "job")?)),
-                            ("command", json!(command_line(req)?)),
+                            ("command", json!(job_line(req)?)),
                             ("cwd", json!(opt_str(req, "cwd")?)),
                             ("label", json!(opt_str(req, "label")?)),
                             ("env", req["env"].clone()),
@@ -838,6 +848,7 @@ impl Mcp {
                         ("mark", json!(opt_str(req, "mark")?)),
                         ("output", json!(output)),
                         ("timeout_ms", json!(60_000)),
+                        ("max", json!(16 * 1024 * 1024)),
                         ("encoding", json!("base64")),
                     ]),
                 )

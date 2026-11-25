@@ -1284,6 +1284,8 @@ impl SandboxMcp {
             gap: u64,
         }
         let heard = std::sync::Mutex::new(Heard::default());
+        // Enough output is a reason to answer: the caller attaches again from `next_offset`.
+        let full = tokio::sync::Notify::new();
         let sink = |ev: JobEvent<'_>| {
             let mut h = heard.lock().unwrap_or_else(|e| e.into_inner());
             match ev {
@@ -1298,6 +1300,9 @@ impl SandboxMcp {
                     }
                     h.at += b.len() as u64;
                     h.data.extend_from_slice(b);
+                    if h.data.len() >= max {
+                        full.notify_one();
+                    }
                 }
                 JobEvent::Gap(n) => {
                     h.at += n;
@@ -1309,14 +1314,16 @@ impl SandboxMcp {
         let t = self.target().await?;
         let jobs = t.sandbox.jobs()?;
         // Dropping the call closes the stream; closing an attach never kills.
-        let end = match tokio::time::timeout(
-            wait,
-            jobs.follow_marked(&scope, &id, from, mark.as_deref(), output, &sink),
-        )
-        .await
-        {
-            Ok(r) => Some(r?),
-            Err(_) => None,
+        let attach = jobs.follow_marked(&scope, &id, from, mark.as_deref(), output, &sink);
+        let end = tokio::select! {
+            r = attach => Some(r.map_err(|e| match beyond_sandbox::exec_endpoint::jobs::JobError::of(&e) {
+                Some(beyond_sandbox::exec_endpoint::jobs::JobError::Gone { .. }) => {
+                    ToolError::new("not_found", e.to_string())
+                }
+                _ => ToolError::from(e),
+            })?),
+            () = full.notified() => None,
+            () = tokio::time::sleep(wait) => None,
         };
         let h = heard.into_inner().unwrap_or_else(|e| e.into_inner());
         let Some((mark, started)) = h.attached else {
