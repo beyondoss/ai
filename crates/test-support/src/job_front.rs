@@ -8,7 +8,6 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
 
 /// What a connection gets.
 pub enum Reply {
@@ -32,7 +31,7 @@ pub struct JobFront {
 
 impl JobFront {
     pub async fn start(script: Script) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = crate::ports::tokio_listener().await;
         let url = format!("http://{}/", listener.local_addr().unwrap());
         let seen: Arc<Mutex<Vec<Value>>> = Arc::default();
         let log = seen.clone();

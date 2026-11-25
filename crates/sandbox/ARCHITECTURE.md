@@ -5,24 +5,25 @@ depends on it; it depends on neither `beyond-agent` nor `beyond-agent-core`.
 
 ## Modules
 
-| file                               | what                                                                                                                         |
-| ---------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| `src/lib.rs`                       | the public names: `Exec`, `HttpExec`, `Files`, `Jobs`, `Sandbox`, `TokenSource`, `SandboxError`                              |
-| `src/error.rs`                     | `SandboxError` / `ErrorKind`: FILES-OVER-EXEC §3 vocabulary, classify from `io` / `FsError` / `BulkError`                    |
-| `src/exec.rs`                      | `CommandRunner` (`Exec`), `ExecResult`, `ExecOutput` (code and bytes), `Kill`/`LocalKill`/`kill_all`, bounded output capture |
-| `src/exec_endpoint.rs`             | the protocol spec (module doc), `HttpExecRunner`                                                                             |
-| `src/exec_endpoint/stream.rs`      | stream frames and the frame reader                                                                                           |
-| `src/exec_endpoint/jobs.rs`        | `SandboxJobs`, scopes (`JobScope::named` / `for_session`), ids                                                               |
-| `src/exec_endpoint/jobs_native.rs` | the endpoint's jobs: `NativeJobs`, `HttpJobs`                                                                                |
-| `src/fs.rs`                        | `FsBackend`, its types, and the result policy every backend shares                                                           |
-| `src/fs/shell.rs`                  | `ShellFs` (`Files`): file operations as commands, the one lazy environment probe, parsers, `__fuzz`                          |
-| `src/bulk.rs`                      | `upload`/`download`/`extract`: tar over exec, the three scripts, the staged upload, `Sources`, `Transfer`, `BulkError`       |
-| `src/bulk/extract.rs`              | the policy layer over the `tar` crate for untrusted archives: never writes through a link, directory modes last              |
-| `src/procgroup.rs`                 | process-group identity and kill guards for local children                                                                    |
-| `src/sandbox.rs`                   | `Jobs` (with ergonomic `start`), `Sandbox`, the `Command` / `StartJob` builders                                              |
-| `src/token.rs`                     | `TokenSource` and the one-renewal bearer                                                                                     |
-| `src/tls.rs`                       | installs the `ring` rustls provider before a client is built                                                                 |
-| `src/testing.rs`                   | a plain local runner for unit tests                                                                                          |
+| file                                      | what                                                                                                                         |
+| ----------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `src/lib.rs`                              | the public names: `Exec`, `HttpExec`, `Files`, `Jobs`, `Sandbox`, `TokenSource`, `SandboxError`                              |
+| `src/error.rs`                            | `SandboxError` / `ErrorKind`: FILES-OVER-EXEC §3 vocabulary, classify from `io` / `FsError` / `BulkError`                    |
+| `src/exec.rs`                             | `CommandRunner` (`Exec`), `ExecResult`, `ExecOutput` (code and bytes), `Kill`/`LocalKill`/`kill_all`, bounded output capture |
+| `src/exec_endpoint.rs`                    | the protocol spec (module doc), `HttpExecRunner`                                                                             |
+| `src/exec_endpoint/stream.rs`             | stream frames and the frame reader                                                                                           |
+| `src/exec_endpoint/jobs.rs`               | `SandboxJobs`, scopes (`JobScope::named` / `for_session`), ids                                                               |
+| `src/exec_endpoint/jobs_native.rs`        | the endpoint's jobs: `NativeJobs`, `HttpJobs`                                                                                |
+| `src/exec_endpoint/jobs_native/handle.rs` | the job handle: the shell that drives the client kernel (`step`) for `run_held` and `follow`                                 |
+| `src/fs.rs`                               | `FsBackend`, its types, and the result policy every backend shares                                                           |
+| `src/fs/shell.rs`                         | `ShellFs` (`Files`): file operations as commands, the one lazy environment probe, parsers, `__fuzz`                          |
+| `src/bulk.rs`                             | `upload`/`download`/`extract`: tar over exec, the three scripts, the staged upload, `Sources`, `Transfer`, `BulkError`       |
+| `src/bulk/extract.rs`                     | the policy layer over the `tar` crate for untrusted archives: never writes through a link, directory modes last              |
+| `src/procgroup.rs`                        | process-group identity and kill guards for local children                                                                    |
+| `src/sandbox.rs`                          | `Jobs` (with ergonomic `start`), `Sandbox`, the `Command` / `StartJob` builders                                              |
+| `src/token.rs`                            | `TokenSource` and the one-renewal bearer                                                                                     |
+| `src/tls.rs`                              | installs the `ring` rustls provider before a client is built                                                                 |
+| `src/testing.rs`                          | a plain local runner for unit tests                                                                                          |
 
 ## Layers
 
