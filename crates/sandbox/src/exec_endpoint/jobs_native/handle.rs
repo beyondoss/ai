@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use job_client::step::{
     self, Action, Event as Ev, Fault, Frame as KFrame, Mark, State, silence_limit_ms,
 };
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::super::jobs::{EventSink, JobEnd, JobError, JobEvent, JobId, JobScope, JobSpec, Stream};
@@ -305,7 +306,7 @@ async fn open(
                 return Ok(Ev::Answered {
                     status: st.status,
                     retry_after_s: st.retry_after_s,
-                    gone: says_sandbox_gone(st.status, &st.body),
+                    gone: says_sandbox_gone(st.status, &st.body, h.runner.url()),
                 });
             }
             // A request that cannot be made (a heartbeat out of range, an endpoint that does not
@@ -322,16 +323,42 @@ async fn open(
 }
 
 /// Whether an answer says, authoritatively, that the sandbox no longer exists: the backend's own refusal,
-/// never silence. E2B answers a request for a sandbox it no longer has with a 502 whose body says the
-/// sandbox "was not found"; a deleted sandbox answers the same way on a 404 or 410. A backend that says it
-/// another way is added here, as a row, with the answer it gives. A connect that is refused, a stream that
-/// is cut and a timeout are never this: they are `Broke`, and the handle waits and tries again.
-fn says_sandbox_gone(status: u16, body: &str) -> bool {
-    if !matches!(status, 404 | 410 | 502) {
-        return false;
+/// never silence, and only in the exact shapes the backends send.
+///
+/// - E2B, for a sandbox it no longer has (captured from a deleted VM): `502`, `content-type:
+///   application/json`, body `{"sandboxId":"<id>","message":"The sandbox was not found","code":502}`. The
+///   `sandboxId` must be one the endpoint's own URL names, so an answer about another sandbox, or a proxy's
+///   502 with some other body, is a busy front and the handle waits. Beyond's execfront has the same
+///   test for the same answer (`api/app/execfront/e2b.go` `sandboxNotFound`).
+/// - Beyond, for a session that has ended (`api/app/execfront/front.go` `statusFor`, `serve.go` `retryLater`):
+///   `401` with body `{"code":"session_ended","message":"session ended"}`. A `401` with any other code is a
+///   refused credential.
+///
+/// A backend that says it another way is added here, as a row, with the answer it gives. A connect that is
+/// refused, a stream that is cut and a timeout are never this: they are `Broke`, and the handle waits.
+fn says_sandbox_gone(status: u16, body: &str, url: &str) -> bool {
+    #[derive(Deserialize)]
+    struct Said {
+        code: Option<serde_json::Value>,
+        message: Option<String>,
+        #[serde(rename = "sandboxId")]
+        sandbox_id: Option<String>,
     }
-    let body = body.to_ascii_lowercase();
-    body.contains("sandbox") && (body.contains("not found") || body.contains("deleted"))
+    let Ok(said) = serde_json::from_str::<Said>(body) else {
+        return false;
+    };
+    match status {
+        502 => {
+            said.message.as_deref() == Some("The sandbox was not found")
+                && said.code == Some(serde_json::json!(502))
+                && said
+                    .sandbox_id
+                    .as_deref()
+                    .is_some_and(|id| !id.is_empty() && url.contains(id))
+        }
+        401 => said.code == Some(serde_json::json!("session_ended")),
+        _ => false,
+    }
 }
 
 /// The next kernel event from the open stream: a frame, or `Broke` when it ended or went quiet.
@@ -439,5 +466,64 @@ fn fault_error(fault: Fault, status: u16, refusal: Option<Refusal>, p: &Payload)
                     .unwrap_or_else(|| format!("unexpected answer (status {status})"))
             )),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::says_sandbox_gone;
+
+    const URL: &str = "https://8081-imot0yzwbvc4a43fuehu9.e2b.app/exec";
+
+    /// The vectors: what a backend sends, and what is not it. The first is E2B's real answer to a request for
+    /// a deleted sandbox (captured over HTTP/2, `content-type: application/json; charset=utf-8`).
+    #[test]
+    fn a_gone_sandbox_is_the_backends_exact_answer_and_nothing_else() {
+        let e2b = r#"{"sandboxId":"imot0yzwbvc4a43fuehu9","message":"The sandbox was not found","code":502}"#;
+        assert!(says_sandbox_gone(502, e2b, URL));
+        // Another sandbox's answer, no id, or a url that does not name it.
+        assert!(!says_sandbox_gone(
+            502,
+            &e2b.replace("imot0yzwbvc4a43fuehu9", "zzzzzzzzzzzzzzzzzzzz"),
+            URL
+        ));
+        assert!(!says_sandbox_gone(
+            502,
+            r#"{"message":"The sandbox was not found","code":502}"#,
+            URL
+        ));
+        assert!(!says_sandbox_gone(
+            502,
+            e2b,
+            "https://8081-other.e2b.app/exec"
+        ));
+        // Not the status, the message or the code E2B sends.
+        assert!(!says_sandbox_gone(404, e2b, URL));
+        assert!(!says_sandbox_gone(504, e2b, URL));
+        assert!(!says_sandbox_gone(
+            502,
+            &e2b.replace("was not found", "is starting"),
+            URL
+        ));
+        assert!(!says_sandbox_gone(502, &e2b.replace("502}", "503}"), URL));
+        // A proxy's own 502, with a body that is not that or no body at all.
+        assert!(!says_sandbox_gone(502, "bad gateway", URL));
+        assert!(!says_sandbox_gone(502, "", URL));
+        assert!(!says_sandbox_gone(
+            502,
+            r#"{"message":"upstream connect error"}"#,
+            URL
+        ));
+        // Beyond's execfront: a session that has ended is a 401 whose code says so (`serve.go` `retryLater`).
+        let ended = r#"{"code":"session_ended","message":"session ended"}"#;
+        assert!(says_sandbox_gone(401, ended, URL));
+        assert!(!says_sandbox_gone(401, "unauthorized", URL));
+        assert!(!says_sandbox_gone(
+            401,
+            r#"{"code":"try_again","message":"x"}"#,
+            URL
+        ));
+        assert!(!says_sandbox_gone(503, ended, URL));
+        assert!(!says_sandbox_gone(200, ended, URL));
     }
 }

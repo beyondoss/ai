@@ -122,7 +122,7 @@ kernel event (a status, a frame, a cut, a tick) and does the actions it returns.
 gap or status table of its own. A cut stream is reopened at the offset the consumer has reached, asking for the mark the
 first frame named; a start is sent again with the same `idempotency_key`; a gap is told to the sink before the next
 output; and the handle ends only on the job's end, a terminal answer (`JobGone`, a refused credential, ...) or the
-caller dropping the future. A front that is down for any length of time is a `Reconnecting` log line, never an end.
+caller dropping the future. A front that is down for any length of time is a `Reconnecting` log line, never an end. Only the backend's own exact answer that the sandbox is gone ends it (`says_sandbox_gone`: E2B's `502` with `{"sandboxId", "message": "The sandbox was not found", "code": 502}` naming a sandbox in the endpoint's URL; Beyond's `401` with code `session_ended`); any other 502 is a busy front. `crates/sandbox-conformance/tests/e2b_sandbox_gone.rs` deletes a real E2B VM mid-follow and shows it (opt-in, billed).
 An endpoint that does not echo a mark (`started{mark}`, `attached{mark,from}`) is refused as `Unsupported` (the kernel's
 `NotOffered`): there is no version check and no capabilities op. `JobError::classify` takes a start's and an attach's
 statuses from the kernel's `classify`. `HttpExecRunner::with_time_divisor` is test-only: it runs the handle's clock and

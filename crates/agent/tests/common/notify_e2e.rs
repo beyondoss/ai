@@ -129,6 +129,8 @@ pub struct Meter {
     chunks: Arc<Mutex<Vec<(Instant, usize)>>>,
     down: Arc<AtomicBool>,
     dead: Arc<AtomicBool>,
+    /// The sandbox id the dead sandbox's answer names: a segment of this meter's own URL, as E2B's is.
+    id: String,
     pumps: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
     opened: Arc<AtomicUsize>,
 }
@@ -145,6 +147,7 @@ impl Meter {
             chunks: Arc::default(),
             down: Arc::default(),
             dead: Arc::default(),
+            id: path.trim_matches('/').to_string(),
             pumps: Arc::default(),
             opened: Arc::default(),
         };
@@ -156,7 +159,7 @@ impl Meter {
                     continue;
                 }
                 if m.dead.load(Ordering::SeqCst) {
-                    tokio::spawn(sandbox_not_found(inbound));
+                    tokio::spawn(sandbox_not_found(inbound, m.id.clone()));
                     continue;
                 }
                 m.opened.fetch_add(1, Ordering::SeqCst);
@@ -221,7 +224,7 @@ impl Meter {
 }
 
 /// Answer one request as a provider does for a sandbox that does not exist.
-async fn sandbox_not_found(mut inbound: TcpStream) {
+async fn sandbox_not_found(mut inbound: TcpStream, id: String) {
     let mut seen = Vec::new();
     let mut buf = vec![0u8; 16 * 1024];
     // Read the request through its body, so closing does not reset the answer away.
@@ -250,7 +253,8 @@ async fn sandbox_not_found(mut inbound: TcpStream) {
             break;
         }
     }
-    let body = r#"{"message":"The sandbox was not found"}"#;
+    let body =
+        format!(r#"{{"sandboxId":"{id}","message":"The sandbox was not found","code":502}}"#);
     let resp = format!(
         "HTTP/1.1 502 Bad Gateway\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
         body.len()

@@ -14,6 +14,9 @@ use beyond_sandbox::exec_endpoint::jobs_native::NativeJobs;
 use beyond_test_support::job_front::{JobFront, Reply, Script};
 use serde_json::Value;
 
+/// E2B's answer for a sandbox it no longer has (captured from a deleted VM), for this endpoint's sandbox.
+const E2B_GONE: &str = r#"{"sandboxId":"abc123","message":"The sandbox was not found","code":502}"#;
+
 const MARK: &str = "00ff00ff00ff00ff1a";
 
 fn b64(s: &str) -> String {
@@ -64,7 +67,8 @@ impl Sink {
 }
 
 async fn run(front: &JobFront, div: u64) -> (std::io::Result<JobEnd>, Vec<String>) {
-    let runner = HttpExecRunner::new(&front.url)
+    // The endpoint's URL names the sandbox, as E2B's does (`https://8081-<id>.e2b.app/exec`).
+    let runner = HttpExecRunner::new(format!("{}abc123", front.url))
         .unwrap()
         .with_time_divisor(div);
     let jobs = NativeJobs::over(&runner);
@@ -181,7 +185,7 @@ async fn a_front_that_is_down_for_minutes_does_not_end_the_handle() {
 async fn an_answer_that_the_sandbox_is_gone_ends_the_handle_at_once() {
     let front = JobFront::start(script(|i, _| match i {
         0 => Reply::Stream(vec![started(), out("hello")]),
-        _ => Reply::Status(502, r#"{"message":"The sandbox was not found"}"#.into()),
+        _ => Reply::Status(502, E2B_GONE.into()),
     }))
     .await;
     let (r, lines) = run(&front, 1000).await;
@@ -204,4 +208,41 @@ async fn a_bare_502_is_a_busy_front_not_a_gone_sandbox() {
     let (r, lines) = run(&front, 2000).await;
     assert_eq!(r.unwrap(), JobEnd::Exit(0));
     assert_eq!(lines, ["started", "out:hello", "attached", "out:world"]);
+}
+
+/// The front is down but the sandbox is alive: a proxy answers 502 with some other body, or with E2B's
+/// shape about another sandbox. Either is a busy front, however many times it comes.
+#[tokio::test]
+async fn a_502_that_is_not_the_backends_gone_answer_keeps_the_handle_waiting() {
+    let front = JobFront::start(script(|i, _| match i {
+        0 => Reply::Stream(vec![started(), out("hello")]),
+        1..=20 => Reply::Status(502, r#"{"message":"upstream connect error"}"#.into()),
+        21..=40 => Reply::Status(
+            502,
+            r#"{"sandboxId":"other","message":"The sandbox was not found","code":502}"#.into(),
+        ),
+        _ => Reply::Stream(vec![attached(5), out("world"), r#"{"exit_code":0}"#.into()]),
+    }))
+    .await;
+    let (r, lines) = run(&front, 2000).await;
+    assert_eq!(r.unwrap(), JobEnd::Exit(0));
+    assert_eq!(lines, ["started", "out:hello", "attached", "out:world"]);
+}
+
+/// Beyond's front says a session has ended with a 401 whose code says so: the job's sandbox is gone. A
+/// 401 without it is a refused credential, which also ends the handle, as `Auth`.
+#[tokio::test]
+async fn a_session_that_has_ended_ends_the_handle_as_gone() {
+    let front = JobFront::start(script(|i, _| match i {
+        0 => Reply::Stream(vec![started(), out("hello")]),
+        _ => Reply::Status(
+            401,
+            r#"{"code":"session_ended","message":"session ended"}"#.into(),
+        ),
+    }))
+    .await;
+    let (r, _) = run(&front, 1000).await;
+    let e = r.unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "{e}");
+    assert!(e.to_string().contains("sandbox no longer exists"), "{e}");
 }
