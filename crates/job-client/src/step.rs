@@ -186,6 +186,11 @@ pub enum Fault {
     /// A start that nothing ever answered: the connection was refused or the name did not resolve on the
     /// first try, so no request of it reached any server.
     Transport,
+    /// The sandbox no longer exists, and the answer that said so was the backend's ([`Authority::SandboxGone`]).
+    /// The only way an unreachable endpoint ends a handle.
+    SandboxGone,
+    /// The session has ended, and the front said so ([`Authority::SessionEnded`]).
+    SessionEnded,
 }
 
 /// What a request is, for classifying its answer.
@@ -273,13 +278,28 @@ pub enum Frame {
     Bad,
 }
 
+/// Whether a refusal is the backend's own authoritative answer about the sandbox or the session, as
+/// [`authority`] decides from what the shell parsed out of the answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Authority {
+    /// Anything else: a busy front, a proxy's 502, a refused credential. The handle waits or the class
+    /// table decides.
+    NotAuthoritative,
+    /// The backend says the sandbox does not exist (E2B's `502` naming ours).
+    SandboxGone,
+    /// The front says the session has ended (Beyond's `401` with code `session_ended`).
+    SessionEnded,
+}
+
 /// What the shell observed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Event {
     /// Send the first request.
     Go,
     /// The request was answered with this status (and `Retry-After` in whole seconds, 0 if none).
-    Answered { status: u16, retry_after_s: u32 },
+    /// `authority`: what [`authority`] made of the answer. Silence, a refused connect and a timeout are never
+    /// authoritative: they are `Broke`.
+    Answered { status: u16, retry_after_s: u32, authority: Authority },
     /// A frame arrived.
     Frame(Frame),
     /// The stream broke: reset, silence for the limit, EOF or a truncated line before the final frame.
@@ -392,8 +412,12 @@ pub open spec fn op_of(p: Phase) -> Op {
 }
 
 /// The table of answers, as a spec.
-pub open spec fn class_of(op: Op, status: int) -> Class {
-    if 200 <= status && status <= 299 {
+pub open spec fn class_of(op: Op, status: int, auth: Authority) -> Class {
+    if auth is SandboxGone {
+        Class::Terminal(Fault::SandboxGone)
+    } else if auth is SessionEnded {
+        Class::Terminal(Fault::SessionEnded)
+    } else if 200 <= status && status <= 299 {
         Class::Ok
     } else if op is Remove && status == 404 {
         Class::Ok
@@ -418,6 +442,13 @@ pub open spec fn ev_status(ev: Event) -> int {
     match ev {
         Event::Answered { status, .. } => status as int,
         _ => -1,
+    }
+}
+
+pub open spec fn ev_authority(ev: Event) -> Authority {
+    match ev {
+        Event::Answered { authority, .. } => authority,
+        _ => Authority::NotAuthoritative,
     }
 }
 
@@ -564,10 +595,10 @@ pub open spec fn fair(s: State, ev: Event, now: u64) -> bool {
     match s.phase {
         Phase::Idle => ev is Go,
         Phase::Backoff => ev is Tick && now >= s.until_ms,
-        Phase::Starting => 200 <= ev_status(ev) && ev_status(ev) <= 299,
-        Phase::Opening => 200 <= ev_status(ev) && ev_status(ev) <= 299,
+        Phase::Starting => 200 <= ev_status(ev) && ev_status(ev) <= 299 && ev_authority(ev) is NotAuthoritative,
+        Phase::Opening => 200 <= ev_status(ev) && ev_status(ev) <= 299 && ev_authority(ev) is NotAuthoritative,
         Phase::Confirming => good_echo(s, ev),
-        Phase::Removing => 200 <= ev_status(ev) && ev_status(ev) <= 299,
+        Phase::Removing => 200 <= ev_status(ev) && ev_status(ev) <= 299 && ev_authority(ev) is NotAuthoritative,
         Phase::ExitHeld => ev is ExitTaken,
         _ => false,
     }
@@ -800,7 +831,7 @@ pub open spec fn post_remove(s: State, ev: Event, now: u64, s2: State, out: Seq<
 /// goes on.
 pub open spec fn post_classify(s: State, ev: Event, s2: State, out: Seq<Action>) -> bool {
     (s.phase is Starting || s.phase is Opening || s.phase is Removing) && ev is Answered ==> {
-        match class_of(op_of(s.phase), ev_status(ev)) {
+        match class_of(op_of(s.phase), ev_status(ev), ev_authority(ev)) {
             Class::Ok => {
                 &&& s2.misses == s.misses
                 &&& s.phase is Removing ==> (s2.phase is Done && out == seq![Action::Finish])
@@ -829,7 +860,7 @@ pub open spec fn post_backoff(s: State, ev: Event, now: u64, s2: State, out: Seq
         _ => true,
     }
     &&& ((s.phase is Starting || s.phase is Opening || s.phase is Removing) && ev is Answered
-        && class_of(op_of(s.phase), ev_status(ev)) is Retry) ==> {
+        && class_of(op_of(s.phase), ev_status(ev), ev_authority(ev)) is Retry) ==> {
         &&& s2.phase is Backoff
         &&& s2.until_ms as int >= min_int(
             now as int + min_int(ev_retry_after_ms(ev), BACKOFF_CAP_MS as int),
@@ -967,12 +998,12 @@ pub open spec fn post_only_these_end(s: State, ev: Event, s2: State, out: Seq<Ac
         && !s.remove_on_exit)
     &&& (ev is Answered && s2.phase is Done && !(s.phase is Done)) ==> {
         &&& s.phase is Starting || s.phase is Opening || s.phase is Removing
-        &&& (class_of(op_of(s.phase), ev_status(ev)) is Terminal || (s.phase is Removing
-            && class_of(op_of(s.phase), ev_status(ev)) is Ok))
+        &&& (class_of(op_of(s.phase), ev_status(ev), ev_authority(ev)) is Terminal || (s.phase is Removing
+            && class_of(op_of(s.phase), ev_status(ev), ev_authority(ev)) is Ok))
     }
     &&& ((s.phase is Starting || s.phase is Opening || s.phase is Removing) && ev is Answered
-        && !(class_of(op_of(s.phase), ev_status(ev)) is Terminal)
-        && !(s.phase is Removing && class_of(op_of(s.phase), ev_status(ev)) is Ok)) ==> !(s2.phase is Done)
+        && !(class_of(op_of(s.phase), ev_status(ev), ev_authority(ev)) is Terminal)
+        && !(s.phase is Removing && class_of(op_of(s.phase), ev_status(ev), ev_authority(ev)) is Ok)) ==> !(s2.phase is Done)
     &&& (s.phase is Streaming && ev is Frame && ev->Frame_0 is Heartbeat) ==> !(s2.phase is Done)
     &&& (s.phase is Streaming && is_output(ev) && s.offset as int + s.pending as int + output_len(ev)
         <= u64::MAX as int) ==> !(s2.phase is Done)
@@ -983,7 +1014,12 @@ pub open spec fn post_only_these_end(s: State, ev: Event, s2: State, out: Seq<Ac
     &&& (s.phase is Confirming && good_echo(s, ev)) ==> !(s2.phase is Done)
     &&& ((ev is Broke || ev is Tick) && !(s.phase is Done)) ==> !(s2.phase is Done)
     &&& forall|i: int| 0 <= i < out.len() ==> match #[trigger] out[i] {
-        Action::Fail { fault, .. } => (fault is Deadline) == (ev is Deadline),
+        Action::Fail { fault, .. } => {
+            &&& (fault is Deadline) == (ev is Deadline)
+            // SG: an unreachable endpoint ends nothing; only an authoritative answer does.
+            &&& (fault is SandboxGone) ==> (ev is Answered && ev_authority(ev) is SandboxGone)
+            &&& (fault is SessionEnded) ==> (ev is Answered && ev_authority(ev) is SessionEnded)
+        },
         _ => true,
     }
 }
@@ -1037,31 +1073,41 @@ pub fn silence_ms(beat_s: u32) -> (r: u64)
 }
 
 /// What an answer to `op` with `status` means.
-pub fn classify(op: Op, status: u16) -> (c: Class)
+pub fn classify(op: Op, status: u16, auth: Authority) -> (c: Class)
     ensures
+        // (j) an authoritative answer is its own terminal class, whatever the status (E2B says it with a
+        // 502), and nothing else is: `SandboxGone` and `SessionEnded` come from `auth` alone.
+        auth is SandboxGone ==> c == Class::Terminal(Fault::SandboxGone),
+        auth is SessionEnded ==> c == Class::Terminal(Fault::SessionEnded),
+        c == Class::Terminal(Fault::SandboxGone) ==> auth is SandboxGone,
+        c == Class::Terminal(Fault::SessionEnded) ==> auth is SessionEnded,
         // (a) any 2xx goes on.
-        200 <= status <= 299 ==> c == Class::Ok,
+        ((auth is NotAuthoritative) && 200 <= status <= 299) ==> c == Class::Ok,
         // (b) 500 is terminal, whatever the request: a retry would not change it.
-        status == 500 ==> c == Class::Terminal(Fault::Protocol),
+        ((auth is NotAuthoritative) && status == 500) ==> c == Class::Terminal(Fault::Protocol),
         // (c) 503 on a start means no pseudo-terminal is free: terminal.
-        (matches!(op, Op::Start) && status == 503) ==> c == Class::Terminal(Fault::NoPty),
+        ((auth is NotAuthoritative) && matches!(op, Op::Start) && status == 503) ==> c == Class::Terminal(Fault::NoPty),
         // (d) the busy answers are retried (completeness: a retry class is never terminal).
-        (status == 429 || status == 502 || status == 504 || (status == 503 && !(matches!(op, Op::Start))))
+        ((auth is NotAuthoritative) && (status == 429 || status == 502 || status == 504 || (status == 503 && !(matches!(op, Op::Start)))))
             ==> c == Class::Retry,
         // (e) an attach of a job that is gone is `JobGone`.
-        ((matches!(op, Op::Attach) || matches!(op, Op::Other)) && status == 404) ==> c == Class::Terminal(Fault::JobGone),
+        ((auth is NotAuthoritative) && (matches!(op, Op::Attach) || matches!(op, Op::Other)) && status == 404) ==> c == Class::Terminal(Fault::JobGone),
         // (f) the start answers that name a cause.
-        (matches!(op, Op::Start) && status == 409) ==> c == Class::Terminal(Fault::JobExists),
-        (matches!(op, Op::Start) && status == 507) ==> c == Class::Terminal(Fault::DiskFull),
+        ((auth is NotAuthoritative) && matches!(op, Op::Start) && status == 409) ==> c == Class::Terminal(Fault::JobExists),
+        ((auth is NotAuthoritative) && matches!(op, Op::Start) && status == 507) ==> c == Class::Terminal(Fault::DiskFull),
         // (g) the credential is refused.
-        (status == 401 || status == 403) ==> c == Class::Terminal(Fault::Auth),
+        ((auth is NotAuthoritative) && (status == 401 || status == 403)) ==> c == Class::Terminal(Fault::Auth),
         // (h) a remove of a job already gone is done.
-        (matches!(op, Op::Remove) && status == 404) ==> c == Class::Ok,
+        ((auth is NotAuthoritative) && matches!(op, Op::Remove) && status == 404) ==> c == Class::Ok,
         // (i) nothing else is retried: only the four busy statuses are.
         c is Retry ==> (status == 429 || status == 502 || status == 503 || status == 504),
-        c == class_of(op, status as int),
+        c == class_of(op, status as int, auth),
 {
-    if 200 <= status && status <= 299 {
+    if matches!(auth, Authority::SandboxGone) && !cfg!(feature = "mut_gone_ignored") {
+        Class::Terminal(Fault::SandboxGone)
+    } else if matches!(auth, Authority::SessionEnded) && !cfg!(feature = "mut_gone_ignored") {
+        Class::Terminal(Fault::SessionEnded)
+    } else if 200 <= status && status <= 299 {
         Class::Ok
     } else if matches!(op, Op::Remove) && status == 404 {
         Class::Ok
@@ -1097,6 +1143,73 @@ pub fn classify(op: Op, status: u16) -> (c: Class)
         Class::Retry
     } else {
         Class::Terminal(Fault::Protocol)
+    }
+}
+
+/// The body of E2B's answer for a sandbox it no longer has: `{"sandboxId": ours, "message": <this>, "code": 502}`.
+pub open spec fn gone_message() -> Seq<u8> {
+    seq![84u8, 104u8, 101u8, 32u8, 115u8, 97u8, 110u8, 100u8, 98u8, 111u8, 120u8, 32u8, 119u8, 97u8, 115u8, 32u8, 110u8, 111u8, 116u8, 32u8, 102u8, 111u8, 117u8, 110u8, 100u8]
+}
+
+/// The `code` of Beyond's answer for a session that has ended: status 401, `{"code": <this>, ...}`.
+pub open spec fn session_ended_code() -> Seq<u8> {
+    seq![115u8, 101u8, 115u8, 115u8, 105u8, 111u8, 110u8, 95u8, 101u8, 110u8, 100u8, 101u8, 100u8]
+}
+
+/// What a refusal is, from the fields the shell parsed out of its JSON body (all empty or `None` for a field the
+/// body lacks, or for a body that is not JSON). `ours` is the sandbox id the endpoint is configured for
+/// (empty when it has none): an answer about any other sandbox is not about this one.
+pub open spec fn authority_of(
+    status: int,
+    message: Seq<u8>,
+    code_num: Option<u64>,
+    code_text: Seq<u8>,
+    sandbox_id: Seq<u8>,
+    ours: Seq<u8>,
+) -> Authority {
+    if status == 502 && message == gone_message() && code_num == Some(502u64) && ours.len() > 0
+        && sandbox_id == ours {
+        Authority::SandboxGone
+    } else if status == 401 && code_text == session_ended_code() {
+        Authority::SessionEnded
+    } else {
+        Authority::NotAuthoritative
+    }
+}
+
+/// Whether a refusal is the backend's own authoritative answer: `SandboxGone` exactly when it is a `502` whose
+/// message is exactly "The sandbox was not found", whose code is the number 502 and whose `sandboxId` is
+/// `ours` (not empty); `SessionEnded` exactly when it is a `401` whose code is exactly "session_ended";
+/// `NotAuthoritative` for everything else, a proxy's 502 and a refused credential included. A wrong
+/// `SandboxGone` abandons a live job, so this is the one place that decides it, and the shell only parses.
+pub fn authority(
+    status: u16,
+    message: &[u8],
+    code_num: Option<u64>,
+    code_text: &[u8],
+    sandbox_id: &[u8],
+    ours: &[u8],
+) -> (a: Authority)
+    ensures
+        a == authority_of(status as int, message@, code_num, code_text@, sandbox_id@, ours@),
+{
+    let gone: [u8; 25] = [84, 104, 101, 32, 115, 97, 110, 100, 98, 111, 120, 32, 119, 97, 115, 32, 110, 111, 116, 32, 102, 111, 117, 110, 100];
+    let ended: [u8; 13] = [115, 101, 115, 115, 105, 111, 110, 95, 101, 110, 100, 101, 100];
+    proof {
+        assert(gone@ =~= gone_message());
+        assert(ended@ =~= session_ended_code());
+    }
+    let is502_code = match code_num {
+        Some(c) => c == 502,
+        None => false,
+    };
+    let ours_ok = cfg!(feature = "mut_gone_any_502") || (ours.len() > 0 && crate::same(sandbox_id, ours));
+    if status == 502 && crate::same(message, &gone) && is502_code && ours_ok {
+        Authority::SandboxGone
+    } else if status == 401 && (cfg!(feature = "mut_gone_any_401") || crate::same(code_text, &ended)) {
+        Authority::SessionEnded
+    } else {
+        Authority::NotAuthoritative
     }
 }
 
@@ -1524,7 +1637,7 @@ fn step_request(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<Act
 {
     let s = mark_reached(s, ev);
     match ev {
-        Event::Answered { status, retry_after_s } => {
+        Event::Answered { status, retry_after_s, authority } => {
             let op = if matches!(s.phase, Phase::Starting) {
                 Op::Start
             } else if matches!(s.phase, Phase::Removing) {
@@ -1532,7 +1645,7 @@ fn step_request(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<Act
             } else {
                 Op::Attach
             };
-            match classify(op, status) {
+            match classify(op, status, authority) {
                 Class::Ok => {
                     if matches!(s.phase, Phase::Removing) {
                         let mut t = s;
@@ -1558,6 +1671,9 @@ fn step_request(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<Act
             }
         },
         Event::Broke => {
+            if cfg!(feature = "mut_gone_on_silence") {
+                return fail(s, Fault::SandboxGone, 0, true);
+            }
             if cfg!(feature = "mut_start_lost_gives_up") && matches!(s.phase, Phase::Starting) {
                 return fail(s, Fault::Protocol, 0, true);
             }
@@ -1926,6 +2042,55 @@ pub proof fn lemma_exit_progress(s: State, ev: Event, now: u64, s2: State, out: 
 {
 }
 
+/// SG-live (the liveness partner of the refusals that end a handle on an answer): the first authoritative
+/// answer ends the handle in that one step, with its own fault, whatever the status. The fairness
+/// assumption: the backend answers (the authority is what `authority` made of that answer).
+pub proof fn lemma_gone_ends_in_one_step(s: State, ev: Event, now: u64, s2: State, out: Seq<Action>)
+    requires
+        wf(s),
+        s.phase is Starting || s.phase is Opening || s.phase is Removing,
+        ev is Answered,
+        !(ev_authority(ev) is NotAuthoritative),
+        step_post(s, ev, now, s2, out),
+    ensures
+        s2.phase is Done,
+        ev_authority(ev) is SandboxGone ==> fails_with(out, Fault::SandboxGone),
+        ev_authority(ev) is SessionEnded ==> fails_with(out, Fault::SessionEnded),
+{
+}
+
+/// SG-complete (the completeness partner of `authority`'s refusals): the backend's exact answer is always
+/// recognised, so a retry with the same answer never ends in `NotAuthoritative`.
+pub proof fn lemma_authority_complete(
+    message: Seq<u8>,
+    sandbox_id: Seq<u8>,
+    ours: Seq<u8>,
+    code_text: Seq<u8>,
+)
+    requires
+        message == gone_message(),
+        ours.len() > 0,
+        sandbox_id == ours,
+    ensures
+        authority_of(502, message, Some(502u64), code_text, sandbox_id, ours) is SandboxGone,
+        authority_of(401, Seq::empty(), None, session_ended_code(), sandbox_id, ours) is SessionEnded,
+{
+}
+
+/// SG-silent: an endpoint that cannot be reached ends nothing. A cut, a refused connect and a timeout are
+/// `Broke`, and a tick is the wait ending: neither ever finishes a handle, however many came before.
+pub proof fn lemma_unreachable_never_ends(s: State, ev: Event, now: u64, s2: State, out: Seq<Action>)
+    requires
+        wf(s),
+        !(s.phase is Done),
+        ev is Broke || ev is Tick,
+        step_post(s, ev, now, s2, out),
+    ensures
+        !(s2.phase is Done),
+        forall|i: int| 0 <= i < out.len() ==> !is_fail(#[trigger] out[i]),
+{
+}
+
 } // verus!
 
 impl Mark {
@@ -2021,6 +2186,93 @@ mod tests {
         assert_eq!(silence_limit_ms(Some(11)), 32_000);
         assert_eq!(silence_limit_ms(Some(60)), 130_000);
         assert_eq!(silence_limit_ms(Some(240)), 490_000);
+    }
+
+    /// The answers that are authoritative and the ones that are not. The first is E2B's real answer for a
+    /// deleted sandbox, captured over HTTP/2 (`content-type: application/json; charset=utf-8`).
+    #[test]
+    fn an_answer_is_authoritative_only_in_the_exact_shapes_the_backends_send() {
+        let msg = b"The sandbox was not found";
+        let ours = b"imot0yzwbvc4a43fuehu9";
+        let a = |st, m: &[u8], cn, ct: &[u8], id: &[u8], o: &[u8]| authority(st, m, cn, ct, id, o);
+        assert_eq!(
+            a(502, msg, Some(502), b"", ours, ours),
+            Authority::SandboxGone
+        );
+        // About another sandbox, no id, or an endpoint with none configured.
+        assert_eq!(
+            a(502, msg, Some(502), b"", b"zzz", ours),
+            Authority::NotAuthoritative
+        );
+        assert_eq!(
+            a(502, msg, Some(502), b"", b"", ours),
+            Authority::NotAuthoritative
+        );
+        assert_eq!(
+            a(502, msg, Some(502), b"", b"", b""),
+            Authority::NotAuthoritative
+        );
+        assert_eq!(
+            a(502, msg, Some(502), b"", ours, b""),
+            Authority::NotAuthoritative
+        );
+        // Not the status, message or code E2B sends.
+        for st in [404, 410, 503, 504, 200] {
+            assert_eq!(
+                a(st, msg, Some(502), b"", ours, ours),
+                Authority::NotAuthoritative
+            );
+        }
+        assert_eq!(
+            a(502, b"The sandbox is starting", Some(502), b"", ours, ours),
+            Authority::NotAuthoritative
+        );
+        assert_eq!(
+            a(502, b"", Some(502), b"", ours, ours),
+            Authority::NotAuthoritative
+        );
+        assert_eq!(
+            a(502, msg, Some(503), b"", ours, ours),
+            Authority::NotAuthoritative
+        );
+        assert_eq!(
+            a(502, msg, None, b"502", ours, ours),
+            Authority::NotAuthoritative
+        );
+        // Beyond's execfront: a session that has ended is a 401 whose code says so; any other 401 is a refused credential.
+        assert_eq!(
+            a(401, b"session ended", None, b"session_ended", b"", b""),
+            Authority::SessionEnded
+        );
+        assert_eq!(
+            a(401, b"", None, b"try_again", b"", b""),
+            Authority::NotAuthoritative
+        );
+        assert_eq!(
+            a(401, b"", None, b"", b"", b""),
+            Authority::NotAuthoritative
+        );
+        assert_eq!(
+            a(503, b"", None, b"session_ended", b"", b""),
+            Authority::NotAuthoritative
+        );
+        // Its classes: each ends a handle as its own fault, whatever the status.
+        assert_eq!(
+            classify(Op::Attach, 502, Authority::SandboxGone),
+            Class::Terminal(Fault::SandboxGone)
+        );
+        assert_eq!(
+            classify(Op::Attach, 401, Authority::SessionEnded),
+            Class::Terminal(Fault::SessionEnded)
+        );
+        assert_eq!(
+            classify(Op::Attach, 502, Authority::NotAuthoritative),
+            Class::Retry
+        );
+        assert_eq!(
+            classify(Op::Attach, 401, Authority::NotAuthoritative),
+            Class::Terminal(Fault::Auth)
+        );
     }
 
     #[test]

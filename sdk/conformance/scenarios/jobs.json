@@ -5706,7 +5706,7 @@
           "expect": {
             "ok": {
               "data_utf8": {
-                "$contains": "back\r\n"
+                "$contains": "echo back\r\nback\r\n"
               }
             }
           },

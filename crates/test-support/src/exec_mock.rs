@@ -1163,7 +1163,8 @@ impl Jobs {
 fn fresh_mark(pgid: u32) -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
-    format!("{pgid:x}-{:x}", N.fetch_add(1, Ordering::Relaxed))
+    // Hex only, as execd's mark is: a client refuses any other spelling.
+    format!("{pgid:016x}{:x}", N.fetch_add(1, Ordering::Relaxed))
 }
 
 fn epoch() -> u64 {

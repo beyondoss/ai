@@ -183,14 +183,12 @@ pub(crate) async fn run(
         stream_ended(shared, link);
     }
     match outcome {
-        Some(Ok(end)) => return Ok(status_result(end.code())),
-        Some(Err(e)) if !link.kept() => return Err(e.to_string()),
-        Some(Err(e)) => {
-            tracing::info!(job = %link.id, error = %e, "a kept job's stream broke; following it by polling");
-        }
-        None => return steered(shared, link, &mut ctl, Phase::Released).await,
+        Some(Ok(end)) => Ok(status_result(end.code())),
+        // The handle reconnects a cut stream itself, however long the front is down, so an error is
+        // the job's end (gone, lost) or one a retry cannot change.
+        Some(Err(e)) => Err(e.to_string()),
+        None => steered(shared, link, &mut ctl, Phase::Released).await,
     }
-    steered(shared, link, &mut ctl, Phase::Follow(FollowKind::Holding)).await
 }
 
 /// A held foreground command has run for [`exec_notify::keep_gate::KEEP_AFTER_MS`]: hand it to the
@@ -284,8 +282,6 @@ async fn steered(
     ctl: &mut Steer<'_>,
     mut phase: Phase,
 ) -> Result<ExecResult, String> {
-    // Breaks of the followed stream in a row that delivered nothing new: see [`resumes`].
-    let mut breaks = Breaks::default();
     loop {
         phase = match phase {
             Phase::Released => {
@@ -327,12 +323,6 @@ async fn steered(
                             None => Err(format!("{LOST_END} ({e})")),
                         });
                     }
-                    (Some(Err(e)), FollowKind::Holding)
-                        if resumes(shared, link, &mut breaks).await =>
-                    {
-                        tracing::info!(job = %link.id, error = %e, "a followed job's stream broke; following it again");
-                        Phase::Follow(kind)
-                    }
                     (Some(r), FollowKind::Holding) => {
                         stream_ended(shared, link);
                         return r;
@@ -345,40 +335,6 @@ async fn steered(
         };
     }
 }
-
-/// A kept job's followed stream breaks without the job having ended (the front serving it was
-/// restarted, as a rolling deploy does, and the next connection reaches the sandbox through a
-/// peer). Whether to follow again, from the offset reached: the job is still the sandbox's
-/// (running, or ended and not yet read to its end), and the breaks since the stream last delivered
-/// anything number fewer than [`MAX_BREAKS`]. Waits a moment first, so a front that is down is
-/// not spun on. `Lost` and `Gone` are the job's end, which the error reports.
-async fn resumes(shared: &JobShared, link: &SandboxLink, breaks: &mut Breaks) -> bool {
-    let at = shared.offset();
-    if breaks.at != Some(at) {
-        *breaks = Breaks { at: Some(at), n: 0 };
-    }
-    breaks.n += 1;
-    if breaks.n > MAX_BREAKS {
-        return false;
-    }
-    tokio::time::sleep(BREAK_PAUSE).await;
-    match link.store.read(&link.scope, &link.id, at, 0).await {
-        Ok(chunk) => !matches!(chunk.status, JobStatus::Lost | JobStatus::Gone),
-        // The sandbox cannot be reached this moment (a front with no replica yet): try again.
-        Err(_) => true,
-    }
-}
-
-/// The offset a followed stream last broke at, and how many times in a row.
-#[derive(Default)]
-struct Breaks {
-    at: Option<u64>,
-    n: u32,
-}
-
-/// Breaks at one offset after which a kept job is no longer followed (about a minute).
-const MAX_BREAKS: u32 = 120;
-const BREAK_PAUSE: Duration = Duration::from_millis(500);
 
 /// The stream holding a job (or the follow standing for it) delivered its final frame or broke:
 /// a proving or closing job is held as today from here (the release table's `proving, held` row).
@@ -970,5 +926,64 @@ mod notify_tests {
         let result = task.await.unwrap().unwrap();
         assert_eq!(result.code, Some(0));
         assert_eq!(session.kernel().job(&job), None, "held, as today");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod front_tests {
+    use super::*;
+    use beyond_test_support::job_front::{JobFront, Reply};
+
+    /// bug-agent-front-outage-60s: a kept job's command outlives any number of front restarts. The
+    /// front is down for far longer than three minutes of the handle's clock (the handle's waits run
+    /// 2000 times faster here; the default is the wall clock) and the command's output and end still
+    /// arrive. Red before the handle: the follow loop gave up after 120 breaks, about a minute.
+    #[tokio::test]
+    async fn a_front_down_for_minutes_does_not_end_a_kept_job() {
+        let b64 = |s: &str| {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode(s)
+        };
+        let mark = "00ff00ff00ff00ff1a";
+        let (first, second) = (b64("hello"), b64("world"));
+        let front = JobFront::start(std::sync::Arc::new(move |i, _| match i {
+            0 => Reply::Stream(vec![
+                format!(r#"{{"started":4242,"mark":"{mark}","stdin":false}}"#),
+                format!(r#"{{"stdout":"{first}"}}"#),
+            ]),
+            1..=130 => Reply::Down,
+            _ => Reply::Stream(vec![
+                format!(r#"{{"attached":{{"mark":"{mark}","from":5}}}}"#),
+                format!(r#"{{"stdout":"{second}"}}"#),
+                r#"{"exit_code":0}"#.into(),
+            ]),
+        }))
+        .await;
+        let runner = std::sync::Arc::new(
+            crate::exec_endpoint::HttpExecRunner::new(&front.url)
+                .unwrap()
+                .with_time_divisor(2000),
+        );
+        let jobs = Arc::new(BashJobs::new(EndPolicy::KeepRunning));
+        let link = SandboxLink::new(
+            runner.sandbox_jobs().unwrap(),
+            JobScope::under("/tmp/unused", "s"),
+            JobId::parse("j1").unwrap(),
+            true,
+        );
+        let shared = Arc::new(JobShared::in_sandbox(link.clone(), 0, &jobs));
+        let spec = JobSpec {
+            pty: None,
+            program: "sh".into(),
+            args: vec!["-c".into(), "true".into()],
+            cwd: None,
+            label: "t".into(),
+            env: Vec::new(),
+            stdin_open: false,
+        };
+        let result = run(&shared, &link, &spec).await.unwrap();
+        assert_eq!(result.code, Some(0));
+        assert_eq!(shared.offset(), 10, "hello and world, once each");
     }
 }

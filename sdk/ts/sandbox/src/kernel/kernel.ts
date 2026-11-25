@@ -269,7 +269,7 @@ function eventBytes(w: Wr, e: KEvent): void {
       w.u8(7);
       return;
     case "unreached":
-      w.u8(8);
+      w.u8(9);
       return;
   }
 }

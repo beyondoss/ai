@@ -111,7 +111,7 @@ class Event:
     CLOSE = b"\6"
     DEADLINE = b"\7"
     #: The request never reached a server: refused, unreachable, or the name did not resolve.
-    UNREACHED = b"\x08"
+    UNREACHED = b"\x09"
 
 
 @dataclass(frozen=True, slots=True)
