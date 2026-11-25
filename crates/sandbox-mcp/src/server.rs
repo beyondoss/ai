@@ -433,7 +433,9 @@ fn transfer(t: beyond_sandbox::Transfer) -> Value {
 
 fn job_id(s: &str) -> Result<JobId, ToolError> {
     JobId::parse(s).ok_or_else(|| {
-        ToolError::invalid(format!("bad job id {s:?}: 1 to 32 characters of [0-9a-z]"))
+        ToolError::invalid(format!(
+            "bad job id {s:?}: 1 to 64 characters of [0-9a-z_-]"
+        ))
     })
 }
 
