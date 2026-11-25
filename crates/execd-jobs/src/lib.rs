@@ -747,7 +747,9 @@ pub fn step(s: &mut State, ev: Ev) -> (act: Act)
         },
         Ev::Hangup => {
             if let Term::Open { size, .. } = s.term {
-                s.term = Term::Gone { size };
+                if !cfg!(feature = "mut_hangup_keeps_terminal") {
+                    s.term = Term::Gone { size };
+                }
             }
             Act::Nothing
         },

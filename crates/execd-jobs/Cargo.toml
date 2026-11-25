@@ -85,6 +85,7 @@ mut_exit_before_drain = [] # the keeper tells the shell's exit before the output
 mut_keeper_waits_forever = [] # the keeper never ends (K2)
 mut_keeper_reconnect_resets_written = [] # a reconnect makes the keeper forget what landed (T5b)
 mut_keeper_exits_unasked = [] # a keeper ends before execd ever connected, so a shell that ends at once is never served (K2b)
+mut_hangup_keeps_terminal = [] # a dead keeper leaves its terminal open (T7)
 mut_admit_any_peer = [] # a peer of any uid or pid is admitted (P1)
 mut_pty_cap_ignored = [] # a start over the cap of open terminals goes on (M1)
 mut_keeper_no_pty_is_500 = [] # a keeper that found no pty is a 500, not a 503 (M1)

@@ -278,55 +278,56 @@ cargo test -p beyond-execd --test job_model faithful          # both bounds, all
 cargo test -p beyond-execd --features <mut> --test job_model the_mutation   # each MUST pass only if its property is red
 ```
 
-| mutation                              | property it turns red                                                 |
-| ------------------------------------- | --------------------------------------------------------------------- |
-| `mut_start_overwrites`                | J1                                                                    |
-| `mut_scope_ignored`                   | J2                                                                    |
-| `mut_remove_keeps_entry`              | J3                                                                    |
-| `mut_end_rewritten`                   | J4 (`ended_is_final`, over every phase and event)                     |
-| `mut_disconnect_kills_kept`           | J6                                                                    |
-| `mut_remove_live`                     | J7                                                                    |
-| `mut_signal_ended`                    | J8                                                                    |
-| `mut_ended_not_removable`             | L1                                                                    |
-| `mut_stream_follows_key`              | J9                                                                    |
-| `mut_take_by_key`                     | J10                                                                   |
-| `mut_follow_waits_after_end`          | L2                                                                    |
-| `mut_signal_after_reap`               | J11 (`os_model`, and Verus on `may_deliver`)                          |
-| `mut_held_forgets`                    | J11-live (`os_model`, and Verus on `Held::insert`)                    |
-| `mut_stdin_replays`                   | W2 (Verus on `stdin_plan`)                                            |
-| `mut_stdin_written_shrinks`           | W2b (Verus on `advance`)                                              |
-| `mut_stdin_apply_off_start`           | W2c (Verus on `stdin_plan`)                                           |
-| `mut_stdin_wait_sticks`               | W5-live (progress lemma)                                              |
-| `mut_stdin_closes_early`              | W4 (Verus on `closes`)                                                |
-| `mut_stdin_applies_ahead`             | W5 (Verus on `stdin_plan`)                                            |
-| `mut_stdin_writes_ended`              | W3 (Verus on `stdin_plan`)                                            |
-| `mut_stdin_writes_after_eof`          | W4 (Verus on `stdin_plan`)                                            |
-| `mut_stdin_waiters_unbounded`         | W1 (Verus on `admit_waiter`)                                          |
-| `mut_stdin_waiter_stuck`              | W1-live (Verus on `admit_waiter`)                                     |
-| `mut_stdin_waits_at_written`          | W5-live (Verus on `stdin_plan`)                                       |
-| `mut_resize_ended`                    | T1 (Verus on `step`; `job_model` `PTY`)                               |
-| `mut_resize_lost_while_spawning`      | T1-live (Verus on `step`, `lemma_resize_progress`; `job_model` `PTY`) |
-| `mut_size_unbounded`                  | T3 (Verus on `size_ok`)                                               |
-| `mut_size_off_by_one`                 | T4 (Verus on `size_ok`, the completeness half)                        |
-| `mut_pty_err_sink`                    | T5 (Verus on `sinks`)                                                 |
-| `mut_recover_hangs_up_live_terminal`  | T6 (Verus on `recover`; `job_model` `PTY`)                            |
-| `mut_recover_opens_silent_terminal`   | T7 (Verus on `recover`; `job_model` `PTY`)                            |
-| `mut_recover_drops_status`            | T7b (Verus on `recover`)                                              |
-| `mut_end_keeps_terminal`              | T8 (Verus on `step`; `job_model` `PTY`)                               |
-| `mut_pty_kill_group_only`             | T9 (Verus on `step`; `job_model` `PTY`)                               |
-| `mut_pty_eof_closes`                  | T10 (Verus on `write_gate`; `job_model` `PTY`)                        |
-| `mut_gate_refuses_open`               | T11 (Verus on `write_gate`, the completeness half)                    |
-| `mut_write_after_hangup`              | T12 (Verus on `write_gate`; `job_model` `PTY`)                        |
-| `mut_exit_before_drain`               | K1 (Verus on `keeper::step`; `keeper_model`)                          |
-| `mut_keeper_waits_forever`            | K2 (Verus on `keeper::step`; `keeper_model`)                          |
-| `mut_keeper_reconnect_resets_written` | T5b (Verus on `keeper::step`; `keeper_model`)                         |
-| `mut_admit_any_peer`                  | P1 (Verus on `admit_peer`)                                            |
-| `mut_pty_cap_ignored`                 | M1 (Verus on `pty_cap`)                                               |
-| `mut_keeper_no_pty_is_500`            | M1 (Verus on `keeper_ended`)                                          |
-| `mut_keeper_answer_unchecked`         | T6a (Verus on `keeper_of`)                                            |
-| `mut_resize_not_idempotent`           | T14 (Verus on `step`, `resized`)                                      |
-| `mut_spool_failure_silent`            | M6 (Verus on `keeper::step`; `keeper_model`; `tests/pty.rs`)          |
-| `mut_spool_failure_keeps_code`        | M6 (Verus on `keeper::exit_status`; `keeper_model`; `tests/pty.rs`)   |
+| mutation                              | property it turns red                                                                 |
+| ------------------------------------- | ------------------------------------------------------------------------------------- |
+| `mut_start_overwrites`                | J1                                                                                    |
+| `mut_scope_ignored`                   | J2                                                                                    |
+| `mut_remove_keeps_entry`              | J3                                                                                    |
+| `mut_end_rewritten`                   | J4 (`ended_is_final`, over every phase and event)                                     |
+| `mut_disconnect_kills_kept`           | J6                                                                                    |
+| `mut_remove_live`                     | J7                                                                                    |
+| `mut_signal_ended`                    | J8                                                                                    |
+| `mut_ended_not_removable`             | L1                                                                                    |
+| `mut_stream_follows_key`              | J9                                                                                    |
+| `mut_take_by_key`                     | J10                                                                                   |
+| `mut_follow_waits_after_end`          | L2                                                                                    |
+| `mut_signal_after_reap`               | J11 (`os_model`, and Verus on `may_deliver`)                                          |
+| `mut_held_forgets`                    | J11-live (`os_model`, and Verus on `Held::insert`)                                    |
+| `mut_stdin_replays`                   | W2 (Verus on `stdin_plan`)                                                            |
+| `mut_stdin_written_shrinks`           | W2b (Verus on `advance`)                                                              |
+| `mut_stdin_apply_off_start`           | W2c (Verus on `stdin_plan`)                                                           |
+| `mut_stdin_wait_sticks`               | W5-live (progress lemma)                                                              |
+| `mut_stdin_closes_early`              | W4 (Verus on `closes`)                                                                |
+| `mut_stdin_applies_ahead`             | W5 (Verus on `stdin_plan`)                                                            |
+| `mut_stdin_writes_ended`              | W3 (Verus on `stdin_plan`)                                                            |
+| `mut_stdin_writes_after_eof`          | W4 (Verus on `stdin_plan`)                                                            |
+| `mut_stdin_waiters_unbounded`         | W1 (Verus on `admit_waiter`)                                                          |
+| `mut_stdin_waiter_stuck`              | W1-live (Verus on `admit_waiter`)                                                     |
+| `mut_stdin_waits_at_written`          | W5-live (Verus on `stdin_plan`)                                                       |
+| `mut_resize_ended`                    | T1 (Verus on `step`; `job_model` `PTY`)                                               |
+| `mut_resize_lost_while_spawning`      | T1-live (Verus on `step`, `lemma_resize_progress`; `job_model` `PTY`)                 |
+| `mut_size_unbounded`                  | T3 (Verus on `size_ok`)                                                               |
+| `mut_size_off_by_one`                 | T4 (Verus on `size_ok`, the completeness half)                                        |
+| `mut_pty_err_sink`                    | T5 (Verus on `sinks`)                                                                 |
+| `mut_recover_hangs_up_live_terminal`  | T6 (Verus on `recover`; `job_model` `PTY`)                                            |
+| `mut_recover_opens_silent_terminal`   | T7 (Verus on `recover`; `job_model` `PTY`)                                            |
+| `mut_recover_drops_status`            | T7b (Verus on `recover`)                                                              |
+| `mut_end_keeps_terminal`              | T8 (Verus on `step`; `job_model` `PTY`)                                               |
+| `mut_pty_kill_group_only`             | T9 (Verus on `step`; `job_model` `PTY`)                                               |
+| `mut_pty_eof_closes`                  | T10 (Verus on `write_gate`; `job_model` `PTY`)                                        |
+| `mut_gate_refuses_open`               | T11 (Verus on `write_gate`, the completeness half)                                    |
+| `mut_write_after_hangup`              | T12 (Verus on `write_gate`; `job_model` `PTY`)                                        |
+| `mut_exit_before_drain`               | K1 (Verus on `keeper::step`; `keeper_model`)                                          |
+| `mut_keeper_waits_forever`            | K2 (Verus on `keeper::step`; `keeper_model`)                                          |
+| `mut_keeper_reconnect_resets_written` | T5b (Verus on `keeper::step`; `keeper_model`)                                         |
+| `mut_hangup_keeps_terminal`           | T7 (Verus on `step`; `job_model` `PTY`; conformance `jobs.pty.keeper-killed-is-gone`) |
+| `mut_admit_any_peer`                  | P1 (Verus on `admit_peer`)                                                            |
+| `mut_pty_cap_ignored`                 | M1 (Verus on `pty_cap`)                                                               |
+| `mut_keeper_no_pty_is_500`            | M1 (Verus on `keeper_ended`)                                                          |
+| `mut_keeper_answer_unchecked`         | T6a (Verus on `keeper_of`)                                                            |
+| `mut_resize_not_idempotent`           | T14 (Verus on `step`, `resized`)                                                      |
+| `mut_spool_failure_silent`            | M6 (Verus on `keeper::step`; `keeper_model`; `tests/pty.rs`)                          |
+| `mut_spool_failure_keeps_code`        | M6 (Verus on `keeper::exit_status`; `keeper_model`; `tests/pty.rs`)                   |
 
 ### The OS boundary (J11)
 

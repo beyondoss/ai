@@ -165,6 +165,7 @@ mut_keeper_reconnect_resets_written = [
   "beyond-execd-jobs/mut_keeper_reconnect_resets_written",
 ] # T5b
 mut_keeper_exits_unasked = ["beyond-execd-jobs/mut_keeper_exits_unasked"] # K2b
+mut_hangup_keeps_terminal = ["beyond-execd-jobs/mut_hangup_keeps_terminal"] # T7
 mut_admit_any_peer = ["beyond-execd-jobs/mut_admit_any_peer"] # P1
 mut_pty_cap_ignored = ["beyond-execd-jobs/mut_pty_cap_ignored"] # M1
 mut_keeper_no_pty_is_500 = ["beyond-execd-jobs/mut_keeper_no_pty_is_500"] # M1
