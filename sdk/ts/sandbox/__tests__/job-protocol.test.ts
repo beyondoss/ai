@@ -389,6 +389,24 @@ describe("the mark on the wire", () => {
     });
   });
 
+  it("a list entry that names no mark, command or args is not_offered", async () => {
+    for (const drop of ["mark", "command", "args"]) {
+      const entry: Record<string, unknown> = {
+        id: "aa",
+        state: "running",
+        code: null,
+        mark: "m1",
+        command: "sh",
+        args: [],
+      };
+      delete entry[drop];
+      const { t } = await answering(() => [200, { jobs: [entry] }]);
+      await expect(t.jobs.list("s")).rejects.toMatchObject({
+        kind: "not_offered",
+      });
+    }
+  });
+
   async function attaching(body: string) {
     const bodies: Array<{ job: Record<string, any> }> = [];
     const e = await fakeEndpoint((r, res) => {

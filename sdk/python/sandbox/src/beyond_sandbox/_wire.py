@@ -423,6 +423,15 @@ def parse_list(v: Any) -> list[JobInfo]:
         st = _state(j.get("state"), j.get("code"))
         if st is None:
             continue
+        # An endpoint that predates marks names none of these: its list is not trusted.
+        if (
+            not isinstance(j.get("mark"), str)
+            or not isinstance(j.get("command"), str)
+            or not isinstance(j.get("args"), list)
+        ):
+            raise NotOfferedError(
+                "the endpoint predates job marks: its list did not name the job's incarnation"
+            )
         out.append(
             JobInfo(
                 id=j["id"],
@@ -435,9 +444,9 @@ def parse_list(v: Any) -> list[JobInfo]:
                 started=_int(j, "started") or 0,
                 ended=_int(j, "ended") or 0,
                 label=j["label"] if isinstance(j.get("label"), str) else "",
-                mark=j["mark"] if isinstance(j.get("mark"), str) else "",
-                command=j["command"] if isinstance(j.get("command"), str) else "",
-                args=tuple(a for a in (j.get("args") or ()) if isinstance(a, str)),
+                mark=j["mark"],
+                command=j["command"],
+                args=tuple(a for a in j["args"] if isinstance(a, str)),
                 output_start=_int(j, "outputStart") or 0,
                 output_end=_int(j, "outputEnd") or 0,
                 signal=_signal(j, st[0]),

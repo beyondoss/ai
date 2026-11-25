@@ -175,7 +175,13 @@ mut_attach_refuses = [
 ] # an attach refuses the incarnation it names (M4-live)
 mut_status_only_streams = [
   "beyond-execd-jobs/mut_status_only_streams",
-] # a status-only attach starts at its offset, so it streams bytes (M5, M6, M7)
+] # a status-only attach starts at its offset, not the end (M6)
+mut_status_only_sends = [
+  "beyond-execd-jobs/mut_status_only_sends",
+] # a status-only stream is not moved to the end before it follows (M7)
+mut_attach_offset_shifted = [
+  "beyond-execd-jobs/mut_attach_offset_shifted",
+] # an attach with output starts at the end, not at its offset (M5)
 # Mutations of `ring` (the crate `execd-ring`, which Verus proves), used only by `src/ring.rs`'s differential
 # test's red runs: each removes one guard.
 mut_window_before_base = [

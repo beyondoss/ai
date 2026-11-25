@@ -995,6 +995,16 @@ class HttpJobs implements JobOps {
       if (!isRecord(j) || typeof j.id !== "string" || !isJobId(j.id)) continue;
       const st = jobState(j.state, j.code);
       if (!st) continue;
+      // An endpoint that predates marks names none of these: its list is not trusted.
+      if (
+        typeof j.mark !== "string"
+        || typeof j.command !== "string"
+        || !Array.isArray(j.args)
+      ) {
+        throw new NotOfferedError(
+          "the endpoint predates job marks: its list did not name the job's incarnation",
+        );
+      }
       out.push({
         id: j.id,
         state: st.state,
@@ -1007,11 +1017,9 @@ class HttpJobs implements JobOps {
         started: count(j.started),
         ended: count(j.ended),
         label: typeof j.label === "string" ? j.label : "",
-        mark: typeof j.mark === "string" ? j.mark : "",
-        command: typeof j.command === "string" ? j.command : "",
-        args: Array.isArray(j.args)
-          ? j.args.filter((a): a is string => typeof a === "string")
-          : [],
+        mark: j.mark,
+        command: j.command,
+        args: j.args.filter((a): a is string => typeof a === "string"),
         outputStart: count(j.outputStart),
         outputEnd: count(j.outputEnd),
       });
