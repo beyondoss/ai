@@ -151,7 +151,7 @@ class _Response:
             raise TimeoutError(f"exec endpoint {self._url} timed out")
         wait = left if silence is None else min(left, silence)
         try:
-            self._sock.settimeout(wait)
+            self._sock.settimeout(_wire.socket_s(wait))
             data = self._sock.recv(65536)
             self._reader.feed(data)
         except builtins.TimeoutError:
@@ -333,7 +333,7 @@ class HttpTransport:
         t = self._target
         try:
             sock = socket.create_connection(
-                (t.host, t.port), timeout=max(deadline - time.monotonic(), 0.001)
+                (t.host, t.port), timeout=_wire.socket_s(deadline - time.monotonic())
             )
             if t.tls:
                 sock = self._tls_context().wrap_socket(sock, server_hostname=t.host)
@@ -376,7 +376,7 @@ class HttpTransport:
         reader = _http.ResponseReader()
         resp = _Response(sock, reader, deadline, self.url)
         try:
-            sock.settimeout(max(deadline - time.monotonic(), 0.001))
+            sock.settimeout(_wire.socket_s(deadline - time.monotonic()))
             sock.sendall(request)
             while not reader.head_done:
                 resp._fill(None)

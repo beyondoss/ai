@@ -57,6 +57,12 @@ MAX_FRAME_LINE = 1024 * 1024
 ENVELOPE_SLACK = 4096
 
 
+def socket_s(seconds: float) -> float:
+    """A socket timeout: at least a millisecond, and at most what every platform's socket takes (Windows'
+    timeval holds milliseconds in 32 bits, which the 24-day deadline of a stream does not fit)."""
+    return min(max(seconds, 0.001), 1_000_000.0)
+
+
 def check_heartbeat(heartbeat_seconds: int | None) -> int | None:
     """The heartbeat a request may ask for: whole seconds, 1 to 240, or nothing. Anything else would be
     silently replaced by the endpoint's own, so it is refused before anything is sent."""
