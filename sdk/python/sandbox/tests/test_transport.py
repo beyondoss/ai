@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 import shutil
+import socket
 import ssl
 import subprocess
 import threading
@@ -414,3 +415,53 @@ def test_default_tls_context_is_built_once(
         assert calls["n"] == 2  # one more for the async transport
 
     asyncio.run(main())
+
+
+def test_async_close_drops_the_connection_at_once_even_if_tls_is_not_answered(
+    tmp_path: Path,
+) -> None:
+    """A held start dies with its stream: closing a response must end the TCP connection, not wait
+    (30 s by default) for a peer that holds a TLS connection open to answer the shutdown."""
+    assert shutil.which("openssl") is not None, "openssl is needed to make a test certificate"
+    cert, key = tmp_path / "cert.pem", tmp_path / "key.pem"
+    subprocess.run(
+        ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(key),
+         "-out", str(cert), "-days", "1", "-subj", "/CN=localhost",
+         "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1"],
+        check=True, capture_output=True,
+    )  # fmt: skip
+    tcp_closed = threading.Event()
+    answered: list[bytes] = []
+
+    def hold(h: BaseHTTPRequestHandler, body: Any) -> None:
+        ndjson_head(h)
+        chunk(h, {"stdout": b64(b"x")})
+        conn = h.connection
+        conn.settimeout(10)
+        # The TLS alert the client sends is read here and never answered; the raw socket then ends only
+        # when the client drops the TCP connection.
+        assert conn.recv(1) == b""
+        answered.append(b"alert")
+        raw = socket.socket.recv(conn, 1)
+        if raw == b"":
+            tcp_closed.set()
+
+    e = Endpoint()
+    server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_ctx.load_cert_chain(cert, key)
+    e.server.socket = server_ctx.wrap_socket(e.server.socket, server_side=True)
+    e.url = e.url.replace("http://", "https://")
+    e.handler = hold
+    ctx = ssl.create_default_context(cafile=str(cert))
+
+    async def main() -> None:
+        t = AsyncHttpTransport(e.url, ssl_context=ctx)
+        s = await t.stream("sleep")
+        assert await s.__anext__() == Stdout(b"x")
+        await s.aclose()
+
+    try:
+        asyncio.run(main())
+        assert tcp_closed.wait(3), "the connection stayed open after the response was closed"
+    finally:
+        e.server.shutdown()

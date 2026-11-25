@@ -161,7 +161,12 @@ class _Response:
             await self.fill(silence)
 
     async def close(self) -> None:
-        self._w.close()
+        # Closing a response drops the connection, and with it the command of a held start. Over TLS
+        # ``StreamWriter.close()`` first waits for the peer's close_notify (``ssl_shutdown_timeout``,
+        # 30 s) before it closes the socket: a proxy that holds the connection open until then keeps the
+        # sandbox's side open, and the command alive, for those 30 s. The sync transport shuts the
+        # socket down at once; so does this.
+        self._w.transport.abort()
         with contextlib.suppress(Exception):
             await self._w.wait_closed()
 
