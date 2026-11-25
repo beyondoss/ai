@@ -41,10 +41,11 @@ use crate::exec::{self, Cut, Sink};
 use crate::frame::{self, FRAME_MAX};
 use crate::http::{self, Line, Request, Resp};
 use crate::job_kernel::{
-    self as kernel, Act, Admit, Alive, Attach, Ev, Follow, Gate, Keeper, Kind, Pick, Recovery,
-    Removal, Resizable, Sink as Dest, Size, Term,
+    self as kernel, Act, Admit, Alive, Attach, Begin, Ev, Follow, Gate, Keeper, Kind, Launch,
+    Persist, Pick, Rec, Recovery, Refusal, Removal, Replied, Resizable, Sink as Dest, Size, Sweep,
+    Term,
 };
-use crate::ledger::{Entry, Ledger, Saved};
+use crate::ledger::{Entry, Idem, Ledger, Saved};
 use crate::notify::{self, Notifier, NotifyTarget};
 use crate::proc::{self, locked};
 use crate::ring::Ring;
@@ -80,6 +81,9 @@ pub(crate) struct Job {
     stdin: Option<Arc<JobStdin>>,
     /// Streams open on it now (an `attach`, a held start): a terminal someone watches is attached.
     streams: usize,
+    /// The start's idempotency key and spec digest, for the ledger (the table's own record of the key is
+    /// [`kernel::Rec`]); `None` for an unkeyed start. Written once, at the start or the restart.
+    idem: Option<Idem>,
 }
 
 /// A job's command and arguments (never its environment), kept with it and in the ledger.
@@ -135,29 +139,38 @@ impl Jobs {
         if !self.ledger.enabled() {
             return;
         }
-        self.ledger.save(|| {
-            let cells = locked(&self.map).all();
-            cells
-                .into_iter()
-                .filter_map(|((scope, id), cell)| {
-                    let j = locked(&cell);
-                    let keeper = j
-                        .stdin
-                        .as_ref()
-                        .and_then(|s| s.term.as_ref())
-                        .map(|t| t.keeper_pid);
-                    Entry::of(
-                        (&scope, &id),
-                        &j.label,
-                        &j.argv,
-                        &j.mark,
-                        &j.k,
-                        j.spool.as_ref().map(Spool::dir),
-                        keeper,
-                    )
-                })
-                .collect()
-        });
+        self.ledger.save(|| self.entries());
+    }
+
+    /// [`Self::save`] for a keyed start's claim: durable, and how it came out (K10).
+    fn claim(&self) -> Persist {
+        self.ledger.claim(|| self.entries())
+    }
+
+    /// What the ledger holds of the table: each job that has a group (or a keyed intent) and is not removed.
+    fn entries(&self) -> Vec<Entry> {
+        let cells = locked(&self.map).all();
+        cells
+            .into_iter()
+            .filter_map(|((scope, id), cell)| {
+                let j = locked(&cell);
+                let keeper = j
+                    .stdin
+                    .as_ref()
+                    .and_then(|s| s.term.as_ref())
+                    .map(|t| t.keeper_pid);
+                Entry::of(
+                    (&scope, &id),
+                    &j.label,
+                    &j.argv,
+                    &j.mark,
+                    &j.k,
+                    j.spool.as_ref().map(Spool::dir),
+                    keeper,
+                    j.idem.as_ref(),
+                )
+            })
+            .collect()
     }
 
     /// The server is shutting down and kills every group: nothing is left to recover.
@@ -398,6 +411,9 @@ struct JobReq {
     notify: Option<Value>,
     /// `start`: keep the job's stdin open for `write` (default: `/dev/null`).
     stdin_open: bool,
+    /// `start`: the idempotency key. A start that carries the key of an earlier start of the same spec
+    /// answers that job and runs nothing; the same key with another spec is `409`.
+    idempotency_key: Option<String>,
     /// `signal`: the signal's name.
     signal: Option<String>,
     /// `write`: the stream position of the data's first byte and whether to close
@@ -1181,7 +1197,7 @@ async fn launch_term(
             .into_iter()
             .filter(|(_, c)| matches!(locked(c).k.term, Term::Open { .. }))
             .count() as u64;
-        if kernel::pty_cap(open, max) == kernel::Begin::NoPty {
+        if kernel::pty_cap(open, max) == kernel::PtyBegin::NoPty {
             return Err((503, "no pseudo-terminal is free"));
         }
     }
@@ -1232,7 +1248,7 @@ async fn launch_term(
                     // 124: no pseudo-terminal is free (the table is full, or the kernel is out of memory for one).
                     return Err(
                         match kernel::keeper_ended(st.as_ref().ok().and_then(|s| s.code())) {
-                            kernel::Begin::NoPty => (503, "no pseudo-terminal is free"),
+                            kernel::PtyBegin::NoPty => (503, "no pseudo-terminal is free"),
                             _ => (500, "cannot start the terminal"),
                         },
                     );
@@ -1287,32 +1303,105 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
         }
     };
     let key = (job.scope.clone(), job.id.clone());
-    let cell: JobCell = {
-        let mut map = locked(&ctx.jobs.map);
-        if map.admit(&key) == Admit::Exists {
-            return http::error_response(409, "the job exists");
-        }
-        // Placeholder until the spawn gives the group: the entry is the claim on the id, so two
-        // starts of one id cannot both run.
-        let cell = Arc::new(Mutex::new(Job {
-            mark: proc::new_job_mark(ctx.next_seq.fetch_add(1, Ordering::Relaxed)),
-            sp: 0,
-            label: job.label.clone(),
-            argv: Argv {
-                command: req.command.clone(),
-                args: req.args.clone(),
-            },
-            out: Ring::new(ctx.opts.job_output_retention, ctx.spool.new_job()),
-            spool: None,
-            k: kernel::State::new(epoch(), job.hold, pty),
-            notify: None,
-            notifier: Notifier::default(),
-            stdin: None,
-            streams: 0,
-        }));
-        map.insert(key.clone(), cell.clone());
-        cell
+    let idem = match job.idempotency_key.as_deref() {
+        None => None,
+        Some(k) if kernel::key_valid(k.as_bytes()) => Some(Idem {
+            key: k.to_string(),
+            digest: spec_digest(req, job),
+        }),
+        Some(_) => return http::error_response(400, "bad idempotency key"),
     };
+    /// What the table's decision leaves to do once its lock is dropped.
+    enum Gate {
+        Run(JobCell),
+        Answer(Resp),
+        Replay(Key, Option<JobCell>),
+    }
+    let gate = {
+        let mut map = locked(&ctx.jobs.map);
+        // The kernel's decision (K1-K5): a key already used for this command replays its job, a key used
+        // for another command is refused, and an id in the table is the claim.
+        let begin = map.begin(
+            &key.0,
+            &key.1,
+            idem.as_ref().map(|i| i.key.as_str()),
+            idem.as_ref().map_or("", |i| i.digest.as_str()),
+        );
+        match begin {
+            Begin::Refuse(Refusal::IdExists) => {
+                Gate::Answer(http::error_response(409, "the job exists"))
+            }
+            Begin::Refuse(Refusal::KeyReused) => Gate::Answer(http::json_response(
+                409,
+                &json!({
+                    "error": "the key was used for a different command or id",
+                    "code": "key_conflict",
+                }),
+            )),
+            Begin::Replay(id) => {
+                let replayed = (job.scope.clone(), id);
+                let cell = map.get(&replayed);
+                Gate::Replay(replayed, cell)
+            }
+            Begin::Start => {
+                // Placeholder until the spawn gives the group: the entry is the claim on the id, so two
+                // starts of one id cannot both run.
+                let cell = Arc::new(Mutex::new(Job {
+                    mark: proc::new_job_mark(ctx.next_seq.fetch_add(1, Ordering::Relaxed)),
+                    sp: 0,
+                    label: job.label.clone(),
+                    argv: Argv {
+                        command: req.command.clone(),
+                        args: req.args.clone(),
+                    },
+                    out: Ring::new(ctx.opts.job_output_retention, ctx.spool.new_job()),
+                    spool: None,
+                    k: kernel::State::new(epoch(), job.hold, pty),
+                    notify: None,
+                    notifier: Notifier::default(),
+                    stdin: None,
+                    streams: 0,
+                    idem: idem.clone(),
+                }));
+                map.insert(key.clone(), cell.clone());
+                // The key's record goes in with the entry, under the same lock: no other start sees the id
+                // without it.
+                if let Some(i) = &idem {
+                    map.record(Rec {
+                        scope: key.0.clone(),
+                        key: i.key.clone(),
+                        id: key.1.clone(),
+                        digest: i.digest.clone(),
+                    });
+                }
+                Gate::Run(cell)
+            }
+        }
+    };
+    let cell = match gate {
+        Gate::Run(cell) => cell,
+        Gate::Answer(resp) => return resp,
+        Gate::Replay(replayed, cell) => {
+            return replay_job(ctx, req, job, replayed, cell).await;
+        }
+    };
+    // A keyed start's claim is durable before anything is spawned (K9, K10): a crash from here to the group's save
+    // leaves an intent a restart answers as lost, never a start to run again. A claim that cannot be written is a
+    // start that does not run: the kernel says which refusal, and the retry, once the disk takes it, starts.
+    match kernel::launch(idem.is_some().then(|| ctx.jobs.claim())) {
+        Launch::Spawn => {}
+        Launch::DiskFull => {
+            ctx.jobs.remove(&[(key, cell)]);
+            return http::error_response(
+                507,
+                "the sandbox's disk is full: no room to record the start",
+            );
+        }
+        Launch::Failed => {
+            ctx.jobs.remove(&[(key, cell)]);
+            return http::error_response(500, "cannot record the start");
+        }
+    }
     let mut cmd = exec::command_for(ctx, req, Kind::Job);
     cmd.stdin(if job.stdin_open && pty.is_none() {
         Stdio::piped()
@@ -1386,6 +1475,10 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
     };
     // The child has its own copies of the write ends; execd holds none.
     drop(cmd);
+    if crate::fault::at("after_spawn").as_deref() == Some("exit") {
+        // A test's crash of execd between the spawn and the group's save (K11).
+        std::process::exit(86);
+    }
     let (pgid, pg) = match &lead {
         Lead::Proc(p) => (p.pgid, p.pg()),
         // The session leads a group of its own, which a keeper started: held as an adopted one.
@@ -1452,6 +1545,7 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
     }
 
     let opened = job.stdin_open || pty.is_some();
+    let first_frame = started_json(pgid, &mark, opened, pty, job.idempotency_key.as_deref());
     if job.hold {
         let (resp, out) = http::stream_response();
         let seq = ctx.next_seq.fetch_add(1, Ordering::Relaxed);
@@ -1466,13 +1560,7 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
         }
         let ctx2 = ctx.clone();
         let beat = req.beat;
-        let mut first = json!({ "started": pgid, "mark": mark });
-        if opened {
-            first["stdin"] = json!(true);
-        }
-        if let Some(size) = pty {
-            first["pty"] = json!({ "cols": size.cols, "rows": size.rows });
-        }
+        let first = first_frame.clone();
         tokio::spawn(async move {
             let end = stream_job(
                 ctx2.clone(),
@@ -1493,15 +1581,136 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
         });
         resp
     } else {
-        let mut body = json!({ "started": pgid, "mark": mark });
-        if opened {
-            body["stdin"] = json!(true);
-        }
-        if let Some(size) = pty {
-            body["pty"] = json!({ "cols": size.cols, "rows": size.rows });
-        }
-        http::json_response(200, &body)
+        http::json_response(200, &first_frame)
     }
+}
+
+/// The digest of what a start runs: command, args, cwd, env, stdin_open and hold, length-prefixed so no two
+/// specs share a byte string, hashed with SHA-256. This is all execd keeps of a keyed start's spec: the env can
+/// hold secrets, so the spec itself is never stored. The label is not in it (a name, not a command). Every field
+/// that decides what runs is here: a field added to `start` that changes the command belongs in this list.
+fn spec_digest(req: &Request, job: &JobReq) -> String {
+    use sha2::{Digest as _, Sha256};
+    let mut h = Sha256::new();
+    let mut field = |tag: u8, bytes: &[u8]| {
+        h.update([tag]);
+        h.update((bytes.len() as u64).to_le_bytes());
+        h.update(bytes);
+    };
+    field(b'c', req.command.as_bytes());
+    for a in &req.args {
+        field(b'a', a.as_bytes());
+    }
+    match &req.cwd {
+        Some(c) => field(b'd', c.as_bytes()),
+        None => field(b'D', b""),
+    }
+    // The environment is a set: the order a client wrote it in is not part of the spec.
+    let mut env: Vec<&(String, String)> = req.env_pairs.iter().collect();
+    env.sort();
+    for (k, v) in env {
+        field(b'k', k.as_bytes());
+        field(b'v', v.as_bytes());
+    }
+    field(b'i', &[u8::from(job.stdin_open)]);
+    field(b'h', &[u8::from(job.hold)]);
+    let out = h.finalize();
+    out.iter().fold(String::with_capacity(64), |mut s, b| {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
+/// The answer to a start the key ledger already has: the original job's, as its start answered (its group, mark and
+/// `stdin`; the key, echoed), or, for a held start, its stream from the first byte. Nothing is spawned. A replay that
+/// arrives while the original is still spawning waits for its group, so it never answers a job with no process; what
+/// it answers at each look is the kernel's (K14, K15). `cell` is `None` when the table no longer holds the job: the
+/// same refusal as a job removed before it started.
+async fn replay_job(
+    ctx: &Arc<Ctx>,
+    req: &Request,
+    job: &JobReq,
+    key: Key,
+    cell: Option<JobCell>,
+) -> Resp {
+    let mut waited = 0;
+    let (cell, pgid) = loop {
+        let (pgid, ended, removed) = match &cell {
+            Some(c) => {
+                let j = locked(c);
+                (j.k.pgid(), j.k.ended(), j.k.removed)
+            }
+            None => (0, false, true),
+        };
+        match (kernel::replay_poll(pgid, ended, removed, waited), &cell) {
+            // A job a restart found claimed and never spawned is ended with no group: its answer is that.
+            (Replied::Answer, Some(c)) => break (c.clone(), pgid),
+            (Replied::Wait, _) => {
+                waited += 1;
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            // A refusal, or (never: no job is no group, so the kernel refuses it) an answer with no job: fail closed.
+            _ => return http::error_response(500, "the job did not start"),
+        }
+    };
+    // The replay answers as the first start did, with the same incarnation's mark and terminal.
+    let (mark, pty) = {
+        let j = locked(&cell);
+        let pty = match j.k.term {
+            Term::Open { size, .. } | Term::Gone { size } => Some(size),
+            Term::No => None,
+        };
+        (j.mark.clone(), pty)
+    };
+    let opened = job.stdin_open || pty.is_some();
+    let first = started_json(pgid, &mark, opened, pty, job.idempotency_key.as_deref());
+    if job.hold {
+        let (resp, out) = http::stream_response();
+        let ctx2 = ctx.clone();
+        let beat = req.beat;
+        tokio::spawn(async move {
+            stream_job(
+                ctx2,
+                key,
+                cell,
+                true,
+                Opening {
+                    offset: 0,
+                    output: true,
+                    first: Some(first),
+                },
+                Sink::new(out, beat, None),
+            )
+            .await;
+        });
+        resp
+    } else {
+        http::json_response(200, &first)
+    }
+}
+
+/// What a start answers: the job's process group, its incarnation's mark, `stdin` when its stdin was opened, the
+/// terminal's size when it has one, and the start's key when it had one: the echo that tells a client its key was
+/// kept (an execd that ignores keys says nothing). A held start's first frame is the same value.
+fn started_json(
+    pgid: i32,
+    mark: &str,
+    opened: bool,
+    pty: Option<Size>,
+    key: Option<&str>,
+) -> Value {
+    let mut body = json!({ "started": pgid, "mark": mark });
+    if opened {
+        body["stdin"] = json!(true);
+    }
+    if let Some(size) = pty {
+        body["pty"] = json!({ "cols": size.cols, "rows": size.rows });
+    }
+    if let Some(k) = key {
+        body["key"] = json!(k);
+    }
+    body
 }
 
 /// What a start answers when its output spool cannot be made: `507` with a plain reason when the
@@ -1728,6 +1937,9 @@ async fn supervise_after(
     ctx.jobs.save();
 }
 
+/// How many times a restart's sweep of a lost claim's marked processes looks again after a kill.
+const SWEEP_PASSES: usize = 5;
+
 /// Start of a server: the jobs a previous execd saved ([`crate::ledger`]) come back as
 /// [`kernel::recover`] decides, each in the table under its address. A job whose group lives is
 /// adopted (watched until the group empties, then ended with the shell's saved status, else
@@ -1758,7 +1970,8 @@ pub(crate) fn recover(ctx: &Arc<Ctx>) {
         {
             conn = Some((stream, written, frames, t.keeper_pid));
         }
-        let (mut state, how) = kernel::recover(e.state(), alive, keeper, epoch());
+        let (mut state, how, sweep) =
+            kernel::recover(e.state(), alive, keeper, epoch(), e.idem.is_some());
         if how == Recovery::Drop {
             continue;
         }
@@ -1771,6 +1984,26 @@ pub(crate) fn recover(ctx: &Arc<Ctx>) {
         ) = (how, keeper)
         {
             kernel::step(&mut state, Ev::ShellExit { code, signal });
+        }
+        if sweep == Sweep::KillMarked {
+            // The intent's spawn may have happened and its save not: nobody can find its processes but by the
+            // mark, and its answer is lost. Never leave them running unseen (K11). A process still between its
+            // fork and its exec carries execd's environment, not the mark, so the sweep looks again until a pass
+            // finds none.
+            for _ in 0..SWEEP_PASSES {
+                let marked = proc::job_members(0, &e.mark);
+                if marked.is_empty() {
+                    break;
+                }
+                for pid in marked {
+                    if let Ok(raw) = i32::try_from(pid) {
+                        let _ = nix::sys::signal::kill(
+                            nix::unistd::Pid::from_raw(raw),
+                            Signal::SIGKILL,
+                        );
+                    }
+                }
+            }
         }
         let key = (e.scope.clone(), e.id.clone());
         let pgid = state.pgid();
@@ -1826,6 +2059,7 @@ pub(crate) fn recover(ctx: &Arc<Ctx>) {
             notifier: Notifier::default(),
             stdin: None,
             streams: 0,
+            idem: e.idem.clone(),
         }));
         {
             let mut map = locked(&ctx.jobs.map);
@@ -1833,6 +2067,17 @@ pub(crate) fn recover(ctx: &Arc<Ctx>) {
                 continue;
             }
             map.insert(key.clone(), cell.clone());
+            // K6: the job came back, so does its key's record.
+            if let Some(i) = &e.idem
+                && kernel::keeps_record(how)
+            {
+                map.record(Rec {
+                    scope: key.0.clone(),
+                    key: i.key.clone(),
+                    id: key.1.clone(),
+                    digest: i.digest.clone(),
+                });
+            }
         }
         if let Some(pg) = pg {
             ctx.groups.insert(pg, Kind::Job);

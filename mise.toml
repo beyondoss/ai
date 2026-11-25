@@ -120,6 +120,17 @@ for m in mut_id_length_unbounded mut_id_any_byte mut_id_rejects_dash mut_mark_ig
 done
 '''
 
+[tasks."verify:start-key-mutants"]
+description = "crates/execd-jobs under each of the start key's seventeen mut_* features (K1-K16): every proof must go red (a Verus verification failure, not a build error). The execd tests (crates/execd/tests/startkey.rs) go red under the same features. Pairs with `verify:kernels`, which must be green without a feature."
+run = '''
+set -u
+for m in mut_key_replay_starts mut_key_digest_ignored mut_key_fresh_refused mut_unkeyed_replays mut_key_forgotten_on_restart mut_key_record_clears mut_key_take_forgets_none mut_intent_respawns mut_key_id_ignored mut_key_held_starts mut_spawn_without_claim mut_durable_claim_refused mut_orphan_survives mut_bad_key_accepted mut_valid_key_refused mut_replay_refuses_started mut_replay_waits_forever; do
+  out=$(KERNEL_CRATES=crates/execd-jobs .github/scripts/verify-kernels.sh --features "$m" 2>&1) && { echo "proof stayed green under $m" >&2; exit 1; }
+  line=$(grep -E "verification results:: .* [1-9][0-9]* errors" <<<"$out") || { echo "$m: failed without a Verus verification result (build error?)" >&2; exit 1; }
+  echo "red under $m: $line"
+done
+'''
+
 [tasks."test:job-client-model-mutants"]
 description = "The step model (crates/job-client/tests/step_model.rs) under each step mutation it can reach: every run must go red. Under it the model (M10, M11) also goes red for mut_gone_ignored and mut_gone_on_silence. The mutations no model state reaches (an offset near u64::MAX, the classification rows, the wait cap, the silence limit) are Verus's alone. Pairs with `verify:job-client-mutants`."
 run = '''

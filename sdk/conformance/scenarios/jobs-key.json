@@ -1,0 +1,508 @@
+{
+  "suite": "jobs-key",
+  "version": 1,
+  "description": "Layer 1: the start's idempotency key (K1-K8 of the job kernel).",
+  "scenarios": [
+    {
+      "id": "jobs-key.a-retried-start-answers-the-first-job-and-runs-nothing",
+      "description": "A start whose answer was lost, sent again with its key, answers the job the first send started (the same process group) and runs nothing: the command ran once, and one job is listed. The same key under another id is refused: the id is part of what the call asked for.",
+      "requires": {
+        "features": [
+          "job_start_key"
+        ]
+      },
+      "steps": [
+        {
+          "id": "first",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "ka01",
+          "command": "sh",
+          "args": [
+            "-c",
+            "echo run >> \"${ROOT}/mark\"; sleep 30"
+          ],
+          "label": "",
+          "idempotency_key": "retry-${SCOPE}",
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              }
+            }
+          },
+          "save": {
+            "pg": "pgid"
+          }
+        },
+        {
+          "id": "lost-answer-retried",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "ka01",
+          "command": "sh",
+          "args": [
+            "-c",
+            "echo run >> \"${ROOT}/mark\"; sleep 30"
+          ],
+          "label": "",
+          "idempotency_key": "retry-${SCOPE}",
+          "expect": {
+            "ok": {
+              "pgid": "${pg}"
+            }
+          }
+        },
+        {
+          "id": "another-id-same-key",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "ka02",
+          "command": "sh",
+          "args": [
+            "-c",
+            "echo run >> \"${ROOT}/mark\"; sleep 30"
+          ],
+          "label": "",
+          "idempotency_key": "retry-${SCOPE}",
+          "expect": {
+            "error": {
+              "detail": {
+                "$contains": "different command"
+              }
+            }
+          }
+        },
+        {
+          "id": "ran-once",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "wc -l < \"$1/mark\"",
+            "sh",
+            "${ROOT}"
+          ],
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          },
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": {
+                "$re": "^\\s*1\\s*$"
+              }
+            }
+          }
+        },
+        {
+          "id": "one-job",
+          "op": "job_list",
+          "scope": "${SCOPE}",
+          "expect": {
+            "ok": {
+              "jobs": {
+                "$len": 1
+              }
+            }
+          }
+        },
+        {
+          "id": "kill",
+          "op": "job_kill",
+          "scope": "${SCOPE}",
+          "jobs": [
+            "ka01"
+          ],
+          "expect": {
+            "ok": {
+              "survivors": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs-key.a-key-used-for-another-command-is-refused",
+      "description": "The same key with another command, or the same command with another environment, is refused with the reason (the key was used for a different command), and nothing else starts; the first job still runs.",
+      "requires": {
+        "features": [
+          "job_start_key"
+        ]
+      },
+      "steps": [
+        {
+          "id": "first",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "kb01",
+          "command": "sh",
+          "args": [
+            "-c",
+            "sleep 30"
+          ],
+          "label": "",
+          "idempotency_key": "differ-${SCOPE}",
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              }
+            }
+          }
+        },
+        {
+          "id": "other-command",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "kb02",
+          "command": "sh",
+          "args": [
+            "-c",
+            "sleep 31"
+          ],
+          "label": "",
+          "idempotency_key": "differ-${SCOPE}",
+          "expect": {
+            "error": {
+              "detail": {
+                "$contains": "different command"
+              }
+            }
+          }
+        },
+        {
+          "id": "other-env",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "kb02",
+          "command": "sh",
+          "args": [
+            "-c",
+            "sleep 30"
+          ],
+          "label": "",
+          "idempotency_key": "differ-${SCOPE}",
+          "expect": {
+            "error": {
+              "detail": {
+                "$contains": "different command"
+              }
+            }
+          },
+          "env": {
+            "A": "1"
+          }
+        },
+        {
+          "id": "still-one",
+          "op": "job_list",
+          "scope": "${SCOPE}",
+          "expect": {
+            "ok": {
+              "jobs": {
+                "$len": 1
+              }
+            }
+          }
+        },
+        {
+          "id": "same-again",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "kb01",
+          "command": "sh",
+          "args": [
+            "-c",
+            "sleep 30"
+          ],
+          "label": "",
+          "idempotency_key": "differ-${SCOPE}",
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              }
+            }
+          }
+        },
+        {
+          "id": "kill",
+          "op": "job_kill",
+          "scope": "${SCOPE}",
+          "jobs": [
+            "kb01"
+          ],
+          "expect": {
+            "ok": {
+              "survivors": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs-key.a-conflicting-key-is-a-typed-key-conflict",
+      "description": "The same key with another command, or under another id, is a conflict of its own type (key_conflict), not a job that exists: nothing started and the first job still runs.",
+      "requires": {
+        "features": [
+          "job_start_key",
+          "job_errors"
+        ]
+      },
+      "steps": [
+        {
+          "id": "first",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "kd01",
+          "command": "sh",
+          "args": [
+            "-c",
+            "sleep 30"
+          ],
+          "label": "",
+          "idempotency_key": "typed-${SCOPE}",
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              }
+            }
+          }
+        },
+        {
+          "id": "other-command",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "kd01",
+          "command": "sh",
+          "args": [
+            "-c",
+            "sleep 31"
+          ],
+          "label": "",
+          "idempotency_key": "typed-${SCOPE}",
+          "expect": {
+            "error": {
+              "kind": "conflict",
+              "code": "key_conflict"
+            }
+          }
+        },
+        {
+          "id": "other-id",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "kd02",
+          "command": "sh",
+          "args": [
+            "-c",
+            "sleep 30"
+          ],
+          "label": "",
+          "idempotency_key": "typed-${SCOPE}",
+          "expect": {
+            "error": {
+              "kind": "conflict",
+              "code": "key_conflict"
+            }
+          }
+        },
+        {
+          "id": "id-taken",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "kd01",
+          "command": "sh",
+          "args": [
+            "-c",
+            "sleep 33"
+          ],
+          "label": "",
+          "idempotency_key": "another-${SCOPE}",
+          "expect": {
+            "error": {
+              "kind": "conflict",
+              "code": "job_exists"
+            }
+          }
+        },
+        {
+          "id": "kill",
+          "op": "job_kill",
+          "scope": "${SCOPE}",
+          "jobs": [
+            "kd01"
+          ],
+          "expect": {
+            "ok": {
+              "survivors": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "jobs-key.a-keyed-start-retried-after-an-execd-restart-replays",
+      "description": "execd restarts (its jobs run on, its ledger is read again) and the start is sent again with its key: it answers the first job and runs nothing. The marker is the restarted execd answering.",
+      "requires": {
+        "features": [
+          "job_start_key"
+        ],
+        "vars": [
+          "EXECD_RESTART"
+        ]
+      },
+      "steps": [
+        {
+          "id": "first",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "kc01",
+          "command": "sh",
+          "args": [
+            "-c",
+            "echo run >> \"${ROOT}/mark\"; sleep 30"
+          ],
+          "label": "",
+          "idempotency_key": "restart-${SCOPE}",
+          "expect": {
+            "ok": {
+              "pgid": {
+                "$gt": 0
+              }
+            }
+          },
+          "save": {
+            "pg": "pgid"
+          }
+        },
+        {
+          "id": "ran",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "wc -l < \"$1/mark\"",
+            "sh",
+            "${ROOT}"
+          ],
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          },
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": {
+                "$re": "^\\s*1\\s*$"
+              }
+            }
+          }
+        },
+        {
+          "id": "restart",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "${EXECD_RESTART} ${ROOT}/restarted"
+          ],
+          "expect": {
+            "ok": {
+              "exit_code": 0
+            }
+          }
+        },
+        {
+          "id": "restarted",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "test -f \"$1/restarted\"",
+            "sh",
+            "${ROOT}"
+          ],
+          "poll": {
+            "timeout_ms": 30000,
+            "interval_ms": 200
+          },
+          "expect": {
+            "ok": {
+              "exit_code": 0
+            }
+          }
+        },
+        {
+          "id": "retried",
+          "op": "job_start",
+          "scope": "${SCOPE}",
+          "job": "kc01",
+          "command": "sh",
+          "args": [
+            "-c",
+            "echo run >> \"${ROOT}/mark\"; sleep 30"
+          ],
+          "label": "",
+          "idempotency_key": "restart-${SCOPE}",
+          "expect": {
+            "ok": {
+              "pgid": "${pg}"
+            }
+          }
+        },
+        {
+          "id": "still-running",
+          "op": "job_read",
+          "scope": "${SCOPE}",
+          "job": "kc01",
+          "offset": 0,
+          "expect": {
+            "ok": {
+              "state": "running"
+            }
+          }
+        },
+        {
+          "id": "ran-once",
+          "op": "exec",
+          "command": "sh",
+          "args": [
+            "-c",
+            "wc -l < \"$1/mark\"",
+            "sh",
+            "${ROOT}"
+          ],
+          "poll": {
+            "timeout_ms": 8000,
+            "interval_ms": 50
+          },
+          "expect": {
+            "ok": {
+              "exit_code": 0,
+              "stdout_utf8": {
+                "$re": "^\\s*1\\s*$"
+              }
+            }
+          }
+        },
+        {
+          "id": "kill",
+          "op": "job_kill",
+          "scope": "${SCOPE}",
+          "jobs": [
+            "kc01"
+          ],
+          "expect": {
+            "ok": {
+              "survivors": []
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

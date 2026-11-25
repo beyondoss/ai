@@ -9,6 +9,7 @@ kernel steers.
 from __future__ import annotations
 
 import re
+import uuid
 from typing import Any, Callable, Sequence
 
 from . import _kernel, _wire
@@ -62,6 +63,21 @@ def check_timeout(timeout: float | None) -> float | None:
     ):
         raise InvalidRequestError("`timeout` must be a non-negative number of seconds")
     return timeout
+
+
+_KEY = re.compile(r"[0-9A-Za-z._:-]{1,128}")
+
+
+def start_key(key: str | None) -> str:
+    """The start's idempotency key: the caller's, checked, else a fresh one. Taken once per call, before the first
+    send, so a start sent again for a lost answer carries the key of the first send."""
+    if key is None:
+        return uuid.uuid4().hex
+    if not _KEY.fullmatch(key):
+        raise InvalidRequestError(
+            f"bad idempotency key {key!r}: 1 to 128 characters of [0-9A-Za-z._:-]"
+        )
+    return key
 
 
 def check_scope(scope: str) -> str:
@@ -141,6 +157,7 @@ def start(
     heartbeat_seconds: int | None = None,
     timeout: float | None = None,
     pty: Pty | None = None,
+    idempotency_key: str | None = None,
 ) -> Op[JobStart]:
     """Start a job the sandbox keeps from the start (wire ``hold: false``): its process group and mark.
     The handle (``_held.py``) does the request and the checks of its answer; an endpoint that lacks the
@@ -148,7 +165,17 @@ def start(
     check_scope(scope)
     check_id(job)
     check_timeout(timeout)
-    what = Start(command, args, cwd, label, env, stdin_open, hold=False, pty=pty)
+    what = Start(
+        command,
+        args,
+        cwd,
+        label,
+        env,
+        stdin_open,
+        hold=False,
+        pty=pty,
+        key=start_key(idempotency_key),
+    )
     started = yield from _first_started(held(scope, job, what, heartbeat_seconds, timeout=timeout))
     return JobStart(started.pgid, started.mark)
 
@@ -185,6 +212,7 @@ def start_held(
     on_reconnecting: Callable[[Reconnecting], None] | None = None,
     timeout: float | None = None,
     pty: Pty | None = None,
+    idempotency_key: str | None = None,
 ) -> Op[None]:
     """Start a job held by this stream (wire ``hold: true``). Emits the job's events, the first a
     :class:`~beyond_sandbox.JobStarted` and the last a :class:`~beyond_sandbox.JobEnd`. If the stream
@@ -192,7 +220,17 @@ def start_held(
     check_scope(scope)
     check_id(job)
     check_timeout(timeout)
-    what = Start(command, args, cwd, label, env, stdin_open, hold=True, pty=pty)
+    what = Start(
+        command,
+        args,
+        cwd,
+        label,
+        env,
+        stdin_open,
+        hold=True,
+        pty=pty,
+        key=start_key(idempotency_key),
+    )
     return held(scope, job, what, heartbeat_seconds, on_reconnecting, timeout)
 
 

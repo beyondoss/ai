@@ -76,6 +76,8 @@ struct Payload {
     bytes: Vec<u8>,
     stream: Option<Stream>,
     pgid: u32,
+    /// The start's key as the `started` frame echoed it.
+    key: Option<String>,
     /// The text of an error frame.
     error: Option<String>,
 }
@@ -84,12 +86,6 @@ fn draw() -> u32 {
     let mut b = [0u8; 4];
     let _ = getrandom::fill(&mut b);
     u32::from_le_bytes(b)
-}
-
-fn fresh_key() -> String {
-    let mut b = [0u8; 16];
-    let _ = getrandom::fill(&mut b);
-    hex::encode(b)
 }
 
 fn mark_text(m: &Mark) -> &str {
@@ -106,7 +102,10 @@ pub(super) async fn drive(
         began: Instant::now(),
         divisor: h.runner.time_divisor,
     };
-    let key = fresh_key();
+    let key = match h.spec {
+        Some(spec) => super::start_key(spec)?,
+        None => String::new(),
+    };
     let silence = |ms: u64| Duration::from_millis(ms);
     let mut reader: Option<FrameReader> = None;
     let mut refusal: Option<Refusal> = None;
@@ -136,6 +135,14 @@ pub(super) async fn drive(
                 }
                 // The kernel took the first frame: the sink hears of the incarnation.
                 Action::Started { mark, .. } => {
+                    // The endpoint ignored the key: a start sent again for a lost answer would run twice.
+                    // Stop what it started (a held job dies with its stream), as for a stdin it ignored.
+                    if h.spec.is_some() && payload.key.as_deref() != Some(key.as_str()) {
+                        let _ = NativeJobs::over(h.runner)
+                            .kill(h.scope, std::slice::from_ref(h.id), true)
+                            .await;
+                        return Err(super::predates("start keys"));
+                    }
                     events(JobEvent::Started(payload.pgid, mark_text(&mark)));
                 }
                 Action::Attached { mark, from } => {
@@ -398,8 +405,9 @@ async fn read(reader: &mut Option<FrameReader>, limit: Duration, p: &mut Payload
         }
         Ok(JobFrame::End(JobEnd::Exit(code))) => KFrame::Exit { code, signal: 0 },
         Ok(JobFrame::End(JobEnd::Signal(signal))) => KFrame::Exit { code: 0, signal },
-        Ok(JobFrame::Event(Event::Started(pgid, mark, stdin, echoed))) => {
+        Ok(JobFrame::Event(Event::Started(pgid, mark, stdin, echoed, key))) => {
             p.pgid = pgid;
+            p.key = key;
             KFrame::Started {
                 mark: as_mark(mark.as_deref(), p),
                 stdin,

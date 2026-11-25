@@ -25,6 +25,7 @@ from beyond_sandbox import (
     Jobs,
     JobStart,
     JobStarted,
+    KeyConflictError,
     NotFoundError,
     NotOfferedError,
     Pty,
@@ -45,6 +46,20 @@ def jobs_over(handler: Any) -> tuple[Jobs, Endpoint]:
     e = Endpoint()
     e.handler = handler
     return Jobs(HttpTransport(e.url)), e
+
+
+def test_start_409_key_conflict_is_its_own_conflict() -> None:
+    sb, _ = jobs_over(
+        lambda h, b: reply(
+            h,
+            409,
+            {"error": "the key was used for a different command or id", "code": "key_conflict"},
+        )
+    )
+    with pytest.raises(KeyConflictError) as e:
+        sb.start("s", "aa", "true")
+    assert isinstance(e.value, ConflictError) and not isinstance(e.value, JobExistsError)
+    assert e.value.id == "aa"
 
 
 def test_start_409_and_507_are_typed() -> None:
@@ -109,7 +124,8 @@ def test_keep_seen_and_grace_ms_go_out_under_their_wire_names() -> None:
 
 
 def held_stream(h: Any, b: Any) -> None:
-    body = b'{"started":42,"mark":"ab12"}\n{"exit_code":0}\n'
+    key = b["job"]["idempotency_key"]
+    body = f'{{"started":42,"mark":"ab12","key":"{key}"}}\n{{"exit_code":0}}\n'.encode()
     reply(h, 200, body, NDJSON)
 
 
@@ -164,7 +180,15 @@ def test_async_jobs_carry_the_same_options() -> None:
 def test_pty_goes_out_on_start_and_its_echo_is_required() -> None:
     sb, e = jobs_over(
         lambda h, b: reply(
-            h, 200, {"started": 5, "mark": "0a", "stdin": True, "pty": b["job"].get("pty")}
+            h,
+            200,
+            {
+                "started": 5,
+                "mark": "0a",
+                "stdin": True,
+                "pty": b["job"].get("pty"),
+                "key": b["job"]["idempotency_key"],
+            },
         )
     )
     assert sb.start("s", "aa", "sh", pty=Pty(80, 24)) == JobStart(5, "0a")
@@ -188,13 +212,25 @@ def test_an_endpoint_that_does_not_echo_pty_is_not_offered_and_the_job_is_stoppe
 def test_a_held_terminal_start_needs_the_echo_in_its_first_frame() -> None:
     sb, _ = jobs_over(
         lambda h, b: reply(
-            h, 200, b'{"started":42,"mark": "0a","stdin":true}\n{"exit_code":0}\n', NDJSON
+            h,
+            200,
+            f'{{"started":42,"mark":"0a","stdin":true,"key":"{b["job"]["idempotency_key"]}"}}\n{{"exit_code":0}}\n'.encode(),
+            NDJSON,
         )
     )
     with pytest.raises(NotOfferedError):
         list(sb.start_held("s", "aa", "sh", pty=Pty(80, 24)))
-    ok = b'{"started":42,"mark": "0a","stdin":true,"pty":{"cols":80,"rows":24}}\n{"exit_code":0}\n'
-    sb, _ = jobs_over(lambda h, b: reply(h, 200, ok, NDJSON))
+    sb, _ = jobs_over(
+        lambda h, b: reply(
+            h,
+            200,
+            (
+                '{"started":42,"mark":"0a","stdin":true,"pty":{"cols":80,"rows":24},'
+                f'"key":"{b["job"]["idempotency_key"]}"}}\n{{"exit_code":0}}\n'
+            ).encode(),
+            NDJSON,
+        )
+    )
     first = next(iter(sb.start_held("s", "aa", "sh", pty=Pty(80, 24))))
     assert isinstance(first, JobStarted) and first.pty == Pty(80, 24)
 
@@ -276,7 +312,13 @@ def test_async_resize_and_start() -> None:
         200,
         {"cols": 9, "rows": 8}
         if b["job"]["op"] == "resize"
-        else {"started": 3, "mark": "0a", "stdin": True, "pty": b["job"]["pty"]},
+        else {
+            "started": 3,
+            "mark": "0a",
+            "stdin": True,
+            "pty": b["job"]["pty"],
+            "key": b["job"]["idempotency_key"],
+        },
     )
 
     async def go() -> None:

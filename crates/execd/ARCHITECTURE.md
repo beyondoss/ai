@@ -148,6 +148,43 @@ beside `code` 128 + S, set in the same step as `shell_exit` or the end, so no re
 in place of `{"exit_code": 128 + S}`, as a one-shot stream's is. A job stopped by `kill` therefore reports the signal that
 killed its shell (15, or 9 after the grace). Nothing is persisted: a job lives in the table and is gone with execd.
 
+**The start key.** `start` may carry `idempotency_key` (1 to 128 characters of `[0-9A-Za-z._:-]`, else `400`; `execd_jobs::key_valid`, K12 and K13): a start retried
+after its answer was lost never runs a second job. What `start` does is `Table::begin`'s decision (`start_decision`, K1 to K5, proven in
+`crates/execd-jobs`): a key already used for this command, by a job still in the table, answers that job (`200`, its process group, `stdin`
+as the first answer had it, and `key`, the key echoed: the answer, or a held start's first frame, says the endpoint kept the key, and a client that
+sent one and got no echo fails closed with `not_offered`; a held start streams the job from its first byte) and runs nothing; the same key for another command is `409`
+"the key was used for a different command or id" (`"code": "key_conflict"`; the id is part of what the client asked for); an id in the table with no key that names it (no key, or another) is `409` "the job exists".
+"The same command" is a SHA-256 digest of command, args, cwd, env (as a set), `stdin_open` and `hold` (`jobs::spec_digest`); only the
+digest is kept, never the env, which can hold secrets, and the label and the id are not in it.
+
+_Where the record lives, and how long._ The key's record (`Rec`: scope, key, id, digest) is the table's, written under its lock with the entry
+(K7), saved in the job's ledger entry (`Idem`, `execd-jobs.json`, a field the version-1 file already ignores) and put back by `recover` for
+every job it brings back (K6, `keeps_record`), so a retry after a restart of execd replays. It leaves only with its job, in `Table::take`
+(K8: exactly that job's records, no other's, never one a successor of the id could be mistaken for). There is no retention and no eviction
+(see Bounds), so a keyed record is never dropped before its job's output: a job that ended, even one whose group the restart found gone, is
+still answered by its key until it is removed. If a retention budget is ever added, a keyed job must not be evicted by it.
+
+_The claim comes first (K9, K10)._ A keyed start's ledger entry is written as an intent (phase `spawning`, the key, digest and id) before
+anything is spawned, then rewritten with the group. The write of the claim is durable: the file is written aside, synced, renamed, and
+its directory synced (`Ledger::claim`; the best-effort `save` of every other change is not). How it came out goes to the kernel
+(`launch(Option<Persist>)`, K10 and its liveness partner K16): a claim that is not durable is a start that does not run, `507` when the disk is full and
+`500` otherwise, with nothing spawned and the entry taken out of the table (its key's record with it, K8), so the retry, once the disk takes the
+claim, starts. A server with no state directory keeps nothing across a restart, so there is no claim to lose.
+
+_The restart (K9, K11)._ A restart that finds an intent with no group (a crash between the claim and the group's save) asks
+`recover(.., keyed = true)`: the job comes back ended with the lost status (`-1`, no group), in the table, its record kept, and `recover`
+returns the action `Sweep::KillMarked`, whatever the OS saw: the shell kills every process carrying the intent's mark (`proc::job_members`
+then `SIGKILL`, looking again until a pass finds none), because the spawn may have happened and nobody can find those processes by a group.
+A process between its fork and its exec carries execd's environment and not the mark yet; the repeated look catches it once it execs.
+The retry replays the lost job (`started` is `0`: there is no group), and no restart sequence runs the command twice. An unkeyed start with no group is still not saved (R4).
+
+_The replay's wait (K14, K15)._ A replay that arrives while the original is still spawning polls for its group; what each poll answers
+(`replay_poll`: answer, wait, or refuse with `500` "the job did not start") is the kernel's, over the group, whether the job ended, whether it was removed
+and how many polls were made. A job that has a group or has ended is always answered; a refusal is only for a job that never started, and the wait is bounded.
+
+_Test knob._ `EXECD_TEST_FAULT` (a debug build only) names a file whose lines `claim_save=full|eio` and `after_spawn=exit` make the claim's write fail or
+execd exit between the spawn and the group's save; removing the file clears the fault. It is read in `fault.rs` alone.
+
 **Output streams.** (`src/ring.rs` does the I/O; which offsets are held, where a read starts, which chunks retention drops and which bytes are stderr are the Verus-proven kernel `crates/execd-ring`, R1 to R6 in its docs, and `ring.rs`'s tests hold the whole to a plain `Vec` under random pushes, reads and refused chunks.) The ring keeps which pipe each byte came from, one bit per byte: an in-memory bitmap for the unfinished tail,
 allocated at the job's first stderr byte, and a `<chunk>.e` sidecar (8 KiB, same `0600`, `O_EXCL|O_NOFOLLOW`) beside each full
 chunk that holds any stderr. A job that never writes stderr allocates and writes nothing extra. Eviction removes the sidecar with
@@ -238,8 +275,8 @@ The job table's decisions are pure functions in `crates/execd-jobs` (re-exported
 no closure in a decision. `jobs.rs` takes a lock, calls the kernel, and performs the action it returns, in the same order as
 before. The two locks stay as they were, and the kernel follows them:
 
-- the table's (`Jobs::map`): `Table` (`admit`, `insert`, `get`, `in_scope`, `take`). A key in the table is `Exists` (409), a lookup
-  never leaves its scope, and `take` is the only way out.
+- the table's (`Jobs::map`): `Table` (`admit`, `begin`, `insert`, `record`, `get`, `in_scope`, `take`). A key in the table is `Exists` (409), a lookup
+  never leaves its scope, and `take` is the only way out. `begin` is what a start asks: `Start`, `Replay(id)` or `Refuse` (K1 to K5, the start key above), over the table and the key records it holds.
 - one job's (`Job`'s mutex): `State` (`Phase`: `Spawning`, `Running`, `Exited`, `Ended`, one way only; `Claim`: `Held` or `Kept`,
   never back; `seen`; `removed`, final), changed only by `step(&mut State, Ev) -> Act`.
 - output offsets: `follow` (a stream's next frame: gap, data,
@@ -266,10 +303,10 @@ There is no cap and no expiry here (see Bounds): an ended job is freed only by `
 `tests/job_model.rs` is a Stateright model that calls these functions, never a copy, and an environment (the shell dying with or
 without a descendant, `kill`, pumps, eviction, a held connection dropping at any point). Five bounded configs, each under ten
 seconds (CI kills a test at 180s): `REUSE` (one scope, one id, two jobs, one client, a one-byte ring: an id reused after a removal),
-`SCOPES` (two scopes that both use one id), `IDS` (two ids in one scope), `STREAMS` (one job, two clients, a two-byte ring), `SLOW` (a `remove`/`wipe` that decides and takes as two steps, other clients' removals and restarts of the id between). Properties: J1 an id is the claim (a start never replaces a job in the table), J2 no
+`SCOPES` (two scopes that both use one id), `IDS` (two ids in one scope), `STREAMS` (one job, two clients, a two-byte ring), `SLOW` (a `remove`/`wipe` that decides and takes as two steps, other clients' removals and restarts of the id between), `KEYED` (two keys, two specs, two ids, two jobs: a keyed start sent again at any later point, which is the retry of a lost answer, across a restart of execd, a removal and another key's record). Properties: J1 an id is the claim (a start never replaces a job in the table), J2 no
 operation resolves another scope's job, J3 a removed job never answers again (and a stream never follows a later job of its id),
 J4 an ended job never changes, J5 output offsets only move forward over what is held, J6 a kept job never dies with a held client,
-J7 a job leaves only with its group empty, J8 no signal reaches an ended job, J9 a stream follows the job it attached to, never a later job of its id, J10 a take removes only the job that was checked, never its key's successor, J11 (OS boundary, below), L1 an ended job can always be removed, L2 an ended
+J7 a job leaves only with its group empty, J8 no signal reaches an ended job, J9 a stream follows the job it attached to, never a later job of its id, J10 a take removes only the job that was checked, never its key's successor, J11 (OS boundary, below), K1 a keyed start never runs a second job for its key and spec, K2 a replay names the job started under its key and spec and a key used for another spec never starts, K3 (liveness, `k = 1`) a retry of a keyed start whose job is in the table is answered with it and a fresh key on a free id starts, K4 a start with no key never replays, L1 an ended job can always be removed, L2 an ended
 job's stream sends its final frame. `production_calls_the_kernel` fails if `jobs.rs` stops calling the kernel or writes job state
 outside it. `crates/execd-jobs/tests/production.rs` fails if `execd::job_kernel` stops being that crate, a decision leaves its `verus!` block, or a second copy of the state machine appears.
 
@@ -367,6 +404,23 @@ cargo test -p beyond-execd --features <mut> --test job_model the_mutation   # ea
 | `mut_attach_offset_shifted`           | M5 (Verus on `attach_plan`)                                                           |
 | `mut_status_only_streams`             | M6 (Verus on `quiet_from`)                                                            |
 | `mut_status_only_sends`               | M7 (Verus on `stream_next`)                                                           |
+| `mut_key_replay_starts`               | K1 (`job_model`, Verus on `start_decision`)                                           |
+| `mut_key_digest_ignored`              | K2 (`job_model`, Verus on `start_decision`)                                           |
+| `mut_key_fresh_refused`               | K3 (`job_model`, Verus on `start_decision`)                                           |
+| `mut_unkeyed_replays`                 | K4 (`job_model`, Verus on `Table::begin`)                                             |
+| `mut_key_forgotten_on_restart`        | K6 (`job_model` K3, Verus on `keeps_record`)                                          |
+| `mut_key_record_clears`               | K7 (`job_model` K3, Verus on `Table::record`)                                         |
+| `mut_key_take_forgets_none`           | K8 (`job_model` K2, Verus on `Table::forget`)                                         |
+| `mut_intent_respawns`                 | K9 (`job_model` K1, Verus on `recover`)                                               |
+| `mut_key_id_ignored`                  | K1, K2 (`job_model` K2, Verus on `Table::lookup`)                                     |
+| `mut_key_held_starts`                 | K5 (`job_model` J1, Verus on `start_decision`)                                        |
+| `mut_spawn_without_claim`             | K10 (`job_model` K10, Verus on `launch`)                                              |
+| `mut_orphan_survives`                 | K11 (`job_model` K11, Verus on `recover`)                                             |
+| `mut_durable_claim_refused`           | K16 (`job_model` K16, Verus on `launch`)                                              |
+| `mut_bad_key_accepted`                | K12 (Verus on `key_valid`)                                                            |
+| `mut_valid_key_refused`               | K13 (Verus on `key_valid`)                                                            |
+| `mut_replay_refuses_started`          | K14 (Verus on `replay_poll`)                                                          |
+| `mut_replay_waits_forever`            | K15 (Verus on `replay_poll`)                                                          |
 
 ### The OS boundary (J11)
 

@@ -38,7 +38,11 @@ def jobs_over(handler: Any) -> tuple[Jobs, Endpoint]:
 
 
 def test_start_answers_the_pgid_and_the_mark() -> None:
-    sb, _ = jobs_over(lambda h, b: reply(h, 200, {"started": 7, "mark": "ab12"}))
+    sb, _ = jobs_over(
+        lambda h, b: reply(
+            h, 200, {"started": 7, "mark": "ab12", "key": b["job"]["idempotency_key"]}
+        )
+    )
     assert sb.start("s", "aa", "true") == JobStart(7, "ab12")
 
 
@@ -50,7 +54,12 @@ def test_a_start_without_a_mark_is_not_offered() -> None:
 
 def test_a_held_start_names_its_mark_in_started_and_without_it_is_not_offered() -> None:
     sb, _ = jobs_over(
-        lambda h, b: reply(h, 200, b'{"started":4,"mark":"a1"}\n{"exit_code":0}\n', NDJSON)
+        lambda h, b: reply(
+            h,
+            200,
+            f'{{"started":4,"mark":"a1","key":"{b["job"]["idempotency_key"]}"}}\n{{"exit_code":0}}\n'.encode(),
+            NDJSON,
+        )
     )
     assert list(sb.start_held("s", "aa", "true")) == [JobStarted(4, False, "a1"), JobEnd(0)]
     sb, _ = jobs_over(lambda h, b: reply(h, 200, b'{"started":4}\n{"exit_code":0}\n', NDJSON))
@@ -83,7 +92,9 @@ def test_a_list_entry_that_names_no_mark_command_or_args_is_not_offered(missing:
 
 
 def test_ids_are_1_to_64_of_lowercase_digits_dash_and_underscore() -> None:
-    sb, e = jobs_over(lambda h, b: reply(h, 200, {"started": 1, "mark": "ab"}))
+    sb, e = jobs_over(
+        lambda h, b: reply(h, 200, {"started": 1, "mark": "ab", "key": b["job"]["idempotency_key"]})
+    )
     for ok in ("a", "a-b_c", "z" * 64):
         sb.start("s", ok, "true")
     for bad in ("", "A", "a.b", "a/b", "z" * 65):
@@ -151,7 +162,7 @@ def test_the_async_client_does_the_same() -> None:
             elif op == "remove":
                 reply(h, 200, {"running": [], "mismatch": ["m"]})
             else:
-                reply(h, 200, {"started": 7, "mark": "ab12"})
+                reply(h, 200, {"started": 7, "mark": "ab12", "key": b["job"]["idempotency_key"]})
 
         e.handler = handler
         t = AsyncHttpTransport(e.url)

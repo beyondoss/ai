@@ -6,6 +6,7 @@ import {
   IoError,
   JobExistsError,
   JobGoneError,
+  KeyConflictError,
   NotFoundError,
   StdinBusyError,
   StdinClosedError,
@@ -22,6 +23,15 @@ afterEach(async () => {
 });
 const b64 = (s: string) => Buffer.from(s).toString("base64");
 const line = (v: unknown) => utf8(JSON.stringify(v));
+
+/** An endpoint that keeps start keys echoes the one it was sent beside `started`. */
+function echoKey(b: any, v: any): unknown {
+  const k = b?.job?.idempotency_key;
+  return k !== undefined && v !== null && typeof v === "object"
+      && "started" in v && !("key" in v)
+    ? { ...v, key: k }
+    : v;
+}
 
 describe("job frames keep their stream", () => {
   it("decodes stdout and stderr frames apart, and the stdin echo", () => {
@@ -74,7 +84,7 @@ describe("job ops over HTTP", () => {
       const b = r.body as any;
       seen.push(b);
       const [status, v] = answer(b);
-      json(res, status, v);
+      json(res, status, echoKey(b, v));
     });
     closers.push(e.close);
     return { t: new HttpTransport({ url: e.url }), seen };
@@ -140,6 +150,65 @@ describe("job ops over HTTP", () => {
     });
   });
 
+  it("sends an idempotency key: one per start call, the caller's when given, checked", async () => {
+    const { t, seen } = await jobs(() => [200, { started: 5, mark: "0a" }]);
+    const jobsApi = new Jobs(t);
+    await jobsApi.start("s", "aa", { command: "true" });
+    await jobsApi.start("s", "ab", { command: "true" });
+    const [first, second] = seen.map((b) => b.job.idempotency_key);
+    expect(first).not.toEqual(second);
+    for (const k of [first, second]) {
+      expect(k).toMatch(/^[0-9A-Za-z._:-]{1,128}$/);
+    }
+    await jobsApi.start("s", "ac", {
+      command: "true",
+      idempotencyKey: "deploy-2026-11-24",
+    });
+    expect(seen[2].job.idempotency_key).toBe("deploy-2026-11-24");
+    for (const bad of ["", "a b", "k/1", "k".repeat(129)]) {
+      await expect(
+        jobsApi.start("s", "ad", { command: "true", idempotencyKey: bad }),
+      ).rejects.toMatchObject({ kind: "invalid_request" });
+    }
+    expect(seen).toHaveLength(3);
+  });
+
+  it("an endpoint that ignores start keys is not_offered: a kept start is stopped, a held one is let go", async () => {
+    const ops: string[] = [];
+    const k = await fakeEndpoint((r, res) => {
+      const op = (r.body as any).job.op as string;
+      ops.push(op);
+      json(
+        res,
+        200,
+        op === "start" ? { started: 5, mark: "0a" } : { survivors: [] },
+      );
+    });
+    closers.push(k.close);
+    await expect(
+      new Jobs(new HttpTransport({ url: k.url })).start("s", "aa", {
+        command: "true",
+      }),
+    ).rejects.toMatchObject({ kind: "not_offered" });
+    expect(ops).toEqual(["start", "kill"]);
+    const e = await fakeEndpoint((_r, res) => {
+      res.writeHead(200, { "content-type": "application/x-ndjson" });
+      res.end("{\"started\":42,\"mark\":\"00ff\"}\n{\"exit_code\":0}\n");
+    });
+    closers.push(e.close);
+    await expect((async () => {
+      for await (
+        const _ of new Jobs(new HttpTransport({ url: e.url })).startHeld(
+          "s",
+          "aa",
+          {
+            command: "true",
+          },
+        )
+      );
+    })()).rejects.toMatchObject({ kind: "not_offered" });
+  });
+
   it("kills a job whose stdin_open was ignored", async () => {
     const { t, seen } = await jobs((b) =>
       b.job.op === "start"
@@ -160,6 +229,20 @@ describe("typed job errors (each a subclass of today's kind)", () => {
     return new HttpTransport({ url: e.url });
   }
   const fail = (p: Promise<unknown>) => p.then(() => undefined, (e) => e);
+
+  it("start: a 409 key_conflict is KeyConflictError, a ConflictError that is not JobExistsError", async () => {
+    const e = await fail(
+      new Jobs(
+        await failing(409, {
+          error: "the key was used for a different command or id",
+          code: "key_conflict",
+        }),
+      ).start("s", "aa", { command: "true" }),
+    );
+    expect(e).toBeInstanceOf(KeyConflictError);
+    expect(e).toBeInstanceOf(ConflictError);
+    expect(e).not.toBeInstanceOf(JobExistsError);
+  });
 
   it("start: 409 is JobExistsError, 507 is DiskFullError", async () => {
     const exists = await fail(
@@ -273,9 +356,12 @@ describe("the wire options, under their wire names", () => {
   });
 
   it("a held start sends hold: true with stream, and the heartbeat header", async () => {
-    const e = await fakeEndpoint((_r, res) => {
+    const e = await fakeEndpoint((r, res) => {
       res.writeHead(200, { "content-type": "application/x-ndjson" });
-      res.end("{\"started\":42,\"mark\":\"00ff\"}\n{\"exit_code\":0}\n");
+      const key = (r.body as any).job.idempotency_key;
+      res.end(
+        `{"started":42,"mark":"00ff","key":"${key}"}\n{"exit_code":0}\n`,
+      );
     });
     closers.push(e.close);
     const t = new HttpTransport({ url: e.url });
@@ -325,7 +411,7 @@ describe("the mark on the wire", () => {
       const b = r.body as { job: Record<string, any> };
       bodies.push(b);
       const [status, v] = answer(b);
-      json(res, status, v);
+      json(res, status, echoKey(b, v));
     });
     closers.push(e.close);
     return { t: new HttpTransport({ url: e.url }), bodies };
@@ -477,7 +563,7 @@ describe("job terminals", () => {
       const b = r.body as any;
       seen.push(b);
       const [status, v] = answer(b);
-      json(res, status, v);
+      json(res, status, echoKey(b, v));
     });
     closers.push(e.close);
     return { t: new HttpTransport({ url: e.url }), seen };

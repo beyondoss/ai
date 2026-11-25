@@ -221,7 +221,7 @@
 //!
 //! | op | `job` fields | answer |
 //! |---|---|---|
-//! | `start` | `id`, `hold`, `label`, `stdin_open`, `pty` — the command is the request's `command`/`args`/`cwd`/`env` | `hold: true` (with `"stream": true`): a job stream; `hold: false`: `{"started": pgid, "mark"}`; both name the job's `mark` (this incarnation of the id), say `"stdin": true` when `stdin_open` was honoured, and `"pty": {"cols", "rows"}` when `pty` was ("Job terminals") |
+//! | `start` | `id`, `hold`, `label`, `stdin_open`, `pty`, `idempotency_key` — the command is the request's `command`/`args`/`cwd`/`env` | `hold: true` (with `"stream": true`): a job stream; `hold: false`: `{"started": pgid, "mark"}`; A start whose key (1 to 128 characters of `[0-9A-Za-z._:-]`) an earlier start of the same command, args, cwd, env, `stdin_open` and `hold` used answers that job as the first answer did and runs nothing, echoing the `key` beside the `mark`; the key of another command is `409`; a key an endpoint does not know is ignored and not echoed. Both name the job's `mark` (this incarnation of the id), say `"stdin": true` when `stdin_open` was honoured, and `"pty": {"cols", "rows"}` when `pty` was ("Job terminals") |
 //! | `attach` | `id`, `offset`, `mark`?, `output`? (default true) (with `"stream": true`) | a job stream from `offset`, `{"attached": {"mark", "from"}}` first; a `mark` that is not the job's is 404; `output: false` streams no output and no gap, only the end, and `from` is the output's end |
 //! | `read` | `id`, `offset`, `max` | `{"state", "code", "signal"?, "offset", "end", "data", "stderr_ranges"?, "pty"?}` |
 //! | `keep` | `id`, `num`, `kind`, `seen` | `{}` |

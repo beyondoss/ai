@@ -6,6 +6,7 @@ import {
   InvalidRequestError,
   JobExistsError,
   JobGoneError,
+  KeyConflictError,
   NotOfferedError,
   ProtocolError,
   TimeoutError,
@@ -64,7 +65,9 @@ function faultError(
     case "job_gone":
       return new JobGoneError(`job ${id}: ${said}`, id);
     case "job_exists":
-      return new JobExistsError(`job ${id} exists: ${said}`, id);
+      return said.includes("key_conflict")
+        ? new KeyConflictError(`job ${id}: ${said}`, id)
+        : new JobExistsError(`job ${id} exists: ${said}`, id);
     case "disk_full":
       return new DiskFullError(said);
     case "no_pty":
@@ -208,6 +211,22 @@ export async function* held(
             });
             break;
           case "started":
+            if (
+              init.flow === "start" && init.spec.idempotencyKey !== undefined
+              && line?.key !== init.spec.idempotencyKey
+            ) {
+              // The endpoint ignored the key: a start sent again for a lost answer would run twice.
+              // Stop what it started (a held job dies with its stream).
+              if (!init.hold) {
+                await ops.kill(init.scope, [init.id], {
+                  remove: true,
+                  graceMs: DEFAULT_KILL_GRACE_MS,
+                }).catch(() => {});
+              }
+              throw new NotOfferedError(
+                "the endpoint did not echo the start's idempotency key: it ignores keys, so a start sent again for a lost answer would run twice",
+              );
+            }
             yield {
               type: "started",
               pgid: line?.pgid ?? 0,

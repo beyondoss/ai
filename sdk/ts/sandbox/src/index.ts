@@ -76,6 +76,7 @@ export {
   IsDirectoryError,
   JobExistsError,
   JobGoneError,
+  KeyConflictError,
   NotADirectoryError,
   NotFoundError,
   NotOfferedError,

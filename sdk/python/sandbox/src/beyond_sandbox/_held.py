@@ -27,6 +27,7 @@ from .errors import (
     InvalidRequestError,
     JobExistsError,
     JobGoneError,
+    KeyConflictError,
     NotOfferedError,
     ProtocolError,
     SandboxError,
@@ -58,6 +59,9 @@ class Start:
     hold: bool = False
     #: Run the command on a terminal of this size.
     pty: Pty | None = None
+    #: The start's idempotency key, taken once per call: every send of the start carries it, and the
+    #: endpoint's echo of it is checked (an endpoint that ignores keys is ``NotOfferedError``).
+    key: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +78,8 @@ def fault_error(fault: str, status: int, detail: str, job: str) -> SandboxError:
     said = detail or f"status {status}"
     if fault == "job_gone":
         return JobGoneError(f"job {job}: {said}", id=job, status=status or None)
+    if fault == "job_exists" and "key_conflict" in said:
+        return KeyConflictError(f"job {job}: {said}", id=job, status=status or None)
     if fault == "job_exists":
         return JobExistsError(f"job {job} exists: {said}", id=job, status=status or None)
     if fault == "disk_full":
@@ -149,6 +155,25 @@ def held(
                 if on_reconnecting is not None:
                     on_reconnecting(Reconnecting(a.attempts, K.elapsed_ms(a.since_ms)))
             elif isinstance(a, K.Started):
+                if isinstance(what, Start) and what.key and (line is None or line.key != what.key):
+                    # The endpoint ignored the key: a start sent again for a lost answer would run twice.
+                    # Stop what it started (a held job dies with its stream), as for a stdin it ignored.
+                    if not what.hold:
+                        with contextlib.suppress(SandboxError):
+                            yield Call(
+                                _wire.job_op(
+                                    "kill",
+                                    scope,
+                                    ids=[job],
+                                    remove=True,
+                                    grace_ms=_wire.KILL_GRACE_MS,
+                                )
+                            )
+                    yield Release()
+                    raise NotOfferedError(
+                        "the endpoint did not echo the start's idempotency key: it ignores keys, so a "
+                        "start sent again for a lost answer would run twice"
+                    )
                 yield Emit(
                     JobStarted(
                         line.pgid if line else 0, a.stdin, a.mark, line.pty if line else None
@@ -194,7 +219,7 @@ def _start_open(
     scope: str, job: str, s: Start, heartbeat_seconds: int | None, silence_ms: int
 ) -> Open:
     return Open(
-        _wire.job_start_op(scope, job, s.hold, s.label, s.stdin_open, s.pty),
+        _wire.job_start_op(scope, job, s.hold, s.label, s.stdin_open, s.pty, s.key),
         silence_ms,
         s.command,
         s.args,

@@ -14,7 +14,7 @@ use tokio::io::{AsyncBufReadExt as _, BufReader};
 
 /// What a scenario's `requires.features` may name (sdk/conformance/DRIVER.md): this client reads the
 /// raw stream, so it has all of them.
-const FEATURES: [&str; 11] = [
+const FEATURES: [&str; 12] = [
     "frames",
     "unbounded_stream",
     "exit_signal",
@@ -26,6 +26,7 @@ const FEATURES: [&str; 11] = [
     "job_options",
     "job_marks",
     "job_pty",
+    "job_start_key",
 ];
 
 fn config() -> Config {

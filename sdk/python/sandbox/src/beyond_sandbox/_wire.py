@@ -254,10 +254,19 @@ def check_pty(pty: Pty) -> dict[str, int]:
 
 
 def job_start_op(
-    scope: str, job: str, hold: bool, label: str, stdin_open: bool, pty: Pty | None
+    scope: str, job: str, hold: bool, label: str, stdin_open: bool, pty: Pty | None, key: str
 ) -> dict[str, Any]:
     extra: dict[str, Any] = {} if pty is None else {"pty": check_pty(pty)}
-    return job_op("start", scope, id=job, hold=hold, label=label, stdin_open=stdin_open, **extra)
+    return job_op(
+        "start",
+        scope,
+        id=job,
+        hold=hold,
+        label=label,
+        stdin_open=stdin_open,
+        idempotency_key=key,
+        **extra,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -273,6 +282,8 @@ class JobLine:
     pgid: int = 0
     #: A ``started`` frame's terminal, as the endpoint echoed it.
     pty: Pty | None = None
+    #: A ``started`` frame's echo of the start's idempotency key (``None``: the endpoint ignores keys).
+    key: str | None = None
     #: Why the frame is ``bad``.
     note: str = ""
 
@@ -334,6 +345,7 @@ def _line_of(obj: dict[str, Any]) -> JobLine:
             ),
             pgid=int(started),
             pty=pty,
+            key=obj["key"] if isinstance(obj.get("key"), str) else None,
         )
     for key in ("stdout", "stderr"):
         if isinstance(obj.get(key), str):

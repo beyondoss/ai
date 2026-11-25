@@ -934,6 +934,9 @@ class HttpJobs implements JobOps {
         ...(spec.pty
           ? { pty: { cols: spec.pty.cols, rows: spec.pty.rows } }
           : {}),
+        ...(spec.idempotencyKey !== undefined
+          ? { idempotency_key: spec.idempotencyKey }
+          : {}),
       }),
       env: spec.env,
       heartbeatSeconds: req.heartbeatSeconds,
@@ -1259,6 +1262,8 @@ export interface JobLine {
   pgid?: number;
   /** A `started` frame's terminal size (the shell keeps it; the kernel is told only whether one was echoed). */
   pty?: PtySize;
+  /** A `started` frame's echo of the start's idempotency key (absent: the endpoint ignores keys). */
+  key?: string;
   /** Why the frame is `bad`. */
   note?: string;
 }
@@ -1332,6 +1337,7 @@ export function decodeJobLine(line: Uint8Array): JobLine {
       },
       pgid: v.started,
       ...(pty === null ? {} : { pty }),
+      ...(typeof v.key === "string" ? { key: v.key } : {}),
     };
   }
   const stream = typeof v.stdout === "string"

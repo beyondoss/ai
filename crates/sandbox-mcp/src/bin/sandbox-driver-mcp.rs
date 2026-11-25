@@ -460,6 +460,7 @@ impl Mcp {
                             ("label", json!(opt_str(req, "label")?)),
                             ("env", req["env"].clone()),
                             ("stdin_open", req["stdin_open"].clone()),
+                            ("idempotency_key", req["idempotency_key"].clone()),
                         ]),
                     )
                     .await?;
@@ -1011,6 +1012,7 @@ async fn main() {
                     Ok(json!({
                         "driver": DRIVER, "protocol": 1, "ops": OPS,
                         "features": ["exit_signal", "exec_env", "job_streams", "job_stdin", "job_signal_op", "job_marks"], "missing": missing_features(),
+                        "features": ["exit_signal", "exec_env", "job_streams", "job_stdin", "job_signal_op", "job_start_key"], "missing": missing_features(),
                     }))
                 } else if !OPS.contains(&op.as_str()) {
                     Err(err("unsupported", "no such op"))

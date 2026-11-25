@@ -166,6 +166,7 @@ pub(crate) async fn connect(
         env: Vec::new(),
         stdin_open: false,
         pty: None,
+        idempotency_key: None,
     };
     store.start_kept(&scope, &id, &spec).await?;
 

@@ -168,6 +168,19 @@ export class JobExistsError extends ConflictError {
   }
 }
 
+/**
+ * `start` whose idempotency key was already used for another command or under another id (409
+ * `key_conflict`): the id is part of what the call asked for. Nothing started; the first job is left alone.
+ */
+export class KeyConflictError extends ConflictError {
+  readonly id: string;
+
+  constructor(detail: string, id: string, options?: { cause?: unknown }) {
+    super(detail, options);
+    this.id = id;
+  }
+}
+
 /** `start` refused because the sandbox's disk is full (507): there is no room for the job's output. */
 export class DiskFullError extends IoError {
   constructor(detail: string, options?: { cause?: unknown }) {

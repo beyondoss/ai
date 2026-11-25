@@ -92,9 +92,10 @@ class Server:
                 echo = {
                     "started": 42,
                     **({} if self.script.echo is None else {"mark": self.script.echo}),
+                    **({} if "idempotency_key" not in job else {"key": job["idempotency_key"]}),
                 }
                 return self._json(h, 200, echo)
-            return self._stream(h, 0, True)
+            return self._stream(h, 0, True, job.get("idempotency_key"))
         if job["op"] == "kill":
             self.kills.append(job)
             return self._json(h, 200, {"survivors": []})
@@ -127,7 +128,9 @@ class Server:
         h.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
         h.wfile.flush()
 
-    def _stream(self, h: BaseHTTPRequestHandler, offset: int, start: bool) -> None:
+    def _stream(
+        self, h: BaseHTTPRequestHandler, offset: int, start: bool, key: str | None = None
+    ) -> None:
         sc = self.script
         h.send_response(200)
         h.send_header("Content-Type", "application/x-ndjson")
@@ -136,7 +139,14 @@ class Server:
         at = max(offset, sc.base)
         mark = sc.reattach_echo if not start and sc.reattach_echo is not None else sc.echo
         if start:
-            self._write(h, {"started": 42, **({} if mark is None else {"mark": mark})})
+            self._write(
+                h,
+                {
+                    "started": 42,
+                    **({} if mark is None else {"mark": mark}),
+                    **({} if key is None else {"key": key}),
+                },
+            )
         elif mark is not None:
             self._write(h, {"attached": {"mark": mark, "from": at}})
         if sc.hang_s:

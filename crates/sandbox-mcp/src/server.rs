@@ -282,6 +282,10 @@ pub struct JobStartArgs {
     env: Opt<std::collections::BTreeMap<String, String>>,
     /// Keep the job's standard input open for `job_write`. Default false: the job reads EOF.
     stdin_open: Opt<bool>,
+    /// Makes the start safe to repeat: 1 to 128 characters of [0-9A-Za-z._:-]. A job_start that repeats an
+    /// earlier call's key with the same command, cwd and env returns that job and runs nothing; the key of another
+    /// command is an error. Default: a fresh key for each call.
+    idempotency_key: Opt<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -1159,6 +1163,7 @@ impl SandboxMcp {
             env: a.env.into_inner().unwrap_or_default().into_iter().collect(),
             stdin_open: a.stdin_open.unwrap_or(false),
             pty: None,
+            idempotency_key: a.idempotency_key.into_inner(),
         };
         let t = self.target().await?;
         let st = t.sandbox.jobs()?.start_kept(&scope, &id, &spec).await?;
