@@ -2,11 +2,15 @@ import { concat } from "./bytes.js";
 import { InvalidRequestError, JobGoneError, ProtocolError } from "./errors.js";
 import { DEFAULT_KILL_GRACE_MS, isJobId } from "./transport.js";
 import type {
+  AttachOptions,
   JobChunk,
   JobFrame,
   JobInfo,
   JobSpec,
+  JobStarted,
   KeepFields,
+  RemoveOptions,
+  RemoveResult,
   ReqOptions,
   StdinWritten,
   Survivor,
@@ -44,6 +48,8 @@ export interface JobOutput {
   stderr: Uint8Array;
   /** Bytes of output dropped before they could be read. */
   gap: number;
+  /** The job's mark and where the stream started (the `attached` frame). */
+  attached?: { mark: string; from: number };
 }
 
 function validScope(scope: string): void {
@@ -57,7 +63,7 @@ function validScope(scope: string): void {
 function validId(id: string): void {
   if (typeof id !== "string" || !isJobId(id)) {
     throw new InvalidRequestError(
-      `bad job id ${JSON.stringify(id)}: 1 to 32 characters of [0-9a-z]`,
+      `bad job id ${JSON.stringify(id)}: 1 to 64 characters of [0-9a-z_-]`,
     );
   }
 }
@@ -83,7 +89,7 @@ export class Jobs {
   }
 
   /**
-   * Start a job the sandbox keeps from the start; returns its process group. An id that exists is
+   * Start a job the sandbox keeps from the start; returns its process group and mark. An id that exists is
    * {@link JobExistsError}; a full disk is {@link DiskFullError}.
    */
   async start(
@@ -91,7 +97,7 @@ export class Jobs {
     id: string,
     spec: JobSpec,
     req: ReqOptions = {},
-  ): Promise<number> {
+  ): Promise<JobStarted> {
     validScope(scope);
     validId(id);
     return this.transport.jobs.start(scope, id, spec, req);
@@ -158,7 +164,7 @@ export class Jobs {
     scope: string,
     id: string,
     offset = 0,
-    req: ReqOptions = {},
+    req: AttachOptions = {},
   ): AsyncGenerator<JobFrame> {
     validScope(scope);
     validId(id);
@@ -171,13 +177,15 @@ export class Jobs {
     scope: string,
     id: string,
     offset = 0,
-    req: ReqOptions = {},
+    req: AttachOptions = {},
   ): Promise<JobOutput> {
     const chunks: Uint8Array[] = [];
     const errs: Uint8Array[] = [];
     let gap = 0;
+    let attached: { mark: string; from: number } | undefined;
     for await (const f of this.follow(scope, id, offset, req)) {
-      if (f.type === "output") {
+      if (f.type === "attached") attached = { mark: f.mark, from: f.from };
+      else if (f.type === "output") {
         chunks.push(f.data);
         if (f.stream === "stderr") errs.push(f.data);
       } else if (f.type === "gap") gap += f.bytes;
@@ -187,6 +195,7 @@ export class Jobs {
           output: concat(chunks),
           stderr: concat(errs),
           gap,
+          ...(attached ? { attached } : {}),
         };
       } else if (f.type === "signal") {
         return {
@@ -195,6 +204,7 @@ export class Jobs {
           output: concat(chunks),
           stderr: concat(errs),
           gap,
+          ...(attached ? { attached } : {}),
         };
       }
     }
@@ -253,15 +263,18 @@ export class Jobs {
     }, req);
   }
 
-  /** Delete jobs whose process group is empty; a running job is left alone. */
+  /**
+   * Delete jobs whose process group is empty. A running job is left and reported in `running`; a job
+   * whose mark is not the one `marks` names for its id is left and reported in `mismatch`.
+   */
   async remove(
     scope: string,
     ids: string[],
-    req: ReqOptions = {},
-  ): Promise<void> {
+    req: RemoveOptions = {},
+  ): Promise<RemoveResult> {
     validScope(scope);
     ids.forEach(validId);
-    if (ids.length === 0) return;
+    if (ids.length === 0) return { running: [], mismatch: [] };
     return this.transport.jobs.remove(scope, ids, req);
   }
 

@@ -27,6 +27,7 @@ describe("driver without an endpoint", () => {
           "job_signal_op",
           "job_errors",
           "job_options",
+          "job_marks",
         ],
       },
     });
@@ -116,7 +117,7 @@ describe("driver without an endpoint", () => {
       { op: "exec", command: "true", args: [1] },
       { op: "list", path: "/", include_hidden: "yes" },
       { op: "job_start", scope: "s", job: "BAD", command: "true" },
-      { op: "job_start", scope: "s", job: "x".repeat(33), command: "true" },
+      { op: "job_start", scope: "s", job: "x".repeat(65), command: "true" },
       { op: "job_kill", scope: "s", jobs: ["a/b"] },
       { op: "job_remove", scope: "s", jobs: ["A"] },
     ];
