@@ -26,18 +26,7 @@ import tempfile
 import traceback
 from typing import Any, Callable, cast
 
-from . import (
-    AsyncSandbox,
-    Exit,
-    Sandbox,
-    SandboxError,
-    Signal,
-    Stderr,
-    Stdout,
-    TimedOut,
-    _bulk,
-    _jobs,
-)
+from . import AsyncSandbox, Exit, Sandbox, SandboxError, Signal, Stderr, Stdout, TimedOut, _bulk
 from .atransport import AsyncHttpTransport
 from .errors import (
     DiskFullError,
@@ -402,15 +391,6 @@ def _job_plan(op: str, req: dict[str, Any]) -> Plan:
             "gap": a.gap,
         },
     )
-
-
-def _check_job_names(req: dict[str, Any]) -> None:
-    """A bad scope or job id is ``invalid_request`` before the endpoint is probed, not a transport error."""
-    _jobs.check_scope(_str(req, "scope"))
-    for key in ("job", "jobs"):
-        if key in req:
-            for i in [req[key]] if key == "job" else _strings(req, key):
-                _jobs.check_id(i if isinstance(i, str) else "")
 
 
 def _marks(req: dict[str, Any]) -> dict[str, str] | None:
@@ -874,9 +854,6 @@ class Driver:
         self.sb: Any = None
 
     def _ensure_sync(self) -> Any:
-        # A job handle keeps trying while the endpoint is unreachable (the kernel's rule: reconnecting is a
-        # status, never an end), so the driver probes once before a job op, which is what makes an endpoint
-        # nobody answers `transport` for a job op as for every other.
         # Construct without probing: plan()/Jobs validate client-side first, so a bad job id
         # stays invalid_request instead of racing a transport error. Public Sandbox.connect still probes.
         if self.sb is None:
@@ -928,11 +905,7 @@ class Driver:
                 return {"id": id_, "ok": _bulk_sync(op, req, self._ensure_sync())}
             # Validate the request before connecting so a bad payload is never a transport error.
             call, shape = plan(op, req)
-            sb = self._ensure_sync()
-            if op.startswith("job_"):
-                _check_job_names(req)
-                sb.capabilities()  # an endpoint nobody answers is `transport` here, as for every other op
-            return {"id": id_, "ok": shape(call(sb))}
+            return {"id": id_, "ok": shape(call(self._ensure_sync()))}
         except Exception as e:
             return _fail(id_, e)
 
@@ -952,9 +925,6 @@ class Driver:
                 return {"id": id_, "ok": await _bulk_async(op, req, sb)}
             call, shape = plan(op, req)
             sb = await self._ensure_async()
-            if op.startswith("job_"):
-                _check_job_names(req)
-                await sb.capabilities()  # as in `handle`
             result = call(sb)
             if inspect.isawaitable(result):
                 result = await result

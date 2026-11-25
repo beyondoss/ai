@@ -28,6 +28,7 @@ from typing import (
 
 from . import _http, _wire
 from .errors import (
+    ConnectError,
     NotOfferedError,
     ProtocolError,
     SandboxError,
@@ -341,7 +342,7 @@ class HttpTransport:
         except builtins.TimeoutError:
             raise TimeoutError(f"exec endpoint {self.url} timed out") from None
         except OSError as e:
-            raise TransportError(f"exec endpoint {self.url} unreachable: {e}") from None
+            raise ConnectError(f"exec endpoint {self.url} unreachable: {e}") from None
 
     def _open(
         self,

@@ -183,6 +183,9 @@ pub enum Fault {
     Protocol,
     /// The credential is refused.
     Auth,
+    /// A start that nothing ever answered: the connection was refused or the name did not resolve on the
+    /// first try, so no request of it reached any server.
+    Transport,
 }
 
 /// What a request is, for classifying its answer.
@@ -224,6 +227,10 @@ pub struct State {
     pub kept: bool,
     /// The consumer has been told the echo (`Started` or the first `Attached`): a reattach's is not told again.
     pub announced: bool,
+    /// A request of this handle may have reached a server: it was answered, or its answer was lost. Until
+    /// then a start that cannot connect ends with `Transport`; after it, only the job's end or a terminal
+    /// answer does.
+    pub reached: bool,
     /// The incarnation this handle holds; length 0 until the echo names it (a start, or a `get`).
     pub mark: Mark,
     /// The next output byte the consumer has not been given.
@@ -274,6 +281,9 @@ pub enum Event {
     Frame(Frame),
     /// The stream broke: reset, silence for the limit, EOF or a truncated line before the final frame.
     Broke,
+    /// The request never reached a server: the connection was refused, the host was unreachable or its name
+    /// did not resolve. Nothing was sent, so nothing was started.
+    Unreached,
     /// A sleep the kernel asked for ended.
     Tick,
     /// The consumer received the exit.
@@ -871,6 +881,29 @@ pub open spec fn post_key(s: State, ev: Event, s2: State, out: Seq<Action>) -> b
     }
 }
 
+/// T: a start nothing answered. A start whose first request could not even connect (`Unreached`: refused,
+/// unreachable, the name did not resolve) before any request of it may have reached a server ends with
+/// `Transport`: nothing was started and nobody answered, so there is nothing to keep trying for. From the
+/// moment any request of the handle was answered, or its answer was lost (`reached`), the handle never ends on
+/// a failure to connect: it backs off and reopens, however many fail in a row. Only that one case ends with
+/// `Transport`, and each failure to connect after it is the retry that a retry-class answer gets (the handle
+/// is not done, so the caller's retry is the next `Tick`).
+pub open spec fn post_unreached(s: State, ev: Event, s2: State, out: Seq<Action>) -> bool {
+    &&& s2.reached == (s.reached || (s.phase is Starting && (ev is Answered || ev is Broke)))
+    &&& (ev is Unreached && s.phase is Starting && !s.reached) ==> {
+        &&& s2.phase is Done
+        &&& out == seq![Action::Fail { fault: Fault::Transport, status: 0, offset: s.offset }]
+    }
+    &&& (ev is Unreached && !(s.phase is Done) && !(s.phase is Starting && !s.reached)) ==> !(s2.phase is Done)
+    &&& (ev is Unreached && ((s.phase is Starting && s.reached) || s.phase is Opening || s.phase is Removing))
+        ==> s2.phase is Backoff
+    &&& forall|i: int| 0 <= i < out.len() ==> match #[trigger] out[i] {
+        Action::Fail { fault, .. } => (fault is Transport) ==> (ev is Unreached && s.phase is Starting
+            && !s.reached),
+        _ => true,
+    }
+}
+
 /// V: watch. A watching handle counts output and delivers none of it.
 pub open spec fn post_watch(s: State, s2: State, out: Seq<Action>) -> bool {
     &&& s2.mode == s.mode
@@ -914,6 +947,7 @@ pub open spec fn post_only_these_end(s: State, ev: Event, s2: State, out: Seq<Ac
         ||| ev is ExitTaken
         ||| ev is Answered
         ||| ev is Frame
+        ||| ev is Unreached
     }
     &&& (ev is ExitTaken && s2.phase is Done && !(s.phase is Done)) ==> (s.phase is ExitHeld
         && !s.remove_on_exit)
@@ -957,6 +991,7 @@ pub open spec fn step_post(s: State, ev: Event, now: u64, s2: State, out: Seq<Ac
     &&& post_watch(s, s2, out)
     &&& post_end(s, ev, s2, out)
     &&& post_only_these_end(s, ev, s2, out)
+    &&& post_unreached(s, ev, s2, out)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1343,6 +1378,7 @@ fn step_close(s: State, ev: Event, now: u64) -> (r: (State, Vec<Action>))
         post_watch(s, r.0, r.1@),
         post_end(s, ev, r.0, r.1@),
         post_only_these_end(s, ev, r.0, r.1@),
+        post_unreached(s, ev, r.0, r.1@),
         post_surface(s, ev, r.0, r.1@),
 {
     let open = matches!(s.phase, Phase::Starting) || matches!(s.phase, Phase::Opening)
@@ -1383,6 +1419,7 @@ fn step_idle(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<Action
         post_watch(s, r.0, r.1@),
         post_end(s, ev, r.0, r.1@),
         post_only_these_end(s, ev, r.0, r.1@),
+        post_unreached(s, ev, r.0, r.1@),
         post_surface(s, ev, r.0, r.1@),
 {
     if matches!(ev, Event::Go) {
@@ -1414,6 +1451,7 @@ fn step_backoff(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<Act
         post_watch(s, r.0, r.1@),
         post_end(s, ev, r.0, r.1@),
         post_only_these_end(s, ev, r.0, r.1@),
+        post_unreached(s, ev, r.0, r.1@),
         post_surface(s, ev, r.0, r.1@),
 {
     if matches!(ev, Event::Tick) {
@@ -1428,6 +1466,19 @@ fn step_backoff(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<Act
         return (s, out);
     }
     (s, Vec::new())
+}
+
+/// The handle after an event, as to `reached`: an answer or a lost answer of a start means a request of it may
+/// have reached a server.
+fn mark_reached(s: State, ev: Event) -> (r: State)
+    ensures
+        r == (State { reached: s.reached || (s.phase is Starting && (ev is Answered || ev is Broke)), ..s }),
+{
+    let mut t = s;
+    if matches!(s.phase, Phase::Starting) && (matches!(ev, Event::Answered { .. }) || matches!(ev, Event::Broke)) {
+        t.reached = true;
+    }
+    t
 }
 
 /// A request is in flight (start, attach or remove) and the answer, or the cut, came.
@@ -1454,8 +1505,10 @@ fn step_request(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<Act
         post_watch(s, r.0, r.1@),
         post_end(s, ev, r.0, r.1@),
         post_only_these_end(s, ev, r.0, r.1@),
+        post_unreached(s, ev, r.0, r.1@),
         post_surface(s, ev, r.0, r.1@),
 {
+    let s = mark_reached(s, ev);
     match ev {
         Event::Answered { status, retry_after_s } => {
             let op = if matches!(s.phase, Phase::Starting) {
@@ -1496,6 +1549,12 @@ fn step_request(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<Act
             }
             backoff(s, 0, now, draw, true)
         },
+        Event::Unreached => {
+            if matches!(s.phase, Phase::Starting) && !s.reached && !cfg!(feature = "mut_unanswered_start_retries") {
+                return fail(s, Fault::Transport, 0, false);
+            }
+            backoff(s, 0, now, draw, false)
+        },
         _ => (s, Vec::new()),
     }
 }
@@ -1524,6 +1583,7 @@ fn step_confirming(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<
         post_watch(s, r.0, r.1@),
         post_end(s, ev, r.0, r.1@),
         post_only_these_end(s, ev, r.0, r.1@),
+        post_unreached(s, ev, r.0, r.1@),
         post_surface(s, ev, r.0, r.1@),
 {
     match ev {
@@ -1596,6 +1656,7 @@ fn step_streaming(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<A
         post_watch(s, r.0, r.1@),
         post_end(s, ev, r.0, r.1@),
         post_only_these_end(s, ev, r.0, r.1@),
+        post_unreached(s, ev, r.0, r.1@),
         post_surface(s, ev, r.0, r.1@),
 {
     match ev {
@@ -1708,6 +1769,7 @@ fn step_exit_held(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<A
         post_watch(s, r.0, r.1@),
         post_end(s, ev, r.0, r.1@),
         post_only_these_end(s, ev, r.0, r.1@),
+        post_unreached(s, ev, r.0, r.1@),
         post_surface(s, ev, r.0, r.1@),
 {
     match ev {
@@ -1765,6 +1827,7 @@ pub fn step(s: State, ev: Event, now: u64, draw: u32) -> (r: (State, Vec<Action>
         post_watch(s, r.0, r.1@),
         post_end(s, ev, r.0, r.1@),
         post_only_these_end(s, ev, r.0, r.1@),
+        post_unreached(s, ev, r.0, r.1@),
         post_surface(s, ev, r.0, r.1@),
 {
     if matches!(s.phase, Phase::Done) {
@@ -1874,6 +1937,7 @@ impl State {
             stdin_open,
             kept,
             announced: false,
+            reached: false,
             key,
             mark: Mark { len: 0, b: [0; 32] },
             offset: 0,
@@ -1901,6 +1965,7 @@ impl State {
             stdin_open: false,
             kept: false,
             announced: false,
+            reached: false,
             key: 0,
             mark,
             offset,

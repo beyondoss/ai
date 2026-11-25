@@ -18,6 +18,7 @@ from held_server import MARK, Script, Server, serve
 from beyond_sandbox import (
     AsyncHttpTransport,
     AuthError,
+    ConnectError,
     DiskFullError,
     EndpointError,
     HttpTransport,
@@ -29,6 +30,8 @@ from beyond_sandbox import (
     JobStarted,
     NotOfferedError,
     Reconnecting,
+    TimeoutError,
+    TransportError,
     _drive,
 )
 from beyond_sandbox import _kernel as K
@@ -308,3 +311,80 @@ def test_the_shell_delivers_exactly_the_gap_and_the_frame_the_kernel_names(
     monkeypatch.setattr(K, "_loaded", stub)
     # The first line is the `attached` echo, which has no data: the gap is told, no output follows.
     assert list(r.jobs.follow("s", "aa")) == [JobGap(7)]
+
+
+# ---- a start nothing answers, and the caller's deadline ------------------------------------------
+
+
+def closed_url() -> str:
+    """An endpoint nothing listens on: the connection is refused."""
+    import socket
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return f"http://127.0.0.1:{s.getsockname()[1]}/exec"
+
+
+def test_a_start_nothing_answers_ends_with_a_connect_error_at_once() -> None:
+    import time
+
+    t0 = time.monotonic()
+    with pytest.raises(ConnectError) as e:
+        Jobs(HttpTransport(closed_url())).start("s", "aa", "true")
+    assert isinstance(e.value, TransportError)  # `except TransportError` keeps working
+    assert time.monotonic() - t0 < 5
+    with pytest.raises(ConnectError):
+        list(Jobs(HttpTransport(closed_url())).start_held("s", "aa", "true"))
+
+
+def test_async_a_start_nothing_answers_ends_with_a_connect_error() -> None:
+    async def main() -> None:
+        with pytest.raises(ConnectError):
+            await AsyncJobs(AsyncHttpTransport(closed_url())).start("s", "aa", "true")
+
+    asyncio.run(main())
+
+
+def test_once_anything_answered_a_failure_to_connect_never_ends_the_handle(rig: Any) -> None:
+    import threading
+    import time
+
+    r = rig(Script("abc", start_status=429))
+    threading.Timer(0.15, r.server.close).start()  # the endpoint goes away after its first answer
+    t0 = time.monotonic()
+    # It is not `ConnectError`: the first start was answered (429), so the handle keeps trying until the
+    # caller's own deadline ends it.
+    with pytest.raises(TimeoutError):
+        r.jobs.start("s", "aa", "true", timeout=1.5)
+    assert 1.4 < time.monotonic() - t0 < 6
+    assert len(r.server.starts) >= 1
+
+
+def test_the_callers_deadline_ends_a_follow_that_cannot_connect() -> None:
+    import time
+
+    t0 = time.monotonic()
+    with pytest.raises(TimeoutError):
+        list(Jobs(HttpTransport(closed_url())).follow("s", "aa", timeout=0.6))
+    assert 0.5 < time.monotonic() - t0 < 5
+
+
+def test_async_the_callers_deadline_ends_a_follow_that_cannot_connect() -> None:
+    async def main() -> None:
+        jobs = AsyncJobs(AsyncHttpTransport(closed_url()))
+        with pytest.raises(TimeoutError):
+            await jobs.collect("s", "aa", timeout=0.6)
+        with pytest.raises(TimeoutError):
+            [f async for f in jobs.follow("s", "aa", timeout=0.6)]
+
+    asyncio.run(main())
+
+
+def test_a_deadline_that_is_not_a_number_of_seconds_is_refused(rig: Any) -> None:
+    from beyond_sandbox import InvalidRequestError
+
+    r = rig(Script("abc"))
+    for bad in (-1, "5", True):
+        with pytest.raises(InvalidRequestError):
+            list(r.jobs.follow("s", "aa", timeout=bad))
+    assert list(r.jobs.follow("s", "aa", timeout=30))[-1] == JobEnd(0)

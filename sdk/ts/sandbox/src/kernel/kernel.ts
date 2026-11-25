@@ -17,7 +17,8 @@ export type Fault =
   | "deadline"
   | "not_offered"
   | "protocol"
-  | "auth";
+  | "auth"
+  | "transport";
 const FAULTS: readonly Fault[] = [
   "job_gone",
   "job_exists",
@@ -27,6 +28,7 @@ const FAULTS: readonly Fault[] = [
   "not_offered",
   "protocol",
   "auth",
+  "transport",
 ];
 
 /** What the stream's frames said; the payload bytes stay in the shell. `mark` is hex, "" for none. */
@@ -49,7 +51,8 @@ export type KEvent =
   | { t: "tick" }
   | { t: "exitTaken" }
   | { t: "close" }
-  | { t: "deadline" };
+  | { t: "deadline" }
+  | { t: "unreached" };
 
 /** What the shell does. */
 export type KAction =
@@ -109,10 +112,10 @@ interface Exports {
 type Call = (inp: number, n: number, out: number, cap: number) => number;
 
 /** The ABI `codec.rs` lays out. A change to a layout there bumps `ABI_VERSION`, and this must follow. */
-const ABI_VERSION = 4;
-/** Room for any one call's input or answer: a state (88 B) and an event (45 B at most), or a cursor. */
+const ABI_VERSION = 5;
+/** Room for any one call's input or answer: a state (89 B) and an event (45 B at most), or a cursor. */
 const BUF = 1024;
-const STATE = 88;
+const STATE = 89;
 
 const MAX_SAFE = BigInt(Number.MAX_SAFE_INTEGER);
 
@@ -262,6 +265,9 @@ function eventBytes(w: Wr, e: KEvent): void {
       return;
     case "deadline":
       w.u8(7);
+      return;
+    case "unreached":
+      w.u8(8);
       return;
   }
 }

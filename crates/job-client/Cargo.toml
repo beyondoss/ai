@@ -73,6 +73,7 @@ mut_attached_not_told = [] # the first attached echo is not told (U)
 mut_shell_exit_not_told = [] # the shell's exit is not told (U)
 mut_kill_skipped = [] # a kept start whose echo was refused is left running (U)
 mut_kill_when_held = [] # a held start's refused echo also kills (U)
+mut_unanswered_start_retries = [] # a start that never connected is retried, not ended (T)
 mut_other_404_unclassified = [] # 404 of an op on one job is not JobGone (C)
 mut_signal_zero_kills = [] # an exit with no signal is told as a kill, and a kill as an exit (X)
 

@@ -12,7 +12,7 @@ use std::ptr::NonNull;
 use crate::codec;
 
 /// The ABI's version: the layout of every record in `codec.rs`. A change to a layout bumps it.
-pub const ABI_VERSION: u32 = 4;
+pub const ABI_VERSION: u32 = 5;
 
 /// The most input one call takes. A host that passes more has a wrong length: no record here is near it.
 const MAX_IN: usize = 0x1_0000;

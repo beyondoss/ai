@@ -64,6 +64,7 @@ ignore = [
 "src/beyond_sandbox/atransport.py" = ["A004"]
 "src/beyond_sandbox/transport.py" = ["A004"]
 "tests/test_bulk.py" = ["A004"]
+"tests/test_held.py" = ["A004"]
 "tests/test_transport.py" = ["A004"]
 
 [tool.ruff.format]

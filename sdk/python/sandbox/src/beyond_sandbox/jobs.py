@@ -65,13 +65,16 @@ class Jobs:
         env: dict[str, str] | None = None,
         stdin_open: bool = False,
         heartbeat_seconds: int | None = None,
+        timeout: float | None = None,
     ) -> JobStart:
         """Start a job the sandbox keeps from the start; returns its process group and mark. ``env`` is the
         command's own environment; ``stdin_open`` keeps its stdin open for :meth:`write_stdin`
         (an endpoint that predates it is a ``NotOfferedError`` and the job is stopped). An id that
         exists is :class:`~beyond_sandbox.JobExistsError`; a full disk is
         :class:`~beyond_sandbox.DiskFullError`."""
-        op = _jobs.start(scope, job, command, args, cwd, label, env, stdin_open, heartbeat_seconds)
+        op = _jobs.start(
+            scope, job, command, args, cwd, label, env, stdin_open, heartbeat_seconds, timeout
+        )
         return drive(op, self._t)
 
     def start_held(
@@ -87,6 +90,7 @@ class Jobs:
         stdin_open: bool = False,
         heartbeat_seconds: int | None = None,
         on_reconnecting: Callable[[Reconnecting], None] | None = None,
+        timeout: float | None = None,
     ) -> Generator[JobFrame, None, None]:
         """Start a job held by the returned stream (wire ``hold: true``): events, the first a
         :class:`JobStarted`, ending with a :class:`JobEnd`. If you stop before the end and did not
@@ -104,6 +108,7 @@ class Jobs:
             stdin_open,
             heartbeat_seconds,
             on_reconnecting,
+            timeout,
         )
         yield from iter_items(op, self._t)
 
@@ -152,6 +157,7 @@ class Jobs:
         mark: str | None = None,
         output: bool = True,
         on_reconnecting: Callable[[Reconnecting], None] | None = None,
+        timeout: float | None = None,
     ) -> Iterator[JobFrame]:
         """Events, the first a :class:`JobAttached` (the job's mark and where the stream starts), then
         (:class:`JobOutput`, :class:`JobGap`, :class:`JobShellExit`, …), ending with a
@@ -164,7 +170,9 @@ class Jobs:
         incarnation of the id to follow: another is a ``JobGoneError`` and nothing is streamed.
         ``output=False`` sends no output and no gap, only the end. An endpoint that does not name the
         mark is :class:`~beyond_sandbox.NotOfferedError`, before any byte."""
-        op = _jobs.follow(scope, job, offset, heartbeat_seconds, mark, output, on_reconnecting)
+        op = _jobs.follow(
+            scope, job, offset, heartbeat_seconds, mark, output, on_reconnecting, timeout
+        )
         yield from iter_items(op, self._t)
 
     def collect(
@@ -177,6 +185,7 @@ class Jobs:
         mark: str | None = None,
         output: bool = True,
         on_reconnecting: Callable[[Reconnecting], None] | None = None,
+        timeout: float | None = None,
     ) -> Attached:
         """Follow the job to its end and collect everything."""
         result = Attached(-1)
@@ -188,6 +197,7 @@ class Jobs:
             mark=mark,
             output=output,
             on_reconnecting=on_reconnecting,
+            timeout=timeout,
         ):
             if isinstance(ev, JobEnd):
                 result.exit_code, result.signal = ev.code, ev.signal
@@ -236,8 +246,11 @@ class AsyncJobs:
         env: dict[str, str] | None = None,
         stdin_open: bool = False,
         heartbeat_seconds: int | None = None,
+        timeout: float | None = None,
     ) -> JobStart:
-        op = _jobs.start(scope, job, command, args, cwd, label, env, stdin_open, heartbeat_seconds)
+        op = _jobs.start(
+            scope, job, command, args, cwd, label, env, stdin_open, heartbeat_seconds, timeout
+        )
         return await adrive(op, self._t)
 
     async def start_held(
@@ -253,6 +266,7 @@ class AsyncJobs:
         stdin_open: bool = False,
         heartbeat_seconds: int | None = None,
         on_reconnecting: Callable[[Reconnecting], None] | None = None,
+        timeout: float | None = None,
     ) -> AsyncGenerator[JobFrame, None]:
         """As :meth:`Jobs.start_held`."""
         op = _jobs.start_held(
@@ -266,6 +280,7 @@ class AsyncJobs:
             stdin_open,
             heartbeat_seconds,
             on_reconnecting,
+            timeout,
         )
         async for item in aiter_items(op, self._t):
             yield item
@@ -308,9 +323,12 @@ class AsyncJobs:
         mark: str | None = None,
         output: bool = True,
         on_reconnecting: Callable[[Reconnecting], None] | None = None,
+        timeout: float | None = None,
     ) -> AsyncIterator[JobFrame]:
         """As :meth:`Jobs.follow`."""
-        op = _jobs.follow(scope, job, offset, heartbeat_seconds, mark, output, on_reconnecting)
+        op = _jobs.follow(
+            scope, job, offset, heartbeat_seconds, mark, output, on_reconnecting, timeout
+        )
         async for item in aiter_items(op, self._t):
             yield item
 
@@ -324,9 +342,12 @@ class AsyncJobs:
         mark: str | None = None,
         output: bool = True,
         on_reconnecting: Callable[[Reconnecting], None] | None = None,
+        timeout: float | None = None,
     ) -> Attached:
         result = Attached(-1)
-        op = _jobs.follow(scope, job, offset, heartbeat_seconds, mark, output, on_reconnecting)
+        op = _jobs.follow(
+            scope, job, offset, heartbeat_seconds, mark, output, on_reconnecting, timeout
+        )
 
         async def collect(ev: JobFrame) -> None:
             if isinstance(ev, JobEnd):

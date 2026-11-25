@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { text } from "../src/bytes.js";
 import {
   AuthError,
+  ConnectError,
   DiskFullError,
   EndpointError,
   JobExistsError,
@@ -240,5 +241,19 @@ describe("a handle that cannot reach the endpoint keeps trying and says so", () 
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("a start nothing answers", () => {
+  it("ends with a connect error (a TransportError), where an answered one would keep trying", async () => {
+    // Nothing listens on port 1: the connection is refused, so no request reached any server.
+    const jobs = new Jobs(
+      new HttpTransport({ url: "http://127.0.0.1:1/exec" }),
+    );
+    const err = await jobs.start("s", "aa", { command: "true" }).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(ConnectError);
   });
 });

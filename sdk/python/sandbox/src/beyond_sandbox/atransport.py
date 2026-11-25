@@ -26,6 +26,7 @@ from typing import (
 
 from . import _http, _wire
 from .errors import (
+    ConnectError,
     NotOfferedError,
     ProtocolError,
     SandboxError,
@@ -350,7 +351,7 @@ class AsyncHttpTransport:
         except asyncio.TimeoutError:
             raise TimeoutError(f"exec endpoint {self.url} timed out") from None
         except OSError as e:
-            raise TransportError(f"exec endpoint {self.url} unreachable: {e}") from None
+            raise ConnectError(f"exec endpoint {self.url} unreachable: {e}") from None
         parsed = _http.ResponseReader()
         resp = _Response(reader, writer, parsed, deadline, self.url)
         try:

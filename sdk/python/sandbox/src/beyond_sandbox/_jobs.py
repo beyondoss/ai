@@ -54,6 +54,14 @@ def check_id(job: str) -> str:
     return job
 
 
+def check_timeout(timeout: float | None) -> float | None:
+    if timeout is not None and (
+        isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout < 0
+    ):
+        raise InvalidRequestError("`timeout` must be a non-negative number of seconds")
+    return timeout
+
+
 def check_scope(scope: str) -> str:
     if not _SCOPE.fullmatch(scope):
         raise InvalidRequestError(f"bad job scope {scope!r}: 1 to 64 characters of [0-9a-z-]")
@@ -111,14 +119,16 @@ def start(
     env: dict[str, str] | None = None,
     stdin_open: bool = False,
     heartbeat_seconds: int | None = None,
+    timeout: float | None = None,
 ) -> Op[JobStart]:
     """Start a job the sandbox keeps from the start (wire ``hold: false``): its process group and mark.
     The handle (``_held.py``) does the request and the checks of its answer; an endpoint that lacks the
     mark or the stdin echo is ``NotOfferedError``, and the kernel has the job it started stopped."""
     check_scope(scope)
     check_id(job)
+    check_timeout(timeout)
     what = Start(command, args, cwd, label, env, stdin_open, hold=False)
-    started = yield from _first_started(held(scope, job, what, heartbeat_seconds))
+    started = yield from _first_started(held(scope, job, what, heartbeat_seconds, timeout=timeout))
     return JobStart(started.pgid, started.mark)
 
 
@@ -152,12 +162,14 @@ def start_held(
     stdin_open: bool = False,
     heartbeat_seconds: int | None = None,
     on_reconnecting: Callable[[Reconnecting], None] | None = None,
+    timeout: float | None = None,
 ) -> Op[None]:
     """Start a job held by this stream (wire ``hold: true``). Emits the job's events, the first a
     :class:`~beyond_sandbox.JobStarted` and the last a :class:`~beyond_sandbox.JobEnd`. If the stream
     stops before the end and the job was not kept (:func:`keep`), the sandbox kills its group."""
     check_scope(scope)
     check_id(job)
+    check_timeout(timeout)
     what = Start(command, args, cwd, label, env, stdin_open, hold=True)
     return held(scope, job, what, heartbeat_seconds, on_reconnecting)
 
@@ -182,6 +194,7 @@ def follow(
     mark: str | None = None,
     output: bool = True,
     on_reconnecting: Callable[[Reconnecting], None] | None = None,
+    timeout: float | None = None,
 ) -> Op[None]:
     """Emits the job's events, the first a :class:`~beyond_sandbox.JobAttached` and the last a
     :class:`~beyond_sandbox.JobEnd`. A job that does not exist, or whose mark is not ``mark``, is
@@ -193,8 +206,9 @@ def follow(
         raise InvalidRequestError("`mark` must be a non-empty string")
     if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
         raise InvalidRequestError("`offset` must be a non-negative integer")
+    check_timeout(timeout)
     what = Attach(offset, mark or "", output)
-    return held(scope, job, what, heartbeat_seconds, on_reconnecting)
+    return held(scope, job, what, heartbeat_seconds, on_reconnecting, timeout)
 
 
 def keep(

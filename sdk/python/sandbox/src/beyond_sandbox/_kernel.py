@@ -25,10 +25,10 @@ from typing import Union
 from .errors import ProtocolError
 
 #: The ABI ``codec.rs`` lays out. A change to a layout there bumps ``ABI_VERSION`` in ``abi.rs``.
-ABI_VERSION = 4
-#: Room for any one call's input or answer: a state (88 B) and an event (45 B at most), or a cursor.
+ABI_VERSION = 5
+#: Room for any one call's input or answer: a state (89 B) and an event (45 B at most), or a cursor.
 _BUF = 1024
-_STATE = 88
+_STATE = 89
 
 #: The one vocabulary of typed failures: the kernel's ``Fault``, in its declared order.
 FAULTS = (
@@ -40,6 +40,7 @@ FAULTS = (
     "not_offered",
     "protocol",
     "auth",
+    "transport",
 )
 
 _LIB_NAMES = {
@@ -109,6 +110,8 @@ class Event:
     EXIT_TAKEN = b"\5"
     CLOSE = b"\6"
     DEADLINE = b"\7"
+    #: The request never reached a server: refused, unreachable, or the name did not resolve.
+    UNREACHED = b"\x08"
 
 
 @dataclass(frozen=True, slots=True)
@@ -424,9 +427,23 @@ def now_ms() -> int:
     return time.monotonic_ns() // 1_000_000
 
 
-def wait_s(until_ms: int) -> float:
-    """Seconds from now to a time the kernel named."""
-    return max(until_ms - now_ms(), 0) / 1000
+def wait_s(until_ms: int, deadline_ms: int | None = None) -> float:
+    """Seconds from now to a time the kernel named, or to the caller's deadline if that comes first."""
+    end = until_ms if deadline_ms is None else min(until_ms, deadline_ms)
+    return max(end - now_ms(), 0) / 1000
+
+
+class Limit:
+    """The caller's timeout, on the shell's clock. The kernel's `Deadline` event is what ends a handle;
+    this only says when the shell sends it."""
+
+    __slots__ = ("ends_ms",)
+
+    def __init__(self, timeout_s: float | None) -> None:
+        self.ends_ms = None if timeout_s is None else now_ms() + round(timeout_s * 1000)
+
+    def passed(self) -> bool:
+        return self.ends_ms is not None and now_ms() >= self.ends_ms
 
 
 def elapsed_ms(since_ms: int) -> int:

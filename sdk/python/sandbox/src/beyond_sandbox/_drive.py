@@ -98,6 +98,8 @@ class Sleep:
     """Wait until the kernel's time ``until_ms``."""
 
     until_ms: int
+    #: The caller's deadline: a wait never runs past it.
+    deadline_ms: int | None = None
 
 
 @dataclass(slots=True)
@@ -227,7 +229,7 @@ def drive_iter(op: Op[T], transport: Any) -> Generator[Any, None, None]:
                         conn = None
                     answer = _NOTHING
                 elif isinstance(effect, Sleep):
-                    time.sleep(_kernel.wait_s(effect.until_ms))
+                    time.sleep(_kernel.wait_s(effect.until_ms, effect.deadline_ms))
                     answer = _NOTHING
                 else:
                     raise AssertionError(f"unknown effect {effect!r}")
@@ -314,7 +316,7 @@ async def adrive_emit(
                         conn = None
                     answer = _NOTHING
                 elif isinstance(effect, Sleep):
-                    await asyncio.sleep(_kernel.wait_s(effect.until_ms))
+                    await asyncio.sleep(_kernel.wait_s(effect.until_ms, effect.deadline_ms))
                     answer = _NOTHING
                 else:
                     raise AssertionError(f"unknown effect {effect!r}")

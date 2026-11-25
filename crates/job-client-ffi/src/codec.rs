@@ -3,8 +3,8 @@
 //! `tests/no_decision.rs` fails on a branch, a loop or a comparison in this file.
 //!
 //! Layout. All integers little-endian. A mark is 33 bytes: its length, then 32 bytes. A state is the
-//! 88 bytes `[phase, flow, mode, remove_on_exit, stdin_open, kept, announced, key u64, mark, offset u64, pending u64, misses u32,
-//! since_ms u64, until_ms u64, beat_s u32]`. Tags are the order the variants are declared in `job_client::step`, except the actions `Reconnecting` (10), `Started` (11), `Attached` (12), `ShellExit` (13) and `Kill` (14).
+//! 89 bytes `[phase, flow, mode, remove_on_exit, stdin_open, kept, announced, reached, key u64, mark, offset u64, pending u64, misses u32,
+//! since_ms u64, until_ms u64, beat_s u32]`. Tags are the order the variants are declared in `job_client::step`, except the actions `Reconnecting` (10), `Started` (11), `Attached` (12), `ShellExit` (13) and `Kill` (14), and the event `Unreached` (8).
 
 use job_client::step::{
     Action, Class, Event, Flow, Frame, Mark, Mode, Op, Phase, State, classify as k_classify,
@@ -95,6 +95,7 @@ impl Rd<'_> {
             stdin_open: self.flag()?,
             kept: self.flag()?,
             announced: self.flag()?,
+            reached: self.flag()?,
             key: self.u64()?,
             mark: self.mark()?,
             offset: self.u64()?,
@@ -140,6 +141,7 @@ impl Rd<'_> {
             5 => Ok(Event::ExitTaken),
             6 => Ok(Event::Close),
             7 => Ok(Event::Deadline),
+            8 => Ok(Event::Unreached),
             _ => Err(BAD_INPUT),
         }
     }
@@ -158,6 +160,7 @@ fn put_state(v: &mut Vec<u8>, s: &State) {
     v.push(u8::from(s.stdin_open));
     v.push(u8::from(s.kept));
     v.push(u8::from(s.announced));
+    v.push(u8::from(s.reached));
     v.extend_from_slice(&s.key.to_le_bytes());
     put_mark(v, &s.mark);
     v.extend_from_slice(&s.offset.to_le_bytes());

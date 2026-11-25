@@ -21,6 +21,7 @@ from . import _wire
 from ._drive import Call, Emit, NextLine, Op, Open, Release, Sleep
 from .errors import (
     AuthError,
+    ConnectError,
     DiskFullError,
     EndpointError,
     InvalidRequestError,
@@ -83,6 +84,8 @@ def fault_error(fault: str, status: int, detail: str, job: str) -> SandboxError:
             "the endpoint did not name the job's mark: it predates marks, so a cursor cannot be "
             "trusted to name one job"
         )
+    if fault == "transport":
+        return ConnectError(f"job {job}: {said}")
     if fault == "auth":
         return AuthError(said, status=status or None)
     return EndpointError(said, status=status) if status else ProtocolError(said)
@@ -94,6 +97,7 @@ def held(
     what: Start | Attach,
     heartbeat_seconds: int | None = None,
     on_reconnecting: Callable[[Reconnecting], None] | None = None,
+    timeout: float | None = None,
 ) -> Op[None]:
     """Frames in order, ``started`` first for a start and the last a :class:`~beyond_sandbox.JobEnd`.
     Closing the generator detaches. Every decision is the kernel's; every request, read and wait is a
@@ -115,12 +119,16 @@ def held(
         # The kernel refuses a mark that is not 1 to 32 hex digits: nothing was sent.
         raise InvalidRequestError("a job mark is 1 to 32 hex digits") from e
 
+    limit = K.Limit(timeout)
     line: _wire.JobLine | None = None
     refused = ""
     event: bytes | None = K.Event.GO
     while True:
         read = event is None
-        if event is None:
+        if limit.passed():
+            # The caller's deadline is the shell's clock and the kernel's event: it ends the handle.
+            event, read = K.Event.DEADLINE, False
+        elif event is None:
             event, line = yield from _read()
         state, actions = k.step(state, event, K.now_ms(), K.draw())
         event = None
@@ -162,7 +170,7 @@ def held(
                 yield Emit(JobEnd.of(a.code, a.signal, a.killed))
                 event = K.Event.EXIT_TAKEN
             elif isinstance(a, K.Sleep):
-                yield Sleep(a.until_ms)
+                yield Sleep(a.until_ms, limit.ends_ms)
                 event = K.Event.TICK
             elif isinstance(a, K.Fail):
                 note = line.note if line is not None and read else ""
@@ -207,6 +215,8 @@ def _send(open_: Open) -> Op[tuple[bytes, str]]:
     """Send a request and report its answer as an event, with what a refusal said."""
     try:
         opened = yield open_
+    except ConnectError as e:
+        return K.Event.UNREACHED, e.detail
     except (TransportError, TimeoutError):
         return K.Event.BROKE, ""
     return K.Event.answered(opened.status, opened.retry_after_s), opened.detail

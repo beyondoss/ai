@@ -36,6 +36,12 @@ export class TransportError extends SandboxError {
   }
 }
 
+/**
+ * The connection was never made: refused, no route, or the name did not resolve. Nothing was sent, so
+ * nothing happened. A {@link TransportError}: a catch of that keeps working.
+ */
+export class ConnectError extends TransportError {}
+
 /** The request deadline passed (not a command's own exit 124). */
 export class TimeoutError extends SandboxError {
   constructor(detail: string, options?: { cause?: unknown }) {

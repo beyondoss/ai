@@ -1,6 +1,7 @@
 import { concat, fromBase64, text, toBase64 } from "./bytes.js";
 import {
   AuthError,
+  ConnectError,
   EndpointError,
   InvalidRequestError,
   JobGoneError,
@@ -385,10 +386,10 @@ export class HttpTransport implements Transport {
           cause: e,
         });
       }
-      throw new TransportError(
-        `exec endpoint ${this.url} unreachable: ${errorText(e)}`,
-        { cause: e },
-      );
+      const detail = `exec endpoint ${this.url} unreachable: ${errorText(e)}`;
+      throw neverConnected(e)
+        ? new ConnectError(detail, { cause: e })
+        : new TransportError(detail, { cause: e });
     }
     const response = res;
     return {
@@ -1209,6 +1210,20 @@ const wireCount = (v: unknown): v is number =>
 /** A 32-bit signed integer of the wire. */
 const int32 = (v: unknown): v is number =>
   typeof v === "number" && (v | 0) === v;
+
+/** The codes of a connection that was never made: refused, no route, a name that does not resolve. */
+const NEVER_CONNECTED = new Set([
+  "ECONNREFUSED",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "ENETUNREACH",
+  "EHOSTUNREACH",
+]);
+
+function neverConnected(e: unknown): boolean {
+  const code = (e as { cause?: { code?: unknown } } | undefined)?.cause?.code;
+  return typeof code === "string" && NEVER_CONNECTED.has(code);
+}
 
 /** One line of a job stream, read for the facts the kernel decides on. Never throws. */
 export function decodeJobLine(line: Uint8Array): JobLine {

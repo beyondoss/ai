@@ -95,8 +95,11 @@ byte arrives once and a reopen can never read another job that reused the id; a 
 `504`, `Retry-After`) is waited out; a refusal that will not change (`404`, `409`, `507`, `401`, `403`, `500`, a bad
 frame) is one typed error. When the endpoint stays unreachable the handle keeps trying and says so through
 `on_reconnecting(Reconnecting(attempts, since_ms))`; it ends only when the job does, the endpoint refuses for
-good, or you stop iterating. That includes a `start` whose endpoint nobody answers: it keeps trying and says so, so bound it yourself
-(stop iterating, or run it in a thread or task you can cancel). An endpoint that does not name the job's mark is `NotOfferedError`, before any byte.
+good, or you stop iterating, or your `timeout=` (seconds, on `start`, `start_held`, `follow` and `collect`) passes:
+the kernel's `Deadline`, which raises `TimeoutError`; it is checked between frames and waits, so a quiet stream notices it at its
+next heartbeat. One start is the exception: a `start` whose first request cannot connect at all (refused, unreachable, the name
+does not resolve) while nothing of it was ever answered ends with `ConnectError` (a `TransportError`): nothing was started and
+nobody answered. Once any request of it was answered or lost, a failure to connect keeps trying like every other. An endpoint that does not name the job's mark is `NotOfferedError`, before any byte.
 
 Python holds none of that. `_held.py` makes the request the kernel names, reads the answer, and does what the
 kernel's actions say; `tests/test_no_decision.py` fails if it grows a status code, an offset sum, a retry counter
@@ -119,6 +122,7 @@ compiler pinned in `crates/job-client-ffi/toolchain`. A library older than its s
 - A start of an existing id is `JobExistsError`, a full disk `DiskFullError`, and a stdin write's 409 and 429 are `StdinClosedError`, `StdinGapError` and `StdinBusyError` (all still `ConflictError`s).
 - A custom `job_call` is passed `heartbeat_seconds` only when set. `job_stream` is replaced by `job_open(job, silence_ms, *, command, args, cwd, env, heartbeat_seconds)`: one request, answered with its status (a `JobOpened`: `status`, `retry_after_s`, `detail`, `lines`, `close`), never retried and never an exception for a refusal. The kernel decides what the status means. `AsyncJobTransport.job_open` is the awaited twin (`AsyncJobOpened`).
 - A cut or silent job stream is reopened by the kernel instead of ending as `TransportError`. A held job's frames are the same; a stream that ends in an error frame is `EndpointError` or `ProtocolError`, no longer `TransportError`.
+- A `start` that cannot connect at all ends with `ConnectError`; a started job's handle, or any follow, keeps trying until its `timeout=` passes.
 - A job mark is 1 to 32 hex digits: `follow(mark=...)` refuses anything else with `InvalidRequestError`, before anything is sent.
 - The wheel is platform-specific and there is no sdist.
 

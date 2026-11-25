@@ -18,6 +18,7 @@ from .atransport import (
 from .errors import (
     AuthError,
     ConflictError,
+    ConnectError,
     DiskFullError,
     EndpointError,
     InvalidQueryError,
@@ -91,6 +92,7 @@ __all__ = [
     "Capabilities",
     "CapsOverride",
     "ConflictError",
+    "ConnectError",
     "DiskFullError",
     "EndpointError",
     "Entry",
