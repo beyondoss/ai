@@ -150,6 +150,13 @@ pub struct JobSpec {
     /// its output is one stream (stdout only) and a stdin write takes no `eof`. An endpoint that
     /// does not echo the terminal is `ErrorKind::Unsupported` and the job is stopped.
     pub pty: Option<PtySize>,
+    /// The start's idempotency key (wire `idempotency_key`): 1 to 128 characters of `[0-9A-Za-z._:-]`. A start
+    /// that repeats an earlier one's key with the same command, arguments, directory, environment, stdin and
+    /// hold answers that job and runs nothing; the same key with another command is a conflict
+    /// ([`JobError::Exists`]). `None`: a fresh key is generated for each start call, before its first send, so a
+    /// start whose answer was lost can be sent again without running twice. Set your own to make a re-run of a
+    /// whole program return its job.
+    pub idempotency_key: Option<String>,
 }
 
 /// A terminal's size: both are integers from 1 to 1024 ([`PtySize::MAX`]).
@@ -248,6 +255,8 @@ pub enum JobError {
     Gone { text: String },
     /// `start` of an id that exists (`409`); the first job is left alone.
     Exists { text: String },
+    /// `start` whose idempotency key was used for another command or under another id (`409` `key_conflict`).
+    KeyConflict { text: String },
     /// `start` on a full disk (`507`).
     DiskFull { text: String },
     /// A stdin write the job cannot take (`409`).
@@ -284,6 +293,7 @@ impl JobError {
         };
         use job_client::step::{Fault, Op};
         Some(match (op, status) {
+            (JobOp::Start, 409) if body.contains("key_conflict") => Self::KeyConflict { text },
             (JobOp::Start, _) => match kernel(Op::Start)? {
                 Fault::JobExists => Self::Exists { text },
                 Fault::DiskFull => Self::DiskFull { text },
@@ -328,6 +338,7 @@ impl JobError {
         match self {
             Self::Gone { .. } => "job_gone",
             Self::Exists { .. } => "job_exists",
+            Self::KeyConflict { .. } => "key_conflict",
             Self::DiskFull { .. } => "disk_full",
             Self::StdinClosed {
                 reason: StdinClosedReason::NeverOpened,
@@ -357,7 +368,7 @@ impl JobError {
         };
         match self {
             Self::Gone { .. } => NotFound,
-            Self::Exists { .. } => AlreadyExists,
+            Self::Exists { .. } | Self::KeyConflict { .. } => AlreadyExists,
             Self::DiskFull { .. } => StorageFull,
             Self::StdinClosed {
                 reason: StdinClosedReason::NeverOpened,
@@ -377,6 +388,7 @@ impl JobError {
         match self {
             Self::Gone { text }
             | Self::Exists { text }
+            | Self::KeyConflict { text }
             | Self::DiskFull { text }
             | Self::StdinClosed { text, .. }
             | Self::StdinGap { text }

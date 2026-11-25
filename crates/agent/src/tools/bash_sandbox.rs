@@ -907,6 +907,7 @@ mod notify_tests {
             env: Vec::new(),
             stdin_open: false,
             pty: None,
+            idempotency_key: None,
         };
         let job = link.id.as_str().to_string();
         let task = {
@@ -949,7 +950,7 @@ mod front_tests {
         let (first, second) = (b64("hello"), b64("world"));
         let front = JobFront::start(std::sync::Arc::new(move |i, _| match i {
             0 => Reply::Stream(vec![
-                format!(r#"{{"started":4242,"mark":"{mark}","stdin":false}}"#),
+                format!(r#"{{"started":4242,"mark":"{mark}","stdin":false,"key":"k"}}"#),
                 format!(r#"{{"stdout":"{first}"}}"#),
             ]),
             1..=130 => Reply::Down,
@@ -975,6 +976,7 @@ mod front_tests {
         let shared = Arc::new(JobShared::in_sandbox(link.clone(), 0, &jobs));
         let spec = JobSpec {
             pty: None,
+            idempotency_key: Some("k".into()),
             program: "sh".into(),
             args: vec!["-c".into(), "true".into()],
             cwd: None,

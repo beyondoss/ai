@@ -27,6 +27,7 @@ from .errors import (
     InvalidRequestError,
     JobExistsError,
     JobGoneError,
+    KeyConflictError,
     NotOfferedError,
     ProtocolError,
     SandboxError,
@@ -58,6 +59,9 @@ class Start:
     hold: bool = False
     #: Run the command on a terminal of this size.
     pty: Pty | None = None
+    #: The start's idempotency key, taken once per call: every send of the start carries it, and the
+    #: endpoint's echo of it is checked (an endpoint that ignores keys is ``NotOfferedError``).
+    key: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +78,8 @@ def fault_error(fault: str, status: int, detail: str, job: str) -> SandboxError:
     said = detail or f"status {status}"
     if fault == "job_gone":
         return JobGoneError(f"job {job}: {said}", id=job, status=status or None)
+    if fault == "job_exists" and "key_conflict" in said:
+        return KeyConflictError(f"job {job}: {said}", id=job, status=status or None)
     if fault == "job_exists":
         return JobExistsError(f"job {job} exists: {said}", id=job, status=status or None)
     if fault == "disk_full":
@@ -110,6 +116,7 @@ def held(
         watch=isinstance(what, Attach) and not what.output,
         stdin_open=isinstance(what, Start) and what.stdin_open,
         pty_open=isinstance(what, Start) and what.pty is not None,
+        key_sent=isinstance(what, Start) and bool(what.key),
         kept=isinstance(what, Start) and not what.hold,
         beat_s=heartbeat_seconds or 0,
     )
@@ -133,7 +140,7 @@ def held(
             # The caller's deadline is the shell's clock and the kernel's event: it ends the handle.
             event, read = K.Event.DEADLINE, False
         elif event is None:
-            event, line = yield from _read()
+            event, line = yield from _read(what.key if isinstance(what, Start) else "")
         state, actions = k.step(state, event, K.now_ms(), K.draw())
         event = None
         for a in actions:
@@ -194,7 +201,7 @@ def _start_open(
     scope: str, job: str, s: Start, heartbeat_seconds: int | None, silence_ms: int
 ) -> Open:
     return Open(
-        _wire.job_start_op(scope, job, s.hold, s.label, s.stdin_open, s.pty),
+        _wire.job_start_op(scope, job, s.hold, s.label, s.stdin_open, s.pty, s.key),
         silence_ms,
         s.command,
         s.args,
@@ -230,7 +237,7 @@ def _send(open_: Open) -> Op[tuple[bytes, str]]:
     return K.Event.answered(opened.status, opened.retry_after_s), opened.detail
 
 
-def _read() -> Op[tuple[bytes, _wire.JobLine | None]]:
+def _read(sent_key: str = "") -> Op[tuple[bytes, _wire.JobLine | None]]:
     """The next line of the open stream, as an event, and the line."""
     try:
         raw = yield NextLine()
@@ -241,5 +248,5 @@ def _read() -> Op[tuple[bytes, _wire.JobLine | None]]:
         return K.Event.frame(bad.frame), bad
     if raw is None:
         return K.Event.BROKE, None
-    line = _wire.decode_job_line(raw)
+    line = _wire.decode_job_line(raw, sent_key)
     return K.Event.frame(line.frame), line

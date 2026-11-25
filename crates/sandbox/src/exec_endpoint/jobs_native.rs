@@ -228,10 +228,10 @@ impl<'a> NativeJobs<'a> {
     }
 
     /// The `start` request's members: `pty` only when a terminal is asked for.
-    fn start_op(scope: &JobScope, id: &JobId, hold: bool, spec: &JobSpec) -> Value {
+    fn start_op(scope: &JobScope, id: &JobId, hold: bool, spec: &JobSpec, key: &str) -> Value {
         let mut extra = json!({
             "id": id.as_str(), "hold": hold, "label": spec.label,
-            "stdin_open": spec.stdin_open,
+            "stdin_open": spec.stdin_open, "idempotency_key": key,
         });
         if let Some(p) = spec.pty {
             extra["pty"] = json!({ "cols": p.cols, "rows": p.rows });
@@ -259,6 +259,28 @@ impl<'a> NativeJobs<'a> {
             ))
         })
     }
+}
+
+/// The start's idempotency key: the caller's, checked, else a fresh one (128 random bits). Taken once per start
+/// call, before the first send.
+pub(super) fn start_key(spec: &JobSpec) -> std::io::Result<String> {
+    if let Some(k) = &spec.idempotency_key {
+        let ok = (1..=128).contains(&k.len())
+            && k.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'));
+        return if ok {
+            Ok(k.clone())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("bad idempotency key {k:?}: 1 to 128 characters of [0-9A-Za-z._:-]"),
+            ))
+        };
+    }
+    let mut b = [0u8; 16];
+    getrandom::fill(&mut b)
+        .map_err(|e| std::io::Error::other(format!("no randomness for the start key: {e}")))?;
+    Ok(hex::encode(b))
 }
 
 impl NativeJobs<'_> {
@@ -289,6 +311,7 @@ impl NativeJobs<'_> {
             beat.unwrap_or(0),
             spec.stdin_open,
             spec.pty.is_some(),
+            true,
             false,
         );
         handle::drive(&h, state, events).await
@@ -419,7 +442,8 @@ impl SandboxJobs for NativeJobs<'_> {
         id: &JobId,
         spec: &JobSpec,
     ) -> std::io::Result<Started> {
-        let job = Self::start_op(scope, id, false, spec);
+        let key = start_key(spec)?;
+        let job = Self::start_op(scope, id, false, spec, &key);
         let resp = self
             .runner
             .send_env(
@@ -452,6 +476,7 @@ impl SandboxJobs for NativeJobs<'_> {
             let _ = self.kill(scope, std::slice::from_ref(id), true).await;
             return Err(predates("job terminals"));
         }
+        let echoed = answer.as_ref().and_then(|v| v.get("key")?.as_str()) == Some(key.as_str());
         let mark = answer
             .as_ref()
             .and_then(|v| v.get("mark")?.as_str())
@@ -469,6 +494,11 @@ impl SandboxJobs for NativeJobs<'_> {
                 "unreadable job answer: the endpoint reported an out-of-range job start: {started}"
             ))
         })?;
+        if !echoed {
+            // The endpoint ignored the key: stop what it started, as for a stdin it ignored.
+            let _ = self.kill(scope, std::slice::from_ref(id), true).await;
+            return Err(predates("start keys"));
+        }
         let mark = mark.ok_or_else(|| predates("job marks"))?;
         Ok(Started { pgid, mark })
     }
@@ -729,8 +759,8 @@ pub enum JobFrame {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Event {
     /// The job's process group, its mark, whether it was started with its stdin open (the echo of
-    /// `stdin_open`) and the terminal's size (the echo of `pty`).
-    Started(u32, Option<String>, bool, Option<PtySize>),
+    /// `stdin_open`), the terminal's size (the echo of `pty`) and the start's idempotency key (its echo).
+    Started(u32, Option<String>, bool, Option<PtySize>, Option<String>),
     /// An attach's answer: the job's mark and the offset the stream starts at.
     Attached(String, u64),
     Output(Vec<u8>, Stream),
@@ -752,6 +782,7 @@ struct WireJobFrame {
     #[serde(default)]
     stdin: bool,
     pty: Option<Value>,
+    key: Option<String>,
     stdout: Option<String>,
     stderr: Option<String>,
     gap: Option<u64>,
@@ -791,7 +822,7 @@ pub fn decode_job_frame(line: &[u8]) -> Result<JobFrame, String> {
     } else if let Some(p) = w.started {
         let p = u32::try_from(p).map_err(|_| wire_out_of_range("started", p))?;
         let pty = w.pty.as_ref().and_then(parse_pty);
-        JobFrame::Event(Event::Started(p, w.mark, w.stdin, pty))
+        JobFrame::Event(Event::Started(p, w.mark, w.stdin, pty, w.key))
     } else if let Some(s) = w.stdout.as_deref() {
         JobFrame::Event(Event::Output(b64(s)?, Stream::Stdout))
     } else if let Some(s) = w.stderr.as_deref() {
@@ -938,7 +969,7 @@ pub fn parse_written(v: &Value) -> std::io::Result<StdinWritten> {
 }
 
 /// The error for an endpoint that ignores something the request asked for.
-fn predates(what: &str) -> std::io::Error {
+pub(super) fn predates(what: &str) -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         format!("the endpoint predates {what}: it ran the job without it"),
@@ -1166,7 +1197,8 @@ mod tests {
                 7,
                 None,
                 true,
-                PtySize::new(80, 24)
+                PtySize::new(80, 24),
+                None
             )))
         );
         for bad in [
@@ -1177,7 +1209,7 @@ mod tests {
         ] {
             assert_eq!(
                 decode_job_frame(bad.as_bytes()),
-                Ok(JobFrame::Event(Event::Started(7, None, true, None))),
+                Ok(JobFrame::Event(Event::Started(7, None, true, None, None))),
                 "{bad}"
             );
         }

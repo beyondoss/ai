@@ -552,6 +552,7 @@ impl Bash {
                             env: Vec::new(),
                             stdin_open: false,
                             pty: None,
+                            idempotency_key: None,
                         };
                         super::bash_sandbox::run(&shared, &link, &spec).await
                     }

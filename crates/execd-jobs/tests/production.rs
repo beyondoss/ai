@@ -26,6 +26,7 @@ fn production_calls_the_verified_kernel() {
         "kernel::bound(",
         "kernel::State::new(",
         ".admit(&key)",
+        ".begin(",
     ] {
         assert!(jobs.contains(needle), "jobs.rs no longer calls {needle}");
     }
@@ -48,6 +49,12 @@ fn the_decisions_are_in_the_verified_block() {
         "pub fn follow(",
         "pub fn bound<",
         "pub fn admit(",
+        "pub fn start_decision(",
+        "pub fn keeps_record(",
+        "pub fn begin(",
+        "pub fn record(",
+        "fn forget(",
+        "fn lookup(",
         "pub fn visible(",
         "pub struct Table<",
         "fn locate(",
@@ -75,6 +82,8 @@ fn the_decisions_are_in_the_verified_block() {
         ".entries.remove(",
         ".entries.insert(",
         ".entries.push(",
+        ".recs.push(",
+        ".recs.remove(",
         ".entries.get(",
         "fn locate(",
         "fn has(",

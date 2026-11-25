@@ -82,6 +82,29 @@ export function checkPtySize(p: PtySize): void {
   }
 }
 
+function validKey(key: string): void {
+  if (typeof key !== "string" || !/^[0-9A-Za-z._:-]{1,128}$/.test(key)) {
+    throw new InvalidRequestError(
+      `bad idempotency key ${
+        JSON.stringify(key)
+      }: 1 to 128 characters of [0-9A-Za-z._:-]`,
+    );
+  }
+}
+
+/** The spec with its idempotency key: the caller's, checked, else a fresh one (one per call, before the first send). */
+async function keyed(spec: JobSpec): Promise<JobSpec> {
+  if (spec.idempotencyKey !== undefined) {
+    validKey(spec.idempotencyKey);
+    return spec;
+  }
+  const c = (globalThis as { crypto?: Crypto }).crypto;
+  const key = c?.randomUUID
+    ? c.randomUUID()
+    : (await import("node:crypto")).randomUUID();
+  return { ...spec, idempotencyKey: key };
+}
+
 function count(name: string, v: number | undefined, dflt: number): number {
   if (v === undefined) return dflt;
   if (!Number.isInteger(v) || v < 0) {
@@ -104,7 +127,10 @@ export class Jobs {
 
   /**
    * Start a job the sandbox keeps from the start; returns its process group and mark. An id that exists is
-   * {@link JobExistsError}; a full disk is {@link DiskFullError}.
+   * {@link JobExistsError}; a full disk is {@link DiskFullError}. The start carries an idempotency key
+   * (`spec.idempotencyKey`, or one generated for this call): sent again, it answers the same job and runs
+   * nothing, and the key of another command is {@link KeyConflictError} (`409`); an endpoint that ignores
+   * keys is {@link NotOfferedError}.
    */
   async start(
     scope: string,
@@ -117,7 +143,7 @@ export class Jobs {
     if (spec.pty !== undefined) checkPtySize(spec.pty);
     const frames = held(
       this.transport.jobs,
-      { flow: "start", scope, id, spec, hold: false },
+      { flow: "start", scope, id, spec: await keyed(spec), hold: false },
       req,
     );
     for await (const f of frames) {
@@ -142,7 +168,7 @@ export class Jobs {
     if (spec.pty !== undefined) checkPtySize(spec.pty);
     yield* held(
       this.transport.jobs,
-      { flow: "start", scope, id, spec, hold: true },
+      { flow: "start", scope, id, spec: await keyed(spec), hold: true },
       req,
     );
   }

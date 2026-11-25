@@ -453,7 +453,8 @@ impl Driver {
                 "ops": self.ops(),
                 "features": [
                     "frames", "unbounded_stream", "exit_signal", "exec_env", "job_streams",
-                    "job_stdin", "job_signal_op", "job_errors", "job_options", "job_marks", "job_pty"
+                    "job_stdin", "job_signal_op", "job_errors", "job_options", "job_marks", "job_pty",
+                    "job_start_key"
                 ],
             }));
         }
@@ -598,6 +599,7 @@ impl Driver {
             env: env_arg(req)?,
             stdin_open: flag(req, "stdin_open")?,
             pty: pty_arg(req)?,
+            idempotency_key: opt_str(req, "idempotency_key")?.map(str::to_string),
         };
         let started = self
             .jobs()?
@@ -625,6 +627,7 @@ impl Driver {
             env: env_arg(req)?,
             stdin_open: flag(req, "stdin_open")?,
             pty: pty_arg(req)?,
+            idempotency_key: None,
         };
         let keep = flag(req, "keep")?;
         let beat = self.beat(req)?;

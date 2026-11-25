@@ -26,9 +26,9 @@ from .errors import ProtocolError
 
 #: The ABI ``codec.rs`` lays out. A change to a layout there bumps ``ABI_VERSION`` in ``abi.rs``.
 ABI_VERSION = 5
-#: Room for any one call's input or answer: a state (90 B) and an event (45 B at most), or a cursor.
+#: Room for any one call's input or answer: a state (91 B) and an event (45 B at most), or a cursor.
 _BUF = 1024
-_STATE = 90
+_STATE = 91
 
 #: The one vocabulary of typed failures: the kernel's ``Fault``, in its declared order.
 FAULTS = (
@@ -68,8 +68,8 @@ class Frame:
         return b"\0" + _mark(mark) + struct.pack("<Q", from_)
 
     @staticmethod
-    def started(mark: str, stdin: bool, pty: bool = False) -> bytes:
-        return b"\1" + _mark(mark) + bytes([stdin, pty])
+    def started(mark: str, stdin: bool, pty: bool = False, key: bool = False) -> bytes:
+        return b"\1" + _mark(mark) + bytes([stdin, pty, key])
 
     @staticmethod
     def output(length: int) -> bytes:
@@ -122,6 +122,8 @@ class Policy:
     stdin_open: bool = False
     #: A start on a terminal: an echo that says none was opened is refused.
     pty_open: bool = False
+    #: A start that sent a key: an echo that does not say it was kept is refused.
+    key_sent: bool = False
     #: A start of a kept job (``hold: false``): a refused echo stops the job.
     kept: bool = False
     #: The heartbeat the request chose, whole seconds; 0 for the default.
@@ -352,13 +354,14 @@ class Kernel:
         return self._call(
             "jc_state_for_start",
             struct.pack(
-                "<QBBIBBB",
+                "<QBBIBBBB",
                 key,
                 p.watch,
                 p.remove_on_exit,
                 p.beat_s,
                 p.stdin_open,
                 p.pty_open,
+                p.key_sent,
                 p.kept,
             ),
         )

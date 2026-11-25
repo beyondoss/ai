@@ -78,6 +78,7 @@ fn spec(script: &str) -> JobSpec {
         env: Vec::new(),
         stdin_open: false,
         pty: None,
+        idempotency_key: None,
     }
 }
 
@@ -678,4 +679,37 @@ async fn a_refused_notify_is_invalid_input_to_the_client() {
         .keep(&sc, &id, Some(1), "background", 0)
         .await
         .unwrap();
+}
+
+/// An endpoint that ignores start keys is `Unsupported` to the client, and what it started is stopped: a start
+/// sent again for a lost answer would run twice. Red on a client that does not check the echo.
+#[tokio::test]
+async fn an_endpoint_that_ignores_start_keys_is_unsupported_and_the_job_is_stopped() {
+    let e = Endpoint::start(MockOptions {
+        ignores_keys: true,
+        ..MockOptions::default()
+    })
+    .await;
+    let (sc, id) = (scope("nokey"), JobId::fresh());
+    let err = e
+        .jobs()
+        .start_kept(&sc, &id, &spec("sleep 120"))
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::Unsupported, "{err}");
+    assert!(
+        e.jobs()
+            .list(&sc)
+            .await
+            .unwrap()
+            .iter()
+            .all(|j| j.status != JobStatus::Running),
+        "the job it started was stopped"
+    );
+    let held = e
+        .jobs()
+        .run_held(&sc, &JobId::fresh(), &spec("sleep 120"), &|_| {})
+        .await
+        .unwrap_err();
+    assert_eq!(held.kind(), std::io::ErrorKind::Unsupported, "{held}");
 }

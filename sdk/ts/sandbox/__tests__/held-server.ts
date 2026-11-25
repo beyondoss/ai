@@ -43,7 +43,7 @@ export async function markServer(script: Script) {
         res.end(JSON.stringify({ error: "refused" }));
         return;
       }
-      stream(res, 0, true);
+      stream(res, 0, true, job.idempotency_key as string | undefined);
       return;
     }
     attaches.push(seen);
@@ -64,7 +64,12 @@ export async function markServer(script: Script) {
     stream(res, Number(job.offset), false);
   });
 
-  function stream(res: ServerResponse, from: number, start: boolean): void {
+  function stream(
+    res: ServerResponse,
+    from: number,
+    start: boolean,
+    key?: string,
+  ): void {
     res.writeHead(200, { "content-type": "application/x-ndjson" });
     const base = script.base ?? 0;
     const at = Math.max(from, base);
@@ -75,7 +80,11 @@ export async function markServer(script: Script) {
       : script.echo;
     if (start) {
       res.write(
-        JSON.stringify({ started: 42, ...(mark === null ? {} : { mark }) })
+        JSON.stringify({
+          started: 42,
+          ...(mark === null ? {} : { mark }),
+          ...(key === undefined ? {} : { key }),
+        })
           + "\n",
       );
     } else if (mark !== null) {

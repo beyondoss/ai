@@ -340,15 +340,50 @@ pub async fn start(name: &str) -> Result<Started, String> {
         return Err(format!("e2b: envd never accepted a command: {last}"));
     }
     // execd runs as root (the VM's passwordless sudo) and drops to the VM's user for the commands it runs.
+    // The jobs ledger (`EXECD_STATE_DIR`) outlives a restart of execd, which the `jobs-key` restart scenario drives
+    // through `execd-restart` (the `EXECD_RESTART` variable).
+    let env = format!(
+        "EXECD_LISTEN=0.0.0.0:{PORT} EXECD_ROOT={HOME}/work EXECD_HOME={HOME} EXECD_RUN_AS=user \
+         EXECD_STATE_DIR={STATE_DIR} EXECD_JOBS_DIR={JOBS_DIR}"
+    );
     let launch = format!(
-        "sudo env -u SUDO_COMMAND -u SUDO_USER -u SUDO_UID -u SUDO_GID EXECD_LISTEN=0.0.0.0:{PORT} \
-         EXECD_ROOT={HOME}/work EXECD_HOME={HOME} EXECD_RUN_AS=user EXECD_BEARER=\"$BEARER\" \
-         EXECD_STATE_DIR={STATE_DIR} EXECD_JOBS_DIR={JOBS_DIR} \
+        "sudo env -u SUDO_COMMAND -u SUDO_USER -u SUDO_UID -u SUDO_GID {env} EXECD_BEARER=\"$BEARER\" \
          setsid nohup {HOME}/bin/execd >/tmp/execd.log 2>&1 < /dev/null &\nsleep 1"
     );
     let (c, o, e) = vm.run(&launch, json!({"BEARER": bearer})).await?;
     if c != 0 {
         return Err(format!("e2b: starting execd exited {c}: {o}{e}"));
+    }
+    // `execd-restart MARKER`: SIGHUP execd (its jobs run on), start the next one on the same ledger, and touch
+    // MARKER once it answers. Detached, because the call that runs it is served by the execd it restarts: it returns only
+    // once the helper is in its own session (`MARKER.started`), or execd, seeing the command end, kills the group the
+    // helper had not yet left. The helper then waits a second, so that call has answered before the SIGHUP ends every
+    // command. The next
+    // one logs to its own file: `/tmp/execd.log` belongs to the VM's user (the launch's redirect), and root may not
+    // append to it in a sticky `/tmp` (`fs.protected_regular`).
+    let restart = r#"sudo tee @HOME@/bin/execd-restart >/dev/null <<EOS
+#!/bin/sh
+marker="\$1"
+setsid sh -c '
+  touch "\$0.started"
+  sleep 1
+  pid=\$(pidof execd || pgrep -x execd)
+  kill -HUP \$pid
+  while kill -0 \$pid 2>/dev/null; do sleep 0.1; done
+  env -u SUDO_COMMAND -u SUDO_USER -u SUDO_UID -u SUDO_GID @ENV@ EXECD_BEARER=$BEARER setsid nohup @HOME@/bin/execd >>/tmp/execd.restart.log 2>&1 </dev/null &
+  until [ "\$(curl -s -o /dev/null -w %{http_code} -m 2 -X POST http://127.0.0.1:@PORT@/exec -d "{}")" = 401 ]; do sleep 0.2; done
+  touch "\$0"
+' "\$marker" >/dev/null 2>&1 </dev/null &
+i=0
+while [ ! -e "\$marker.started" ] && [ \$i -lt 100 ]; do i=\$((i+1)); sleep 0.05; done
+EOS
+sudo chmod 700 @HOME@/bin/execd-restart"#
+        .replace("@HOME@", HOME)
+        .replace("@ENV@", &env)
+        .replace("@PORT@", &PORT.to_string());
+    let (c, o, e) = vm.run(&restart, json!({"BEARER": bearer})).await?;
+    if c != 0 {
+        return Err(format!("e2b: writing execd-restart exited {c}: {o}{e}"));
     }
     let url = format!("https://{PORT}-{}.e2b.app/exec", vm.id);
     // Up when the public URL answers 401 to a caller without the bearer.
@@ -408,6 +443,10 @@ pub async fn start(name: &str) -> Result<Started, String> {
         vars: BTreeMap::from([
             ("SPOOL_STATE".into(), STATE_DIR.into()),
             ("SPOOL_JOBS".into(), JOBS_DIR.into()),
+            (
+                "EXECD_RESTART".into(),
+                format!("sudo {HOME}/bin/execd-restart"),
+            ),
         ]),
         lease: Some(Arc::new({
             let vm = vm.clone();

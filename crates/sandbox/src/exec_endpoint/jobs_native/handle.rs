@@ -76,6 +76,9 @@ struct Payload {
     bytes: Vec<u8>,
     stream: Option<Stream>,
     pgid: u32,
+    /// The start's key as the `started` frame echoed it, and the key the start sent.
+    key: Option<String>,
+    sent: String,
     /// The text of an error frame.
     error: Option<String>,
 }
@@ -84,12 +87,6 @@ fn draw() -> u32 {
     let mut b = [0u8; 4];
     let _ = getrandom::fill(&mut b);
     u32::from_le_bytes(b)
-}
-
-fn fresh_key() -> String {
-    let mut b = [0u8; 16];
-    let _ = getrandom::fill(&mut b);
-    hex::encode(b)
 }
 
 fn mark_text(m: &Mark) -> &str {
@@ -106,11 +103,17 @@ pub(super) async fn drive(
         began: Instant::now(),
         divisor: h.runner.time_divisor,
     };
-    let key = fresh_key();
+    let key = match h.spec {
+        Some(spec) => super::start_key(spec)?,
+        None => String::new(),
+    };
     let silence = |ms: u64| Duration::from_millis(ms);
     let mut reader: Option<FrameReader> = None;
     let mut refusal: Option<Refusal> = None;
-    let mut payload = Payload::default();
+    let mut payload = Payload {
+        sent: key.clone(),
+        ..Payload::default()
+    };
     let mut end: Option<JobEnd> = None;
     let mut ev = Ev::Go;
     let mut limit = silence(silence_limit_ms(h.beat));
@@ -398,12 +401,14 @@ async fn read(reader: &mut Option<FrameReader>, limit: Duration, p: &mut Payload
         }
         Ok(JobFrame::End(JobEnd::Exit(code))) => KFrame::Exit { code, signal: 0 },
         Ok(JobFrame::End(JobEnd::Signal(signal))) => KFrame::Exit { code: 0, signal },
-        Ok(JobFrame::Event(Event::Started(pgid, mark, stdin, echoed))) => {
+        Ok(JobFrame::Event(Event::Started(pgid, mark, stdin, echoed, key))) => {
             p.pgid = pgid;
+            p.key = key;
             KFrame::Started {
                 mark: as_mark(mark.as_deref(), p),
                 stdin,
                 pty: echoed.is_some(),
+                key: p.key.as_deref() == Some(p.sent.as_str()),
             }
         }
         Ok(JobFrame::Event(Event::Attached(mark, from))) => KFrame::Attached {

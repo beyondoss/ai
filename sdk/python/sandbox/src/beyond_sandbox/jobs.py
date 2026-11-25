@@ -68,6 +68,7 @@ class Jobs:
         heartbeat_seconds: int | None = None,
         timeout: float | None = None,
         pty: Pty | None = None,
+        idempotency_key: str | None = None,
     ) -> JobStart:
         """Start a job the sandbox keeps from the start; returns its process group and mark. ``env`` is the
         command's own environment; ``stdin_open`` keeps its stdin open for :meth:`write_stdin`
@@ -76,9 +77,24 @@ class Jobs:
         when the endpoint does not echo it; ``stdin_open`` is implied, and ``write_stdin`` takes no
         ``eof``). An id that
         exists is :class:`~beyond_sandbox.JobExistsError`; a full disk is
-        :class:`~beyond_sandbox.DiskFullError`."""
+        :class:`~beyond_sandbox.DiskFullError`. The start carries an idempotency key
+        (``idempotency_key``, 1 to 128 characters of ``[0-9A-Za-z._:-]``; omitted, one is generated for this
+        call): sent again, it answers the same job and runs nothing, and the key of another command is
+        :class:`~beyond_sandbox.KeyConflictError` (``409``). An endpoint that ignores keys is a
+        ``NotOfferedError``. Pass your own to make a re-run of a whole program return its job."""
         op = _jobs.start(
-            scope, job, command, args, cwd, label, env, stdin_open, heartbeat_seconds, timeout, pty
+            scope,
+            job,
+            command,
+            args,
+            cwd,
+            label,
+            env,
+            stdin_open,
+            heartbeat_seconds,
+            timeout,
+            pty,
+            idempotency_key,
         )
         return drive(op, self._t)
 
@@ -97,6 +113,7 @@ class Jobs:
         on_reconnecting: Callable[[Reconnecting], None] | None = None,
         timeout: float | None = None,
         pty: Pty | None = None,
+        idempotency_key: str | None = None,
     ) -> Generator[JobFrame, None, None]:
         """Start a job held by the returned stream (wire ``hold: true``): events, the first a
         :class:`JobStarted`, ending with a :class:`JobEnd`. If you stop before the end and did not
@@ -116,6 +133,7 @@ class Jobs:
             on_reconnecting,
             timeout,
             pty,
+            idempotency_key,
         )
         yield from iter_items(op, self._t)
 
@@ -261,9 +279,21 @@ class AsyncJobs:
         heartbeat_seconds: int | None = None,
         timeout: float | None = None,
         pty: Pty | None = None,
+        idempotency_key: str | None = None,
     ) -> JobStart:
         op = _jobs.start(
-            scope, job, command, args, cwd, label, env, stdin_open, heartbeat_seconds, timeout, pty
+            scope,
+            job,
+            command,
+            args,
+            cwd,
+            label,
+            env,
+            stdin_open,
+            heartbeat_seconds,
+            timeout,
+            pty,
+            idempotency_key,
         )
         return await adrive(op, self._t)
 
@@ -282,6 +312,7 @@ class AsyncJobs:
         on_reconnecting: Callable[[Reconnecting], None] | None = None,
         timeout: float | None = None,
         pty: Pty | None = None,
+        idempotency_key: str | None = None,
     ) -> AsyncGenerator[JobFrame, None]:
         """As :meth:`Jobs.start_held`."""
         op = _jobs.start_held(
@@ -297,6 +328,7 @@ class AsyncJobs:
             on_reconnecting,
             timeout,
             pty,
+            idempotency_key,
         )
         async for item in aiter_items(op, self._t):
             yield item

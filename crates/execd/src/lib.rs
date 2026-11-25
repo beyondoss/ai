@@ -28,6 +28,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 mod exec;
+mod fault;
 mod frame;
 mod http;
 /// The job table's decisions, proven in Verus (`crates/execd-jobs`); the model checks the function

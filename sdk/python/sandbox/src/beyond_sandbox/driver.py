@@ -34,6 +34,7 @@ from .errors import (
     IoError,
     JobExistsError,
     JobGoneError,
+    KeyConflictError,
     ProtocolError,
     StdinBusyError,
     StdinClosedError,
@@ -57,6 +58,7 @@ class _Unsupported(SandboxError):
 FEATURES = [
     "frames", "unbounded_stream", "exit_signal", "exec_env", "job_streams", "job_stdin",
     "job_signal_op", "job_errors", "job_options", "job_marks", "job_pty",
+    "job_signal_op", "job_errors", "job_options", "job_start_key",
 ]  # fmt: skip
 
 OPS = [
@@ -347,9 +349,10 @@ def _job_plan(op: str, req: dict[str, Any]) -> Plan:
         cwd, label = _opt_str(req, "cwd"), _opt_str(req, "label") or ""
         env, stdin_open, keep = _env(req), _flag(req, "stdin_open"), _flag(req, "keep")
         beat, pty = _count(req, "heartbeat_seconds"), _pty(req)
+        key = _opt_str(req, "idempotency_key")
         return (
             lambda sb: _start_held(
-                sb, scope, job, command, args, cwd, label, env, stdin_open, keep, beat, pty
+                sb, scope, job, command, args, cwd, label, env, stdin_open, keep, beat, pty, key
             ),
             lambda st: {"pgid": st.pgid, "mark": st.mark, **_echo(pty)},
         )
@@ -357,6 +360,7 @@ def _job_plan(op: str, req: dict[str, Any]) -> Plan:
         command, args = _str(req, "command"), _strings(req, "args")
         cwd, label = _opt_str(req, "cwd"), _opt_str(req, "label") or ""
         env, stdin_open, pty = _env(req), _flag(req, "stdin_open"), _pty(req)
+        key = _opt_str(req, "idempotency_key")
         return (
             lambda sb: sb.jobs.start(
                 scope,
@@ -368,6 +372,7 @@ def _job_plan(op: str, req: dict[str, Any]) -> Plan:
                 env=env,
                 stdin_open=stdin_open,
                 pty=pty,
+                idempotency_key=key,
             ),
             # The client refused (`not_offered`) an endpoint that did not echo `pty`, so a start
             # that came back echoed it.
@@ -508,12 +513,13 @@ def _start_held(
     keep: bool,
     beat: int | None,
     pty: Pty | None,
+    key: str | None,
 ) -> Any:
     """``job_start_held``: start held, learn the pgid from the first frame, optionally ``keep``, then
     drop the stream: a job nobody kept dies with it (wire ``hold: true``)."""
     kw: dict[str, Any] = {
         "cwd": cwd, "label": label, "env": env, "stdin_open": stdin_open, "heartbeat_seconds": beat,
-        "pty": pty,
+        "pty": pty, "idempotency_key": key,
     }  # fmt: skip
     if isinstance(sb, AsyncSandbox):
 
@@ -833,6 +839,8 @@ def _code(e: SandboxError) -> str | None:
         return "job_gone"
     if isinstance(e, JobExistsError):
         return "job_exists"
+    if isinstance(e, KeyConflictError):
+        return "key_conflict"
     if isinstance(e, DiskFullError):
         return "disk_full"
     if isinstance(e, StdinClosedError):

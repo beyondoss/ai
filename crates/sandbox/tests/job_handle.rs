@@ -29,7 +29,7 @@ fn out(s: &str) -> String {
 }
 
 fn started() -> String {
-    format!(r#"{{"started":4242,"mark":"{MARK}","stdin":false}}"#)
+    format!(r#"{{"started":4242,"mark":"{MARK}","stdin":false,"key":"k"}}"#)
 }
 
 fn attached(from: u64) -> String {
@@ -39,6 +39,7 @@ fn attached(from: u64) -> String {
 fn spec() -> JobSpec {
     JobSpec {
         pty: None,
+        idempotency_key: Some("k".into()),
         program: "sh".into(),
         args: vec!["-c".into(), "true".into()],
         cwd: None,
@@ -132,13 +133,16 @@ async fn a_start_lost_before_its_echo_is_sent_again_with_the_same_key() {
     assert_eq!(seen[0]["op"], "start");
     assert_eq!(seen[1]["op"], "start");
     assert_eq!(seen[0]["idempotency_key"], seen[1]["idempotency_key"]);
-    assert!(seen[0]["idempotency_key"].as_str().unwrap().len() >= 16);
+    assert_eq!(seen[0]["idempotency_key"], "k");
 }
 
 #[tokio::test]
 async fn an_endpoint_that_sends_no_mark_is_refused_not_trusted() {
     let front = JobFront::start(script(|_, _| {
-        Reply::Stream(vec![r#"{"started":4242,"stdin":false}"#.into(), out("x")])
+        Reply::Stream(vec![
+            r#"{"started":4242,"stdin":false,"key":"k"}"#.into(),
+            out("x"),
+        ])
     }))
     .await;
     let (r, lines) = run(&front, 1000).await;

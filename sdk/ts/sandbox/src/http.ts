@@ -934,6 +934,9 @@ class HttpJobs implements JobOps {
         ...(spec.pty
           ? { pty: { cols: spec.pty.cols, rows: spec.pty.rows } }
           : {}),
+        ...(spec.idempotencyKey !== undefined
+          ? { idempotency_key: spec.idempotencyKey }
+          : {}),
       }),
       env: spec.env,
       heartbeatSeconds: req.heartbeatSeconds,
@@ -1303,7 +1306,7 @@ function neverConnected(e: unknown, depth = 0): boolean {
 }
 
 /** One line of a job stream, read for the facts the kernel decides on. Never throws. */
-export function decodeJobLine(line: Uint8Array): JobLine {
+export function decodeJobLine(line: Uint8Array, sentKey?: string): JobLine {
   let s = text(line);
   if (s.endsWith("\r")) s = s.slice(0, -1);
   if (s.trim() === "") return { frame: { t: "heartbeat" } };
@@ -1329,6 +1332,7 @@ export function decodeJobLine(line: Uint8Array): JobLine {
         mark: typeof v.mark === "string" ? v.mark : "",
         stdin: v.stdin === true,
         pty: pty !== null,
+        key: sentKey !== undefined && v.key === sentKey,
       },
       pgid: v.started,
       ...(pty === null ? {} : { pty }),

@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::job_kernel::{Claim, Phase, Size, State, Term};
+use crate::job_kernel::{Claim, Persist, Phase, Size, State, Term};
 
 const FILE: &str = "execd-jobs.json";
 const VERSION: u32 = 1;
@@ -61,6 +61,11 @@ pub(crate) struct Entry {
     /// A terminal's: its size, its keeper's pid and whether it was open. The keeper's socket is in the spool.
     #[serde(default)]
     pub term: Option<SavedTerm>,
+    /// The start's idempotency key and the digest of the spec it started with (`jobs::spec_digest`): the
+    /// job's record in the key ledger. Never the spec itself, which can hold secrets in its env. A restarted
+    /// execd puts it back (K6), so a start retried across the restart replays the job. `None`: an unkeyed start.
+    #[serde(default)]
+    pub idem: Option<Idem>,
 }
 
 /// What a restart needs of a terminal: the keeper to ask (its pid is what `SO_PEERCRED` must say) and
@@ -71,6 +76,12 @@ pub(crate) struct SavedTerm {
     pub rows: u16,
     pub keeper_pid: i32,
     pub open: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Idem {
+    pub key: String,
+    pub digest: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,6 +96,8 @@ pub(crate) struct Kept {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Saved {
+    /// A keyed start's claim, written before its spawn (`idem` is set, `pgid` is 0).
+    Spawning,
     Running,
     Exited,
     Ended,
@@ -98,6 +111,7 @@ struct File {
 
 impl Entry {
     /// What to save of a job, or `None` for one not worth saving: no group yet, or removed.
+    #[allow(clippy::too_many_arguments)] // one saved row, each field from a different owner
     pub fn of(
         (scope, id): (&str, &str),
         label: &str,
@@ -106,11 +120,15 @@ impl Entry {
         k: &State,
         spool: Option<&Path>,
         keeper_pid: Option<i32>,
+        idem: Option<&Idem>,
     ) -> Option<Self> {
         if k.removed {
             return None;
         }
         let (phase, pgid, code, signal, at, told) = match k.phase {
+            // A keyed start's intent is saved before the spawn, so a crash before the group's save leaves a claim a
+            // restart can answer (K9). An unkeyed start with no group is not saved (R4).
+            Phase::Spawning if idem.is_some() => (Saved::Spawning, 0, None, None, None, None),
             Phase::Spawning => return None,
             Phase::Running { pgid } => (Saved::Running, pgid, None, None, None, None),
             Phase::Exited { pgid, code, signal } => {
@@ -170,6 +188,7 @@ impl Entry {
                     open: false,
                 }),
             },
+            idem: idem.cloned(),
         })
     }
 
@@ -177,6 +196,7 @@ impl Entry {
     pub fn state(&self) -> State {
         let (pgid, code, signal) = (self.pgid, self.code.unwrap_or(0), self.signal);
         let phase = match self.phase {
+            Saved::Spawning => Phase::Spawning,
             Saved::Running => Phase::Running { pgid },
             Saved::Exited => Phase::Exited { pgid, code, signal },
             Saved::Ended => Phase::Ended {
@@ -271,11 +291,44 @@ impl Ledger {
             version: VERSION,
             jobs: snapshot(),
         };
-        if let Err(e) = write_atomic(dir, &file) {
+        if let Err(e) = write_atomic(dir, &file, false) {
             crate::log_warn!(
                 "cannot save the jobs ledger dir={} error={e}",
                 dir.display()
             );
+        }
+    }
+
+    /// [`Self::save`] for a keyed start's claim (K10): the file is written, synced, renamed and its directory synced,
+    /// and how that came out is returned, so the start can refuse when the claim is not on disk. A ledger that is not
+    /// enabled keeps nothing across a restart, so there is nothing to lose: `Durable`.
+    pub fn claim(&self, snapshot: impl FnOnce() -> Vec<Entry>) -> Persist {
+        let Some(dir) = &self.dir else {
+            return Persist::Durable;
+        };
+        let _one = crate::proc::locked(&self.write);
+        let file = File {
+            version: VERSION,
+            jobs: snapshot(),
+        };
+        let written = match crate::fault::at("claim_save").as_deref() {
+            Some("full") => Err(std::io::ErrorKind::StorageFull.into()),
+            Some(_) => Err(std::io::Error::other("injected claim fault")),
+            None => write_atomic(dir, &file, true),
+        };
+        match written {
+            Ok(()) => Persist::Durable,
+            Err(e) => {
+                crate::log_warn!(
+                    "cannot save a start's claim dir={} error={e}",
+                    dir.display()
+                );
+                if e.kind() == std::io::ErrorKind::StorageFull {
+                    Persist::DiskFull
+                } else {
+                    Persist::Failed
+                }
+            }
         }
     }
 
@@ -297,15 +350,32 @@ impl Ledger {
     }
 }
 
-fn write_atomic(dir: &Path, file: &File) -> std::io::Result<()> {
+/// Replace the ledger file with `file`: write a temporary beside it, rename it over. With `durable`, the temporary is
+/// synced before the rename and the directory after, so a crash of the host leaves the old file or the new one, and
+/// a failure at any step is the caller's to see (the temporary is removed).
+fn write_atomic(dir: &Path, file: &File, durable: bool) -> std::io::Result<()> {
     let tmp = dir.join(format!("{FILE}.tmp"));
     let _ = fs::remove_file(&tmp);
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)?;
-    f.write_all(&serde_json::to_vec(file).map_err(std::io::Error::other)?)?;
-    drop(f);
-    fs::rename(&tmp, dir.join(FILE))
+    let put = || -> std::io::Result<()> {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(&serde_json::to_vec(file).map_err(std::io::Error::other)?)?;
+        if durable {
+            f.sync_all()?;
+        }
+        drop(f);
+        fs::rename(&tmp, dir.join(FILE))?;
+        if durable {
+            fs::File::open(dir)?.sync_all()?;
+        }
+        Ok(())
+    };
+    let r = put();
+    if r.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    r
 }

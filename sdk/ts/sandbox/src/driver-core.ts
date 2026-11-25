@@ -24,6 +24,7 @@ import {
   DiskFullError,
   JobExistsError,
   JobGoneError,
+  KeyConflictError,
   SandboxError,
   StdinBusyError,
   StdinClosedError,
@@ -265,6 +266,7 @@ export class Driver {
               "job_options",
               "job_marks",
               "job_pty",
+              "job_start_key",
             ],
           },
         };
@@ -347,6 +349,9 @@ export class Driver {
           ...(env !== undefined ? { env } : {}),
           ...(flag(req, "stdin_open") ? { stdinOpen: true } : {}),
           ...(pty !== undefined ? { pty } : {}),
+          ...(optStr(req, "idempotency_key") !== undefined
+            ? { idempotencyKey: optStr(req, "idempotency_key") as string }
+            : {}),
         });
         // The client refused (`not_offered`) an endpoint that did not echo `pty`, so a start that
         // came back echoed it.
@@ -373,6 +378,9 @@ export class Driver {
           ...(env !== undefined ? { env } : {}),
           ...(flag(req, "stdin_open") ? { stdinOpen: true } : {}),
           ...(pty !== undefined ? { pty } : {}),
+          ...(optStr(req, "idempotency_key") !== undefined
+            ? { idempotencyKey: optStr(req, "idempotency_key") as string }
+            : {}),
         }, heartbeat(req));
         try {
           for await (const f of stream) {
@@ -701,6 +709,7 @@ function heartbeat(req: Json): { heartbeatSeconds?: number } {
 function codeOf(e: SandboxError): string | undefined {
   if (e instanceof JobGoneError) return "job_gone";
   if (e instanceof JobExistsError) return "job_exists";
+  if (e instanceof KeyConflictError) return "key_conflict";
   if (e instanceof DiskFullError) return "disk_full";
   if (e instanceof StdinClosedError) {
     return e.reason === "never_opened" ? "stdin_never_opened" : "stdin_closed";

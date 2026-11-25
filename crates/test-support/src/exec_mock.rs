@@ -81,6 +81,8 @@ pub enum Protocol {
 /// How the endpoint behaves. [`Default`] is a conforming sandbox.
 #[derive(Clone, Debug)]
 pub struct MockOptions {
+    /// Ignore a start's `idempotency_key`, as an endpoint that predates keys does: nothing is echoed.
+    pub ignores_keys: bool,
     /// Answer every one-shot request with corrupted base64 in `stdout` and `stderr`: the
     /// non-conforming endpoint the verifier has to catch.
     pub corrupts_base64: bool,
@@ -193,6 +195,7 @@ pub enum LoseCallbacks {
 impl Default for MockOptions {
     fn default() -> Self {
         Self {
+            ignores_keys: false,
             corrupts_base64: false,
             bare_spawn_errors: false,
             protocol: Protocol::Streaming,
@@ -249,6 +252,7 @@ impl MockOptions {
             && self.faults == NotifyFaults::default()
             && self.enforces_timeout
             && self.reports_job_signal
+            && !self.ignores_keys
     }
 }
 
@@ -1630,11 +1634,25 @@ async fn start_job(sock: tokio::net::TcpStream, req: Value, shared: Shared) {
             });
             streams.len() - 1
         };
-        let head = json!({ "started": pgid, "mark": mark });
+        let mut head = json!({ "started": pgid, "mark": mark });
+        if !shared.opts.ignores_keys {
+            echo_key(&mut head, job);
+        }
         let end = stream_job(sock, shared.clone(), key, 0, true, Some(head), false).await;
         shared.streams.lock().unwrap()[index].end = Some((end, Instant::now()));
     } else {
-        respond_json(sock, 200, &json!({ "started": pgid, "mark": mark })).await;
+        let mut answer = json!({ "started": pgid, "mark": mark });
+        if !shared.opts.ignores_keys {
+            echo_key(&mut answer, job);
+        }
+        respond_json(sock, 200, &answer).await;
+    }
+}
+
+/// An endpoint that keeps start keys echoes the key it was sent beside `started`.
+fn echo_key(answer: &mut Value, job: &Value) {
+    if let Some(k) = job["idempotency_key"].as_str() {
+        answer["key"] = json!(k);
     }
 }
 

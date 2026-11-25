@@ -29,6 +29,7 @@ describe("driver without an endpoint", () => {
           "job_options",
           "job_marks",
           "job_pty",
+          "job_start_key",
         ],
       },
     });

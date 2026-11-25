@@ -41,6 +41,15 @@
 //!   group number now names.
 //! - L2 (`k = 1`): a stream that has sent everything of an ended job sends its final frame next.
 //!   Fairness assumed: the supervisor and the stream task are always scheduled.
+//! - K1 a start with a key never runs a second job for a key and spec already in the table: the retry of a
+//!   start whose answer was lost (`StartKeyed` again with the same key and spec, at any later point, across
+//!   a `Restart` of execd too) answers the first job.
+//! - K2 a replay names the job that was started under that key and spec, and a key used for another spec
+//!   never starts.
+//! - K3 (`k = 1`, the liveness partner of K2's and J1's refusals): a retry of a keyed start whose job is in
+//!   the table is answered with that job, and a fresh key on a free id starts, whatever came before (a
+//!   restart, a removal, another key's record).
+//! - K4 a start with no key never replays.
 //!
 //! Not modelled: bytes (the ring is two counters: its content is the fuzz target `ring`'s), stdin (its decisions, `stdin_plan` and
 //! `admit_waiter`, are the kernel's and proven in Verus; this model only checks production calls them),
@@ -55,8 +64,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use execd::job_kernel::{
-    self as kernel, Act, Admit, Alive, Attach, Ev, Follow, Gate, Key, Phase, Pick, Recovery,
-    Removal, Resizable, Size, State, Term,
+    self as kernel, Act, Admit, Alive, Attach, Begin, Ev, Follow, Gate, Key, Launch, Persist,
+    Phase, Pick, Rec, Recovery, Removal, Resizable, Size, State, Sweep, Term,
 };
 use stateright::{Checker, Model, Property};
 
@@ -78,6 +87,11 @@ const V_T7: u32 = 1 << 14;
 const V_T9: u32 = 1 << 15;
 const V_T10: u32 = 1 << 16;
 const V_T12: u32 = 1 << 17;
+const V_K1: u32 = 1 << 18;
+const V_K2: u32 = 1 << 19;
+const V_K4: u32 = 1 << 20;
+const V_K10: u32 = 1 << 21;
+const V_K16: u32 = 1 << 22;
 
 /// The terminal's size at its start, and the sizes a client may ask for (the last is outside the bounds).
 const START: Size = Size { cols: 80, rows: 24 };
@@ -146,6 +160,24 @@ struct Sim {
     asked: Option<Size>,
     /// The incarnation's mark: one per job, so two jobs of one id never share it.
     mark: String,
+    /// The start's key and spec (the model's own record of what the client sent), `None` for an unkeyed start.
+    idem: Option<(u8, u8)>,
+    /// A restart dropped this keyed job's claim while its process may have been spawned: whatever starts for its key
+    /// next would be a second spawn (K9). The model's own fact, never the kernel's.
+    orphan: bool,
+    /// How far a keyed start's claim step is (K10): the claim's write, then the spawn.
+    claimed: Claimed,
+}
+
+/// A keyed start's claim step, as the environment saw it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Claimed {
+    /// Its claim has not been written yet: nothing may spawn.
+    Pending,
+    /// Its claim is on disk, or the start has no key.
+    Durable,
+    /// Its claim is not on disk and the start went on to spawn (the kernel said `Spawn`).
+    Unsaved,
 }
 
 impl Sim {
@@ -195,6 +227,14 @@ impl std::hash::Hash for St {
         let mut all = self.table.all();
         all.sort();
         all.hash(h);
+        let mut recs: Vec<_> = self
+            .table
+            .records()
+            .into_iter()
+            .map(|r| (r.scope, r.key, r.id, r.digest))
+            .collect();
+        recs.sort();
+        recs.hash(h);
         (
             &self.sims,
             &self.clients,
@@ -213,6 +253,21 @@ enum A {
         id: u8,
         client: Option<usize>,
     },
+    /// A keyed start: the first send, or the retry of one whose answer was lost.
+    StartKeyed {
+        scope: u8,
+        id: u8,
+        key: u8,
+        spec: u8,
+    },
+    /// execd restarts: its table is gone and the ledger's jobs come back as `recover` decides.
+    RestartAll,
+    /// A keyed job's process is spawned and execd restarts before the group's save: only the intent is on disk (K9).
+    /// A keyed start's claim is written (K10).
+    ClaimOk(usize),
+    /// A keyed start's claim cannot be written (the disk is full, or the write fails): the kernel says what the start does.
+    ClaimFail(usize),
+    SpawnCrash(usize),
     SpawnOk(usize),
     SpawnFail(usize),
     ShellDies(usize),
@@ -286,6 +341,11 @@ struct Jobs {
     term: bool,
     /// Attach and remove may name a mark, and an attach may be status-only.
     marks: bool,
+    /// Start keys in use (`0`: no keyed start), and the specs a key may be sent with.
+    keys: u8,
+    specs: u8,
+    /// execd may restart.
+    restart: bool,
 }
 
 /// One scope, one id, two jobs: a key is reused after a removal.
@@ -298,6 +358,9 @@ const REUSE: Jobs = Jobs {
     slow: false,
     term: false,
     marks: true,
+    keys: 0,
+    specs: 0,
+    restart: false,
 };
 /// One scope, one id, two jobs, no streams: a `remove`/`wipe` decides, other clients remove and
 /// restart the id, then it takes (J10).
@@ -310,6 +373,9 @@ const SLOW: Jobs = Jobs {
     slow: true,
     term: false,
     marks: false,
+    keys: 0,
+    specs: 0,
+    restart: false,
 };
 /// Two scopes that both use one id (no ring: the ring is REUSE's and STREAMS').
 const SCOPES: Jobs = Jobs {
@@ -321,6 +387,9 @@ const SCOPES: Jobs = Jobs {
     slow: false,
     term: false,
     marks: false,
+    keys: 0,
+    specs: 0,
+    restart: false,
 };
 /// One scope, two ids: `kill` of one id leaves the other (no streams, no ring).
 const IDS: Jobs = Jobs {
@@ -332,6 +401,9 @@ const IDS: Jobs = Jobs {
     slow: false,
     term: false,
     marks: false,
+    keys: 0,
+    specs: 0,
+    restart: false,
 };
 /// One terminal job, held and kept, two clients: resizes at any step (spawning too), a keeper that
 /// dies, a foreground command in its own group, a client that leaves, and a restart of execd.
@@ -344,6 +416,9 @@ const PTY: Jobs = Jobs {
     slow: false,
     term: true,
     marks: false,
+    keys: 0,
+    specs: 0,
+    restart: false,
 };
 /// One job, two clients, two bytes: streams and the ring (a gap, an eviction under a reader).
 const STREAMS: Jobs = Jobs {
@@ -355,9 +430,112 @@ const STREAMS: Jobs = Jobs {
     slow: false,
     term: false,
     marks: true,
+    keys: 0,
+    specs: 0,
+    restart: false,
 };
 
+/// Keys and specs: two keys, two specs, two ids, two jobs: a keyed start retried after a lost answer, after a
+/// restart, after a removal, with another spec, and with another key's record beside it.
+const KEYED: Jobs = Jobs {
+    scopes: 1,
+    ids: 2,
+    max_jobs: 2,
+    clients: 0,
+    max_end: 0,
+    slow: false,
+    term: false,
+    marks: false,
+    keys: 2,
+    specs: 2,
+    restart: true,
+};
+
+fn key_name(key: u8) -> String {
+    format!("k{key}")
+}
+
+fn digest(spec: u8) -> String {
+    format!("d{spec}")
+}
+
 impl St {
+    /// execd restarts: its table is gone; every job the ledger saved comes back as `recover` decides
+    /// (`jobs::recover`): the table is rebuilt, with each job's key record when the kernel keeps it.
+    fn restart(&mut self) {
+        let old = self.table.all();
+        self.table = kernel::Table::default();
+        self.pending.clear();
+        for cl in &mut self.clients {
+            cl.st = Cl::Done;
+        }
+        for ((sc, idn), h) in old {
+            let sim = &mut self.sims[h];
+            if sim.idem.is_some() && sim.claimed != Claimed::Durable {
+                // Its claim never reached the disk: the ledger has no entry for it, and a process it spawned (the
+                // kernel let it) is one no restart can name. The next start of its key would spawn it again.
+                sim.orphan = sim.alive();
+                kernel::step(&mut sim.k, Ev::Taken);
+                continue;
+            }
+            let (mut state, how, sweep) = kernel::recover(
+                sim.k.clone(),
+                sim.alive(),
+                kernel::keeper_of(false, None, None),
+                0,
+                sim.idem.is_some(),
+            );
+            if how == Recovery::Drop {
+                // Never saved (it was spawning): the spawn died with the process. A keyed one's process may
+                // exist: the claim is gone, so the next start of its key would spawn it again.
+                sim.orphan = sim.idem.is_some() && sim.alive();
+                kernel::step(&mut sim.k, Ev::Taken);
+                continue;
+            }
+            if sweep == Sweep::KillMarked {
+                // The kernel's action: the shell kills what carries the intent's mark. Whether a process of the
+                // claim lives is the environment's fact (`SpawnCrash` left one); the kill is only what the kernel
+                // asked for.
+                sim.shell = false;
+                sim.desc = false;
+            }
+            if how == Recovery::Adopt {
+                sim.sup = if sim.shell {
+                    Sup::Wait
+                } else if sim.desc {
+                    Sup::Reported
+                } else {
+                    Sup::Reaping
+                };
+                if let Act::Kill { .. } = kernel::step(&mut state, Ev::Disconnect { hold: true }) {
+                    sim.shell = false;
+                    sim.desc = false;
+                }
+            } else {
+                sim.pumps = false;
+                sim.sup = Sup::Done;
+                if let Phase::Ended { code, signal, .. } = state.phase
+                    && sim.snap.is_none()
+                {
+                    sim.snap = Some((code, signal, sim.end));
+                }
+            }
+            sim.k = state;
+            let idem = sim.idem;
+            self.table.insert((sc.clone(), idn.clone()), h);
+            if let Some((kk, spec)) = idem
+                && kernel::keeps_record(how)
+            {
+                self.table.record(Rec {
+                    scope: sc,
+                    key: key_name(kk),
+                    id: idn,
+                    digest: digest(spec),
+                });
+            }
+        }
+    }
+
     /// The job a lookup in `scope` resolved to, judged against the facts: J2 and J3.
     fn resolved(&mut self, scope: u8, h: usize) {
         if self.sims[h].scope != scope {
@@ -536,11 +714,36 @@ impl Model for Jobs {
                 }
             }
         }
+        for scope in 0..self.scopes {
+            for id in 0..self.ids {
+                for key in 0..self.keys {
+                    for spec in 0..self.specs {
+                        out.push(A::StartKeyed {
+                            scope,
+                            id,
+                            key,
+                            spec,
+                        });
+                    }
+                }
+            }
+        }
+        if self.restart && !s.table.all().is_empty() {
+            out.push(A::RestartAll);
+        }
         for (i, sim) in s.sims.iter().enumerate() {
             // A failed spawn took the entry: nothing spawns after it.
             if sim.k.phase == Phase::Spawning && !sim.k.removed {
-                out.push(A::SpawnOk(i));
-                out.push(A::SpawnFail(i));
+                if sim.claimed == Claimed::Pending {
+                    out.push(A::ClaimOk(i));
+                    out.push(A::ClaimFail(i));
+                } else {
+                    out.push(A::SpawnOk(i));
+                    out.push(A::SpawnFail(i));
+                    if self.restart && sim.idem.is_some() {
+                        out.push(A::SpawnCrash(i));
+                    }
+                }
             }
             if sim.shell {
                 out.push(A::ShellDies(i));
@@ -661,8 +864,17 @@ impl Model for Jobs {
         match a {
             A::Start { scope, id, client } => {
                 let k = key(scope, id);
-                if s.table.admit(&k) == Admit::Exists {
-                    return None;
+                // `start_job`'s decision, with no key (K4, K5).
+                match s
+                    .table
+                    .begin(&scope_name(scope), &format!("i{id}"), None, "")
+                {
+                    Begin::Refuse(_) => return None,
+                    Begin::Replay(_) => {
+                        s.bad |= V_K4;
+                        return Some(s);
+                    }
+                    Begin::Start => {}
                 }
                 // J1: the entry is the claim; a start never replaces a job still in the table.
                 if let Some(old) = s.table.get(&k)
@@ -690,6 +902,9 @@ impl Model for Jobs {
                     applied: None,
                     asked: None,
                     mark: format!("m{h}"),
+                    idem: None,
+                    orphan: false,
+                    claimed: Claimed::Durable,
                 });
                 s.table.insert(k, h);
                 if let Some(c) = client {
@@ -705,7 +920,132 @@ impl Model for Jobs {
                     };
                 }
             }
+            A::StartKeyed {
+                scope,
+                id,
+                key: kk,
+                spec,
+            } => {
+                let (sc, idn, kn, dg) = (
+                    scope_name(scope),
+                    format!("i{id}"),
+                    key_name(kk),
+                    digest(spec),
+                );
+                let in_table = |s: &St, f: &dyn Fn(&Sim) -> bool| {
+                    s.table
+                        .all()
+                        .iter()
+                        .any(|((sco, _), h)| *sco == sc && f(&s.sims[*h]))
+                };
+                match s.table.begin(&sc, &idn, Some(&kn), &dg) {
+                    Begin::Refuse(_) => {}
+                    Begin::Replay(rid) => {
+                        // K2: the job it names was started under this key and spec.
+                        match s.table.get(&(sc.clone(), rid)) {
+                            Some(h)
+                                if s.sims[h].idem == Some((kk, spec))
+                                    && s.sims[h].id == id
+                                    && s.sims[h].scope == scope =>
+                            {
+                                s.resolved(scope, h);
+                            }
+                            _ => s.bad |= V_K2,
+                        }
+                    }
+                    Begin::Start => {
+                        // K1: no job of this key and spec is in the table. K2: no job of this key and
+                        // another spec is either (the key was used for another command).
+                        if s.sims
+                            .iter()
+                            .any(|x| x.idem == Some((kk, spec)) && x.scope == scope && x.orphan)
+                            || in_table(&s, &|x| x.idem == Some((kk, spec)))
+                        {
+                            s.bad |= V_K1;
+                        }
+                        if in_table(&s, &|x| {
+                            x.idem.is_some_and(|(k2, s2)| k2 == kk && s2 != spec)
+                        }) {
+                            s.bad |= V_K2;
+                        }
+                        if s.sims.len() >= self.max_jobs {
+                            return if s.bad == last.bad { None } else { Some(s) };
+                        }
+                        let h = s.sims.len();
+                        s.sims.push(Sim {
+                            scope,
+                            id,
+                            k: State::new(0, false, None),
+                            shell: false,
+                            desc: false,
+                            pumps: false,
+                            sup: Sup::Idle,
+                            base: 0,
+                            end: 0,
+                            snap: None,
+                            was_kept: true,
+                            term: false,
+                            keeper: false,
+                            handle: false,
+                            fg: false,
+                            applied: None,
+                            asked: None,
+                            mark: format!("m{h}"),
+                            idem: Some((kk, spec)),
+                            orphan: false,
+                            claimed: Claimed::Pending,
+                        });
+                        if let Some(old) = s.table.get(&key(scope, id))
+                            && !s.sims[old].k.removed
+                        {
+                            s.bad |= V_J1;
+                        }
+                        s.table.insert(key(scope, id), h);
+                        s.table.record(Rec {
+                            scope: sc,
+                            key: kn,
+                            id: idn,
+                            digest: dg,
+                        });
+                    }
+                }
+            }
+            A::RestartAll => s.restart(),
+            A::ClaimOk(i) => {
+                // `start_job`: the claim is written, then the kernel says whether to spawn.
+                if kernel::launch(Some(Persist::Durable)) == Launch::Spawn {
+                    s.sims[i].claimed = Claimed::Durable;
+                } else {
+                    // K16: a durable claim always spawns.
+                    s.bad |= V_K16;
+                    let k = key(s.sims[i].scope, s.sims[i].id);
+                    s.take(&[(k, i)]);
+                }
+            }
+            A::ClaimFail(i) => {
+                // The claim could not be written: the kernel refuses (the entry goes, as a failed spawn's does) or,
+                // under a mutation, spawns with no claim on disk.
+                if kernel::launch(Some(Persist::Failed)) == Launch::Spawn {
+                    s.sims[i].claimed = Claimed::Unsaved;
+                } else {
+                    let k = key(s.sims[i].scope, s.sims[i].id);
+                    s.take(&[(k, i)]);
+                }
+            }
+            A::SpawnCrash(i) => {
+                if s.sims[i].claimed != Claimed::Durable {
+                    s.bad |= V_K10;
+                }
+                let sim = &mut s.sims[i];
+                sim.shell = true;
+                sim.desc = true;
+                sim.pumps = true;
+                s.restart();
+            }
             A::SpawnOk(i) => {
+                if s.sims[i].idem.is_some() && s.sims[i].claimed != Claimed::Durable {
+                    s.bad |= V_K10;
+                }
                 let sim = &mut s.sims[i];
                 let act = kernel::step(
                     &mut sim.k,
@@ -1025,7 +1365,7 @@ impl Model for Jobs {
                 });
                 let keeper = kernel::keeper_of(sim.term, reply, None);
                 let before = sim.k.clone();
-                let (after, how) = kernel::recover(before.clone(), alive, keeper, 2);
+                let (after, how, _) = kernel::recover(before.clone(), alive, keeper, 2, false);
                 sim.k = after;
                 // T7: a recovered terminal is open only if its keeper answered. T6: one whose
                 // keeper answered stays open.
@@ -1231,6 +1571,58 @@ impl Model for Jobs {
                 |_, s: &St| s.bad & V_T12 == 0,
             ),
             Property::always(
+                "K1: a keyed start never runs a second job for its key and spec",
+                |_, s: &St| s.bad & V_K1 == 0,
+            ),
+            Property::always(
+                "K2: a replay names the job started under its key and spec; another spec never starts",
+                |_, s: &St| s.bad & V_K2 == 0,
+            ),
+            Property::always(
+                "K3: a retry of a keyed start whose job is in the table answers it, and a fresh key on a free id starts",
+                |m, s: &St| {
+                    let retry = s.table.all().iter().all(|((sc, idn), h)| {
+                        s.sims[*h].idem.is_none_or(|(kk, spec)| {
+                            s.table.begin(sc, idn, Some(&key_name(kk)), &digest(spec))
+                                == Begin::Replay(idn.clone())
+                        })
+                    });
+                    let fresh = (0..m.scopes).all(|scope| {
+                        (0..m.ids).all(|id| {
+                            s.table.get(&key(scope, id)).is_some()
+                                || s.table.begin(
+                                    &scope_name(scope),
+                                    &format!("i{id}"),
+                                    Some("fresh"),
+                                    "d",
+                                ) == Begin::Start
+                        })
+                    });
+                    retry && fresh
+                },
+            ),
+            Property::always("K4: a start with no key never replays", |_, s: &St| {
+                s.bad & V_K4 == 0
+            }),
+            Property::always(
+                "K10: no process of a keyed start runs without its claim durable",
+                |_, s: &St| s.bad & V_K10 == 0,
+            ),
+            Property::always(
+                "K11: a restart leaves no process running for a claim it answers as lost",
+                |_, s: &St| {
+                    s.sims.iter().all(|x| {
+                        !(x.idem.is_some()
+                            && matches!(x.k.phase, Phase::Ended { pgid: 0, .. })
+                            && x.alive())
+                    })
+                },
+            ),
+            Property::always(
+                "K16: a keyed start whose claim is durable spawns",
+                |_, s: &St| s.bad & V_K16 == 0,
+            ),
+            Property::always(
                 "alive: a job counts as alive only with a group",
                 |_, s: &St| {
                     s.sims
@@ -1278,6 +1670,13 @@ fn faithful_scopes() {
 #[test]
 fn faithful_ids() {
     check(IDS);
+}
+
+/// ... and with start keys: retried after a lost answer, a restart and a removal, with another spec, and
+/// beside another key's record.
+#[test]
+fn faithful_keyed() {
+    check(KEYED);
 }
 
 /// ... and with two clients.
@@ -1427,68 +1826,104 @@ fn ended_is_final() {
     feature = "mut_attach_ignores_mark",
     feature = "mut_running_unreported",
     feature = "mut_status_only_streams",
-    feature = "mut_status_only_sends"
+    feature = "mut_status_only_sends",
+    feature = "mut_key_replay_starts",
+    feature = "mut_key_digest_ignored",
+    feature = "mut_key_fresh_refused",
+    feature = "mut_unkeyed_replays",
+    feature = "mut_key_forgotten_on_restart",
+    feature = "mut_key_record_clears",
+    feature = "mut_key_take_forgets_none",
+    feature = "mut_intent_respawns",
+    feature = "mut_key_id_ignored",
+    feature = "mut_key_held_starts",
+    feature = "mut_spawn_without_claim",
+    feature = "mut_durable_claim_refused",
+    feature = "mut_orphan_survives"
 ))]
 #[test]
 fn the_mutation_turns_its_property_red() {
-    let property = if cfg!(feature = "mut_start_overwrites") {
-        "J1: "
-    } else if cfg!(feature = "mut_scope_ignored") {
-        "J2: "
-    } else if cfg!(feature = "mut_remove_keeps_entry") {
-        "J3: "
-    } else if cfg!(feature = "mut_end_rewritten") {
-        // The model's supervisor sends one end; the kernel check names this one.
-        let r = std::panic::catch_unwind(ended_is_final);
-        println!("red: [\"J4\"] kernel check failed: {}", r.is_err());
-        assert!(r.is_err(), "no property `J4` went red");
-        return;
-    } else if cfg!(feature = "mut_stream_follows_key") {
-        "J9: "
-    } else if cfg!(feature = "mut_disconnect_kills_kept") {
-        "J6: "
-    } else if cfg!(feature = "mut_remove_live") {
-        "J7: "
-    } else if cfg!(feature = "mut_signal_ended") {
-        "J8: "
-    } else if cfg!(feature = "mut_take_by_key") {
-        "J10: "
-    } else if cfg!(feature = "mut_ended_not_removable") {
-        "L1: "
-    } else if cfg!(feature = "mut_resize_ended") {
-        "T1: "
-    } else if cfg!(feature = "mut_resize_lost_while_spawning") {
-        "T1-live: "
-    } else if cfg!(feature = "mut_pty_kill_group_only") {
-        "T9: "
-    } else if cfg!(feature = "mut_pty_eof_closes") {
-        "T10: "
-    } else if cfg!(feature = "mut_write_after_hangup") {
-        "T12: "
-    } else if cfg!(feature = "mut_end_keeps_terminal") {
-        "T8: "
-    } else if cfg!(feature = "mut_recover_hangs_up_live_terminal") {
-        "T6: "
-    } else if cfg!(feature = "mut_recover_opens_silent_terminal") {
-        "T7: "
-    } else if cfg!(any(
-        feature = "mut_mark_ignored",
-        feature = "mut_remove_ignores_mark",
-        feature = "mut_attach_ignores_mark"
-    )) {
-        "M1: "
-    } else if cfg!(feature = "mut_running_unreported") {
-        "M3: "
-    } else if cfg!(any(
-        feature = "mut_status_only_streams",
-        feature = "mut_status_only_sends"
-    )) {
-        "M7: "
-    } else {
-        "L2: "
-    };
+    let property =
+        if cfg!(feature = "mut_start_overwrites") || cfg!(feature = "mut_key_held_starts") {
+            "J1: "
+        } else if cfg!(feature = "mut_scope_ignored") {
+            "J2: "
+        } else if cfg!(feature = "mut_remove_keeps_entry") {
+            "J3: "
+        } else if cfg!(feature = "mut_end_rewritten") {
+            // The model's supervisor sends one end; the kernel check names this one.
+            let r = std::panic::catch_unwind(ended_is_final);
+            println!("red: [\"J4\"] kernel check failed: {}", r.is_err());
+            assert!(r.is_err(), "no property `J4` went red");
+            return;
+        } else if cfg!(feature = "mut_stream_follows_key") {
+            "J9: "
+        } else if cfg!(feature = "mut_disconnect_kills_kept") {
+            "J6: "
+        } else if cfg!(feature = "mut_remove_live") {
+            "J7: "
+        } else if cfg!(feature = "mut_signal_ended") {
+            "J8: "
+        } else if cfg!(feature = "mut_take_by_key") {
+            "J10: "
+        } else if cfg!(feature = "mut_ended_not_removable") {
+            "L1: "
+        } else if cfg!(feature = "mut_resize_ended") {
+            "T1: "
+        } else if cfg!(feature = "mut_resize_lost_while_spawning") {
+            "T1-live: "
+        } else if cfg!(feature = "mut_pty_kill_group_only") {
+            "T9: "
+        } else if cfg!(feature = "mut_pty_eof_closes") {
+            "T10: "
+        } else if cfg!(feature = "mut_write_after_hangup") {
+            "T12: "
+        } else if cfg!(feature = "mut_end_keeps_terminal") {
+            "T8: "
+        } else if cfg!(feature = "mut_recover_hangs_up_live_terminal") {
+            "T6: "
+        } else if cfg!(feature = "mut_recover_opens_silent_terminal") {
+            "T7: "
+        } else if cfg!(any(
+            feature = "mut_mark_ignored",
+            feature = "mut_remove_ignores_mark",
+            feature = "mut_attach_ignores_mark"
+        )) {
+            "M1: "
+        } else if cfg!(feature = "mut_running_unreported") {
+            "M3: "
+        } else if cfg!(any(
+            feature = "mut_status_only_streams",
+            feature = "mut_status_only_sends"
+        )) {
+            "M7: "
+        } else if cfg!(feature = "mut_key_replay_starts") || cfg!(feature = "mut_intent_respawns") {
+            "K1: "
+        } else if cfg!(feature = "mut_key_digest_ignored")
+            || cfg!(feature = "mut_key_take_forgets_none")
+            || cfg!(feature = "mut_key_id_ignored")
+        {
+            "K2: "
+        } else if cfg!(feature = "mut_key_fresh_refused")
+            || cfg!(feature = "mut_key_forgotten_on_restart")
+            || cfg!(feature = "mut_key_record_clears")
+        {
+            "K3: "
+        } else if cfg!(feature = "mut_unkeyed_replays") {
+            "K4: "
+        } else if cfg!(feature = "mut_spawn_without_claim") {
+            "K10: "
+        } else if cfg!(feature = "mut_orphan_survives") {
+            "K11: "
+        } else if cfg!(feature = "mut_durable_claim_refused") {
+            "K16: "
+        } else if cfg!(feature = "mut_follow_waits_after_end") {
+            "L2: "
+        } else {
+            unreachable!("a mutation with no property")
+        };
     let mut red: Vec<&str> = Vec::new();
-    for m in [SLOW, REUSE, SCOPES, IDS, STREAMS, PTY] {
+    for m in [SLOW, REUSE, SCOPES, IDS, STREAMS, PTY, KEYED] {
         // A red run stops when the named property fails: the counterexample is the evidence.
         let named: std::collections::BTreeSet<&'static str> = m
             .properties()
@@ -1533,6 +1968,13 @@ fn production_calls_the_kernel() {
     );
     for needle in [
         "admit(&key)",
+        ".begin(",
+        "kernel::key_valid(",
+        "kernel::replay_poll(",
+        "kernel::recover(",
+        "Sweep::KillMarked",
+        ".record(Rec {",
+        "kernel::keeps_record(",
         "kernel::State::new(",
         "Ev::Spawned {",
         "Ev::ShellExit {",
@@ -1577,6 +2019,12 @@ fn production_calls_the_kernel() {
     ] {
         assert!(prod.contains(needle), "jobs.rs no longer calls {needle}");
     }
+    // K9, K10: a keyed start's claim is durable before anything is spawned, and the kernel says whether to spawn.
+    let intent = prod
+        .find("kernel::launch(idem.is_some().then(|| ctx.jobs.claim()))")
+        .expect("the keyed start's claim goes through the kernel's launch");
+    let spawn = prod.find("proc::spawn(&mut cmd)").expect("the spawn");
+    assert!(intent < spawn, "the claim is saved after the spawn");
     // The table is the kernel's verified storage, not a map of the shell's.
     assert!(!prod.contains("HashMap<Key"), "jobs.rs keeps its own map");
     // No decision of the job's life is made outside the kernel: its state is only written there.
@@ -1607,10 +2055,8 @@ fn production_calls_the_kernel() {
     // The only insert is the kernel table's, after `admit` said fresh, under the same lock.
     let at = prod.find("map.insert(").expect("the table insert");
     assert!(
-        prod[..at]
-            .rfind("admit(&key)")
-            .is_some_and(|a| at - a < 1500),
-        "the insert is no longer behind `admit`"
+        prod[..at].rfind(".begin(").is_some_and(|a| at - a < 2500),
+        "the insert is no longer behind `begin` (admit, with the key's replay)"
     );
 }
 

@@ -42,7 +42,7 @@ fn job_streams_decode_as_the_vectors_say() {
                     mark = Some(m);
                     from = Some(f);
                 }
-                JobFrame::Event(Event::Started(p, m, s, _)) => {
+                JobFrame::Event(Event::Started(p, m, s, _, _)) => {
                     started = Some(p);
                     mark = m;
                     stdin = s;

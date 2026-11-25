@@ -6,6 +6,7 @@ import {
   InvalidRequestError,
   JobExistsError,
   JobGoneError,
+  KeyConflictError,
   NotOfferedError,
   ProtocolError,
   TimeoutError,
@@ -64,7 +65,9 @@ function faultError(
     case "job_gone":
       return new JobGoneError(`job ${id}: ${said}`, id);
     case "job_exists":
-      return new JobExistsError(`job ${id} exists: ${said}`, id);
+      return said.includes("key_conflict")
+        ? new KeyConflictError(`job ${id}: ${said}`, id)
+        : new JobExistsError(`job ${id} exists: ${said}`, id);
     case "disk_full":
       return new DiskFullError(said);
     case "no_pty":
@@ -104,6 +107,7 @@ export async function* held(
     watch: req.output === false,
     stdinOpen: init.flow === "start" && init.spec.stdinOpen === true,
     ptyOpen: init.flow === "start" && init.spec.pty !== undefined,
+    keySent: init.flow === "start" && init.spec.idempotencyKey !== undefined,
     kept: init.flow === "start" && !init.hold,
   };
   let st: KState;
@@ -151,7 +155,10 @@ export async function* held(
     try {
       const n = await lines?.next();
       if (n === undefined || n.done) return { t: "broke" };
-      line = decodeJobLine(n.value);
+      line = decodeJobLine(
+        n.value,
+        init.flow === "start" ? init.spec.idempotencyKey : undefined,
+      );
     } catch (e) {
       if (e instanceof ProtocolError) {
         line = { frame: { t: "bad" }, note: e.detail };
