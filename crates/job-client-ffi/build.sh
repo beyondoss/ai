@@ -31,6 +31,9 @@ export CARGO_TARGET_DIR=$target
 export CARGO_PROFILE_RELEASE_OPT_LEVEL=s CARGO_PROFILE_RELEASE_LTO=true CARGO_PROFILE_RELEASE_PANIC=abort
 export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 CARGO_PROFILE_RELEASE_STRIP=true CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS=true
 export RUSTFLAGS="--remap-path-prefix=$root=/src --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo --remap-path-prefix=${RUSTUP_HOME:-$HOME/.rustup}=/rustup"
+# The shared compile cache (mbx) must not serve this build: the bytes are a pinned artifact, and a cache hit
+# built under other flags gave different bytes than a clean checkout does.
+export MBX_OFF=1
 slot=${BUILD_SLOT:-$HOME/.cache/tmp/build-slot.sh}
 [[ -x $slot ]] || slot=
 (cd "$root" && $slot cargo build --release --locked --lib --target wasm32-unknown-unknown -p beyond-job-client-ffi)
