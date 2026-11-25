@@ -34,6 +34,11 @@ pub(crate) struct Entry {
     pub scope: String,
     pub id: String,
     pub label: String,
+    /// What the job runs, for `list`. Never its environment.
+    #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
     pub mark: String,
     pub phase: Saved,
     pub pgid: i32,
@@ -97,6 +102,7 @@ impl Entry {
         scope: &str,
         id: &str,
         label: &str,
+        argv: &crate::jobs::Argv,
         mark: &str,
         k: &State,
         spool: Option<&Path>,
@@ -140,6 +146,8 @@ impl Entry {
             scope: scope.to_string(),
             id: id.to_string(),
             label: label.to_string(),
+            command: argv.command.clone(),
+            args: argv.args.clone(),
             mark: mark.to_string(),
             phase,
             pgid,

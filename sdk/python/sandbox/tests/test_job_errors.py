@@ -118,7 +118,7 @@ def test_keep_seen_and_grace_ms_go_out_under_their_wire_names() -> None:
 
 def held_stream(h: Any, b: Any) -> None:
     key = b["job"]["idempotency_key"]
-    body = f'{{"started":42,"key":"{key}"}}\n{{"exit_code":0}}\n'.encode()
+    body = f'{{"started":42,"mark":"ab12","key":"{key}"}}\n{{"exit_code":0}}\n'.encode()
     reply(h, 200, body, NDJSON)
 
 

@@ -41,8 +41,8 @@ use crate::exec::{self, Cut, Sink};
 use crate::frame::{self, FRAME_MAX};
 use crate::http::{self, Line, Request, Resp};
 use crate::job_kernel::{
-    self as kernel, Act, Admit, Alive, Begin, Ev, Follow, Kind, Launch, Persist, Pick, Rec,
-    Recovery, Refusal, Replied, Sink as Dest, Sweep,
+    self as kernel, Act, Admit, Alive, Attach, Begin, Ev, Follow, Kind, Launch, Persist, Pick,
+    Rec, Recovery, Refusal, Removal, Replied, Sink as Dest, Sweep,
 };
 use crate::ledger::{Entry, Idem, Ledger};
 use crate::notify::{self, Notifier, NotifyTarget};
@@ -65,6 +65,8 @@ pub(crate) struct Job {
     /// Which spawn its process group is, for a signal by number ([`proc::Pg`]); 0 before the spawn.
     sp: u64,
     label: String,
+    /// What the job runs, as `list` reports it.
+    argv: Argv,
     out: Ring,
     /// Where its output goes while it runs ([`Spool`]), until it is removed.
     spool: Option<Spool>,
@@ -78,6 +80,13 @@ pub(crate) struct Job {
     /// The start's idempotency key and spec digest, for the ledger (the table's own record of the key is
     /// [`kernel::Rec`]); `None` for an unkeyed start. Written once, at the start or the restart.
     idem: Option<Idem>,
+}
+
+/// A job's command and arguments (never its environment), kept with it and in the ledger.
+#[derive(Clone, Default)]
+pub(crate) struct Argv {
+    pub command: String,
+    pub args: Vec<String>,
 }
 
 impl Job {
@@ -145,6 +154,7 @@ impl Jobs {
                     &scope,
                     &id,
                     &j.label,
+                    &j.argv,
                     &j.mark,
                     &j.k,
                     j.spool.as_ref().map(Spool::dir),
@@ -329,6 +339,12 @@ struct JobReq {
     offset: u64,
     max: u64,
     ids: Vec<String>,
+    /// `attach`, `remove`: the incarnation the request means (the `mark` a start answered). `attach`
+    /// takes one, `remove` one per id (`marks`); a job whose mark differs is not touched.
+    mark: Option<String>,
+    marks: std::collections::HashMap<String, String>,
+    /// `attach`: stream the job's output (default), or only its end (`false`).
+    output: Option<bool>,
     remove: bool,
     grace_ms: Option<u64>,
     num: Option<u64>,
@@ -590,14 +606,30 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq, data: Vec<u8>) -> 
             let Some(cell) = jobs.get(&k) else {
                 return http::error_response(404, "no such job");
             };
+            let output = job.output.unwrap_or(true);
+            // The mark and the stream's start are the kernel's (M1, M4 to M6), read under one lock.
+            let from = {
+                let j = locked(&cell);
+                let ok = kernel::mark_ok(&job.mark, &j.mark);
+                match kernel::attach_plan(ok, output, job.offset, j.out.end()) {
+                    Attach::Refuse => None,
+                    Attach::Stream { from } => Some((from, j.mark.clone())),
+                }
+            };
+            let Some((from, mark)) = from else {
+                return http::error_response(404, "no such job");
+            };
             let (resp, out) = http::stream_response();
             tokio::spawn(stream_job(
                 ctx.clone(),
                 k,
                 cell,
-                job.offset,
                 false,
-                None,
+                Opening {
+                    offset: from,
+                    output,
+                    first: Some(json!({ "attached": { "mark": mark, "from": from } })),
+                },
                 Sink::new(out, req.beat, None),
             ));
             resp
@@ -702,14 +734,21 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq, data: Vec<u8>) -> 
         }
         "remove" => {
             let named = jobs.in_scope(&job.scope, Pick::Ids(&job.ids));
-            let mut gone = Vec::new();
+            let (mut gone, mut running, mut mismatch) = (Vec::new(), Vec::new(), Vec::new());
             for (k, c) in named {
-                if removable(&c, true).await {
-                    gone.push((k, c));
+                let ok = {
+                    let j = locked(&c);
+                    kernel::mark_ok(&job.marks.get(&k.1).cloned(), &j.mark)
+                };
+                let take = removable(&c, true).await;
+                match kernel::removal(ok, take) {
+                    Removal::Take => gone.push((k, c)),
+                    Removal::Running => running.push(k.1),
+                    Removal::Mismatch => mismatch.push(k.1),
                 }
             }
             jobs.remove(&gone);
-            http::json_response(200, &json!({}))
+            http::json_response(200, &json!({ "running": running, "mismatch": mismatch }))
         }
         "list" => {
             let list: Vec<Value> = jobs
@@ -720,6 +759,11 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq, data: Vec<u8>) -> 
                     let (state, code) = state_of(&j);
                     let mut entry = json!({
                         "id": id,
+                        "mark": j.mark,
+                        "command": j.argv.command,
+                        "args": j.argv.args,
+                        "outputStart": j.out.base,
+                        "outputEnd": j.out.end(),
                         "state": state,
                         "code": code,
                         "kept": j.k.kept(),
@@ -831,6 +875,9 @@ fn keep_or_seen(ctx: &Arc<Ctx>, job: &JobReq) -> Resp {
 /// Start a job: its own process group, its output kept under the retention, its end recorded once
 /// the group is empty.
 async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
+    if !kernel::id_ok(job.id.as_bytes()) {
+        return http::error_response(400, "bad job id: 1 to 64 characters of [0-9a-z_-]");
+    }
     let key = (job.scope.clone(), job.id.clone());
     let idem = match job.idempotency_key.as_deref() {
         None => None,
@@ -879,6 +926,10 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
                     mark: proc::new_job_mark(ctx.next_seq.fetch_add(1, Ordering::Relaxed)),
                     sp: 0,
                     label: job.label.clone(),
+                    argv: Argv {
+                        command: req.command.clone(),
+                        args: req.args.clone(),
+                    },
                     out: Ring::new(ctx.opts.job_output_retention, ctx.spool.new_job()),
                     spool: None,
                     k: kernel::State::new(epoch(), job.hold),
@@ -1021,14 +1072,18 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
         }
         let ctx2 = ctx.clone();
         let beat = req.beat;
+        let first = started_json(pgid, &mark, opened, echo.as_deref());
         tokio::spawn(async move {
             let end = stream_job(
                 ctx2.clone(),
                 key,
                 cell,
-                0,
                 true,
-                Some((pgid, opened, echo)),
+                Opening {
+                    offset: 0,
+                    output: true,
+                    first: Some(first),
+                },
                 Sink::new(out, beat, None),
             )
             .await;
@@ -1038,7 +1093,7 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
         });
         resp
     } else {
-        started_body(pgid, opened, echo.as_deref())
+        http::json_response(200, &started_json(pgid, &mark, opened, echo.as_deref()))
     }
 }
 
@@ -1113,6 +1168,9 @@ async fn replay_job(
     };
     let opened = job.stdin_open;
     let echo = job.idempotency_key.clone();
+    // The replay answers as the first start did, with the same incarnation's mark.
+    let mark = locked(&cell).mark.clone();
+    let first = started_json(pgid, &mark, opened, echo.as_deref());
     if job.hold {
         let (resp, out) = http::stream_response();
         let ctx2 = ctx.clone();
@@ -1122,30 +1180,34 @@ async fn replay_job(
                 ctx2,
                 key,
                 cell,
-                0,
                 true,
-                Some((pgid, opened, echo)),
+                Opening {
+                    offset: 0,
+                    output: true,
+                    first: Some(first),
+                },
                 Sink::new(out, beat, None),
             )
             .await;
         });
         resp
     } else {
-        started_body(pgid, opened, echo.as_deref())
+        http::json_response(200, &first)
     }
 }
 
-/// What a start answers: the job's process group, `stdin` when its stdin was opened, and the start's key when it
-/// had one: the echo that tells a client its key was kept (an execd that ignores keys says nothing).
-fn started_body(pgid: i32, opened: bool, key: Option<&str>) -> Resp {
-    let mut body = json!({ "started": pgid });
+/// What a start answers: the job's process group, its incarnation's mark, `stdin` when its stdin was opened, and the
+/// start's key when it had one: the echo that tells a client its key was kept (an execd that ignores keys says
+/// nothing). A held start's first frame is the same value.
+fn started_json(pgid: i32, mark: &str, opened: bool, key: Option<&str>) -> Value {
+    let mut body = json!({ "started": pgid, "mark": mark });
     if opened {
         body["stdin"] = json!(true);
     }
     if let Some(k) = key {
         body["key"] = json!(k);
     }
-    http::json_response(200, &body)
+    body
 }
 
 /// What a start answers when its output spool cannot be made: `507` with a plain reason when the
@@ -1385,6 +1447,10 @@ pub(crate) fn recover(ctx: &Arc<Ctx>) {
             mark: e.mark.clone(),
             sp: pg.map_or(0, |p| p.sp),
             label: e.label.clone(),
+            argv: Argv {
+                command: e.command.clone(),
+                args: e.args.clone(),
+            },
             out,
             spool,
             k: state,
@@ -1562,19 +1628,26 @@ fn bound(ctx: &Ctx, key: &Key, attached: &JobCell) -> Option<JobCell> {
     kernel::bound(found, same)
 }
 
-/// Stream a job's output from `offset` to its end. `started`: a held start, which says so first and
-/// whose job dies with the connection unless it was kept by then. How the stream ended.
+/// How a job stream opens: where it starts, whether it carries output, and the frame that says
+/// which job it is (`started` on a held start, `attached` on an attach).
+struct Opening {
+    offset: u64,
+    output: bool,
+    first: Option<Value>,
+}
+
+/// Stream a job's output from `open.offset` to its end. `hold`: a held start, whose job dies with
+/// the connection unless it was kept by then. How the stream ended.
 async fn stream_job(
     ctx: Arc<Ctx>,
     key: Key,
     attached: JobCell,
-    offset: u64,
     hold: bool,
-    started: Option<(i32, bool, Option<String>)>,
+    open: Opening,
     mut sink: Sink,
 ) -> StreamEnd {
     // A job stream has no deadline of its own: it lives as long as the job or the connection.
-    if let Ok(end) = follow(&ctx, &key, &attached, offset, started, &mut sink).await {
+    if let Ok(end) = follow(&ctx, &key, &attached, open, &mut sink).await {
         return end;
     }
     // The connection is gone before the job's end: a held job nobody kept dies with it. Not when it
@@ -1606,22 +1679,15 @@ async fn follow(
     ctx: &Arc<Ctx>,
     key: &Key,
     attached: &JobCell,
-    offset: u64,
-    started: Option<(i32, bool, Option<String>)>,
+    open: Opening,
     sink: &mut Sink,
 ) -> Result<StreamEnd, Cut> {
-    if let Some((pgid, opened, echo)) = started {
-        let mut first = json!({ "started": pgid });
-        if opened {
-            first["stdin"] = json!(true);
-        }
-        if let Some(k) = echo {
-            first["key"] = json!(k);
-        }
-        sink.put(frame::json(&first)).await?;
+    if let Some(first) = &open.first {
+        sink.put(frame::json(first)).await?;
     }
+    let output = open.output;
     let mut changed = ctx.jobs.changed.subscribe();
-    let mut sent = offset;
+    let mut sent = open.offset;
     let mut shell_told = false;
     loop {
         changed.mark_unchanged();
@@ -1636,7 +1702,11 @@ async fn follow(
             Some(cell) => {
                 let j = locked(&cell);
                 let total = j.out.end();
-                match kernel::follow(&j.k, sent, j.out.base, total, shell_told) {
+                // A status-only stream is never behind: it sends no bytes and no gap (M7).
+                let (at, frame) =
+                    kernel::stream_next(output, &j.k, sent, j.out.base, total, shell_told);
+                sent = at;
+                match frame {
                     Follow::Gap(n) => {
                         sent = j.out.base;
                         Next::Frame(frame::json(&json!({ "gap": n })))

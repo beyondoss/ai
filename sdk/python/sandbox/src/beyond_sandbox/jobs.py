@@ -15,13 +15,16 @@ from .atransport import AsyncJobTransport
 from .errors import NotOfferedError
 from .models import (
     Attached,
+    JobAttached,
     JobEnd,
     JobFrame,
     JobGap,
     JobInfo,
     JobOutput,
     JobRead,
+    JobRemoved,
     JobShellExit,
+    JobStart,
     JobStarted,
     StdinWritten,
     Survivor,
@@ -31,17 +34,25 @@ from .transport import JobTransport
 READ_MAX = _jobs.READ_MAX
 
 
-def _no_stdin(ev: JobFrame, stdin_open: bool) -> bool:
-    """A held start asked for its stdin and the endpoint's ``started`` frame does not echo it."""
-    return stdin_open and isinstance(ev, JobStarted) and not ev.stdin
+def _held_refusal(ev: JobFrame, stdin_open: bool, key: str) -> str | None:
+    """Why a held start's first frame shows an endpoint that lacks a feature asked for, if it does:
+    no stdin echo for ``stdin_open``, no echo of the start's idempotency ``key``, or no mark."""
+    if not isinstance(ev, JobStarted):
+        return None
+    if stdin_open and not ev.stdin:
+        return "the endpoint predates job stdin: it ran the job without it"
+    if ev.key != key:
+        return _jobs.NO_START_KEY
+    if not ev.mark:
+        return "the endpoint predates the job mark: its started frame did not name one"
+    return None
 
 
-_NO_STDIN = "the endpoint predates job stdin: it ran the job without it"
-
-
-def _no_key(ev: JobFrame, key: str) -> bool:
-    """A held start's ``started`` frame does not echo the start's idempotency key (the endpoint ignores keys)."""
-    return isinstance(ev, JobStarted) and ev.key != key
+def _attach_refusal(first: bool, ev: JobFrame) -> str | None:
+    """An attach stream opens with ``attached``; one that does not is an endpoint that predates it."""
+    if first and not isinstance(ev, JobAttached):
+        return "the endpoint predates the job mark: its attach did not answer with `attached`"
+    return None
 
 
 def _collect(a: Attached, ev: JobFrame) -> None:
@@ -53,11 +64,13 @@ def _collect(a: Attached, ev: JobFrame) -> None:
         a.gap += ev.bytes
     elif isinstance(ev, JobShellExit):
         a.shell_exit = ev.code
+    elif isinstance(ev, JobAttached):
+        a.attached = ev
 
 
 class Jobs:
     """Jobs, grouped in *scopes*: a scope is an opaque name (1 to 64 of ``[0-9a-z-]``) for one
-    session's jobs. A job id is 1 to 32 characters of ``[0-9a-z]``, chosen by the caller."""
+    session's jobs. A job id is 1 to 64 characters of ``[0-9a-z_-]``, chosen by the caller."""
 
     def __init__(self, transport: JobTransport) -> None:
         self._t = transport
@@ -75,8 +88,8 @@ class Jobs:
         stdin_open: bool = False,
         heartbeat_seconds: int | None = None,
         idempotency_key: str | None = None,
-    ) -> int:
-        """Start a job the sandbox keeps from the start; returns its process group. ``env`` is the
+    ) -> JobStart:
+        """Start a job the sandbox keeps from the start; returns its process group and mark. ``env`` is the
         command's own environment; ``stdin_open`` keeps its stdin open for :meth:`write_stdin`
         (an endpoint that predates it is a ``NotOfferedError`` and the job is stopped). An id that
         exists is :class:`~beyond_sandbox.JobExistsError`; a full disk is
@@ -135,10 +148,8 @@ class Jobs:
                 if isinstance(item, tuple) and item and item[0] is _DONE:
                     yield item[1]
                 else:
-                    if _no_stdin(item, stdin_open):
-                        raise NotOfferedError(_NO_STDIN)
-                    if _no_key(item, key):
-                        raise NotOfferedError(_jobs.NO_START_KEY)
+                    if (why := _held_refusal(item, stdin_open, key)) is not None:
+                        raise NotOfferedError(why)
                     yield item
         finally:
             items.close()
@@ -179,26 +190,49 @@ class Jobs:
         return drive(_jobs.read(scope, job, offset, max), self._t)
 
     def follow(
-        self, scope: str, job: str, offset: int = 0, *, heartbeat_seconds: int | None = None
+        self,
+        scope: str,
+        job: str,
+        offset: int = 0,
+        *,
+        heartbeat_seconds: int | None = None,
+        mark: str | None = None,
+        output: bool = True,
     ) -> Iterator[JobFrame]:
-        """Events (:class:`JobOutput`, :class:`JobGap`, :class:`JobShellExit`, …), ending with a
+        """Events, the first a :class:`JobAttached` (the job's mark and where the stream starts), then
+        (:class:`JobOutput`, :class:`JobGap`, :class:`JobShellExit`, …), ending with a
         :class:`JobEnd` once the job's group is empty. Stopping early leaves the job running. A job
         that does not exist is :class:`~beyond_sandbox.JobGoneError`. ``heartbeat_seconds`` (1 to 240,
         the ``Keepalive-Ping-Interval`` header) sets the stream's beat; it is presumed dead only after
-        two beats and ten seconds of silence, never under 30 s."""
-        op = _jobs.follow(scope, job, offset, heartbeat_seconds)
+        two beats and ten seconds of silence, never under 30 s. ``mark`` names the incarnation of the
+        id to follow: another is a ``JobGoneError`` and nothing is streamed. ``output=False`` sends no
+        output and no gap, only the end."""
+        op = _jobs.follow(scope, job, offset, heartbeat_seconds, mark, output)
+        first = True
         for item in drive_iter(op, self._t):
             if isinstance(item, tuple) and item and item[0] is _DONE:
                 yield item[1]
             else:
+                if (why := _attach_refusal(first, item)) is not None:
+                    raise NotOfferedError(why)
+                first = False
                 yield item
 
     def collect(
-        self, scope: str, job: str, offset: int = 0, *, heartbeat_seconds: int | None = None
+        self,
+        scope: str,
+        job: str,
+        offset: int = 0,
+        *,
+        heartbeat_seconds: int | None = None,
+        mark: str | None = None,
+        output: bool = True,
     ) -> Attached:
         """Follow the job to its end and collect everything."""
         result = Attached(-1)
-        for ev in self.follow(scope, job, offset, heartbeat_seconds=heartbeat_seconds):
+        for ev in self.follow(
+            scope, job, offset, heartbeat_seconds=heartbeat_seconds, mark=mark, output=output
+        ):
             if isinstance(ev, JobEnd):
                 result.exit_code, result.signal = ev.code, ev.signal
             else:
@@ -216,9 +250,12 @@ class Jobs:
         """SIGTERM, ``grace_ms`` (default 300), SIGKILL to each job's group; the groups that survived."""
         return drive(_jobs.kill(scope, jobs, remove, grace_ms), self._t)
 
-    def remove(self, scope: str, jobs: Sequence[str]) -> None:
-        """Delete ended jobs; never a running one."""
-        drive(_jobs.remove(scope, jobs), self._t)
+    def remove(
+        self, scope: str, jobs: Sequence[str], *, marks: dict[str, str] | None = None
+    ) -> JobRemoved:
+        """Delete ended jobs; never a running one. What was skipped is answered: ``running`` jobs, and
+        ``mismatch`` jobs whose mark is not the one ``marks`` names for their id."""
+        return drive(_jobs.remove(scope, jobs, marks), self._t)
 
     def wipe(self, scope: str, *, grace_ms: int = _jobs.KILL_GRACE_MS) -> builtins.list[Survivor]:
         """Kill and delete every job of the scope; the groups that survived."""
@@ -244,7 +281,7 @@ class AsyncJobs:
         stdin_open: bool = False,
         heartbeat_seconds: int | None = None,
         idempotency_key: str | None = None,
-    ) -> int:
+    ) -> JobStart:
         op = _jobs.start(
             scope,
             job,
@@ -293,10 +330,8 @@ class AsyncJobs:
                 if isinstance(item, tuple) and item and item[0] is _DONE:
                     yield item[1]
                 else:
-                    if _no_stdin(item, stdin_open):
-                        raise NotOfferedError(_NO_STDIN)
-                    if _no_key(item, key):
-                        raise NotOfferedError(_jobs.NO_START_KEY)
+                    if (why := _held_refusal(item, stdin_open, key)) is not None:
+                        raise NotOfferedError(why)
                     yield item
         finally:
             await events.aclose()
@@ -330,27 +365,50 @@ class AsyncJobs:
         return await adrive(_jobs.read(scope, job, offset, max), self._t)
 
     async def follow(
-        self, scope: str, job: str, offset: int = 0, *, heartbeat_seconds: int | None = None
+        self,
+        scope: str,
+        job: str,
+        offset: int = 0,
+        *,
+        heartbeat_seconds: int | None = None,
+        mark: str | None = None,
+        output: bool = True,
     ) -> AsyncIterator[JobFrame]:
         """As :meth:`Jobs.follow`."""
-        op = _jobs.follow(scope, job, offset, heartbeat_seconds)
+        op = _jobs.follow(scope, job, offset, heartbeat_seconds, mark, output)
         events = aiter_events(op, self._t)
+        first = True
         try:
             async for item in events:
                 if isinstance(item, tuple) and item and item[0] is _DONE:
                     yield item[1]
                 else:
+                    if (why := _attach_refusal(first, item)) is not None:
+                        raise NotOfferedError(why)
+                    first = False
                     yield item
         finally:
             await events.aclose()
 
     async def collect(
-        self, scope: str, job: str, offset: int = 0, *, heartbeat_seconds: int | None = None
+        self,
+        scope: str,
+        job: str,
+        offset: int = 0,
+        *,
+        heartbeat_seconds: int | None = None,
+        mark: str | None = None,
+        output: bool = True,
     ) -> Attached:
         result = Attached(-1)
-        op = _jobs.follow(scope, job, offset, heartbeat_seconds)
+        op = _jobs.follow(scope, job, offset, heartbeat_seconds, mark, output)
+        first = True
 
         async def collect(ev: JobFrame) -> None:
+            nonlocal first
+            if (why := _attach_refusal(first, ev)) is not None:
+                raise NotOfferedError(why)
+            first = False
             _collect(result, ev)
 
         end = await adrive_emit(op, self._t, collect)
@@ -367,8 +425,10 @@ class AsyncJobs:
     ) -> builtins.list[Survivor]:
         return await adrive(_jobs.kill(scope, jobs, remove, grace_ms), self._t)
 
-    async def remove(self, scope: str, jobs: Sequence[str]) -> None:
-        await adrive(_jobs.remove(scope, jobs), self._t)
+    async def remove(
+        self, scope: str, jobs: Sequence[str], *, marks: dict[str, str] | None = None
+    ) -> JobRemoved:
+        return await adrive(_jobs.remove(scope, jobs, marks), self._t)
 
     async def wipe(
         self, scope: str, *, grace_ms: int = _jobs.KILL_GRACE_MS

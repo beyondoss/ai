@@ -253,6 +253,8 @@ A stream is bound to the job it attached to (`bound`): after that job is removed
 
 `remove`, and `kill` with `remove` or `wipe`, check a job (`removable`, which may await its group) and take it later. The take is bound to the job checked (J10, `takes`, `Table::take` with the shell's `Arc::ptr_eq`): if the key was freed and started again in between, the successor stays, signalled by nobody and checked by nobody. So does the spawn failure's take, which names the cell it created.
 
+**The mark on the wire.** A job's mark (`EXECD_JOB_MARK`, its spool directory's name) names one incarnation of an id, and the wire says it, so a client never mistakes a later job that reused the id for the one it knew. `start` answers `{"started": pgid, "mark": m}` and a held start's first frame is `{"started": pgid, "mark": m}`; `list` carries each job's `mark`, `command`, `args` (never the environment; the ledger keeps them too), `outputStart` and `outputEnd`. `attach` answers first with `{"attached": {"mark": m, "from": n}}` (`from` is the request's `offset`); it takes an optional `mark`, and a job whose mark differs is refused as `404 no such job` (`mark_ok`, M1, then `attach_plan`, M4; the refusal is not a state, so the retry with the right mark streams, M4-live). `attach` with `"output": false` is status-only: it starts at the output's current end whatever `offset` it names (`from`, M6) and sends no byte and no gap, only the shell's exit and the end (`stream_next`, M7, applied at every frame). `remove` takes an optional `marks` (id to mark) and answers `{"running": [ids], "mismatch": [ids]}`: a job whose mark is not the one named stays (M2) and is reported as a mismatch, a job whose group is not empty stays and is reported as running (M3), an id with no job is in neither, and the retry with the right mark takes it (M2-live). A start's id is 1 to 64 bytes of `[0-9a-z_-]` (`id_ok`, I1, I2; `400` otherwise). This is a clean break: execd used to accept any id. `list` reports each job's argv (`command`, `args`), which the 0600 ledger stores, within the job's scope; never its environment. Every decision above is in `execd-jobs`, proven in Verus with a mutant per row (`mise run verify:execd-jobs-mark-mutants`); `job_model` runs them over the table (`M1`, `M3`, `M7` red under `mut_mark_ignored`, `mut_remove_ignores_mark`, `mut_attach_ignores_mark`, `mut_running_unreported`, `mut_status_only_streams`, `mut_status_only_sends`) and `tests/jobmark.rs` drives them against the binary.
+
 There is no cap and no expiry here (see Bounds): an ended job is freed only by `remove`, `kill` with `remove` or `wipe`.
 
 `tests/job_model.rs` is a Stateright model that calls these functions, never a copy, and an environment (the shell dying with or
@@ -272,19 +274,46 @@ cargo test -p beyond-execd --test job_model faithful          # both bounds, all
 cargo test -p beyond-execd --features <mut> --test job_model the_mutation   # each MUST pass only if its property is red
 ```
 
-| mutation                       | property it turns red                              |
+| mutation                      | property it turns red                              |
+| ----------------------------- | -------------------------------------------------- |
+| `mut_start_overwrites`        | J1                                                 |
+| `mut_scope_ignored`           | J2                                                 |
+| `mut_remove_keeps_entry`      | J3                                                 |
+| `mut_end_rewritten`           | J4 (`ended_is_final`, over every phase and event)  |
+| `mut_disconnect_kills_kept`   | J6                                                 |
+| `mut_remove_live`             | J7                                                 |
+| `mut_signal_ended`            | J8                                                 |
+| `mut_ended_not_removable`     | L1                                                 |
+| `mut_stream_follows_key`      | J9                                                 |
+| `mut_take_by_key`             | J10                                                |
+| `mut_follow_waits_after_end`  | L2                                                 |
+| `mut_signal_after_reap`       | J11 (`os_model`, and Verus on `may_deliver`)       |
+| `mut_held_forgets`            | J11-live (`os_model`, and Verus on `Held::insert`) |
+| `mut_stdin_replays`           | W2 (Verus on `stdin_plan`)                         |
+| `mut_stdin_written_shrinks`   | W2b (Verus on `advance`)                           |
+| `mut_stdin_apply_off_start`   | W2c (Verus on `stdin_plan`)                        |
+| `mut_stdin_wait_sticks`       | W5-live (progress lemma)                           |
+| `mut_stdin_closes_early`      | W4 (Verus on `closes`)                             |
+| `mut_stdin_applies_ahead`     | W5 (Verus on `stdin_plan`)                         |
+| `mut_stdin_writes_ended`      | W3 (Verus on `stdin_plan`)                         |
+| `mut_stdin_writes_after_eof`  | W4 (Verus on `stdin_plan`)                         |
+| `mut_stdin_waiters_unbounded` | W1 (Verus on `admit_waiter`)                       |
+| `mut_stdin_waiter_stuck`      | W1-live (Verus on `admit_waiter`)                  |
+| `mut_stdin_waits_at_written`  | W5-live (Verus on `stdin_plan`)                    |
+| `mut_id_length_unbounded`     | I1 (Verus on `id_ok`)                              |
+| `mut_id_any_byte`             | I2 (Verus on `id_ok`)                              |
+| `mut_id_rejects_dash`         | I1-live (Verus on `id_ok`)                         |
+| `mut_mark_ignored`            | M1 (Verus on `mark_ok`, and `job_model`)           |
+| `mut_mark_refuses`            | M1-live (Verus on `mark_ok`)                       |
+| `mut_remove_ignores_mark`     | M2 (Verus on `removal`, and `job_model`)           |
+| `mut_remove_never_takes`      | M2-live (Verus on `removal`)                       |
+| `mut_running_unreported`      | M3 (Verus on `removal`)                            |
+| `mut_attach_ignores_mark`     | M4 (Verus on `attach_plan`, and `job_model`)       |
+| `mut_attach_refuses`          | M4-live (Verus on `attach_plan`)                   |
+| `mut_attach_offset_shifted`   | M5 (Verus on `attach_plan`)                        |
+| `mut_status_only_streams`     | M6 (Verus on `quiet_from`)                         |
+| `mut_status_only_sends`       | M7 (Verus on `stream_next`)                        |
 | ------------------------------ | -------------------------------------------------- |
-| `mut_start_overwrites`         | J1                                                 |
-| `mut_scope_ignored`            | J2                                                 |
-| `mut_remove_keeps_entry`       | J3                                                 |
-| `mut_end_rewritten`            | J4 (`ended_is_final`, over every phase and event)  |
-| `mut_disconnect_kills_kept`    | J6                                                 |
-| `mut_remove_live`              | J7                                                 |
-| `mut_signal_ended`             | J8                                                 |
-| `mut_ended_not_removable`      | L1                                                 |
-| `mut_stream_follows_key`       | J9                                                 |
-| `mut_take_by_key`              | J10                                                |
-| `mut_follow_waits_after_end`   | L2                                                 |
 | `mut_key_replay_starts`        | K1 (`job_model`, Verus on `start_decision`)        |
 | `mut_key_digest_ignored`       | K2 (`job_model`, Verus on `start_decision`)        |
 | `mut_key_fresh_refused`        | K3 (`job_model`, Verus on `start_decision`)        |
@@ -292,19 +321,16 @@ cargo test -p beyond-execd --features <mut> --test job_model the_mutation   # ea
 | `mut_key_forgotten_on_restart` | K6 (`job_model` K3, Verus on `keeps_record`)       |
 | `mut_key_record_clears`        | K7 (`job_model` K3, Verus on `Table::record`)      |
 | `mut_key_take_forgets_none`    | K8 (`job_model` K2, Verus on `Table::forget`)      |
-| `mut_signal_after_reap`        | J11 (`os_model`, and Verus on `may_deliver`)       |
-| `mut_held_forgets`             | J11-live (`os_model`, and Verus on `Held::insert`) |
-| `mut_stdin_replays`            | W2 (Verus on `stdin_plan`)                         |
-| `mut_stdin_written_shrinks`    | W2b (Verus on `advance`)                           |
-| `mut_stdin_apply_off_start`    | W2c (Verus on `stdin_plan`)                        |
-| `mut_stdin_wait_sticks`        | W5-live (progress lemma)                           |
-| `mut_stdin_closes_early`       | W4 (Verus on `closes`)                             |
-| `mut_stdin_applies_ahead`      | W5 (Verus on `stdin_plan`)                         |
-| `mut_stdin_writes_ended`       | W3 (Verus on `stdin_plan`)                         |
-| `mut_stdin_writes_after_eof`   | W4 (Verus on `stdin_plan`)                         |
-| `mut_stdin_waiters_unbounded`  | W1 (Verus on `admit_waiter`)                       |
-| `mut_stdin_waiter_stuck`       | W1-live (Verus on `admit_waiter`)                  |
-| `mut_stdin_waits_at_written`   | W5-live (Verus on `stdin_plan`)                    |
+| `mut_intent_respawns` | K9 (`job_model` K1, Verus on `recover`) |
+| `mut_key_id_ignored` | K1, K2 (`job_model` K2, Verus on `Table::lookup`) |
+| `mut_key_held_starts` | K5 (`job_model` J1, Verus on `start_decision`) |
+| `mut_spawn_without_claim` | K10 (`job_model` K10, Verus on `launch`) |
+| `mut_orphan_survives` | K11 (`job_model` K11, Verus on `recover`) |
+| `mut_durable_claim_refused` | K16 (`job_model` K16, Verus on `launch`) |
+| `mut_bad_key_accepted` | K12 (Verus on `key_valid`) |
+| `mut_valid_key_refused` | K13 (Verus on `key_valid`) |
+| `mut_replay_refuses_started` | K14 (Verus on `replay_poll`) |
+| `mut_replay_waits_forever` | K15 (Verus on `replay_poll`) |
 
 ### The OS boundary (J11)
 
@@ -538,6 +564,7 @@ What the spec and the conformance verifier assume, and what holds:
 | `tests/security.rs`                             | the bearer is in none of a command's `env`, its parent's environ, or any readable `/proc/*/environ` (by environment, by file, for streams and jobs); fail-closed start in all its cases, including a bearer that cannot be moved out of the environment; `EXECD_RUN_AS` refusals; as root, a user who cannot read execd's memory, environ or a root-owned bearer file, gets the right uid, groups, `HOME` and directory, and is killed by the shutdown                  |
 | `tests/auth_matrix.rs`                          | path, method, `Authorization`, body-framing and smuggling cases over HTTP/1.1 and h2c, each refused and each proven to have run nothing by a command that would create a marker file; a control per family proves the vehicle runs                                                                                                                                                                                                                                      |
 | `tests/jobtable.rs`                             | the job table against a model, over random operations (`EXECD_JOBS_SEED`, `EXECD_JOBS_CASES`, `EXECD_JOBS_SECS`, `EXECD_JOBS_OPS`; a failure prints its seed and a shrunk list); at the end of every case, once every scope is wiped, execd is back at its starting state (see `tests/baseline.rs`)                                                                                                                                                                     |
+| `tests/jobmark.rs`                              | the mark on the wire: `mark` on start, list and the held start's first frame, `attached{mark,from}`, an attach naming another incarnation refused (404) and its retry, a status-only attach, `remove`'s `running` and `mismatch` and its retry, the id rule                                                                                                                                                                                                             |
 | `tests/jobproto.rs`                             | env (applied, hostile shapes refused with nothing run, `EXECD_*` unreachable, `HOME` wins, scope isolation, under `EXECD_RUN_AS` a preload runs only as the target uid), stderr/stdout told apart on one clock with frames and the 1024-range clip, positional stdin writes (retry, overlap, out-of-order over several connections, EOF, after end, 413, bounded waiters, a stalled write does not freeze `list`), the `signal` op (once, scope, ended job, allow-list) |
 | `tests/signals.rs`                              | started with `HUP INT QUIT USR1 USR2 TERM ALRM` ignored (as `cmd &` or `nohup` leaves them), every command still dies of, and every job's `trap` still runs on, each of them                                                                                                                                                                                                                                                                                            |
 | `tests/baseline.rs`                             | after a mixed workload (one-shot, streams finished and dropped, jobs past the 8 MiB spool, kills, removes, a wipe), `/proc` shows the starting open fds and threads, no zombie child, and an empty jobs directory                                                                                                                                                                                                                                                       |

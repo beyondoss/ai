@@ -247,7 +247,7 @@ async fn follow_to_end(
         JobEvent::Gap(n) => {
             offset.fetch_add(n, Ordering::Relaxed);
         }
-        JobEvent::Started(_) | JobEvent::ShellExit(_) => {}
+        JobEvent::Started(..) | JobEvent::Attached { .. } | JobEvent::ShellExit(_) => {}
     };
     let mut failures = 0;
     loop {

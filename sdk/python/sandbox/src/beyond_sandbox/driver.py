@@ -41,7 +41,7 @@ from .errors import (
     StdinGapError,
 )
 from .files import CapsOverride
-from .models import JobRead, JobStarted, Stat
+from .models import JobRead, JobStart, JobStarted, Stat
 from .transport import HttpTransport
 
 Result = dict[str, Any]
@@ -57,7 +57,7 @@ class _Unsupported(SandboxError):
 # raw stream, so it has all of them.
 FEATURES = [
     "frames", "unbounded_stream", "exit_signal", "exec_env", "job_streams", "job_stdin",
-    "job_signal_op", "job_errors", "job_options", "job_start_key",
+    "job_signal_op", "job_errors", "job_options", "job_marks", "job_start_key",
 ]  # fmt: skip
 
 OPS = [
@@ -293,7 +293,9 @@ def _job_plan(op: str, req: dict[str, Any]) -> Plan:
                     {
                         "id": j.id, "state": j.state, "code": j.code, "kept": j.kept, "num": j.num,
                         "kind": j.kind, "seen": j.seen, "started": j.started, "ended": j.ended,
-                        "label": j.label,
+                        "label": j.label, "mark": j.mark, "command": j.command,
+                        "args": list(j.args), "output_start": j.output_start,
+                        "output_end": j.output_end,
                         **({} if j.signal is None else {"signal": j.signal}),
                     }
                     for j in js
@@ -306,7 +308,11 @@ def _job_plan(op: str, req: dict[str, Any]) -> Plan:
     if op in ("job_kill", "job_remove"):
         ids = _strings(req, "jobs")
         if op == "job_remove":
-            return (lambda sb: sb.jobs.remove(scope, ids), lambda _: {})
+            marks = _marks(req)
+            return (
+                lambda sb: sb.jobs.remove(scope, ids, marks=marks),
+                lambda r: {"running": list(r.running), "mismatch": list(r.mismatch)},
+            )
         remove = _flag(req, "remove")
         return (
             lambda sb: sb.jobs.kill(scope, ids, remove=remove, **_grace(req)),
@@ -338,7 +344,7 @@ def _job_plan(op: str, req: dict[str, Any]) -> Plan:
             lambda sb: _start_held(
                 sb, scope, job, command, args, cwd, label, env, stdin_open, keep, beat
             ),
-            lambda pgid: {"pgid": pgid},
+            lambda st: {"pgid": st.pgid, "mark": st.mark},
         )
     if op == "job_start":
         command, args = _str(req, "command"), _strings(req, "args")
@@ -357,7 +363,7 @@ def _job_plan(op: str, req: dict[str, Any]) -> Plan:
                 stdin_open=stdin_open,
                 idempotency_key=key,
             ),
-            lambda pgid: {"pgid": pgid},
+            lambda st: {"pgid": st.pgid, "mark": st.mark},
         )
     offset = _count(req, "offset") or 0
     if op == "job_read":
@@ -374,15 +380,36 @@ def _job_plan(op: str, req: dict[str, Any]) -> Plan:
             },
         )  # fmt: skip
     return (  # job_attach
-        lambda sb: sb.jobs.collect(scope, job, offset, **_beat(req)),
+        lambda sb: sb.jobs.collect(
+            scope,
+            job,
+            offset,
+            mark=_opt_str(req, "mark"),
+            output=req.get("output") is not False,
+            **_beat(req),
+        ),
         # As ``exec_stream`` ends: ``signal`` in place of ``exit_code`` for a death by signal.
         lambda a: {
+            **(
+                {"attached": {"mark": a.attached.mark, "from": a.attached.from_offset}}
+                if a.attached
+                else {}
+            ),
             **({"exit_code": a.exit_code} if a.signal is None else {"signal": a.signal}),
             "output_b64": _b64(a.output),
             **({"stderr_b64": _b64(a.stderr)} if a.stderr else {}),
             "gap": a.gap,
         },
     )
+
+
+def _marks(req: dict[str, Any]) -> dict[str, str] | None:
+    m = req.get("marks")
+    if m is None:
+        return None
+    if not isinstance(m, dict) or not all(isinstance(v, str) for v in m.values()):
+        raise InvalidRequestError("`marks` must be an object of strings")
+    return m
 
 
 def _grace(req: dict[str, Any]) -> dict[str, Any]:
@@ -446,14 +473,14 @@ def _start_held(
     }  # fmt: skip
     if isinstance(sb, AsyncSandbox):
 
-        async def go() -> int:
+        async def go() -> JobStart:
             stream = sb.jobs.start_held(scope, job, command, args, **kw)
             try:
                 async for f in stream:
                     if isinstance(f, JobStarted):
                         if keep:
                             await sb.jobs.keep(scope, job)
-                        return f.pgid
+                        return JobStart(f.pgid, f.mark)
             finally:
                 await stream.aclose()
             raise ProtocolError("the held start ended before `started`")
@@ -465,7 +492,7 @@ def _start_held(
             if isinstance(f, JobStarted):
                 if keep:
                     sb.jobs.keep(scope, job)
-                return f.pgid
+                return JobStart(f.pgid, f.mark)
     finally:
         sync.close()
     raise ProtocolError("the held start ended before `started`")

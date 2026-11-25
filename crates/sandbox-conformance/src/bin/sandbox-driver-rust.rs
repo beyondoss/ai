@@ -25,6 +25,7 @@ const FEATURES: [&str; 10] = [
     "job_errors",
     "job_options",
     "job_start_key",
+    "job_marks",
 ];
 
 fn config() -> Config {
