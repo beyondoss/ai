@@ -31,6 +31,11 @@ const CELL_SECS: u64 = LIFETIME_SECS - 60;
 /// The port `execd` listens on in the VM.
 const PORT: u16 = 8081;
 const HOME: &str = "/home/user";
+/// Where execd keeps its ledger and where it spools job output, as Beyond deploys it: the state
+/// directory on a tmpfs (the ledger dies with the VM, as its processes do), the jobs directory on
+/// disk. The scenarios in `spool.json` name them (`requires.vars`).
+const STATE_DIR: &str = "/run/execd-state";
+const JOBS_DIR: &str = "/var/tmp";
 /// The release installed: its `execd-<tag>-linux-<arch>.tar.gz`, checked against its `.sha256`.
 const DEFAULT_TAG: &str = "v0.1.16";
 const READY_WITHIN: Duration = Duration::from_secs(90);
@@ -330,11 +335,11 @@ pub async fn start(name: &str) -> Result<Started, String> {
         return Err(format!("e2b: envd never accepted a command: {last}"));
     }
     // execd runs as root (the VM's passwordless sudo) and drops to the VM's user for the commands it runs.
-    // `EXECD_STATE_DIR` keeps the jobs ledger across a restart of execd (a tmpfs, as in a sandbox), which the
-    // `jobs-key` restart scenario drives through `execd-restart` (the `EXECD_RESTART` variable).
+    // The jobs ledger (`EXECD_STATE_DIR`) outlives a restart of execd, which the `jobs-key` restart scenario drives
+    // through `execd-restart` (the `EXECD_RESTART` variable).
     let env = format!(
         "EXECD_LISTEN=0.0.0.0:{PORT} EXECD_ROOT={HOME}/work EXECD_HOME={HOME} EXECD_RUN_AS=user \
-         EXECD_STATE_DIR=/dev/shm/execd-state"
+         EXECD_STATE_DIR={STATE_DIR} EXECD_JOBS_DIR={JOBS_DIR}"
     );
     let launch = format!(
         "sudo env -u SUDO_COMMAND -u SUDO_USER -u SUDO_UID -u SUDO_GID {env} EXECD_BEARER=\"$BEARER\" \
@@ -425,10 +430,11 @@ sudo chmod 700 @HOME@/bin/execd-restart"#
         work: format!("{HOME}/work"),
         caps: None,
         suites: None,
-        vars: BTreeMap::from([(
-            "EXECD_RESTART".to_string(),
-            format!("sudo {HOME}/bin/execd-restart"),
-        )]),
+        vars: BTreeMap::from([
+            ("SPOOL_STATE".into(), STATE_DIR.into()),
+            ("SPOOL_JOBS".into(), JOBS_DIR.into()),
+            ("EXECD_RESTART".into(), format!("sudo {HOME}/bin/execd-restart")),
+        ]),
         lease: Some(Arc::new({
             let vm = vm.clone();
             move || {

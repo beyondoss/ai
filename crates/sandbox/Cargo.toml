@@ -16,6 +16,8 @@ workspace = true
 [dependencies]
 async-trait.workspace = true
 base64 = "0.22"
+# The job handle's kernel (proven in Verus): the silence limit is its function, not a constant of this crate.
+beyond-job-client = { path = "../job-client" }
 getrandom = { version = "0.3", features = ["std"] }
 globset = "0.4"
 hex = "0.4"

@@ -70,15 +70,19 @@ fn string_map(v: Option<&Value>) -> BTreeMap<String, String> {
 fn entry(v: &Value) -> Result<Entry, String> {
     let command = v.get("command").and_then(Value::as_str);
     let url = v.get("url").and_then(Value::as_str);
-    let kind = match v.get("type").and_then(Value::as_str) {
-        Some("stdio") => "stdio",
-        Some("http" | "streamable-http" | "streamableHttp" | "sse") => "http",
-        Some(other) => return Err(format!("unsupported type `{}`", other.escape_default())),
-        None if command.is_some() => "stdio",
-        None => "http",
+    let tag = v.get("type").and_then(Value::as_str);
+    let kind = match tag {
+        Some("stdio") => bash_gate::McpType::Stdio,
+        Some("http" | "streamable-http" | "streamableHttp" | "sse") => bash_gate::McpType::Http,
+        Some(_) => bash_gate::McpType::Other,
+        None => bash_gate::McpType::Absent,
     };
-    match (kind, command, url) {
-        ("stdio", Some(command), _) => Ok(Entry::Stdio {
+    match (
+        bash_gate::mcp_entry_shape(kind, command.is_some(), url.is_some()),
+        command,
+        url,
+    ) {
+        (bash_gate::McpShape::Command, Some(command), _) => Ok(Entry::Stdio {
             command: command.to_owned(),
             args: v
                 .get("args")
@@ -91,11 +95,16 @@ fn entry(v: &Value) -> Result<Entry, String> {
                 .unwrap_or_default(),
             env: string_map(v.get("env")),
         }),
-        ("http", _, Some(url)) => Ok(Entry::Http {
+        (bash_gate::McpShape::Url, _, Some(url)) => Ok(Entry::Http {
             url: url.to_owned(),
             headers: string_map(v.get("headers")),
         }),
-        _ => Err("needs a `command` or a `url`".to_owned()),
+        _ => Err(match (kind, tag) {
+            (bash_gate::McpType::Other, Some(other)) => {
+                format!("unsupported type `{}`", other.escape_default())
+            }
+            _ => "needs a `command` or a `url`".to_owned(),
+        }),
     }
 }
 

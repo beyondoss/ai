@@ -610,6 +610,7 @@ dependencies = [
 name = "beyond-job-client"
 version = "0.1.0"
 dependencies = [
+ "stateright",
  "vstd",
 ]
 
@@ -639,6 +640,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "beyond-exec-notify",
+ "beyond-job-client",
  "beyond-sandbox-conformance",
  "beyond-test-support",
  "getrandom 0.3.4",

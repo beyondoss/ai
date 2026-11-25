@@ -368,6 +368,13 @@ The `e2b` backend also defines `${EXECD_RESTART}`, a command that restarts its e
 the jobs run on): `${EXECD_RESTART} MARKER` returns at once, and `MARKER` exists once the new execd answers. The
 `jobs-key` suite's restart scenario `requires.vars` it.
 
+The `spool` suite needs `${SPOOL_STATE}` (execd's `EXECD_STATE_DIR`, on a tmpfs) and `${SPOOL_JOBS}`
+(`EXECD_JOBS_DIR`, on disk), and a sandbox user that is not root. Only the `e2b` backend defines them: it
+launches execd as Beyond deploys it, with `EXECD_STATE_DIR=/run/execd-state` and
+`EXECD_JOBS_DIR=/var/tmp` (so every E2B scenario runs with the ledger on). The scenario fails unless the state
+directory is a tmpfs, then asserts that a kept job's 8 MiB of output is on disk under `${SPOOL_JOBS}`,
+that `${SPOOL_STATE}` holds only the ledger, and that `Shmem` in `/proc/meminfo` grew by under 1 MiB.
+
 ### Edge
 
 `"connect": {"edge": {...}}` puts a proxy owned by the harness between a fresh driver and the
