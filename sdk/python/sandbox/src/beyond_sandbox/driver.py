@@ -26,7 +26,18 @@ import tempfile
 import traceback
 from typing import Any, Callable, cast
 
-from . import AsyncSandbox, Exit, Sandbox, SandboxError, Signal, Stderr, Stdout, TimedOut, _bulk
+from . import (
+    AsyncSandbox,
+    Exit,
+    Sandbox,
+    SandboxError,
+    Signal,
+    Stderr,
+    Stdout,
+    TimedOut,
+    _bulk,
+    _jobs,
+)
 from .atransport import AsyncHttpTransport
 from .errors import (
     DiskFullError,
@@ -391,6 +402,15 @@ def _job_plan(op: str, req: dict[str, Any]) -> Plan:
             "gap": a.gap,
         },
     )
+
+
+def _check_job_names(req: dict[str, Any]) -> None:
+    """A bad scope or job id is ``invalid_request`` before the endpoint is probed, not a transport error."""
+    _jobs.check_scope(_str(req, "scope"))
+    for key in ("job", "jobs"):
+        if key in req:
+            for i in [req[key]] if key == "job" else _strings(req, key):
+                _jobs.check_id(i if isinstance(i, str) else "")
 
 
 def _marks(req: dict[str, Any]) -> dict[str, str] | None:
@@ -910,6 +930,7 @@ class Driver:
             call, shape = plan(op, req)
             sb = self._ensure_sync()
             if op.startswith("job_"):
+                _check_job_names(req)
                 sb.capabilities()  # an endpoint nobody answers is `transport` here, as for every other op
             return {"id": id_, "ok": shape(call(sb))}
         except Exception as e:
@@ -932,6 +953,7 @@ class Driver:
             call, shape = plan(op, req)
             sb = await self._ensure_async()
             if op.startswith("job_"):
+                _check_job_names(req)
                 await sb.capabilities()  # as in `handle`
             result = call(sb)
             if inspect.isawaitable(result):

@@ -12,13 +12,26 @@ An editable install (``pip install -e``) builds nothing: a checkout's library is
 
 from __future__ import annotations
 
+import shutil
 import subprocess
+import sys
 import sysconfig
 import tempfile
 from pathlib import Path
 from typing import Any
 
 from hatchling.builders.hooks.plugin.interface import BuildHookInterface
+
+
+def bash() -> str:
+    """A POSIX shell. On Windows, `bash` on the PATH may be WSL's (which has no distribution): Git's is used."""
+    if sys.platform == "win32":
+        git = shutil.which("git")
+        if git is not None:
+            candidate = Path(git).resolve().parents[1] / "bin" / "bash.exe"
+            if candidate.is_file():
+                return str(candidate)
+    return shutil.which("bash") or "bash"
 
 
 class NativeKernel(BuildHookInterface):  # type: ignore[misc]
@@ -36,7 +49,7 @@ class NativeKernel(BuildHookInterface):  # type: ignore[misc]
             )
         # The library is staged outside the source tree, so a wheel build leaves the checkout clean.
         stage = Path(tempfile.mkdtemp(prefix="beyond-kernel-"))
-        subprocess.run(["bash", str(script), str(stage)], check=True, cwd=root)
+        subprocess.run([bash(), script.as_posix(), stage.as_posix()], check=True, cwd=root)
         build_data["pure_python"] = False
         # The platform the way setuptools names it: cibuildwheel sets it per architecture, and repairs a
         # Linux wheel's `linux_<arch>` into the manylinux or musllinux tag its library is compatible with.
