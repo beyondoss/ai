@@ -516,7 +516,7 @@ const SWEEP_MIN_SLEEP_MS: u64 = 50;
 /// The most ended rows one `list` answer carries ([`serve_op`]). An ended entry is cheap to keep and
 /// the ceiling lets a table hold thousands, while the answer is rebuilt on every reattach: past this
 /// many the newest are listed and the rest are only counted (`"more"`). At 4096 ended entries the
-/// answer would otherwise be 1.45 MB of output and 39 ms of the runtime thread, measured
+/// answer would otherwise be 1.45 MB of output and 37 ms of the runtime thread, measured
 /// (`benches/retention_scale.py`).
 pub(crate) const LIST_ENDED_MAX: usize = 512;
 
@@ -1507,7 +1507,7 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq, data: Vec<u8>) -> 
             http::json_response(200, &json!({ "running": running, "mismatch": mismatch }))
         }
         "list" => {
-            // Every job that has not ended answers in full; the ended ones past `[LIST_ENDED_MAX]`
+            // Every job that has not ended answers in full; the ended ones past [`LIST_ENDED_MAX`]
             // are counted, not listed. The newest rows are the ones kept: the count ceiling reaps the
             // oldest first, and a client that reattaches wants what just happened. A table of 256
             // ended entries — what the old ceiling held — is answered byte for byte as before, since
