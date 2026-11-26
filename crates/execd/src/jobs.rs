@@ -659,10 +659,13 @@ pub(crate) async fn sweep(ctx: &Arc<Ctx>) -> Swept {
     }
     if sweep.acted() {
         jobs.bump();
-        // One pass off the runtime thread: the ledger first (the durable marker — this entry's
-        // output is gone and its offsets are these — then the files it no longer names), and every
-        // unlink here. CAPY-5 is landing the shared off-loop writer for the request path; when it
-        // lands, `Ledger::save` inside this closure is the one line that changes.
+        // One pass off the runtime thread, holding one of `disk_writers` turns (the same gate as a
+        // job's output batches, `Ctx::disk_turn`): the ledger first (the durable marker — this
+        // entry's output is gone and its offsets are these — then the files it no longer names),
+        // and every unlink here. The order is the whole point: a crash between the two leaves a
+        // ledger that names no file, which the next start's `retain` finishes, never a file no
+        // ledger names (`a_crash_after_the_ledger_write_leaves_no_spool_behind`).
+        let turn = ctx.disk_turn().await;
         let ctx = ctx.clone();
         proc::off_runtime(move || {
             ctx.jobs.save();
@@ -678,6 +681,7 @@ pub(crate) async fn sweep(ctx: &Arc<Ctx>) -> Swept {
             }
         })
         .await;
+        drop(turn);
         crate::log_info!(
             "retention sweep acted ended={} bytes={} tombstoned={} reaped={} kept={:?}",
             sweep.ended,
@@ -2324,9 +2328,9 @@ impl Tailing {
                 self.drain_batch(1)
             };
             match step_after(drained, threaded) {
-                Step::Again => {}
-                Step::AgainYielding => tokio::task::yield_now().await,
-                Step::Stop(kept) => return kept,
+                TailStep::Again => {}
+                TailStep::AgainYielding => tokio::task::yield_now().await,
+                TailStep::Stop(kept) => return kept,
             }
         }
     }
@@ -2385,7 +2389,7 @@ fn tail_gate() {
 
 /// What a tail does after one batch: read the next one, or stop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Step {
+enum TailStep {
     /// Read the next batch at once.
     Again,
     /// Read the next batch after giving the runtime a turn (the round-at-a-time path).
@@ -2394,17 +2398,17 @@ enum Step {
     Stop(bool),
 }
 
-/// [`Step`] for a batch that ended [`Drained`]. A batch that filled its rounds with more to read is
+/// [`TailStep`] for a batch that ended [`Drained`]. A batch that filled its rounds with more to read is
 /// never the end: the spool holds bytes that no chunk and no journal hold yet, so stopping there
 /// loses them until something else happens to wake the tail (a punch, or the next write). Only a
 /// batch that read both files to their ends ([`Drained::Idle`]) or was refused
 /// ([`Drained::Stopped`]) stops.
-fn step_after(drained: Drained, threaded: bool) -> Step {
+fn step_after(drained: Drained, threaded: bool) -> TailStep {
     match drained {
-        Drained::More if threaded => Step::Again,
-        Drained::More => Step::AgainYielding,
-        Drained::Idle => Step::Stop(true),
-        Drained::Stopped => Step::Stop(false),
+        Drained::More if threaded => TailStep::Again,
+        Drained::More => TailStep::AgainYielding,
+        Drained::Idle => TailStep::Stop(true),
+        Drained::Stopped => TailStep::Stop(false),
     }
 }
 
@@ -3336,30 +3340,31 @@ mod retention_policy_tests {
             decide(&job(ended(1)), now, &entry_first, Pressure::default()),
             Step::Reap(Why::EntryTtl)
         );
+    }
 }
 
+#[cfg(test)]
 mod tail_step_tests {
-    use super::{Drained, Step, step_after};
+    use super::{Drained, TailStep, step_after};
 
     /// A batch that filled its rounds with more to read is never the end, on either path: the bytes
     /// the spool holds past it are in no chunk and no journal, so stopping loses them until
     /// something else happens to wake the tail. Red when the `Drained::More` arms are folded into
-    /// `Step::Stop(true)` (the dropped-remainder bug), which the integration test cannot see because
+    /// `TailStep::Stop(true)` (the dropped-remainder bug), which the integration test cannot see because
     /// punching the spool wakes the tail again.
     #[test]
     fn more_to_read_is_never_the_end() {
-        assert_eq!(step_after(Drained::More, true), Step::Again);
-        assert_eq!(step_after(Drained::More, false), Step::AgainYielding);
+        assert_eq!(step_after(Drained::More, true), TailStep::Again);
+        assert_eq!(step_after(Drained::More, false), TailStep::AgainYielding);
     }
 
     /// Only an idle tail (both files read to their ends) keeps the job and stops, and only a
     /// refused batch means the job was removed.
     #[test]
     fn only_idle_keeps_and_only_stopped_loses_the_job() {
-        assert_eq!(step_after(Drained::Idle, true), Step::Stop(true));
-        assert_eq!(step_after(Drained::Idle, false), Step::Stop(true));
-        assert_eq!(step_after(Drained::Stopped, true), Step::Stop(false));
-        assert_eq!(step_after(Drained::Stopped, false), Step::Stop(false));
+        assert_eq!(step_after(Drained::Idle, true), TailStep::Stop(true));
+        assert_eq!(step_after(Drained::Idle, false), TailStep::Stop(true));
+        assert_eq!(step_after(Drained::Stopped, true), TailStep::Stop(false));
+        assert_eq!(step_after(Drained::Stopped, false), TailStep::Stop(false));
     }
 }
-
