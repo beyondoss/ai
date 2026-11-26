@@ -834,20 +834,85 @@ for a signal in one-shot, a late background write possibly lost in one-shot) are
   left to accept with, the accept loop frees its spare descriptor and answers each waiting connection `503` rather than leaving it in the kernel's queue with no answer (`a_connection_with_no_descriptor_left_is_refused_503_not_left_waiting`); the soft limit is raised to the hard limit at start (`the_soft_descriptor_limit_is_raised_to_the_hard_limit_at_start`). The `/proc` scans that run off the runtime
   (`proc::off_runtime`) fall back to running in place when no thread can be created, since `tokio::task::spawn_blocking` panics there.
 
-### Descriptor exhaustion and the cap on requests in flight
+### Descriptor exhaustion, the cap on requests in flight, and job output off the runtime
 
-The gate chain for a request, in the order it meets them, and what the client sees at each:
+**The gate chain for a request**, in the order it meets each gate, what each enforced before this
+change, and what it enforces now:
 
-1. **Listener accept** (`src/http.rs:316` `accept_loop`). No cap on connections. At `EMFILE`/`ENFILE` the loop frees a spare descriptor (held since start), accepts up to `SHED_MAX` (64, `http.rs:306`) waiting connections, reads what request bytes have arrived (up to 20 ms each), answers `503` `{"error":"out of file descriptors"}` with `retry-after: 1`, and closes them (so the reset that unread data causes cannot take the answer with it); then it takes a spare again and pauses 100 ms. Before this, those connections waited in the kernel's queue with no answer. A client of HTTP/2 prior knowledge sees a failed handshake, not a hang. Not proven: connections beyond `SHED_MAX` in one round wait for the next round (100 ms later); a client whose request arrives later than 20 ms may see a reset instead of the `503`.
-2. **Header read** (`http.rs:365` `HEAD_TIMEOUT`, 60 s): a connection with no complete head is closed. Unchanged.
-3. **The request cap** (`http.rs:413`, `InFlight::enter_within` `http.rs:517`; `Options::max_in_flight`). Every request but the health paths and one a route hook claims counts; the count moves by compare-and-swap, so concurrent requests cannot pass the limit together. One past the limit is answered `503` `{"error":"too many requests in flight (limit N); retry shortly"}` with `retry-after: 1`, holds nothing, and is logged as `request kind=overload`. `/livez` is never counted, so health answers at the limit. Sizing: `stream_limit` (`lib.rs:98`) takes the soft `RLIMIT_NOFILE` after the raise, keeps an eighth of it (at least 64) for the listener, the inotify instance, the ledger, the spare and idle connections, and divides the rest by 4, the most descriptors a request holds (measured: a stream or one-shot 3, a job start 4). It is never below 1. `EXECD_MAX_STREAMS`: unset sizes it, `0` is no cap (what ran before), `N` is N. A claimed request (`route_hook`) is the embedder's and is not counted.
-4. **Spawn** (unchanged): with no descriptor for a command's pipes, a one-shot answers `exit_code` 126, a job start `500`.
+1. **Accept** (`src/http.rs:316` `accept_loop`). Before: connections were not capped, and an accept
+   error logged and paused the loop 100 ms; at `EMFILE` the connections already in the kernel's queue
+   got no answer at all. Now, on `EMFILE`/`ENFILE`, the loop takes a spare descriptor (opened from
+   `/dev/null` at start), accepts up to `SHED_MAX` = 64 (`http.rs:306`) waiting connections, reads the
+   request bytes that have arrived (waiting at most `SHED_WAIT` = 20 ms each), writes
+   `503` `{"error":"out of file descriptors"}` with `retry-after: 1`, shuts the connection down, then
+   reopens the spare and pauses 100 ms as before. What the client sees: a `503` with a reason, or, for
+   an h2c client, a failed handshake. Worst case: a connection whose request arrives more than 20 ms
+   after accept, or one beyond the 64th in a round, is closed without the body read; the next round,
+   100 ms later, answers it (the kernel queue holds it). `EXECD_SHED_WHEN_OUT_OF_FDS=0` restores the
+   old behaviour exactly, and `with_shedding_off_a_connection_past_the_descriptor_limit_waits_as_before`
+   holds that (it goes red when the knob is ignored).
+2. **Header read** (`http.rs:365` `HEAD_TIMEOUT` 60 s): unchanged; a connection with no complete head
+   is closed.
+3. **Request cap** (`http.rs:413`, `InFlight::enter_within` `http.rs:517`, the counter in
+   `src/admit.rs`). Before: none. Now every request except the health paths and one a route hook
+   claims takes a slot by one compare-and-swap; the request that finds the count at the limit is
+   answered `503` `{"error":"too many requests in flight (limit N); retry shortly"}` with
+   `retry-after: 1`, holds no descriptor and no slot, and is logged `request kind=overload`. `/livez`
+   is never counted, so health answers at the limit. Sizing is `stream_limit` (`lib.rs:98`): from the
+   soft `RLIMIT_NOFILE` after the raise, an eighth (at least 64) stays for the listener, the inotify
+   instance, the ledger, the spare and idle connections, and the rest is divided by
+   `FDS_PER_REQUEST` = 4 (measured: a stream or a one-shot 3, a job start 4), never below 1.
+   `EXECD_MAX_STREAMS`: unset sizes it, `0` is no cap (what ran before; `max_streams_zero_is_no_cap`
+   goes red when the `0` arm is removed), `N` is N. Worst case: at the limit a client is refused
+   though descriptors remain, which is deliberate: a refusal is answerable in 1 s, an unanswered
+   connection is not.
+4. **Spawn** (unchanged): no descriptor for a command's pipes is `exit_code` 126 one-shot, `500` for a
+   job start, never a hang (`tests/faults.rs`).
 
-The soft limit is raised to the hard limit at start (`main.rs:86`, idempotent, logged, never fatal: a refusal leaves the inherited limit and the cap is sized from what the process really has). The commands execd starts inherit the raised soft limit.
+**The soft limit** is raised to the hard limit at start (`main.rs:86` `raise_open_file_limit`):
+idempotent (nothing is set when the soft is already the hard, or unlimited), logged either way, never
+fatal (a refusal logs and the cap is sized from what the process really has), and inherited by the
+commands it starts. `EXECD_RAISE_NOFILE=0` leaves the inherited limit, as before.
 
-**Job output is written off the runtime.** The tail's reads, ring chunk writes, journal appends and hole punching (`tail.rs:281` `Tail::drain_batch`, called from `jobs.rs:1813`) run on a thread (`proc::off_runtime`), at most 16 rounds per batch, and at most `Options::tail_writers` (8, `EXECD_TAIL_WRITERS`; `0` writes on the runtime as before) batches at once: a batch waits for a permit (`jobs.rs:1795`), so the threads are bounded however many jobs write. The queue between a job and its ring is its spool file, written by the job itself: when the disk is slow the tail falls behind and the file grows (the job is never blocked, as before); nothing new is buffered in memory. Ordering holds because one tail task per job drains one batch at a time and the journal is appended before the spool's bytes are punched, as before. The journal append no longer happens under the job's cell lock (only the ring push does, so a chunk write, at most once per chunk, still holds that job's lock: a reader of that one job waits).
+**Atomicity.** The cap's admission is a compare-and-swap loop over the counter in `src/admit.rs`,
+which is loom's atomic under `--cfg beyond_loom`: `mise run test:loom` explores every interleaving of
+two and three racing callers and of a release racing an arrival, and the first four models go red
+under a load-then-add version of `enter_within`.
 
-Tests (`tests/faults.rs`): `a_slow_disk_under_job_output_does_not_stall_an_unrelated_caller` and its baseline `with_tail_writers_zero_the_same_slow_disk_does_stall_the_runtime` (an injected 800 ms per batch, `EXECD_TEST_FAULT` `tail_write_delay_ms`, debug builds only); `output_through_a_slow_writer_keeps_its_order_and_every_byte`; `writer_threads_are_bounded_by_tail_writers_and_the_rest_wait`; `a_connection_with_no_descriptor_left_is_refused_503_not_left_waiting`; `a_request_past_the_cap_is_answered_503_with_a_reason_and_recovers`; `max_streams_zero_is_no_cap`; `a_stingy_descriptor_limit_sizes_the_cap_and_every_stream_is_answered` (soft 64, hard 128); `the_soft_descriptor_limit_is_raised_to_the_hard_limit_at_start`; `stream_limit` in `lib.rs`.
+**Job output is written off the runtime.** The tail's reads, ring chunk writes, journal appends and
+hole punching (`tail.rs:281` `Tail::drain_batch`, driven by `jobs.rs:1813`) run on a thread
+(`proc::off_runtime`), in batches of up to `tail::ROUNDS` = 16 rounds per file, at most
+`Options::tail_writers` (8; `EXECD_TAIL_WRITERS`) batches at once, each holding one permit of a
+semaphore (`jobs.rs:1795`). Nothing is queued in memory: the spool file is the queue, written by the
+job itself, so a slow disk makes the tail fall behind and the file grow, and never blocks the job or
+another connection. A tail that finds no permit waits for one (logged at debug). `EXECD_TAIL_WRITERS=0`
+is the behaviour before this change — one round at a time on the runtime, yielding between rounds —
+and `with_tail_writers_zero_a_stuck_output_write_stalls_every_caller_as_before` holds it.
+
+**Ordering and durability** are the ones the ring and the journal already had: one tail task per job,
+one batch at a time, the journal appended before the batch punches the spool's bytes, and nothing
+else writes the ring. Ordering across batches is covered by
+`output_past_one_batch_keeps_its_order_and_every_byte` (4.9 MB through a stuck disk, every byte once,
+contiguous offsets), which goes red when a batch advances its offset short of what it read; durability
+across a crash is `tests/restart.rs` (`a_client_resumes_at_its_offset_across_a_crash_with_no_gap`),
+which goes red when the journal append is removed.
+
+**Tests** (`tests/faults.rs` unless named): the gate-seam pair
+`a_stuck_output_write_does_not_stall_an_unrelated_caller` /
+`with_tail_writers_zero_a_stuck_output_write_stalls_every_caller_as_before`;
+`writer_threads_are_bounded_by_tail_writers_and_the_rest_wait`;
+`output_past_one_batch_keeps_its_order_and_every_byte`;
+`a_connection_with_no_descriptor_left_is_refused_503_not_left_waiting`;
+`with_shedding_off_a_connection_past_the_descriptor_limit_waits_as_before`;
+`a_request_past_the_cap_is_answered_503_with_a_reason_and_recovers`; `max_streams_zero_is_no_cap`;
+`a_stingy_descriptor_limit_sizes_the_cap_and_every_stream_is_answered` (soft 64, hard 128, so the
+raise and the sizing are seen on a limit this machine does not have);
+`the_soft_descriptor_limit_is_raised_to_the_hard_limit_at_start`;
+`with_raise_nofile_zero_the_soft_limit_is_left_as_inherited`; `stream_limit` (in `lib.rs`) and the
+`admit` loom models. The stuck-disk seam is `EXECD_TEST_FAULT` `tail_gate=<dir>` (debug builds only,
+like every fault point): a batch with output to write creates `<dir>/held-<n>`, waits while
+`<dir>/closed` exists, records the most ever held at once in `<dir>/most`, and leaves. No test sleeps
+to reach a state.
 
 ## Deviations from the reference mock
 

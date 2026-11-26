@@ -2305,7 +2305,10 @@ impl Tailing {
                 let slot = match self.ctx.disk_slots.try_acquire() {
                     Ok(slot) => slot,
                     Err(_) => {
-                        crate::log_debug!("tail waits for a writer slot");
+                        crate::log_debug!(
+                            "tail waits for a writer slot mark={}",
+                            locked(&self.cell).mark
+                        );
                         match self.ctx.disk_slots.acquire().await {
                             Ok(slot) => slot,
                             // Closed only with the server, which never happens.
@@ -2355,17 +2358,29 @@ impl Tailing {
 
 /// The test seam for a slow disk (`EXECD_TEST_FAULT` `tail_gate=<dir>`, debug builds only): a batch
 /// with output to write holds here, with a file `<dir>/held-<n>` naming it, for as long as
-/// `<dir>/closed` exists. A disk that never answers, released when the test says.
+/// `<dir>/closed` exists. A disk that never answers, released when the test says. The most batches
+/// ever held at once is kept in `<dir>/most`.
 fn tail_gate() {
     let Some(dir) = crate::fault::at("tail_gate").map(std::path::PathBuf::from) else {
         return;
     };
     static NEXT: AtomicUsize = AtomicUsize::new(0);
+    static NOW: AtomicUsize = AtomicUsize::new(0);
+    static MOST: Mutex<usize> = Mutex::new(0);
     let held = dir.join(format!("held-{}", NEXT.fetch_add(1, Ordering::Relaxed)));
     let _ = std::fs::write(&held, b"");
+    let now = NOW.fetch_add(1, Ordering::AcqRel) + 1;
+    {
+        let mut most = locked(&MOST);
+        if now > *most {
+            *most = now;
+            let _ = std::fs::write(dir.join("most"), now.to_string());
+        }
+    }
     while dir.join("closed").exists() {
         std::thread::sleep(Duration::from_millis(5));
     }
+    NOW.fetch_sub(1, Ordering::AcqRel);
     let _ = std::fs::remove_file(held);
 }
 

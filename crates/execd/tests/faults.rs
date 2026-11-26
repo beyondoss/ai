@@ -646,6 +646,14 @@ impl Gate {
             .count()
     }
 
+    /// The most batches ever held at the gate at once.
+    fn most(&self) -> usize {
+        std::fs::read_to_string(self.dir.path().join("most"))
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    }
+
     fn open(&self) {
         let _ = std::fs::remove_file(self.dir.path().join("closed"));
     }
@@ -701,10 +709,10 @@ async fn with_disk_writers_zero_a_stuck_output_write_stalls_every_caller_as_befo
     wipe(&e).await;
 }
 
-/// Ten jobs write through two writer slots with the disk stuck: exactly two batches are on the
-/// disk and the other eight have each logged that they wait for a slot (so all ten are accounted
-/// for, and none is on the disk unseen). Opening the disk serves every one. Red: without the
-/// semaphore all ten reach the disk and none waits.
+/// Ten jobs write through two writer slots with the disk stuck: two batches reach the disk and
+/// eight other jobs log that they wait for a slot; opening the disk serves every one, and the most
+/// batches ever on the disk at once (counted by the seam, exactly) is two. Red: without the
+/// semaphore all ten reach the disk together and none waits.
 #[tokio::test]
 async fn writer_threads_are_bounded_by_disk_writers_and_the_rest_wait() {
     let gate = Gate::closed();
@@ -715,13 +723,20 @@ async fn writer_threads_are_bounded_by_disk_writers_and_the_rest_wait() {
     for i in 0..10 {
         assert_eq!(start_job(&e, &format!("w{i}"), CHATTER).await.status, 200);
     }
-    let waiting = || e.log().matches("tail waits for a writer slot").count();
-    until("eight tails waiting for a slot", || async {
-        waiting() >= 8
-    })
+    // Distinct jobs that found no slot (a job may log more than once: its first, empty flush can
+    // wait too).
+    let waiting = || {
+        let log = e.log();
+        log.lines()
+            .filter_map(|l| l.split("tail waits for a writer slot mark=").nth(1))
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+    };
+    until(
+        "two batches on the disk and eight other jobs waiting",
+        || async { gate.held() == 2 && waiting() >= 8 },
+    )
     .await;
-    assert_eq!(gate.held(), 2, "batches on the disk");
-    assert_eq!(waiting(), 8, "tails waiting");
     gate.open();
     for i in 0..10 {
         until("every job's output", || async {
@@ -729,6 +744,8 @@ async fn writer_threads_are_bounded_by_disk_writers_and_the_rest_wait() {
         })
         .await;
     }
+    // Over the whole run, with all ten held back by the disk at once, never more than two were on it.
+    assert_eq!(gate.most(), 2, "the most batches on the disk at once");
     wipe(&e).await;
 }
 
