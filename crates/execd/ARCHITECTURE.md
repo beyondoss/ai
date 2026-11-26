@@ -879,15 +879,31 @@ which is loom's atomic under `--cfg beyond_loom`: `mise run test:loom` explores 
 two and three racing callers and of a release racing an arrival, and the first four models go red
 under a load-then-add version of `enter_within`.
 
-**Job output is written off the runtime.** The tail's reads, ring chunk writes, journal appends and
-hole punching (`tail.rs:281` `Tail::drain_batch`, driven by `jobs.rs:1813`) run on a thread
-(`proc::off_runtime`), in batches of up to `tail::ROUNDS` = 16 rounds per file, at most
-`Options::tail_writers` (8; `EXECD_TAIL_WRITERS`) batches at once, each holding one permit of a
-semaphore (`jobs.rs:1795`). Nothing is queued in memory: the spool file is the queue, written by the
-job itself, so a slow disk makes the tail fall behind and the file grow, and never blocks the job or
-another connection. A tail that finds no permit waits for one (logged at debug). `EXECD_TAIL_WRITERS=0`
-is the behaviour before this change — one round at a time on the runtime, yielding between rounds —
-and `with_tail_writers_zero_a_stuck_output_write_stalls_every_caller_as_before` holds it.
+**Job output is written off the runtime.** The reads, ring chunk writes, journal appends and hole
+punching (`tail.rs` `Tail::drain_batch`, driven from `jobs.rs` `Tailing::flush`) run on a thread
+(`proc::off_runtime`), in batches of up to `tail::ROUNDS` = 16 rounds per file, and each batch holds
+one of `disk_writers` turns (`Ctx::disk_turn`) — the same turn the retention sweep's ledger write and
+unlinks take (`jobs.rs` `sweep`), so there is one gate for all off-loop disk work and the threads are
+bounded however many jobs write and sweeps run. Nothing is queued in memory: the spool file is the
+queue, written by the job itself, so a slow disk makes the tail fall behind and the file grow, and
+never blocks another connection. A tail that finds no turn waits for one (logged at debug).
+`EXECD_DISK_WRITERS=0` is the behaviour before this change — the batches on the runtime, one round at
+a time, yielding between rounds — and
+`with_disk_writers_zero_a_stuck_output_write_stalls_every_caller_as_before` holds it.
+
+A job's **end** is recorded after its last flush (`supervise_after` → `flush`), so a disk that stops
+answering defers that job's `ended` state, and its retention, until the disk answers again. It defers
+no other job's end and never stalls the runtime; before this change the same wait ran on the runtime
+and stalled every caller instead.
+
+**The retention sweep takes the same turn.** Its decision is made in memory first (the output is
+evicted and the spool taken), then `Ctx::disk_turn` before the closure that writes the ledger and
+unlinks: with every turn held by a stuck batch, the decision shows at once (a read is a gap) and its
+durable side waits, bounded by the disk answering. It is one pass at a time by construction (one
+retention task, sequential sweeps), and the ledger-before-unlinks order is unchanged. The ordering
+across a crash is `tests/retention.rs` `a_crash_after_the_ledger_write_leaves_no_spool_behind`
+(`sweep_after_save=exit`); the turn is `a_retention_sweep_waits_for_a_disk_writer_turn`, red when
+`disk_turn` is deleted.
 
 **Ordering and durability** are the ones the ring and the journal already had: one tail task per job,
 one batch at a time, the journal appended before the batch punches the spool's bytes, and nothing
@@ -899,8 +915,8 @@ which goes red when the journal append is removed.
 
 **Tests** (`tests/faults.rs` unless named): the gate-seam pair
 `a_stuck_output_write_does_not_stall_an_unrelated_caller` /
-`with_tail_writers_zero_a_stuck_output_write_stalls_every_caller_as_before`;
-`writer_threads_are_bounded_by_tail_writers_and_the_rest_wait`;
+`with_disk_writers_zero_a_stuck_output_write_stalls_every_caller_as_before`;
+`writer_threads_are_bounded_by_disk_writers_and_the_rest_wait`;
 `output_past_one_batch_keeps_its_order_and_every_byte`;
 `a_connection_with_no_descriptor_left_is_refused_503_not_left_waiting`;
 `with_shedding_off_a_connection_past_the_descriptor_limit_waits_as_before`;

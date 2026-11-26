@@ -634,6 +634,18 @@ impl Gate {
         Self { dir, fault }
     }
 
+    /// A gate that starts open: the disk answers until [`Self::close`].
+    fn answering() -> Self {
+        let g = Self::closed();
+        g.open();
+        g
+    }
+
+    /// The disk stops answering: a batch with output to write holds from here.
+    fn close(&self) {
+        std::fs::write(self.dir.path().join("closed"), b"").unwrap();
+    }
+
     fn env(&self) -> (&'static str, &str) {
         ("EXECD_TEST_FAULT", self.fault.to_str().unwrap())
     }
@@ -837,6 +849,88 @@ async fn with_shedding_off_a_connection_past_the_descriptor_limit_waits_as_befor
     assert!(!e.log().contains("refused"), "{}", e.log());
     drop(idle);
     assert_eq!(livez_within(&e, Duration::from_secs(10)).await, Some(200));
+}
+
+/// Every byte written under `dir`, by file name.
+fn written_under(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    fn walk(p: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+        let Ok(rd) = std::fs::read_dir(p) else {
+            return;
+        };
+        for e in rd.flatten() {
+            let path = e.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if let Ok(bytes) = std::fs::read(&path) {
+                out.push((e.file_name().to_string_lossy().into_owned(), bytes));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, &mut out);
+    out
+}
+
+/// The retention sweep's ledger write and unlinks take one of the same `disk_writers` turns a job's
+/// output batch takes (`jobs.rs` `sweep`, `Ctx::disk_turn`): with the only turn held by a batch
+/// stuck on a disk that never answers, the sweep's decision is made but its durable side waits —
+/// the spool files still hold the dropped output — and the files go once the turn frees. Red when
+/// the sweep runs off-loop without a turn: the spool file vanishes while the disk is stuck.
+#[tokio::test]
+async fn a_retention_sweep_waits_for_a_disk_writer_turn() {
+    let gate = Gate::answering();
+    let spools = tempfile::tempdir().unwrap();
+    let e = Execd::start(
+        &[
+            ("EXECD_DISK_WRITERS", "1"),
+            // A deadline long enough that closing the gate and sticking a batch both happen well
+            // inside it: the sweep then acts on its own timer, not on a race this test wins.
+            ("EXECD_JOB_OUTPUT_MS", "3000"),
+            ("EXECD_JOBS_DIR", spools.path().to_str().unwrap()),
+        ],
+        &[gate.env()],
+    );
+    assert_eq!(start_job(&e, "ended", "printf hi").await.status, 200);
+    until("the ended job's bytes in the ring", || async {
+        read(&e, "ended", 0).await.data == b"hi"
+    })
+    .await;
+    assert!(
+        written_under(spools.path())
+            .iter()
+            .any(|(_, b)| b.as_slice() == b"hi"),
+        "the ended job's spool holds its output: {:?}",
+        written_under(spools.path())
+    );
+    // The disk stops answering, and one job's batch takes the only turn and holds it.
+    gate.close();
+    assert_eq!(start_job(&e, "busy", CHATTER).await.status, 200);
+    until("the only turn held by a stuck batch", || async {
+        gate.held() == 1
+    })
+    .await;
+    // Past its deadline the sweep decides (the output is a gap from here) and then waits for a turn:
+    // its ledger write and its unlinks are the part that cannot happen yet, so the spool file below
+    // is the observable.
+    until("the sweep's decision", || async {
+        read(&e, "ended", 0).await.data.is_empty()
+    })
+    .await;
+    assert!(
+        written_under(spools.path())
+            .iter()
+            .any(|(_, b)| b.as_slice() == b"hi"),
+        "the sweep unlinked the dropped output while the only disk turn was stuck: {:?}",
+        written_under(spools.path())
+    );
+    gate.open();
+    until("the turn to free and the sweep to finish", || async {
+        !written_under(spools.path())
+            .iter()
+            .any(|(_, b)| b.as_slice() == b"hi")
+    })
+    .await;
+    wipe(&e).await;
 }
 
 // ---- a cap on requests in flight ----
