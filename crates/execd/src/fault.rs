@@ -6,7 +6,10 @@
 //!
 //! Points: `claim_save=full` (the claim's write fails with a full disk), `claim_save=eio` (it fails otherwise),
 //! `after_spawn=exit` (execd exits between the spawn and the group's save, leaving the job's process running with
-//! only its intent on disk).
+//! only its intent on disk), `attach_after_decide=<file>` ([`park`]: an attach that has chosen its offset and
+//! registered its stream waits until the file goes), `attach_before_decide=<file>` (an attach that has looked its job
+//! up waits before it locks it), `sweep_after_save=exit` (the retention exits between its ledger write and its
+//! unlinks).
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -24,4 +27,20 @@ pub(crate) fn at(point: &str) -> Option<String> {
     text.lines()
         .find_map(|l| l.strip_prefix(point)?.strip_prefix('='))
         .map(str::to_string)
+}
+
+/// The longest [`park`] holds a request: longer than any test needs, short enough that a test that
+/// forgets to clear the fault cannot hang a server.
+pub(crate) const PARK_MAX: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Hold this step while the fault file at `point` exists (bounded by [`PARK_MAX`]): a test's way to
+/// stop a request between two steps it must not be split across, so the race the two steps could
+/// lose is *forced* rather than hoped for. With no fault file this is one branch.
+pub(crate) async fn park(point: &str) {
+    let Some(hold) = at(point) else { return };
+    crate::log_debug!("fault parked point={point}");
+    let until = tokio::time::Instant::now() + PARK_MAX;
+    while std::path::Path::new(&hold).exists() && tokio::time::Instant::now() < until {
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
 }

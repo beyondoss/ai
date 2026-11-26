@@ -58,6 +58,13 @@ pub(crate) struct Entry {
     /// this names. `None` for a job with no spool.
     #[serde(default)]
     pub spool: Option<String>,
+    /// The offset every byte of the job's output ends at, when the retention dropped the output and
+    /// kept the entry (a tombstone, `jobs::sweep`): nothing is held, and a restart rebuilds the ring
+    /// at this offset so a client's reads never go backwards. `None`: the output is the spool's, if
+    /// any. Serde-default, so a file written before it still parses, and absent when `None`, so a
+    /// ledger with no tombstone is byte for byte the file execd wrote before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub out: Option<u64>,
     /// A terminal's: its size, its keeper's pid and whether it was open. The keeper's socket is in the spool.
     #[serde(default)]
     pub term: Option<SavedTerm>,
@@ -119,6 +126,9 @@ impl Entry {
         mark: &str,
         k: &State,
         spool: Option<&Path>,
+        // Where the job's output ends, when its output was dropped and only its entry kept
+        // (`crate::ring::Ring::evict_all`): a restart answers from there.
+        out: Option<u64>,
         keeper_pid: Option<i32>,
         idem: Option<&Idem>,
     ) -> Option<Self> {
@@ -173,6 +183,7 @@ impl Entry {
             seen: k.seen,
             started: k.started,
             spool: spool.map(|p| p.to_string_lossy().into_owned()),
+            out,
             term: match k.term {
                 Term::No => None,
                 Term::Open { size, .. } => Some(SavedTerm {

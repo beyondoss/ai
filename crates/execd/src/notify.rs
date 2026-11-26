@@ -128,6 +128,24 @@ impl Notifier {
     }
 }
 
+#[cfg(test)]
+impl Notifier {
+    /// A notifier with a callback owed (`Owes`): a test's way to the retention's owed-callback veto
+    /// without a receiver.
+    pub(crate) fn owing() -> Self {
+        let kernel = exec_notify::step(
+            exec_notify::Job::default(),
+            exec_notify::Event::Keep { notify: true },
+            0,
+        )
+        .0;
+        Self {
+            kernel,
+            ..Self::default()
+        }
+    }
+}
+
 /// Feed `event` to job `j`'s kernel (the caller holds the job's lock) and carry out what it says.
 pub(crate) fn feed(
     ctx: &Arc<Ctx>,
@@ -146,6 +164,11 @@ pub(crate) fn feed(
     let now = exec_notify::clock(ctx.epoch.elapsed().as_millis());
     let (next, actions) = exec_notify::step_checked(j.notifier.kernel, event, now);
     j.notifier.kernel = next;
+    // Nothing is owed any more (settled, abandoned at the attempt limit, or the latest `keep`
+    // dropped it): a job the retention was holding back for it is a candidate again.
+    if !j.notifier.owes() && j.ended() {
+        ctx.jobs.wake_retention();
+    }
     // The host's activity view includes the callbacks owed.
     ctx.activity_changed();
     for action in actions {

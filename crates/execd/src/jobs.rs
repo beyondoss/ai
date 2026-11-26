@@ -14,9 +14,9 @@
 //! - *The table*: one entry per job the agent has started and not removed. The agent keeps at most
 //!   `MAX_YIELDED_JOBS` (4) + `MAX_INTENDED_JOBS` (8) running and `MAX_ENDED_JOBS` (8) ended jobs
 //!   per session, and removes them (`remove`, `kill` with `remove`, `wipe`) when the session lets
-//!   them go, so a session holds at most 20 entries, 160 MiB of output at the floor. execd does not
-//!   invent a second limit: an ended job is freed only by `remove` or `wipe`, and a client that
-//!   never sends them keeps its jobs until execd exits. N concurrent cold callers (N sessions)
+//!   them go, so a session holds at most 20 entries, 160 MiB of output at the floor. An ended job a
+//!   client never frees is bounded by the retention ([`crate::Retention`], [`sweep`]): its output
+//!   goes after 15 min or past 256 MiB over ended jobs, its entry past 256 ended entries. N concurrent cold callers (N sessions)
 //!   hold N times that, as the sandbox's own memory allows.
 //! - *A read*: answers at most the output held, so `max` cannot ask for more than the retention.
 //! - *Streams* (`attach`, a held `start`): the same bounded channel as streaming, one task each, freed
@@ -51,7 +51,7 @@ use crate::proc::{self, locked};
 use crate::ring::Ring;
 use crate::tail::{Journal, Spool, Start, Tail};
 use crate::term;
-use crate::{Ctx, StreamEnd, StreamStart};
+use crate::{Ctx, Retention, StreamEnd, StreamStart};
 
 /// `(scope, id)`: a job's address.
 pub(crate) type Key = kernel::Key;
@@ -84,6 +84,10 @@ pub(crate) struct Job {
     /// The start's idempotency key and spec digest, for the ledger (the table's own record of the key is
     /// [`kernel::Rec`]); `None` for an unkeyed start. Written once, at the start or the restart.
     idem: Option<Idem>,
+    /// The retention dropped this job's output and kept its entry (a *tombstone*, [`sweep`]): the
+    /// ring holds nothing at the end offset, the spool is gone, and the ledger says so
+    /// ([`crate::ledger::Entry::out`]), so a restart answers from the same offset. Never unset.
+    tombstoned: bool,
 }
 
 /// A job's command and arguments (never its environment), kept with it and in the ledger.
@@ -120,6 +124,10 @@ pub(crate) struct Jobs {
     activity: Arc<watch::Sender<u64>>,
     /// The table's jobs, kept across a restart of execd ([`crate::ledger`]).
     ledger: Ledger,
+    /// Wakes the retention sweeper ([`start_retention`]). Coalescing: one `notify_one` per event a
+    /// sweep may act on (a job ended, a stream closed, a callback settled, a restart recovered) and
+    /// never one per sweep.
+    retention: tokio::sync::Notify,
 }
 
 impl Jobs {
@@ -129,6 +137,7 @@ impl Jobs {
             changed: watch::Sender::new(0),
             activity,
             ledger,
+            retention: tokio::sync::Notify::new(),
         }
     }
 
@@ -166,6 +175,7 @@ impl Jobs {
                     &j.mark,
                     &j.k,
                     j.spool.as_ref().map(Spool::dir),
+                    j.tombstoned.then(|| j.out.end()),
                     keeper,
                     j.idem.as_ref(),
                 )
@@ -264,20 +274,31 @@ impl Jobs {
     /// another job than the one checked keeps it (J10).
     fn remove(&self, checked: &[(Key, JobCell)]) {
         let cells = locked(&self.map).take(checked, Arc::ptr_eq);
-        for (_, cell) in cells {
-            let mut j = locked(&cell);
-            if let Act::Release { .. } = kernel::step(&mut j.k, Ev::Taken) {
-                j.notifier = Notifier::removed();
-                if let Some(s) = &j.stdin {
-                    s.close();
-                }
-                if let Some(sp) = j.spool.take() {
-                    sp.remove();
-                }
-            }
+        for sp in self.release(cells) {
+            sp.remove();
         }
         self.bump();
         self.save();
+    }
+
+    /// The table's half of a removal, for cells already taken out of it: the kernel lets each go
+    /// (`Ev::Taken`, the only step that sets `removed`), its callback is abandoned and its stdin
+    /// closed, and its spool is handed back. No I/O and no ledger write: the caller deletes the
+    /// spools and writes the ledger where that is cheap ([`sweep`], off the runtime thread) — which
+    /// is what [`Self::remove`] does inline.
+    fn release(&self, cells: Vec<(Key, JobCell)>) -> Vec<Spool> {
+        let mut spools = Vec::new();
+        for (_, cell) in cells {
+            let mut j = locked(&cell);
+            spools.extend(let_go(&mut j));
+        }
+        spools
+    }
+
+    /// Ask the retention sweeper to look at the table soon ([`start_retention`]). Coalescing: a
+    /// second call before the sweep runs costs one stored permit.
+    pub(crate) fn wake_retention(&self) {
+        self.retention.notify_one();
     }
 }
 
@@ -286,6 +307,461 @@ fn epoch() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Ended jobs: what is kept of one, and for how long.
+//
+// A job's end is the moment it stops being worth a stream and starts costing the server for as long
+// as no client says `remove`: up to its retention of output (8 MiB, plus ≤1 MiB of stderr labels,
+// plus <72 KiB in memory) and one table entry, forever. [`sweep`] bounds both, in two tiers, and
+// touches nothing else:
+//
+// 1. **Tombstone** (on by default, 15 min and 256 MiB): drop the output, keep the entry. The entry
+//    keeps its offset, `state: "ended"`, code, signal and end, and the ring goes to `base == end`.
+//    A late reader gets what it would get past the retention floor anyway: the status, and a gap
+//    (`exec_endpoint.rs`, "dropping old output leaves a gap; offsets never move"). `attach` streams
+//    one `{"gap": n}` and then the exit.
+// 2. **Reap** (a count ceiling of 256, on; a clock, off): take the entry itself, through the same
+//    gate `remove` takes (`removable`, `kernel::step(Ev::Remove { ended_counts: true })`,
+//    `Table::take` with `Arc::ptr_eq`). Only then does a client get `404 no such job`, which the
+//    client kernel calls terminal, and only past a ceiling or a deadline an operator asked for.
+//
+// Five things are never reaped, and three of them are why this module exists rather than a timer:
+//
+// - a job with an open stream (`streams > 0`): its output is the only copy of the last bytes, and
+//   a take ends the stream early (J9). Registered under the job's own lock, in `attach` and at a
+//   held start, so a sweep cannot find it at 0 while an attach is deciding to stream (see `attach`
+//   in `serve_op`);
+// - a job whose notify callback is owed (`Notifier::owes`): the take abandons the count and the
+//   fleet never learns the end;
+// - a job that is not `Phase::Ended`: a `Running`/`Exited` job's group can be *observed* empty and
+//   fill again (`removable`'s second step), and its leftovers' bytes are still arriving;
+// - a **keyed** job, ever: its key's record leaves with it (K8), so a reaped keyed job would let a
+//   retried start run the command twice. It is tombstoned, never reaped (ARCHITECTURE.md: "a keyed
+//   job must not be evicted");
+// - a job whose remaining deadlines are all in the future.
+//
+// Every step is idempotent and atomic, in this order: the decision and the state change are one
+// critical section under the job's lock; the ledger (the durable marker: the entry names no spool,
+// and names the offset) is written before anything is unlinked; a crash between the two leaves a
+// spool directory the next start deletes (`Spool::retain`). All of it runs off the runtime thread,
+// and a sweep writes the ledger once however many jobs it touched.
+// ---------------------------------------------------------------------------------------------
+
+/// What the retention does with one ended job now, and why (for the log, and the tests).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Step {
+    Keep(Why),
+    /// Drop its output, keep its entry.
+    Tombstone(Why),
+    /// Take its entry out.
+    Reap(Why),
+}
+
+/// Why a job is kept, tombstoned or reaped. `name` is what the log says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Why {
+    /// Not `Phase::Ended`.
+    Running,
+    /// A stream is open on it.
+    Attached,
+    /// Its notify callback is owed.
+    OwedCallback,
+    /// A keyed job a reap would have taken: it keeps its entry (a liveness gap, logged).
+    Keyed,
+    /// Its output deadline arrived.
+    OutputTtl,
+    /// Its entry deadline arrived.
+    EntryTtl,
+    /// The server holds more ended entries than the ceiling.
+    Count,
+    /// More output is retained over ended jobs than the budget.
+    Bytes,
+    /// Nothing is due for it.
+    WithinDeadline,
+    /// The gate refused a take the policy asked for (never happens for an ended job, L1).
+    NotRemovable,
+}
+
+impl Why {
+    fn name(self) -> &'static str {
+        match self {
+            Why::Running => "running",
+            Why::Attached => "attached",
+            Why::OwedCallback => "owed_callback",
+            Why::Keyed => "keyed",
+            Why::OutputTtl => "output_ttl",
+            Why::EntryTtl => "entry_ttl",
+            Why::Count => "count",
+            Why::Bytes => "bytes",
+            Why::WithinDeadline => "within_deadline",
+            Why::NotRemovable => "not_removable",
+        }
+    }
+}
+
+/// The kernel's `Taken` step for a cell the table has let go, and what the shell does with it: the
+/// callback is abandoned, stdin closed, the spool handed back. `removed` is set here, final, and it
+/// is what an `attach` that lost the race with a take answers `404` for; idempotent, so a second
+/// `Taken` (a retried release) does nothing.
+fn let_go(j: &mut Job) -> Option<Spool> {
+    if let Act::Release { .. } = kernel::step(&mut j.k, Ev::Taken) {
+        j.notifier = Notifier::removed();
+        if let Some(s) = &j.stdin {
+            s.close();
+        }
+        return j.spool.take();
+    }
+    None
+}
+
+/// The two ceilings, as the sweep walks the ended jobs oldest first and both move as it acts: what
+/// is over when this job is looked at.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Pressure {
+    over_bytes: bool,
+    over_count: bool,
+}
+
+/// The vetoes, in one place for [`decide`] and [`next_wake`]: the moment the job ended
+/// (epoch seconds) when the retention may act on it at all, or why it may not. Each line is the one
+/// protection a test in `tests/retention.rs` (or the unit tests below) deletes with a `mut_*` feature
+/// and watches go red.
+fn candidate(j: &Job) -> Result<u64, Why> {
+    // Only an ended job. Not `pgid != 0`, not "its group looks empty": a job the kernel has not
+    // ended can still gain a process or a byte.
+    let at = match j.k.phase {
+        kernel::Phase::Ended { at, .. } => at,
+        _ if cfg!(feature = "mut_retention_any_phase") => j.k.started,
+        _ => return Err(Why::Running),
+    };
+    if j.streams > 0 && !cfg!(feature = "mut_retention_ignores_streams") {
+        return Err(Why::Attached);
+    }
+    if j.notifier.owes() && !cfg!(feature = "mut_retention_ignores_owed") {
+        return Err(Why::OwedCallback);
+    }
+    Ok(at)
+}
+
+/// The policy: what the retention does with `j` at `now` (epoch seconds), given the ceilings. Pure,
+/// so the tests drive it over every [`kernel::Phase`] with no table, no socket and no clock.
+fn decide(j: &Job, now: u64, ret: &Retention, p: Pressure) -> Step {
+    let at = match candidate(j) {
+        Ok(at) => at,
+        Err(why) => return Step::Keep(why),
+    };
+    let age_ms = now.saturating_sub(at).saturating_mul(1000);
+    let entry_due = ret.entry_ms > 0 && age_ms >= ret.entry_ms;
+    // Output first, whatever the numbers say: an entry deadline never lets output outlive it.
+    let output_due = entry_due || (ret.output_ms > 0 && age_ms >= ret.output_ms);
+    let holds = j.out.base < j.out.end() || j.spool.is_some();
+    let keyed = j.idem.is_some() && !cfg!(feature = "mut_retention_reaps_keyed");
+    let reap = if entry_due {
+        Some(Why::EntryTtl)
+    } else if p.over_count {
+        Some(Why::Count)
+    } else {
+        None
+    };
+    if let Some(why) = reap.filter(|_| !keyed) {
+        return Step::Reap(why);
+    }
+    if holds {
+        if output_due {
+            return Step::Tombstone(Why::OutputTtl);
+        }
+        if p.over_bytes {
+            return Step::Tombstone(Why::Bytes);
+        }
+    }
+    match reap {
+        // Everything a keyed job may lose is lost, and it keeps its entry.
+        Some(_) => Step::Keep(Why::Keyed),
+        None => Step::Keep(Why::WithinDeadline),
+    }
+}
+
+/// What one sweep did, for the log and the tests.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Swept {
+    /// Ended jobs in the table when it began, and the output they held.
+    pub ended: usize,
+    pub bytes: u64,
+    pub tombstoned: usize,
+    pub reaped: usize,
+    /// Ended jobs a veto or a future deadline kept, by reason.
+    pub kept: std::collections::BTreeMap<&'static str, usize>,
+}
+
+impl Swept {
+    fn keep(&mut self, why: Why) {
+        *self.kept.entry(why.name()).or_default() += 1;
+    }
+
+    fn acted(&self) -> bool {
+        self.tombstoned + self.reaped > 0
+    }
+}
+
+/// The most jobs one sweep acts on, so a pass never holds the table for long or hands the blocking
+/// pool a burst: what is left is due again, and the sweeper looks again at once.
+const SWEEP_ACTIONS_MAX: usize = 64;
+
+/// The least the sweeper sleeps between two looks, so a job due but vetoed (or one the gate
+/// refused) can never spin.
+const SWEEP_MIN_SLEEP_MS: u64 = 50;
+
+/// One pass of the retention: drop the output of the ended jobs the policy names, reap the entries
+/// it names, then — in **one** pass, off the runtime thread — write the ledger and delete every
+/// file no entry names any more.
+///
+/// Callers: [`start_retention`]. It may run concurrently with `remove`, `kill`, a `start` and a
+/// restart: every take goes through `Table::take` with `Arc::ptr_eq` (J10), so a job a client took
+/// first is simply not found, and one a client started under the same id afterwards is not the one
+/// this sweep gated.
+pub(crate) async fn sweep(ctx: &Arc<Ctx>) -> Swept {
+    let jobs = &ctx.jobs;
+    let ret = &ctx.opts.retention;
+    let now = epoch();
+    // The ended jobs, oldest first: the order both ceilings act in. A snapshot, with the map guard
+    // held while each cell is read (the order `entries` takes them: map, then cell).
+    // Every job is looked at (the phase is [`candidate`]'s to judge, and only there); the ceilings
+    // count the ended ones.
+    let mut ended: Vec<(Key, JobCell, u64)> = {
+        let table = locked(&jobs.map);
+        let cells = table.all();
+        cells
+            .into_iter()
+            .map(|(key, cell)| {
+                let at = locked(&cell).k.ended_at();
+                (key, cell, at)
+            })
+            .collect()
+    };
+    ended.sort_by_key(|&(_, _, at)| at);
+    let (mut count, mut bytes) = (0usize, 0u64);
+    for (_, cell, _) in &ended {
+        let j = locked(cell);
+        if j.k.ended() {
+            count += 1;
+            bytes += j.out.end() - j.out.base;
+        }
+    }
+    let mut sweep = Swept {
+        ended: count,
+        bytes,
+        ..Swept::default()
+    };
+    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+    let mut spools: Vec<Spool> = Vec::new();
+    {
+        let mut table = locked(&jobs.map);
+        for (key, cell, _) in &ended {
+            if sweep.tombstoned + sweep.reaped >= SWEEP_ACTIONS_MAX {
+                break;
+            }
+            let mut j = locked(cell);
+            let step = decide(
+                &j,
+                now,
+                ret,
+                Pressure {
+                    over_bytes: ret.bytes > 0 && bytes > ret.bytes,
+                    over_count: ret.max > 0 && count > ret.max,
+                },
+            );
+            let freed = j.out.end() - j.out.base;
+            match step {
+                Step::Keep(why) => {
+                    if !matches!(why, Why::Running) {
+                        sweep.keep(why);
+                    }
+                    if !matches!(why, Why::Running | Why::WithinDeadline) {
+                        crate::log_debug!(
+                            "job retained scope={:?} id={:?} reason={}",
+                            key.0,
+                            key.1,
+                            why.name()
+                        );
+                    }
+                }
+                Step::Tombstone(why) => {
+                    let files = j.out.evict_all();
+                    let spool = j.spool.take();
+                    j.tombstoned = true;
+                    drop(j);
+                    paths.extend(files);
+                    spools.extend(spool);
+                    bytes = bytes.saturating_sub(freed);
+                    sweep.tombstoned += 1;
+                    crate::log_debug!(
+                        "job output dropped scope={:?} id={:?} reason={} freed_bytes={freed}",
+                        key.0,
+                        key.1,
+                        why.name()
+                    );
+                }
+                Step::Reap(why) => {
+                    // The same gate `remove` takes, asked and committed in one critical section:
+                    // `Ev::Remove` cannot mutate (a refusal leaves nothing behind), the take keeps
+                    // only the cell that was checked (J10), and `let_go` sets `removed` before this
+                    // lock is dropped — so an attach waiting on it finds a job the table no longer
+                    // has and answers `404`, never a stream of a job that is gone.
+                    let gate = kernel::step(
+                        &mut j.k,
+                        Ev::Remove {
+                            empty: false,
+                            ended_counts: true,
+                        },
+                    );
+                    if gate != Act::Take {
+                        sweep.keep(Why::NotRemovable);
+                        continue;
+                    }
+                    let gone = table.take(
+                        std::slice::from_ref(&(key.clone(), cell.clone())),
+                        Arc::ptr_eq,
+                    );
+                    if gone.is_empty() {
+                        sweep.keep(Why::NotRemovable);
+                        continue;
+                    }
+                    debug_assert_eq!(gone.len(), 1);
+                    spools.extend(let_go(&mut j));
+                    drop(j);
+                    bytes = bytes.saturating_sub(freed);
+                    count = count.saturating_sub(1);
+                    sweep.reaped += 1;
+                    crate::log_debug!(
+                        "job entry reaped scope={:?} id={:?} reason={} freed_bytes={freed}",
+                        key.0,
+                        key.1,
+                        why.name()
+                    );
+                }
+            }
+        }
+    }
+    crate::log_debug!(
+        "retention sweep ended={} bytes={} tombstoned={} reaped={} kept={:?}",
+        sweep.ended,
+        sweep.bytes,
+        sweep.tombstoned,
+        sweep.reaped,
+        sweep.kept
+    );
+    if sweep.tombstoned + sweep.reaped >= SWEEP_ACTIONS_MAX {
+        // The pass stopped at its cap with work left: the next one runs as soon as this one is
+        // written, not at the next deadline (a ceiling has none).
+        jobs.wake_retention();
+    }
+    if sweep.acted() {
+        jobs.bump();
+        // One pass off the runtime thread: the ledger first (the durable marker — this entry's
+        // output is gone and its offsets are these — then the files it no longer names), and every
+        // unlink here. CAPY-5 is landing the shared off-loop writer for the request path; when it
+        // lands, `Ledger::save` inside this closure is the one line that changes.
+        let ctx = ctx.clone();
+        proc::off_runtime(move || {
+            ctx.jobs.save();
+            if crate::fault::at("sweep_after_save").as_deref() == Some("exit") {
+                // A test's crash between the durable marker and the unlinks.
+                std::process::exit(86);
+            }
+            for sp in spools {
+                sp.remove();
+            }
+            for path in paths {
+                let _ = std::fs::remove_file(path);
+            }
+        })
+        .await;
+        crate::log_info!(
+            "retention sweep acted ended={} bytes={} tombstoned={} reaped={} kept={:?}",
+            sweep.ended,
+            sweep.bytes,
+            sweep.tombstoned,
+            sweep.reaped,
+            sweep.kept
+        );
+    } else if ret.bytes > 0 && sweep.bytes > ret.bytes {
+        // Every job holding output is vetoed (attached, owed a callback) or keyed and already
+        // tombstoned: said once per sweep, and a sweep runs only on an event, never on a timer for
+        // a vetoed job, so this cannot spin.
+        crate::log_warn!(
+            "retention cannot meet the output budget ended={} bytes={} limit={} kept={:?}",
+            sweep.ended,
+            sweep.bytes,
+            ret.bytes,
+            sweep.kept
+        );
+    }
+    sweep
+}
+
+/// When the retention must look at the table again, or `None` when no ended job has a deadline
+/// ahead and no ceiling is over. Only jobs no veto blocks: a vetoed job is woken by its veto's own
+/// release (the stream closing, the callback settling), so nothing is polled.
+fn next_wake(jobs: &Jobs, ret: &Retention, now: u64) -> Option<tokio::time::Instant> {
+    if !ret.enabled() {
+        return None;
+    }
+    let mut best: Option<u64> = None;
+    let table = locked(&jobs.map);
+    let cells = table.all();
+    drop(table);
+    for (_, cell) in cells {
+        let j = locked(&cell);
+        // A vetoed job is woken by its veto's own release (the stream closing, the callback
+        // settling), never by a timer: nothing is polled.
+        let Ok(at) = candidate(&j) else {
+            continue;
+        };
+        let age_ms = now.saturating_sub(at).saturating_mul(1000);
+        let holds = j.out.base < j.out.end() || j.spool.is_some();
+        let mut deadlines = Vec::with_capacity(2);
+        if holds && ret.output_ms > 0 {
+            deadlines.push(ret.output_ms);
+        }
+        if (j.idem.is_none() || cfg!(feature = "mut_retention_reaps_keyed")) && ret.entry_ms > 0 {
+            deadlines.push(ret.entry_ms);
+        }
+        for deadline in deadlines {
+            let left = deadline.saturating_sub(age_ms);
+            best = Some(best.map_or(left, |b: u64| b.min(left)));
+        }
+    }
+    best.map(|ms| tokio::time::Instant::now() + Duration::from_millis(ms.max(SWEEP_MIN_SLEEP_MS)))
+}
+
+/// The retention's one task: asleep until a job ends, a vetoed job's veto lifts, or a deadline
+/// arrives, and then one [`sweep`]. Started by [`crate::serve`] only when one of the four knobs is
+/// on, and cancelled with the server, so a deployment with today's configuration pays no wakeup and
+/// no task for it at all.
+pub(crate) fn start_retention(ctx: &Arc<Ctx>, stop: CancellationToken) {
+    if !ctx.opts.retention.enabled() {
+        return;
+    }
+    let ctx = ctx.clone();
+    tokio::spawn(async move {
+        loop {
+            let wake = next_wake(&ctx.jobs, &ctx.opts.retention, epoch());
+            tokio::select! {
+                _ = stop.cancelled() => return,
+                // A job ended, a stream closed, a callback settled: look now.
+                _ = ctx.jobs.retention.notified() => {}
+                _ = async {
+                    match wake {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => {}
+            }
+            sweep(&ctx).await;
+        }
+    });
 }
 
 fn state_of(j: &Job) -> (&'static str, Value) {
@@ -847,24 +1323,50 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq, data: Vec<u8>) -> 
             let Some(cell) = jobs.get(&k) else {
                 return http::error_response(404, "no such job");
             };
+            // A test parks the attach between the lookup and the decision (`attach_before_decide`) to
+            // prove a job taken in between answers `404`, never a stream of a job that is gone.
+            crate::fault::park("attach_before_decide").await;
             let output = job.output.unwrap_or(true);
-            // The mark and the stream's start are the kernel's (M1, M4 to M6), read under one lock.
+            // The mark and the stream's start are the kernel's (M1, M4 to M6), read under one lock —
+            // and the stream is registered in that same lock (`Watching::open`), so the retention's
+            // attached-stream veto never sees this job at `streams == 0` after it has been told to
+            // stream. An attach that loses to a take finds no job and answers `404 no such job`, the
+            // defined answer.
             let from = {
-                let j = locked(&cell);
+                let mut j = locked(&cell);
+                // The table let this job go between the lookup above and this lock (a `remove`, or
+                // a sweep reaping it): the defined answer is `404 no such job`, and a client that
+                // retries never gets a stream of a job that is already gone.
+                if j.k.removed && !cfg!(feature = "mut_attach_ignores_removed") {
+                    return http::error_response(404, "no such job");
+                }
                 let ok = kernel::mark_ok(&job.mark, &j.mark);
                 match kernel::attach_plan(ok, output, job.offset, j.out.end()) {
                     Attach::Refuse => None,
-                    Attach::Stream { from } => Some((from, j.mark.clone())),
+                    Attach::Stream { from } => Some((
+                        from,
+                        j.mark.clone(),
+                        (!cfg!(feature = "mut_attach_registers_late"))
+                            .then(|| Watching::open(ctx, &cell, &mut j)),
+                    )),
                 }
             };
-            let Some((from, mark)) = from else {
+            let Some((from, mark, watching)) = from else {
                 return http::error_response(404, "no such job");
             };
+            // The window this closes, made testable: a test parks the attach here
+            // (`EXECD_TEST_FAULT`, `attach_after_decide`) and proves a sweep cannot take the job
+            // while it is parked.
+            crate::fault::park("attach_after_decide").await;
+            // Today's order, kept only as the mutant that proves the window is real: the count is
+            // taken here, after the decision, where a sweep can run between the two.
+            let watching = watching.unwrap_or_else(|| Watching::new(ctx, &cell));
             let (resp, out) = http::stream_response();
             tokio::spawn(stream_job(
                 ctx.clone(),
                 k,
                 cell,
+                watching,
                 false,
                 Opening {
                     offset: from,
@@ -1362,6 +1864,7 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
                     stdin: None,
                     streams: 0,
                     idem: idem.clone(),
+                    tombstoned: false,
                 }));
                 map.insert(key.clone(), cell.clone());
                 // The key's record goes in with the entry, under the same lock: no other start sees the id
@@ -1561,11 +2064,15 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
         let ctx2 = ctx.clone();
         let beat = req.beat;
         let first = first_frame.clone();
+        // Registered before the stream is spawned, as `attach` does: the job is spawning, and a held
+        // stream on an ended job is exactly what the retention must never take.
+        let watching = Watching::new(ctx, &cell);
         tokio::spawn(async move {
             let end = stream_job(
                 ctx2.clone(),
                 key,
                 cell,
+                watching,
                 true,
                 Opening {
                     offset: 0,
@@ -1669,11 +2176,13 @@ async fn replay_job(
         let (resp, out) = http::stream_response();
         let ctx2 = ctx.clone();
         let beat = req.beat;
+        let watching = Watching::new(ctx, &cell);
         tokio::spawn(async move {
             stream_job(
                 ctx2,
                 key,
                 cell,
+                watching,
                 true,
                 Opening {
                     offset: 0,
@@ -1911,6 +2420,7 @@ async fn supervise_after(
         let _ = task.await;
     }
     // The end is observable from here on: notify calls back.
+    let mut ended = false;
     {
         let mut j = locked(cell);
         let act = kernel::step(
@@ -1928,6 +2438,9 @@ async fn supervise_after(
             if notify {
                 notify::change(ctx, cell, key, &mut j);
             }
+            // The end is what makes a job a candidate for the retention (a deadline, or the count
+            // ceiling, which has no clock): look when nothing else is owed.
+            ended = true;
         }
     }
     for g in release {
@@ -1935,6 +2448,9 @@ async fn supervise_after(
     }
     ctx.jobs.bump();
     ctx.jobs.save();
+    if ended {
+        ctx.jobs.wake_retention();
+    }
 }
 
 /// How many times a restart's sweep of a lost claim's marked processes looks again after a kill.
@@ -2034,9 +2550,17 @@ pub(crate) fn recover(ctx: &Arc<Ctx>) {
         let rebuilt = spool
             .as_ref()
             .and_then(|sp| rebuild(ctx, sp).or_else(|| restart_cold(ctx, sp)));
-        let (out, tail) = match rebuilt {
-            Some((ring, tail, journal)) => (ring, Some((tail, journal))),
-            None => (
+        // A job whose output the previous execd dropped keeps its offsets, so a client's reads never
+        // go backwards; one whose spool the ledger still names is rebuilt from it; anything else
+        // starts empty (S2).
+        let tombstoned = e.out.is_some();
+        let (out, tail) = match (rebuilt, e.out) {
+            (Some((ring, tail, journal)), None) => (ring, Some((tail, journal))),
+            (_, Some(end)) => (
+                Ring::evicted(ctx.opts.job_output_retention, ctx.spool.new_job(), end),
+                None,
+            ),
+            (None, None) => (
                 Ring::new(ctx.opts.job_output_retention, ctx.spool.new_job()),
                 None,
             ),
@@ -2060,6 +2584,7 @@ pub(crate) fn recover(ctx: &Arc<Ctx>) {
             stdin: None,
             streams: 0,
             idem: e.idem.clone(),
+            tombstoned,
         }));
         {
             let mut map = locked(&ctx.jobs.map);
@@ -2129,13 +2654,16 @@ pub(crate) fn recover(ctx: &Arc<Ctx>) {
             }
         }
     }
-    // A spool no job in the table owns (its job ended, or was removed, before the restart).
+    // A spool no job in the table owns (its job ended, or was removed, before the restart, or whose
+    // output the retention dropped after the ledger named it and before it was unlinked).
     if ctx.jobs.ledger.enabled() {
         let keep: Vec<&Path> = adopted.iter().map(std::path::PathBuf::as_path).collect();
         Spool::retain(base, &keep);
     }
     ctx.jobs.bump_activity();
     ctx.jobs.save();
+    // A recovered ended job is a candidate for the retention at once: its deadline may be long past.
+    ctx.jobs.wake_retention();
 }
 
 /// A recovered job's ring and tail, from the spool the ledger names: the chunk files, then the
@@ -2282,7 +2810,16 @@ struct Watching {
 
 impl Watching {
     fn new(ctx: &Arc<Ctx>, cell: &JobCell) -> Self {
-        locked(cell).streams += 1;
+        let mut j = locked(cell);
+        Self::open(ctx, cell, &mut j)
+    }
+
+    /// Register a stream on `cell`, whose lock the caller holds as `j`. The caller must hold it from
+    /// the moment it *decides* to stream (`attach_plan`, the held `start`) to this call: the
+    /// retention's attached-stream veto is only airtight if no sweep can see `streams == 0` between
+    /// the decision to stream and the count. See `attach` in [`serve_op`].
+    fn open(ctx: &Arc<Ctx>, cell: &JobCell, j: &mut Job) -> Self {
+        j.streams += 1;
         ctx.jobs.bump_activity();
         Self {
             ctx: ctx.clone(),
@@ -2295,8 +2832,14 @@ impl Drop for Watching {
     fn drop(&mut self) {
         let mut j = locked(&self.cell);
         j.streams = j.streams.saturating_sub(1);
+        // The last stream on an ended job the retention was holding back may have just closed:
+        // look again. One permit, and nothing to look at for a job that is still running.
+        let ended = j.k.ended();
         drop(j);
         self.ctx.jobs.bump_activity();
+        if ended {
+            self.ctx.jobs.wake_retention();
+        }
     }
 }
 
@@ -2314,12 +2857,15 @@ async fn stream_job(
     ctx: Arc<Ctx>,
     key: Key,
     attached: JobCell,
+    // The stream's registration, taken by the caller *before* anything could drop the job's output
+    // (`Watching::open`): while this lives the job is attached (a host that lets idle machines sleep
+    // asks), and the retention never touches it.
+    watching: Watching,
     hold: bool,
     open: Opening,
     mut sink: Sink,
 ) -> StreamEnd {
-    // While it is open the job is attached (a host that lets idle machines sleep asks).
-    let _open = Watching::new(&ctx, &attached);
+    let _open = watching;
     // A job stream has no deadline of its own: it lives as long as the job or the connection.
     if let Ok(end) = follow(&ctx, &key, &attached, open, &mut sink).await {
         return end;
@@ -2469,5 +3015,228 @@ mod spool_failure_tests {
         assert!(spool_failure(&full).1.contains("disk is full"));
         let other = std::io::Error::from_raw_os_error(13) /* EACCES */;
         assert_eq!(spool_failure(&other).0, 500);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod retention_policy_tests {
+    use super::*;
+
+    fn job(phase: kernel::Phase) -> Job {
+        let mut k = kernel::State::new(0, false, None);
+        k.phase = phase;
+        Job {
+            mark: "m".into(),
+            sp: 1,
+            label: String::new(),
+            argv: Argv::default(),
+            // A ring that touches no file until something is pushed into it.
+            out: Ring::new(1024, std::path::PathBuf::from("/nonexistent/job")),
+            spool: None,
+            k,
+            notify: None,
+            notifier: Notifier::default(),
+            stdin: None,
+            streams: 0,
+            idem: None,
+            tombstoned: false,
+        }
+    }
+
+    /// An ended job that still holds output: a few bytes in the unfinished chunk, which touches no
+    /// file (a chunk is written only at 64 KiB).
+    fn holding(at: u64) -> Job {
+        let mut j = job(ended(at));
+        j.out.push(b"out", false);
+        j
+    }
+
+    fn ended(at: u64) -> kernel::Phase {
+        kernel::Phase::Ended {
+            pgid: 7,
+            code: 0,
+            signal: None,
+            at,
+            shell_told: false,
+        }
+    }
+
+    fn pressure() -> Pressure {
+        Pressure {
+            over_bytes: true,
+            over_count: true,
+        }
+    }
+
+    fn every_knob(due: bool) -> Retention {
+        Retention {
+            output_ms: if due { 1 } else { 0 },
+            bytes: if due { 1 } else { 0 },
+            max: if due { 1 } else { 0 },
+            entry_ms: if due { 1 } else { 0 },
+        }
+    }
+
+    /// **Only an ended job is a candidate.** The policy reads the kernel's phase, and nothing about
+    /// the group: a `Running` job whose group was just observed empty (which is enough for
+    /// `removable`'s second step, and not enough for this) is kept, and its bytes stay readable when
+    /// its leftovers arrive. Red if the policy ages a job from `started`, takes a `Running` or
+    /// `Exited` job, or falls back to "its group looks empty".
+    #[test]
+    fn only_an_ended_job_is_a_candidate() {
+        let ret = every_knob(true);
+        let now = 10_000;
+        for phase in [
+            kernel::Phase::Spawning,
+            kernel::Phase::Running { pgid: 7 },
+            kernel::Phase::Exited {
+                pgid: 7,
+                code: 0,
+                signal: None,
+            },
+        ] {
+            let j = job(phase.clone());
+            assert_eq!(
+                decide(&j, now, &ret, pressure()),
+                Step::Keep(Why::Running),
+                "{phase:?} is a candidate"
+            );
+        }
+        // The same job, ended, is a candidate: the phase is the only difference (and the deadline
+        // has passed: `ended` is at 0, `now` is 10,000).
+        assert_eq!(
+            decide(&job(ended(0)), now, &ret, pressure()),
+            Step::Reap(Why::EntryTtl)
+        );
+    }
+
+    /// **The vetoes, one each.** An open stream, an owed callback, a keyed job, and a job nothing is
+    /// due for: every one of them is kept even with both ceilings over and every deadline past.
+    #[test]
+    fn each_veto_keeps_a_job_that_is_due() {
+        let ret = every_knob(true);
+        // An attached stream: the output is the only copy of the last bytes, and a take ends the
+        // stream early (J9).
+        let mut attached = job(ended(0));
+        attached.streams = 1;
+        assert_eq!(
+            decide(&attached, 10_000, &ret, pressure()),
+            Step::Keep(Why::Attached)
+        );
+        // An owed callback: a take abandons the count and the fleet never learns the end.
+        let mut owing = job(ended(0));
+        owing.notifier = Notifier::owing();
+        assert_eq!(
+            decide(&owing, 10_000, &ret, pressure()),
+            Step::Keep(Why::OwedCallback)
+        );
+        // A keyed job: its key's record leaves with it (K8), so a retried start would run the
+        // command a second time. It keeps its entry (`Why::Keyed`), and its output goes like anyone
+        // else's.
+        let mut keyed = job(ended(0));
+        keyed.idem = Some(Idem {
+            key: "k".into(),
+            digest: "d".into(),
+        });
+        assert_eq!(
+            decide(&keyed, 10_000, &ret, pressure()),
+            Step::Keep(Why::Keyed)
+        );
+        // ...and while it still holds output, the output goes and the entry stays.
+        keyed.out.push(b"out", false);
+        assert_eq!(
+            decide(&keyed, 10_000, &ret, pressure()),
+            Step::Tombstone(Why::OutputTtl)
+        );
+        // Nothing due: no deadline has passed and neither ceiling is over.
+        assert_eq!(
+            decide(
+                &job(ended(9_999)),
+                10_000,
+                &every_knob(false),
+                Pressure::default()
+            ),
+            Step::Keep(Why::WithinDeadline)
+        );
+        // Every knob at its off value is exactly today: nothing is ever due, whatever the age.
+        assert_eq!(
+            decide(
+                &holding(0),
+                u64::MAX,
+                &every_knob(false),
+                Pressure::default()
+            ),
+            Step::Keep(Why::WithinDeadline)
+        );
+    }
+
+    /// **The tiers.** Tier 1 drops the output and keeps the entry; tier 2 takes the entry; the byte
+    /// budget only ever tombstones (a take needs a count ceiling or a clock, so byte pressure alone
+    /// never answers a client `404`); and an entry deadline never lets output outlive it.
+    #[test]
+    fn the_tiers_are_output_first_and_entry_only_on_a_ceiling_or_a_clock() {
+        let now = 10_000;
+        // `Phase::Ended.at` is epoch seconds: 1,000 s here.
+        let output_only = Retention {
+            output_ms: 1_000_000,
+            ..every_knob(false)
+        };
+        // Due by time: the output goes, the entry stays.
+        assert_eq!(
+            decide(&holding(1), now, &output_only, Pressure::default()),
+            Step::Tombstone(Why::OutputTtl)
+        );
+        // Not yet due.
+        assert_eq!(
+            decide(&holding(9_500), now, &output_only, Pressure::default()),
+            Step::Keep(Why::WithinDeadline)
+        );
+        // Over the byte budget, no clock: the output goes, oldest first (the caller's order), and
+        // the entry is never taken for it.
+        let bytes_only = Retention {
+            bytes: 1,
+            ..every_knob(false)
+        };
+        assert_eq!(
+            decide(
+                &holding(9_999),
+                now,
+                &bytes_only,
+                Pressure {
+                    over_bytes: true,
+                    over_count: false,
+                }
+            ),
+            Step::Tombstone(Why::Bytes)
+        );
+        // Over the count ceiling, no clock: the entry goes (the oldest is the caller's first).
+        let max_only = Retention {
+            max: 1,
+            ..every_knob(false)
+        };
+        assert_eq!(
+            decide(
+                &job(ended(9_999)),
+                now,
+                &max_only,
+                Pressure {
+                    over_bytes: false,
+                    over_count: true,
+                }
+            ),
+            Step::Reap(Why::Count)
+        );
+        // An entry deadline reaps, and it also takes the output's deadline with it: whatever the
+        // numbers say, output never outlives the entry.
+        let entry_first = Retention {
+            output_ms: 1_000_000,
+            entry_ms: 1_000,
+            ..every_knob(false)
+        };
+        assert_eq!(
+            decide(&job(ended(1)), now, &entry_first, Pressure::default()),
+            Step::Reap(Why::EntryTtl)
+        );
     }
 }

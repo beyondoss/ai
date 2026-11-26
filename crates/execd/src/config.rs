@@ -24,6 +24,9 @@ pub struct Config {
     pub state_dir: Option<PathBuf>,
     /// `EXECD_TERMINALS_MAX`: a cap on open terminals, for tests (see `Options::terminals_max`).
     pub terminals_max: Option<usize>,
+    /// `EXECD_JOB_OUTPUT_MS`, `EXECD_JOBS_ENDED_BYTES`, `EXECD_JOBS_ENDED_MAX`, `EXECD_JOB_ENTRY_MS`:
+    /// how long an ended job keeps its output and its entry (see `Options::retention`).
+    pub retention: execd::Retention,
     pub log_level: Level,
     pub worker_threads: usize,
     pub idle_timeout: Option<Duration>,
@@ -46,6 +49,10 @@ execd takes no arguments; it is configured by environment variables:
   EXECD_LOG                       off, error, warn, info, debug or trace (default info)
   EXECD_WORKER_THREADS            1 (default) one thread, 0 a worker per CPU, N workers
   EXECD_IDLE_TIMEOUT_MS           close a connection with no request in flight for this long; 0 (default) never
+  EXECD_JOB_OUTPUT_MS             drop an ended job's output this long after its end, keeping its status (default 900000 = 15 min; 0 never)
+  EXECD_JOBS_ENDED_BYTES          the most output retained over ended jobs; past it the oldest is dropped first (default 268435456 = 256 MiB; 0 unbounded)
+  EXECD_JOBS_ENDED_MAX            the most ended jobs the server holds; past it the oldest entry is reaped (default 256; 0 unbounded)
+  EXECD_JOB_ENTRY_MS              reap an ended job's entry, status included, this long after its end (default 0 = never)
 ";
 
 fn number<T: std::str::FromStr>(name: &str, v: Option<String>) -> Result<Option<T>, String> {
@@ -80,6 +87,15 @@ pub fn parse<E: Fn(&str) -> Option<String>>(env: E) -> Result<Config, String> {
         jobs_dir: get("EXECD_JOBS_DIR").map(PathBuf::from),
         state_dir: get("EXECD_STATE_DIR").map(PathBuf::from),
         terminals_max: get("EXECD_TERMINALS_MAX").and_then(|v| v.parse().ok()),
+        retention: execd::Retention {
+            output_ms: number::<u64>("EXECD_JOB_OUTPUT_MS", get("EXECD_JOB_OUTPUT_MS"))?
+                .unwrap_or(execd::ENDED_OUTPUT_MS),
+            bytes: number::<u64>("EXECD_JOBS_ENDED_BYTES", get("EXECD_JOBS_ENDED_BYTES"))?
+                .unwrap_or(execd::ENDED_BYTES),
+            max: number::<usize>("EXECD_JOBS_ENDED_MAX", get("EXECD_JOBS_ENDED_MAX"))?
+                .unwrap_or(execd::ENDED_MAX),
+            entry_ms: number::<u64>("EXECD_JOB_ENTRY_MS", get("EXECD_JOB_ENTRY_MS"))?.unwrap_or(0),
+        },
         log_level: match get("EXECD_LOG") {
             None => Level::Info,
             Some(s) => Level::parse(&s).ok_or_else(|| {
@@ -117,6 +133,56 @@ mod tests {
         assert_eq!(c.log_level, Level::Info);
         assert_eq!(c.worker_threads, 1);
         assert_eq!(c.idle_timeout, None);
+        assert_eq!(c.retention, execd::Retention::default());
+        assert_eq!(
+            c.retention,
+            execd::Retention {
+                output_ms: 900_000,
+                bytes: 256 << 20,
+                max: 256,
+                entry_ms: 0,
+            }
+        );
+    }
+
+    /// Each retention knob is read, and `0` for all four is off (`Retention::enabled` is false):
+    /// the sweeper is never started, which is today's behaviour.
+    #[test]
+    fn the_retention_knobs_are_read_and_zero_is_off() {
+        let c = cfg(&[
+            ("EXECD_JOB_OUTPUT_MS", "1"),
+            ("EXECD_JOBS_ENDED_BYTES", "2"),
+            ("EXECD_JOBS_ENDED_MAX", "3"),
+            ("EXECD_JOB_ENTRY_MS", "4"),
+        ])
+        .unwrap();
+        assert_eq!(
+            c.retention,
+            execd::Retention {
+                output_ms: 1,
+                bytes: 2,
+                max: 3,
+                entry_ms: 4,
+            }
+        );
+        let off = cfg(&[
+            ("EXECD_JOB_OUTPUT_MS", "0"),
+            ("EXECD_JOBS_ENDED_BYTES", "0"),
+            ("EXECD_JOBS_ENDED_MAX", "0"),
+            ("EXECD_JOB_ENTRY_MS", "0"),
+        ])
+        .unwrap();
+        assert!(!off.retention.enabled());
+        assert!(c.retention.enabled() && cfg(&[]).unwrap().retention.enabled());
+        for k in [
+            "EXECD_JOB_OUTPUT_MS",
+            "EXECD_JOBS_ENDED_BYTES",
+            "EXECD_JOBS_ENDED_MAX",
+            "EXECD_JOB_ENTRY_MS",
+        ] {
+            let e = cfg(&[(k, "-1")]).unwrap_err();
+            assert!(e.contains(k), "{e}");
+        }
     }
 
     #[test]

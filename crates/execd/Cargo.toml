@@ -272,6 +272,14 @@ mut_status_only_sends = [
 mut_attach_offset_shifted = [
   "beyond-execd-jobs/mut_attach_offset_shifted",
 ] # an attach with output starts at the end, not at its offset (M5)
+# Mutations of the ended-job retention (`jobs::candidate`, `decide` and the attach path), used only by
+# `tests/retention.rs` and `jobs.rs`'s unit tests: each deletes one protection, and its test goes red.
+mut_retention_any_phase = [] # a job that has not ended is a candidate, aged from its start
+mut_retention_ignores_streams = [] # a job with an open stream is tombstoned or reaped
+mut_retention_ignores_owed = [] # a job whose notify callback is owed is tombstoned or reaped
+mut_retention_reaps_keyed = [] # a keyed job's entry, and its key's record (K8), is reaped
+mut_attach_registers_late = [] # an attach counts its stream after deciding to stream (the old order)
+mut_attach_ignores_removed = [] # an attach of a job taken after its lookup streams it anyway
 # Mutations of `ring` (the crate `execd-ring`, which Verus proves), used only by `src/ring.rs`'s differential
 # test's red runs: each removes one guard.
 mut_window_before_base = [
