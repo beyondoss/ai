@@ -308,7 +308,7 @@ impl Tail {
 }
 
 /// How [`Tail::drain_batch`] ended. `Stopped` is also what a panicking batch counts as.
-#[derive(Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum Drained {
     /// The sink refused a piece: the job is gone.
     #[default]

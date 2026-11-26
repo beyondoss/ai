@@ -664,6 +664,6 @@ mod stream_limit_tests {
         assert_eq!(stream_limit(Some(128)), Some(16));
         assert_eq!(stream_limit(Some(8)), Some(1));
         assert_eq!(stream_limit(Some(0)), Some(1));
-        assert_eq!(stream_limit(Some(u64::MAX)).is_some(), true);
+        assert!(stream_limit(Some(u64::MAX)).is_some());
     }
 }
