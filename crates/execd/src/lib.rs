@@ -21,12 +21,13 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+mod admit;
 mod exec;
 mod fault;
 mod frame;
@@ -93,6 +94,25 @@ pub const ENDED_BYTES: u64 = 256 * 1024 * 1024;
 
 /// The most ended entries a server holds ([`Retention::max`]).
 pub const ENDED_MAX: usize = 256;
+
+/// Default for [`Options::disk_writers`]: the blocking disk jobs (job output batches, a retention
+/// sweep) that run off the runtime at once.
+pub const DISK_WRITERS: usize = 8;
+
+/// Descriptors one request in flight holds at most (measured on the binary: a stream or a one-shot
+/// 3, a job start 4: the connection's socket and two pipes or spool files).
+const FDS_PER_REQUEST: u64 = 4;
+
+/// [`Options::max_in_flight`] for a soft `RLIMIT_NOFILE` of `soft` (`None`: unlimited, so no cap):
+/// what is left after an eighth of the limit (at least 64: the listener, the inotify instance, the
+/// ledger, the spare, idle connections) is shared out at [`FDS_PER_REQUEST`] each, and never less
+/// than 1, so a stingy limit still serves.
+pub fn stream_limit(soft: Option<u64>) -> Option<usize> {
+    let soft = soft?;
+    let reserve = (soft / 8).max(64);
+    let n = (soft.saturating_sub(reserve) / FDS_PER_REQUEST).max(1);
+    Some(usize::try_from(n).unwrap_or(usize::MAX))
+}
 
 /// The largest answer the agent accepts (`DEFAULT_MAX_RESPONSE_BYTES`, 16 MiB). A one-shot answer is
 /// one JSON object; the agent refuses a bigger one, so output past this would be thrown away at the
@@ -263,6 +283,22 @@ pub struct Options {
     /// when the kernel's table is full. `None` (the default) is the kernel's own limit. Set only by
     /// `EXECD_TERMINALS_MAX`, so a test can reach the refusal without filling the machine's ptys.
     pub terminals_max: Option<usize>,
+    /// At most this many requests in flight (a stream, a one-shot, a job start: everything but the
+    /// health paths and a request the route hook claims); one more is answered `503` with
+    /// `retry-after: 1` and holds nothing. Each holds descriptors (3 or 4 measured: its socket and its
+    /// pipes or spool files), so a limit sized from `RLIMIT_NOFILE` ([`stream_limit`]) keeps the
+    /// descriptors from running out under the requests execd already took. `None` (the default here,
+    /// and `EXECD_MAX_STREAMS=0`) is no cap: the descriptor limit alone ends it.
+    pub max_in_flight: Option<usize>,
+    /// At most this many jobs' output batches are written to disk at once, each on a thread off the
+    /// runtime; a job's batch beyond it waits its turn (its spool file holds what it wrote
+    /// meanwhile, and the job itself is never slowed). `0` writes on the runtime, as before this
+    /// existed (`EXECD_DISK_WRITERS=0`).
+    pub disk_writers: usize,
+    /// Out of descriptors, answer the connections waiting in the kernel's queue `503` with a spare
+    /// descriptor ([`http::accept_loop`]). `false` (`EXECD_SHED_WHEN_OUT_OF_FDS=0`) leaves them
+    /// waiting, as before this existed.
+    pub shed_when_out_of_fds: bool,
     /// Shown every request except the health paths, after [`Self::authorizer`] or [`Self::bearer`]
     /// has accepted it (a refused one is answered `401` and the hook never sees it) and before its
     /// body is read: [`Route::Claimed`] takes the request over, [`Route::Declined`] hands it back to
@@ -301,6 +337,9 @@ impl Options {
             job_op_hook: None,
             helper_exe: None,
             terminals_max: None,
+            max_in_flight: None,
+            disk_writers: DISK_WRITERS,
+            shed_when_out_of_fds: true,
             route_hook: None,
         }
     }
@@ -440,7 +479,9 @@ pub(crate) struct Ctx {
     pub epoch: Instant,
     pub next_seq: AtomicU64,
     /// Requests in flight, server-wide: the sum of every connection's own count.
-    pub in_flight: AtomicUsize,
+    pub in_flight: admit::InFlightCount,
+    /// Permits for [`Options::disk_writers`] blocking disk jobs at once (see [`Ctx::disk_turn`]).
+    pub disk_slots: tokio::sync::Semaphore,
     /// Bumped whenever [`Handle::activity`] may have changed (shared with `jobs`).
     pub activity: Arc<tokio::sync::watch::Sender<u64>>,
 }
@@ -448,6 +489,18 @@ pub(crate) struct Ctx {
 impl Ctx {
     pub fn activity_changed(&self) {
         self.activity.send_modify(|v| *v = v.wrapping_add(1));
+    }
+
+    /// A turn for one blocking disk job — a job's output batch, a retention sweep's ledger write and
+    /// unlinks — of the [`Options::disk_writers`] allowed at once, or `None` when that is `0` (the
+    /// caller then does its own thing, as before the bound existed). The one gate every off-loop
+    /// disk job passes, so the threads are bounded however many jobs and sweeps want one; the
+    /// semaphore is closed only with the server, which never happens while a job runs.
+    pub(crate) async fn disk_turn(&self) -> Option<tokio::sync::SemaphorePermit<'_>> {
+        if self.opts.disk_writers == 0 {
+            return None;
+        }
+        self.disk_slots.acquire().await.ok()
     }
 }
 
@@ -469,7 +522,7 @@ impl Handle {
     pub fn activity(&self) -> Activity {
         let (jobs_alive, running_kept, callbacks_owed) = self.ctx.jobs.alive();
         Activity {
-            in_flight: self.ctx.in_flight.load(Ordering::Acquire),
+            in_flight: self.ctx.in_flight.get(),
             running_kept,
             jobs_alive,
             callbacks_owed,
@@ -564,6 +617,7 @@ pub fn serve(listener: tokio::net::TcpListener, opts: Options) -> std::io::Resul
         .as_deref()
         .map_or_else(ledger::Ledger::disabled, ledger::Ledger::at);
     let ledger_on = ledger.enabled();
+    let disk_slots = tokio::sync::Semaphore::new(opts.disk_writers);
     let ctx = Arc::new(Ctx {
         opts,
         scrub,
@@ -576,7 +630,8 @@ pub fn serve(listener: tokio::net::TcpListener, opts: Options) -> std::io::Resul
         client: tokio::sync::OnceCell::new(),
         epoch: Instant::now(),
         next_seq: AtomicU64::new(0),
-        in_flight: AtomicUsize::new(0),
+        in_flight: admit::InFlightCount::new(),
+        disk_slots,
         activity,
     });
     // The reaper collects every command's exit (see `proc`); it runs before the first can start.
@@ -596,4 +651,19 @@ pub fn serve(listener: tokio::net::TcpListener, opts: Options) -> std::io::Resul
         reaper,
         ctx,
     })
+}
+
+#[cfg(test)]
+mod stream_limit_tests {
+    use super::stream_limit;
+
+    #[test]
+    fn the_cap_follows_the_descriptor_limit_and_is_never_zero() {
+        assert_eq!(stream_limit(None), None);
+        assert_eq!(stream_limit(Some(1024)), Some(224));
+        assert_eq!(stream_limit(Some(128)), Some(16));
+        assert_eq!(stream_limit(Some(8)), Some(1));
+        assert_eq!(stream_limit(Some(0)), Some(1));
+        assert!(stream_limit(Some(u64::MAX)).is_some());
+    }
 }

@@ -3,8 +3,9 @@
 //! **Bounds.** One task and one socket per open connection: freed when the client closes, when
 //! hyper's header-read timeout closes an idle or stalled one, or when the kernel drops a peer that
 //! stopped acknowledging (the socket's user timeout). The number of connections is not capped by
-//! execd; the file-descriptor limit ends it, and an accept error pauses the loop briefly instead of
-//! spinning. HTTP/2 concurrent streams per connection are hyper's default (200). One request holds
+//! execd; the file-descriptor limit ends it. Out of descriptors, the accept loop answers the waiting
+//! connections `503` with a spare descriptor and closes them (see [`accept_loop`]), and any other
+//! accept error pauses the loop briefly instead of spinning. HTTP/2 concurrent streams per connection are hyper's default (200). One request holds
 //! at most [`crate::Options::max_request_bytes`] of body (plus the parsed copy of it) until its
 //! handler returns; N concurrent cold callers hold N times that, and the callers are the agent's
 //! own tool calls, which are bounded by its session.
@@ -25,6 +26,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::io::AsyncWriteExt as _;
 use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 
@@ -294,12 +296,33 @@ fn authorized(ctx: &Ctx, headers: &hyper::HeaderMap) -> bool {
         .is_some_and(|got| ct_eq(got, want.as_bytes()))
 }
 
+/// What a connection is told when execd has no descriptor left for it. A connection nobody
+/// answers is the worse outcome: the client waits out its own timeout with nothing to read. HTTP/1.1
+/// text, since the request is never read; a client speaking h2c sees a failed handshake at once.
+const OVERLOADED: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\nconnection: close\r\nretry-after: 1\r\ncontent-type: application/json\r\ncontent-length: 36\r\n\r\n{\"error\":\"out of file descriptors\"}\n";
+
+/// The most connections one round of shedding answers, and how long each may take to send its
+/// request before it is answered without one.
+const SHED_MAX: usize = 64;
+const SHED_WAIT: Duration = Duration::from_millis(20);
+
 /// Accept connections until `stop`.
+///
+/// Out of descriptors (`EMFILE`, `ENFILE`) the kernel keeps completed connections in its queue and
+/// `accept` cannot take them, so their clients would wait with no answer. A spare descriptor, held
+/// from the start, is released to accept each waiting connection, answer it `503` and close it
+/// (the descriptor is then free for the next), until the queue is empty; the spare is taken again
+/// and the loop pauses briefly, as for any accept error. Connections already open are untouched.
 pub(crate) async fn accept_loop(
     listener: tokio::net::TcpListener,
     ctx: Arc<Ctx>,
     stop: CancellationToken,
 ) {
+    let mut spare = ctx
+        .opts
+        .shed_when_out_of_fds
+        .then(|| std::fs::File::open("/dev/null").ok())
+        .flatten();
     loop {
         tokio::select! {
             () = stop.cancelled() => return,
@@ -308,9 +331,31 @@ pub(crate) async fn accept_loop(
                     tokio::spawn(connection(sock, ctx.clone(), stop.clone()));
                 }
                 Err(e) => {
-                    // Out of descriptors, mostly. Retrying at once would spin; the pause is not a
-                    // limit, only the time for one open connection to close.
+                    let exhausted = matches!(
+                        rustix::io::Errno::from_io_error(&e),
+                        Some(rustix::io::Errno::MFILE | rustix::io::Errno::NFILE)
+                    );
                     crate::log_warn!("accept failed error={e}");
+                    if exhausted && spare.take().is_some() {
+                        let mut shed = 0usize;
+                        while shed < SHED_MAX
+                            && let Poll::Ready(Ok((mut sock, _))) =
+                                std::future::poll_fn(|cx| Poll::Ready(listener.poll_accept(cx)))
+                                    .await
+                        {
+                            // The request is read (what has arrived) before the close: a socket
+                            // closed with unread data resets, and the reset takes the answer
+                            // with it.
+                            let _ = tokio::time::timeout(SHED_WAIT, sock.readable()).await;
+                            let _ = sock.try_read(&mut [0u8; 4096]);
+                            let _ = sock.try_write(OVERLOADED);
+                            let _ = sock.shutdown().await;
+                            shed += 1;
+                        }
+                        spare = std::fs::File::open("/dev/null").ok();
+                        crate::log_warn!("out of file descriptors: refused {shed} connections with 503");
+                    }
+                    // The pause is not a limit, only the time for one open connection to close.
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             }
@@ -367,7 +412,23 @@ async fn connection(sock: tokio::net::TcpStream, ctx: Arc<Ctx>, stop: Cancellati
                 checked = true;
             }
             // The health paths are not work: they neither count nor keep a connection awake.
-            let guard = (!is_health(&req)).then(|| InFlight::enter(&tracked, &ctx));
+            let guard = if is_health(&req) {
+                None
+            } else if let Some(max) = ctx.opts.max_in_flight {
+                let Some(guard) = InFlight::enter_within(&tracked, &ctx, max) else {
+                    crate::log_warn!("request kind=overload status=503 limit={max}");
+                    let mut resp = error_response(
+                        503,
+                        &format!("too many requests in flight (limit {max}); retry shortly"),
+                    );
+                    resp.headers_mut()
+                        .insert("retry-after", hyper::header::HeaderValue::from_static("1"));
+                    return Ok(resp.map(|b| Tracked::own(b, None)));
+                };
+                Some(guard)
+            } else {
+                Some(InFlight::enter(&tracked, &ctx))
+            };
             let resp = route(ctx, req, checked).await;
             // The guard rides the body: a stream is in flight until its last frame is written.
             Ok(resp.map(|b| Tracked::own(b, guard)))
@@ -455,11 +516,21 @@ impl ConnActivity {
 struct InFlight(Arc<ConnActivity>, Arc<Ctx>);
 
 impl InFlight {
+    /// [`Self::enter`] unless `max` requests are in flight already ([`crate::admit`]).
+    fn enter_within(a: &Arc<ConnActivity>, ctx: &Arc<Ctx>, max: usize) -> Option<Self> {
+        if !ctx.in_flight.enter_within(max) {
+            return None;
+        }
+        a.in_flight.fetch_add(1, Ordering::AcqRel);
+        ctx.activity_changed();
+        Some(Self(a.clone(), ctx.clone()))
+    }
+
     /// Counted on the connection (for its idle timeout) and on the server ([`crate::Handle::activity`]),
     /// by the one guard, so the two cannot disagree.
     fn enter(a: &Arc<ConnActivity>, ctx: &Arc<Ctx>) -> Self {
         a.in_flight.fetch_add(1, Ordering::AcqRel);
-        ctx.in_flight.fetch_add(1, Ordering::AcqRel);
+        ctx.in_flight.enter();
         ctx.activity_changed();
         Self(a.clone(), ctx.clone())
     }
@@ -472,7 +543,7 @@ impl Drop for InFlight {
             // A permit is kept if nobody waits yet, so the wake-up cannot be lost.
             self.0.zero.notify_one();
         }
-        self.1.in_flight.fetch_sub(1, Ordering::AcqRel);
+        self.1.in_flight.leave();
         self.1.activity_changed();
     }
 }

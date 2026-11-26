@@ -361,6 +361,11 @@ sha2 = "0.10"
 tokio = { version = "1.53.3", features = ["io-util", "macros", "net", "process", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util.workspace = true
 
+# Permutation models of the admission counter (`src/admit.rs`); only under `--cfg beyond_loom`
+# (`mise run test:loom`).
+[target.'cfg(beyond_loom)'.dependencies]
+loom = "=0.7.2"
+
 [dev-dependencies]
 # The conformance verifier lives in the agent, the only client of the protocol; the test runs it
 # against the real binary. A dev-dependency only: execd itself links neither.

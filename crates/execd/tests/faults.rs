@@ -552,6 +552,477 @@ async fn running_out_of_descriptors_fails_spawns_cleanly_and_recovers() {
     assert_no_panic(&e);
 }
 
+/// Out of descriptors, a new connection is answered `503` and closed, not left waiting in the
+/// kernel's queue with no answer; the connections already open are unaffected, and the listener
+/// serves again once descriptors are free.
+#[tokio::test]
+async fn a_connection_with_no_descriptor_left_is_refused_503_not_left_waiting() {
+    let mut e = Execd::start(&[], &[]);
+    let pid = e.pid();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    set_prlimit(pid, "--nofile", &(open_fds(pid) + 6).to_string());
+
+    let mut idle = Vec::new();
+    let mut refused = None;
+    for _ in 0..40 {
+        idle.push(tokio::net::TcpStream::connect(addr(&e)).await.unwrap());
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let answer = tokio::time::timeout(
+            Duration::from_secs(3),
+            send(addr(&e), "GET", "/livez", &[], b""),
+        )
+        .await
+        .expect("a connection past the descriptor limit was left waiting with no answer");
+        if answer.status == 503 {
+            refused = Some(answer);
+            break;
+        }
+        assert_eq!(answer.status, 200);
+    }
+    let refused = refused.expect("no connection was ever refused");
+    assert_eq!(refused.json()["error"], "out of file descriptors");
+    assert!(e.child.try_wait().unwrap().is_none(), "execd died");
+    assert!(e.log().contains("refused"), "{}", e.log());
+
+    drop(idle);
+    until("the listener to serve again", || async {
+        try_call(&e, sh("printf ok"), Duration::from_secs(3))
+            .await
+            .is_some_and(|a| a.status == 200)
+    })
+    .await;
+}
+
+/// A stock shell's 256 descriptors are raised to the hard limit at start, and the log says so.
+#[test]
+fn the_soft_descriptor_limit_is_raised_to_the_hard_limit_at_start() {
+    let e = Execd::start_with_soft_nofile(256);
+    let pid = e.pid();
+    let hard = Command::new("prlimit")
+        .args([
+            "--pid",
+            &pid.to_string(),
+            "--nofile",
+            "--noheadings",
+            "--raw",
+            "-o",
+            "HARD",
+        ])
+        .output()
+        .unwrap();
+    let hard = String::from_utf8_lossy(&hard.stdout).trim().to_string();
+    let soft = prlimit(pid, "--nofile");
+    assert_eq!(soft, hard, "{}", e.log());
+    assert!(e.log().contains("open file limit raised"), "{}", e.log());
+}
+
+// ---- a slow disk under job output ----
+
+/// The `tail_gate` seam (`jobs.rs` `tail_gate`): job output batches hold, as on a disk that never
+/// answers, until [`Gate::open`]. Each batch held names itself with a `held-<n>` file.
+struct Gate {
+    dir: tempfile::TempDir,
+    fault: PathBuf,
+}
+
+impl Gate {
+    fn closed() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("closed"), b"").unwrap();
+        let fault = dir.path().join("fault");
+        std::fs::write(&fault, format!("tail_gate={}\n", dir.path().display())).unwrap();
+        Self { dir, fault }
+    }
+
+    /// A gate that starts open: the disk answers until [`Self::close`].
+    fn answering() -> Self {
+        let g = Self::closed();
+        g.open();
+        g
+    }
+
+    /// The disk stops answering: a batch with output to write holds from here.
+    fn close(&self) {
+        std::fs::write(self.dir.path().join("closed"), b"").unwrap();
+    }
+
+    fn env(&self) -> (&'static str, &str) {
+        ("EXECD_TEST_FAULT", self.fault.to_str().unwrap())
+    }
+
+    fn held(&self) -> usize {
+        std::fs::read_dir(self.dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("held-"))
+            .count()
+    }
+
+    /// The most batches ever held at the gate at once.
+    fn most(&self) -> usize {
+        std::fs::read_to_string(self.dir.path().join("most"))
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    }
+
+    fn open(&self) {
+        let _ = std::fs::remove_file(self.dir.path().join("closed"));
+    }
+}
+
+/// Starts writing once its start has been answered, then a line every 50 ms until stopped.
+const CHATTER: &str = "sleep 0.3; while :; do echo chatter; sleep 0.05; done";
+
+async fn livez_within(e: &Execd, within: Duration) -> Option<u16> {
+    tokio::time::timeout(within, send(addr(e), "GET", "/livez", &[], b""))
+        .await
+        .ok()
+        .map(|a| a.status)
+}
+
+/// While a job's output write is stuck on the disk (held at the gate, indefinitely, not for a
+/// time), an unrelated caller is served: `/livez`, and a command run to completion. Red: with the
+/// batch on the runtime (`EXECD_DISK_WRITERS=0`, or `off_runtime` removed) the same stuck write
+/// leaves `/livez` unanswered (next test).
+#[tokio::test]
+async fn a_stuck_output_write_does_not_stall_an_unrelated_caller() {
+    let gate = Gate::closed();
+    let e = Execd::start(&[], &[gate.env()]);
+    assert_eq!(start_job(&e, "slow", CHATTER).await.status, 200);
+    until("a batch stuck on the disk", || async { gate.held() == 1 }).await;
+    assert_eq!(livez_within(&e, Duration::from_secs(5)).await, Some(200));
+    let a = call(&e, sh("printf ok")).await;
+    assert_eq!((a.status, a.json()["exit_code"].as_i64()), (200, Some(0)));
+    assert_eq!(
+        gate.held(),
+        1,
+        "the write is still stuck while the caller was served"
+    );
+    gate.open();
+    until("the job's output", || async {
+        read(&e, "slow", 0).await.end >= 8
+    })
+    .await;
+    wipe(&e).await;
+}
+
+/// The off value: `EXECD_DISK_WRITERS=0` writes on the runtime, as before, so the same stuck write
+/// stalls every caller until it clears. This is the behaviour the fix removes, shown on the seam.
+#[tokio::test]
+async fn with_disk_writers_zero_a_stuck_output_write_stalls_every_caller_as_before() {
+    let gate = Gate::closed();
+    let e = Execd::start(&[("EXECD_DISK_WRITERS", "0")], &[gate.env()]);
+    assert_eq!(start_job(&e, "slow", CHATTER).await.status, 200);
+    until("a batch stuck on the disk", || async { gate.held() == 1 }).await;
+    assert_eq!(livez_within(&e, Duration::from_secs(2)).await, None);
+    gate.open();
+    assert_eq!(livez_within(&e, Duration::from_secs(5)).await, Some(200));
+    wipe(&e).await;
+}
+
+/// Ten jobs write through two writer slots with the disk stuck: two batches reach the disk and
+/// eight other jobs log that they wait for a slot; opening the disk serves every one, and the most
+/// batches ever on the disk at once (counted by the seam, exactly) is two. Red: without the
+/// semaphore all ten reach the disk together and none waits.
+#[tokio::test]
+async fn writer_threads_are_bounded_by_disk_writers_and_the_rest_wait() {
+    let gate = Gate::closed();
+    let e = Execd::start(
+        &[("EXECD_DISK_WRITERS", "2"), ("EXECD_LOG", "debug")],
+        &[gate.env()],
+    );
+    for i in 0..10 {
+        assert_eq!(start_job(&e, &format!("w{i}"), CHATTER).await.status, 200);
+    }
+    // Distinct jobs that found no slot (a job may log more than once: its first, empty flush can
+    // wait too).
+    let waiting = || {
+        let log = e.log();
+        log.lines()
+            .filter_map(|l| l.split("tail waits for a writer slot mark=").nth(1))
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+    };
+    until(
+        "two batches on the disk and eight other jobs waiting",
+        || async { gate.held() == 2 && waiting() >= 8 },
+    )
+    .await;
+    gate.open();
+    for i in 0..10 {
+        until("every job's output", || async {
+            read(&e, &format!("w{i}"), 0).await.end >= 8
+        })
+        .await;
+    }
+    // Over the whole run, with all ten held back by the disk at once, never more than two were on it.
+    assert_eq!(gate.most(), 2, "the most batches on the disk at once");
+    wipe(&e).await;
+}
+
+/// About 4.9 MB of output (more than three batches of 16 rounds of 64 KiB, within the 8 MiB
+/// retention) piles up in the spool while the disk is stuck, then drains in order with every byte
+/// once and contiguous offsets. A regression guard for ordering through the batches: it goes red
+/// when a batch hands over bytes out of place (an offset advanced short of what was read), not
+/// when the batch loop alone is removed, because punching the spool also wakes the tail.
+#[tokio::test]
+async fn output_past_one_batch_keeps_its_order_and_every_byte() {
+    let gate = Gate::closed();
+    let e = Execd::start(&[], &[gate.env()]);
+    let done = gate.dir.path().join("written");
+    let script = format!(
+        "sleep 0.3; seq 1 700000; touch {}; sleep 30",
+        done.display()
+    );
+    assert_eq!(start_job(&e, "ord", &script).await.status, 200);
+    until("the job to write everything", || async { done.exists() }).await;
+    assert_eq!(gate.held(), 1);
+    gate.open();
+    let want: String = (1..=700_000).map(|i| format!("{i}\n")).collect();
+    assert!(want.len() > 3 * 16 * 64 * 1024, "more than three batches");
+    let mut got = Vec::new();
+    let mut next = 0u64;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while got.len() < want.len() {
+        let r = read(&e, "ord", next).await;
+        assert_eq!(r.from, next, "offsets are contiguous");
+        next = r.from + r.data.len() as u64;
+        got.extend_from_slice(&r.data);
+        assert!(
+            Instant::now() < deadline,
+            "only {} of {} bytes",
+            got.len(),
+            want.len()
+        );
+        if r.data.is_empty() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    assert!(
+        got == want.as_bytes(),
+        "the bytes differ from what was written"
+    );
+    wipe(&e).await;
+}
+
+/// `EXECD_RAISE_NOFILE=0` leaves the inherited soft limit, as before.
+#[test]
+fn with_raise_nofile_zero_the_soft_limit_is_left_as_inherited() {
+    let e = Execd::start_launched_with("ulimit -Sn 256", &[("EXECD_RAISE_NOFILE", "0")]);
+    assert_eq!(prlimit(e.pid(), "--nofile"), "256", "{}", e.log());
+    assert!(
+        e.log().contains("open file limit soft=256 (unchanged)"),
+        "{}",
+        e.log()
+    );
+}
+
+/// `EXECD_SHED_WHEN_OUT_OF_FDS=0` (with the cap off too): a connection past the descriptor limit
+/// waits in the kernel's queue with no answer, as before, and is served once descriptors free.
+#[tokio::test]
+async fn with_shedding_off_a_connection_past_the_descriptor_limit_waits_as_before() {
+    let e = Execd::start(
+        &[
+            ("EXECD_SHED_WHEN_OUT_OF_FDS", "0"),
+            ("EXECD_MAX_STREAMS", "0"),
+        ],
+        &[],
+    );
+    let pid = e.pid();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    set_prlimit(pid, "--nofile", &(open_fds(pid) + 6).to_string());
+    let mut idle = Vec::new();
+    let mut waited = false;
+    for _ in 0..40 {
+        idle.push(tokio::net::TcpStream::connect(addr(&e)).await.unwrap());
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        match livez_within(&e, Duration::from_secs(2)).await {
+            Some(s) => assert_eq!(s, 200),
+            None => {
+                waited = true;
+                break;
+            }
+        }
+    }
+    assert!(waited, "no connection ever waited");
+    assert!(!e.log().contains("refused"), "{}", e.log());
+    drop(idle);
+    assert_eq!(livez_within(&e, Duration::from_secs(10)).await, Some(200));
+}
+
+/// Every byte written under `dir`, by file name.
+fn written_under(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    fn walk(p: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+        let Ok(rd) = std::fs::read_dir(p) else {
+            return;
+        };
+        for e in rd.flatten() {
+            let path = e.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if let Ok(bytes) = std::fs::read(&path) {
+                out.push((e.file_name().to_string_lossy().into_owned(), bytes));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, &mut out);
+    out
+}
+
+/// The retention sweep's ledger write and unlinks take one of the same `disk_writers` turns a job's
+/// output batch takes (`jobs.rs` `sweep`, `Ctx::disk_turn`): with the only turn held by a batch
+/// stuck on a disk that never answers, the sweep's decision is made but its durable side waits —
+/// the spool files still hold the dropped output — and the files go once the turn frees. Red when
+/// the sweep runs off-loop without a turn: the spool file vanishes while the disk is stuck.
+#[tokio::test]
+async fn a_retention_sweep_waits_for_a_disk_writer_turn() {
+    let gate = Gate::answering();
+    let spools = tempfile::tempdir().unwrap();
+    let e = Execd::start(
+        &[
+            ("EXECD_DISK_WRITERS", "1"),
+            // A deadline long enough that closing the gate and sticking a batch both happen well
+            // inside it: the sweep then acts on its own timer, not on a race this test wins.
+            ("EXECD_JOB_OUTPUT_MS", "3000"),
+            ("EXECD_JOBS_DIR", spools.path().to_str().unwrap()),
+        ],
+        &[gate.env()],
+    );
+    assert_eq!(start_job(&e, "ended", "printf hi").await.status, 200);
+    until("the ended job's bytes in the ring", || async {
+        read(&e, "ended", 0).await.data == b"hi"
+    })
+    .await;
+    assert!(
+        written_under(spools.path())
+            .iter()
+            .any(|(_, b)| b.as_slice() == b"hi"),
+        "the ended job's spool holds its output: {:?}",
+        written_under(spools.path())
+    );
+    // The disk stops answering, and one job's batch takes the only turn and holds it.
+    gate.close();
+    assert_eq!(start_job(&e, "busy", CHATTER).await.status, 200);
+    until("the only turn held by a stuck batch", || async {
+        gate.held() == 1
+    })
+    .await;
+    // Past its deadline the sweep decides (the output is a gap from here) and then waits for a turn:
+    // its ledger write and its unlinks are the part that cannot happen yet, so the spool file below
+    // is the observable.
+    until("the sweep's decision", || async {
+        read(&e, "ended", 0).await.data.is_empty()
+    })
+    .await;
+    assert!(
+        written_under(spools.path())
+            .iter()
+            .any(|(_, b)| b.as_slice() == b"hi"),
+        "the sweep unlinked the dropped output while the only disk turn was stuck: {:?}",
+        written_under(spools.path())
+    );
+    gate.open();
+    until("the turn to free and the sweep to finish", || async {
+        !written_under(spools.path())
+            .iter()
+            .any(|(_, b)| b.as_slice() == b"hi")
+    })
+    .await;
+    wipe(&e).await;
+}
+
+// ---- a cap on requests in flight ----
+
+/// Open `n` streaming requests that stay open, and return each one's first status line.
+async fn hold_streams(e: &Execd, n: usize) -> (Vec<tokio::net::TcpStream>, Vec<String>) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let body = serde_json::to_vec(&stream("sleep 8")).unwrap();
+    let (mut socks, mut heads) = (Vec::new(), Vec::new());
+    for _ in 0..n {
+        let mut s = tokio::net::TcpStream::connect(addr(e)).await.unwrap();
+        s.write_all(&support::http::request("POST", "/exec", &[], &body))
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 512];
+        let got = tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf))
+            .await
+            .expect("a request over the limit was left with no answer")
+            .unwrap();
+        heads.push(String::from_utf8_lossy(&buf[..got]).into_owned());
+        socks.push(s);
+    }
+    (socks, heads)
+}
+
+/// The `EXECD_MAX_STREAMS` gate (`http.rs`, `InFlight::enter_within`): the request past the cap is
+/// answered `503` with a reason and `retry-after`, health still answers, and a freed slot serves.
+/// Red: without the gate the fourth is served (`200`).
+#[tokio::test]
+async fn a_request_past_the_cap_is_answered_503_with_a_reason_and_recovers() {
+    let e = Execd::start(&[("EXECD_MAX_STREAMS", "3")], &[]);
+    let (mut held, heads) = hold_streams(&e, 3).await;
+    assert!(
+        heads.iter().all(|h| h.starts_with("HTTP/1.1 200")),
+        "{heads:?}"
+    );
+    let over = call(&e, sh("true")).await;
+    assert_eq!(over.status, 503, "{}", String::from_utf8_lossy(&over.body));
+    assert_eq!(over.header("retry-after"), Some("1"));
+    assert!(over.json()["error"].as_str().unwrap().contains("limit 3"));
+    assert_eq!(livez(&e).await, 200, "health is not capped");
+    drop(held.pop());
+    until("a slot to free", || async {
+        call(&e, sh("true")).await.status == 200
+    })
+    .await;
+}
+
+/// `EXECD_MAX_STREAMS=0` is no cap, as before the cap existed.
+#[tokio::test]
+async fn max_streams_zero_is_no_cap() {
+    let e = Execd::start(&[("EXECD_MAX_STREAMS", "0")], &[]);
+    assert!(
+        e.log().contains("no cap on requests in flight"),
+        "{}",
+        e.log()
+    );
+    let (_held, heads) = hold_streams(&e, 6).await;
+    assert!(
+        heads.iter().all(|h| h.starts_with("HTTP/1.1 200")),
+        "{heads:?}"
+    );
+}
+
+/// A machine whose hard limit is 128 (soft 64): the soft limit is raised to 128 (the most there
+/// is), the cap is sized from it (16 requests: `stream_limit`), and 40 concurrent streams are each
+/// either served or answered `503`: none hangs, execd never runs out of descriptors, and health
+/// answers throughout. Red: without the cap, 3-4 descriptors each exhaust the limit.
+#[tokio::test]
+async fn a_stingy_descriptor_limit_sizes_the_cap_and_every_stream_is_answered() {
+    let e = Execd::start_with_nofile(64, 128);
+    let log = e.log();
+    assert!(
+        log.contains("open file limit raised soft=64 -> 128"),
+        "{log}"
+    );
+    assert!(log.contains("at most 16 requests in flight"), "{log}");
+    let (_held, heads) = hold_streams(&e, 40).await;
+    let served = heads
+        .iter()
+        .filter(|h| h.starts_with("HTTP/1.1 200"))
+        .count();
+    let refused = heads
+        .iter()
+        .filter(|h| h.starts_with("HTTP/1.1 503"))
+        .count();
+    assert_eq!((served, refused), (16, 24), "{heads:?}");
+    assert!(!e.log().contains("accept failed"), "{}", e.log());
+    assert!(e.log().contains("request kind=overload"));
+    assert_eq!(livez(&e).await, 200);
+}
+
 // ---- no room for another process ----
 
 #[tokio::test]

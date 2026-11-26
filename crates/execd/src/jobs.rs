@@ -49,7 +49,7 @@ use crate::ledger::{Entry, Idem, Ledger, Saved};
 use crate::notify::{self, Notifier, NotifyTarget};
 use crate::proc::{self, locked};
 use crate::ring::Ring;
-use crate::tail::{Journal, Spool, Start, Tail};
+use crate::tail::{self, Drained, Journal, Spool, Start, Tail};
 use crate::term;
 use crate::{Ctx, Retention, StreamEnd, StreamStart};
 
@@ -659,10 +659,13 @@ pub(crate) async fn sweep(ctx: &Arc<Ctx>) -> Swept {
     }
     if sweep.acted() {
         jobs.bump();
-        // One pass off the runtime thread: the ledger first (the durable marker — this entry's
-        // output is gone and its offsets are these — then the files it no longer names), and every
-        // unlink here. CAPY-5 is landing the shared off-loop writer for the request path; when it
-        // lands, `Ledger::save` inside this closure is the one line that changes.
+        // One pass off the runtime thread, holding one of `disk_writers` turns (the same gate as a
+        // job's output batches, `Ctx::disk_turn`): the ledger first (the durable marker — this
+        // entry's output is gone and its offsets are these — then the files it no longer names),
+        // and every unlink here. The order is the whole point: a crash between the two leaves a
+        // ledger that names no file, which the next start's `retain` finishes, never a file no
+        // ledger names (`a_crash_after_the_ledger_write_leaves_no_spool_behind`).
+        let turn = ctx.disk_turn().await;
         let ctx = ctx.clone();
         proc::off_runtime(move || {
             ctx.jobs.save();
@@ -678,6 +681,7 @@ pub(crate) async fn sweep(ctx: &Arc<Ctx>) -> Swept {
             }
         })
         .await;
+        drop(turn);
         crate::log_info!(
             "retention sweep acted ended={} bytes={} tombstoned={} reaped={} kept={:?}",
             sweep.ended,
@@ -2250,7 +2254,7 @@ fn spool_base(ctx: &Ctx) -> &crate::spool::Base {
 struct Tailing {
     ctx: Arc<Ctx>,
     cell: JobCell,
-    tail: tokio::sync::Mutex<Tail>,
+    tail: Mutex<Tail>,
     /// The unfinished chunk, on disk beside the ring ([`Journal`]).
     journal: Mutex<Journal>,
     done: tokio_util::sync::CancellationToken,
@@ -2267,7 +2271,7 @@ impl Tailing {
         let t = Arc::new(Self {
             ctx: ctx.clone(),
             cell: cell.clone(),
-            tail: tokio::sync::Mutex::new(tail),
+            tail: Mutex::new(tail),
             journal: Mutex::new(journal),
             done: tokio_util::sync::CancellationToken::new(),
         });
@@ -2291,22 +2295,120 @@ impl Tailing {
     }
 
     /// Read what the files hold into the ring. `false`: the job was removed, so nothing is kept.
-    async fn flush(&self) -> bool {
-        let mut tail = self.tail.lock().await;
-        tail.drain(|data, stderr| {
-            {
+    ///
+    /// With `disk_writers` > 0 the reads and every disk write behind them (chunks, journal,
+    /// punching) run off the runtime, a batch of [`tail::ROUNDS`] rounds at a time, each batch
+    /// holding one of `disk_writers` permits, so a slow disk stalls this job's tail and nobody else
+    /// and the threads are bounded however many jobs write. A batch that finds no permit waits for
+    /// one (logged at debug). With `0` it is what ran before: one round at a time on the runtime,
+    /// yielding between rounds.
+    async fn flush(self: &Arc<Self>) -> bool {
+        let threaded = self.ctx.opts.disk_writers > 0;
+        loop {
+            let drained = if threaded {
+                let slot = match self.ctx.disk_slots.try_acquire() {
+                    Ok(slot) => slot,
+                    Err(_) => {
+                        crate::log_debug!(
+                            "tail waits for a writer slot mark={}",
+                            locked(&self.cell).mark
+                        );
+                        match self.ctx.disk_slots.acquire().await {
+                            Ok(slot) => slot,
+                            // Closed only with the server, which never happens.
+                            Err(_) => return false,
+                        }
+                    }
+                };
+                let this = self.clone();
+                let drained = proc::off_runtime(move || this.drain_batch(tail::ROUNDS)).await;
+                drop(slot);
+                drained
+            } else {
+                self.drain_batch(1)
+            };
+            match step_after(drained, threaded) {
+                TailStep::Again => {}
+                TailStep::AgainYielding => tokio::task::yield_now().await,
+                TailStep::Stop(kept) => return kept,
+            }
+        }
+    }
+
+    fn drain_batch(&self, rounds: usize) -> Drained {
+        let mut tail = locked(&self.tail);
+        let mut gated = false;
+        tail.drain_batch(rounds, |data, stderr| {
+            if !gated {
+                gated = true;
+                tail_gate();
+            }
+            let tail_len = {
                 let mut j = locked(&self.cell);
                 if kernel::step(&mut j.k, Ev::Push) == Act::Discard {
                     return false;
                 }
                 j.out.push(data, stderr);
-                // Before the spool's bytes are returned (the drain punches after this returns).
-                locked(&self.journal).record(stderr, data, j.out.tail_len());
-            }
+                j.out.tail_len()
+            };
+            // Before the spool's bytes are returned (the batch punches after this returns).
+            locked(&self.journal).record(stderr, data, tail_len);
             self.ctx.jobs.bump();
             true
         })
-        .await
+    }
+}
+
+/// The test seam for a slow disk (`EXECD_TEST_FAULT` `tail_gate=<dir>`, debug builds only): a batch
+/// with output to write holds here, with a file `<dir>/held-<n>` naming it, for as long as
+/// `<dir>/closed` exists. A disk that never answers, released when the test says. The most batches
+/// ever held at once is kept in `<dir>/most`.
+fn tail_gate() {
+    let Some(dir) = crate::fault::at("tail_gate").map(std::path::PathBuf::from) else {
+        return;
+    };
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    static NOW: AtomicUsize = AtomicUsize::new(0);
+    static MOST: Mutex<usize> = Mutex::new(0);
+    let held = dir.join(format!("held-{}", NEXT.fetch_add(1, Ordering::Relaxed)));
+    let _ = std::fs::write(&held, b"");
+    let now = NOW.fetch_add(1, Ordering::AcqRel) + 1;
+    {
+        let mut most = locked(&MOST);
+        if now > *most {
+            *most = now;
+            let _ = std::fs::write(dir.join("most"), now.to_string());
+        }
+    }
+    while dir.join("closed").exists() {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    NOW.fetch_sub(1, Ordering::AcqRel);
+    let _ = std::fs::remove_file(held);
+}
+
+/// What a tail does after one batch: read the next one, or stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TailStep {
+    /// Read the next batch at once.
+    Again,
+    /// Read the next batch after giving the runtime a turn (the round-at-a-time path).
+    AgainYielding,
+    /// Stop; `true` keeps the job's output, `false` means the job was removed mid-batch.
+    Stop(bool),
+}
+
+/// [`TailStep`] for a batch that ended [`Drained`]. A batch that filled its rounds with more to read is
+/// never the end: the spool holds bytes that no chunk and no journal hold yet, so stopping there
+/// loses them until something else happens to wake the tail (a punch, or the next write). Only a
+/// batch that read both files to their ends ([`Drained::Idle`]) or was refused
+/// ([`Drained::Stopped`]) stops.
+fn step_after(drained: Drained, threaded: bool) -> TailStep {
+    match drained {
+        Drained::More if threaded => TailStep::Again,
+        Drained::More => TailStep::AgainYielding,
+        Drained::Idle => TailStep::Stop(true),
+        Drained::Stopped => TailStep::Stop(false),
     }
 }
 
@@ -3238,5 +3340,31 @@ mod retention_policy_tests {
             decide(&job(ended(1)), now, &entry_first, Pressure::default()),
             Step::Reap(Why::EntryTtl)
         );
+    }
+}
+
+#[cfg(test)]
+mod tail_step_tests {
+    use super::{Drained, TailStep, step_after};
+
+    /// A batch that filled its rounds with more to read is never the end, on either path: the bytes
+    /// the spool holds past it are in no chunk and no journal, so stopping loses them until
+    /// something else happens to wake the tail. Red when the `Drained::More` arms are folded into
+    /// `TailStep::Stop(true)` (the dropped-remainder bug), which the integration test cannot see because
+    /// punching the spool wakes the tail again.
+    #[test]
+    fn more_to_read_is_never_the_end() {
+        assert_eq!(step_after(Drained::More, true), TailStep::Again);
+        assert_eq!(step_after(Drained::More, false), TailStep::AgainYielding);
+    }
+
+    /// Only an idle tail (both files read to their ends) keeps the job and stops, and only a
+    /// refused batch means the job was removed.
+    #[test]
+    fn only_idle_keeps_and_only_stopped_loses_the_job() {
+        assert_eq!(step_after(Drained::Idle, true), TailStep::Stop(true));
+        assert_eq!(step_after(Drained::Idle, false), TailStep::Stop(true));
+        assert_eq!(step_after(Drained::Stopped, true), TailStep::Stop(false));
+        assert_eq!(step_after(Drained::Stopped, false), TailStep::Stop(false));
     }
 }
