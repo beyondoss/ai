@@ -58,7 +58,7 @@ execd takes no arguments; it is configured by environment variables:
   EXECD_LOG                       off, error, warn, info, debug or trace (default info)
   EXECD_WORKER_THREADS            1 (default) one thread, 0 a worker per CPU, N workers
   EXECD_MAX_STREAMS               the most requests in flight, each over its limit answered 503: unset sizes it from the descriptor limit, 0 no cap
-  EXECD_DISK_WRITERS              blocking disk jobs at once off the runtime: job output batches and a retention sweep (default 8); 0 does them on the runtime
+  EXECD_DISK_WRITERS              blocking disk jobs at once off the runtime: job output batches, the jobs ledger, a retention sweep (default 8); 0 does them on the runtime
   EXECD_RAISE_NOFILE              1|true|0|false: raise the soft open file limit to the hard limit at start (default 1)
   EXECD_SHED_WHEN_OUT_OF_FDS      1|true|0|false: out of descriptors, answer waiting connections 503 instead of leaving them queued (default 1)
   EXECD_IDLE_TIMEOUT_MS           close a connection with no request in flight for this long; 0 (default) never

@@ -325,26 +325,36 @@ every 5.6 minutes) did undercut it constantly — a ceiling smaller than the clo
 entries the clock promised to keep. The costs, measured with `benches/retention_scale.py` (release binary, this 2-CPU host, a
 synthetic ledger a restart adopts — the rows execd writes, realistic ids and argv, no spool):
 
-| ended entries | `list` before the bound (bytes, p50 / p95) | `list` now (bytes, p50 / p95) | `/livez` stall in a `list`, before → now | per-event ledger write | start with that ledger | RSS     |
-| ------------- | ------------------------------------------ | ----------------------------- | ---------------------------------------- | ---------------------- | ---------------------- | ------- |
-| 256           | 90.9 KB, 2.2 / 3.4 ms                      | the same                      | 4.0 → 1.0 ms                             | 1.2-1.6 ms             | 0.45 s                 | 7.0 MB  |
-| 1024          | 363.5 KB, 11.3 / 13.2 ms                   | 181.8 KB, 5.2 / 6.2 ms        | 11.5 → 6.4 ms                            | 3.0-6.6 ms             | 1.9 s                  | 7.3 MB  |
-| 4096          | 1.45 MB, 36.9 / 45.7 ms                    | 181.8 KB, 3.0 / 5.7 ms        | 46.6 → 3.0 ms                            | 11-24 ms (median 20)   | 7.0 s                  | 11.3 MB |
+| ended entries | `list` before -> now (bytes, p50 / p95)         | `/livez` in a `list`, before -> now | a life change's own write | `/livez` during that write, before -> now | start with that ledger, before -> now | RSS     |
+| ------------- | ----------------------------------------------- | ----------------------------------- | ------------------------- | ----------------------------------------- | ------------------------------------- | ------- |
+| 256           | 90.9 KB, 2.2 / 3.4 ms -> the same               | 4.0 -> 1.0 ms                       | 2.2 ms                    | 601 -> 0.4 ms                             | 0.45 s -> 0.02 s                      | 7.0 MB  |
+| 1024          | 363.5 KB, 11.3 / 13.2 -> 181.8 KB, 5.2 / 6.2 ms | 11.5 -> 6.4 ms                      | 3.9 ms                    | 1206 -> 0.4 ms                            | 1.9 s -> 0.04 s                       | 9.5 MB  |
+| 4096          | 1.45 MB, 36.9 / 45.7 -> 181.8 KB, 3.0 / 5.7 ms  | 46.6 -> 3.0 ms                      | 14.7 ms                   | 3917 -> 0.4 ms                            | 7.0 s -> 0.11 s                       | 14.6 MB |
 
-Two of those are answered here: `list` is bounded (`LIST_ENDED_MAX`, below), and a first sweep after a restart reaps a full table
-in 64 passes (`SWEEP_ACTIONS_MAX`), which leaves the ledger and the table empty and every reaped id answering `gone`/`404`. Two
-are not, and are the reason this paragraph exists rather than a claim of "costs little":
+Each of the three costs that scales with the table is answered here:
 
-- **The per-event ledger write is on the runtime thread.** Only the sweep's write takes a `disk_turn` (`sweep`, `ctx.disk_turn`
-  then `off_runtime`); every other `Jobs::save` — a start, an end, a keep, a resize, a removal, a hangup, a recovery — writes and
-  renames the whole file inline. 1.5 MB is 20 ms (median of seven runs; 11-24) of every request at 4096 against 1.2-1.6 ms at 256,
-  and on a disk that bills a write at 300 ms it stalls all traffic for 0.60 s at 256, 1.2 s at 1024 and 3.9 s at 4096 (an
-  `LD_PRELOAD` delaying a write under the state directory, billed per 128 KiB; a flat per-syscall delay is 0.6 s at all three,
-  because a ledger replace is one write and one rename). The fix is an incremental ledger (append plus compaction), a change of its
-  own.
-- **Recovery scans `/proc` once per entry.** `jobs::recover` asks `proc::job_members` for every row before it knows the phase;
-  for a row saved as `ended` the answer is unused (`execd_jobs::recover`'s postcondition: an ended state is `Restore`, unchanged).
-  4096 rows are 63,000 `/proc` opens and 7.0 s of start on an 86-process host, and it scales with the host's process count.
+- **`list` is bounded** (`LIST_ENDED_MAX`, below), and a first sweep after a restart reaps a full table in 64 passes
+  (`SWEEP_ACTIONS_MAX`), which leaves the ledger and the table empty and every reaped id answering `gone`/`404`.
+- **The ledger write is off the runtime** (`Ctx::save_jobs`): one of the `disk_writers` turns, the write and the rename on a thread
+  of its own (`proc::off_runtime`), one write per change of a job's life, and the change's own answer awaits it. What that keeps is
+  the promise the inline write made — when a `start` answers, the file names the job; when a `remove` answers, it does not — and
+  what it gives back is everybody else's latency: with every ledger write held 300 ms, an unrelated `GET /livez` waited 601 ms
+  before and 0.4 ms after at 256 (1206 -> 0.4 at 1024, 3917 -> 0.4 at 4096). The request that asked still waits for its own
+  write, as it must: 14.7 ms at a full table on tmpfs, 3.9 s on that disk.
+  **Ordering against the sweep's write, or another life change's:** `Ledger::save` takes the file's writer lock and only then
+  snapshots the table, so writes are serialized and the last file written is the last state snapshotted, whichever thread wrote
+  it; a write asked for earlier can never land over a newer one. A keyed start's claim keeps its stronger promise the same way:
+  written, synced, renamed and its directory synced off the runtime, its result awaited before the start spawns (`claim_jobs`,
+  K10).
+- **Recovery does not scan `/proc` for a row already saved as `ended`** (`jobs::may_be_alive`). A job ends only with its group and
+  every marked process gone, so such a row's processes cannot exist, and `execd_jobs::recover` discards the answer for that phase
+  anyway (an ended state comes back `Restore`, unchanged). Scanning anyway cost one pass over `/proc` per row: 63,000 opens and
+  7.0 s of start at 4096 rows on an 86-process host, 10.3 s at 4000 rows on this one once the scan is put back, and it scales with
+  the host's process count. With the skip, a 4096-row start is 0.11 s: the ledger's parse and the table's insert.
+
+What a bigger table still costs is the write's bytes: the file is replaced whole, so a slow enough disk makes the request that asked
+wait for 1.5 MB (3.9 s there). An incremental ledger — append, with a compaction — would bound that too; it is a change of its own,
+and these numbers are what it waits on.
 
 **The `list` bound.** `list` answers with every job of its scope that has not ended, and with the newest `LIST_ENDED_MAX` (512)
 ended ones; past that it adds `"more": n`, the number it did not list. The newest are the rows it keeps, because the count ceiling
