@@ -92,8 +92,16 @@ pub const ENDED_OUTPUT_MS: u64 = 15 * 60 * 1000;
 /// The most output retained over ended jobs ([`Retention::bytes`]).
 pub const ENDED_BYTES: u64 = 256 * 1024 * 1024;
 
-/// The most ended entries a server holds ([`Retention::max`]).
-pub const ENDED_MAX: usize = 256;
+/// The most ended entries a server holds ([`Retention::max`]): 4096, one job every 21 seconds for a
+/// day, which is what makes [`ENDED_ENTRY_MS`] a clock a busy sandbox can rely on rather than one the
+/// ceiling undercuts. Measured cost of a full table (this host, release binary): 11.3 MiB of RSS
+/// against 7.0 MiB at 256, a 1.5 MB ledger, and 20 ms per job-life change, the ledger being rewritten
+/// whole (`benches/retention_scale.py`).
+pub const ENDED_MAX: usize = 4096;
+
+/// How long an ended job's entry is kept ([`Retention::entry_ms`]): 24 hours, so an unread result has
+/// a predictable lifetime ([`ENDED_MAX`] is then the backstop, not the deadline).
+pub const ENDED_ENTRY_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// Default for [`Options::disk_writers`]: the blocking disk jobs (job output batches, a retention
 /// sweep) that run off the runtime at once.
@@ -182,11 +190,11 @@ pub struct Retention {
     pub bytes: u64,
     /// `EXECD_JOBS_ENDED_MAX`: the most ended entries the table holds. Past it the oldest ended
     /// entry is reaped, with no clock involved: a flood of tiny jobs grows only entries. `0`:
-    /// unbounded. Default [`ENDED_MAX`] (256).
+    /// unbounded. Default [`ENDED_MAX`] (4096).
     pub max: usize,
     /// `EXECD_JOB_ENTRY_MS`: reap an ended job's entry, status included, this long after its end.
-    /// `0`: never, which is the default: reaping an entry is the only change here a client can
-    /// suffer (`404` on a reconnect), so it ships off.
+    /// `0`: never. Default [`ENDED_ENTRY_MS`] (24 h): an ended result's lifetime is then predictable,
+    /// and a client that reconnects later than that gets the defined `404`/`gone`, never a stream.
     pub entry_ms: u64,
 }
 
@@ -196,7 +204,7 @@ impl Default for Retention {
             output_ms: ENDED_OUTPUT_MS,
             bytes: ENDED_BYTES,
             max: ENDED_MAX,
-            entry_ms: 0,
+            entry_ms: ENDED_ENTRY_MS,
         }
     }
 }

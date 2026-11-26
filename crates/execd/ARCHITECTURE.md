@@ -300,7 +300,7 @@ A stream is bound to the job it attached to (`bound`): after that job is removed
 
 `remove`, and `kill` with `remove` or `wipe`, check a job (`removable`, which may await its group) and take it later. The take is bound to the job checked (J10, `takes`, `Table::take` with the shell's `Arc::ptr_eq`): if the key was freed and started again in between, the successor stays, signalled by nobody and checked by nobody. So does the spawn failure's take, which names the cell it created.
 
-**The mark on the wire.** A job's mark (`EXECD_JOB_MARK`, its spool directory's name) names one incarnation of an id, and the wire says it, so a client never mistakes a later job that reused the id for the one it knew. `start` answers `{"started": pgid, "mark": m}` and a held start's first frame is `{"started": pgid, "mark": m}`; `list` carries each job's `mark`, `command`, `args` (never the environment; the ledger keeps them too), `outputStart` and `outputEnd`. `attach` answers first with `{"attached": {"mark": m, "from": n}}` (`from` is the request's `offset`); it takes an optional `mark`, and a job whose mark differs is refused as `404 no such job` (`mark_ok`, M1, then `attach_plan`, M4; the refusal is not a state, so the retry with the right mark streams, M4-live). `attach` with `"output": false` is status-only: it starts at the output's current end whatever `offset` it names (`from`, M6) and sends no byte and no gap, only the shell's exit and the end (`stream_next`, M7, applied at every frame). `remove` takes an optional `marks` (id to mark) and answers `{"running": [ids], "mismatch": [ids]}`: a job whose mark is not the one named stays (M2) and is reported as a mismatch, a job whose group is not empty stays and is reported as running (M3), an id with no job is in neither, and the retry with the right mark takes it (M2-live). A start's id is 1 to 64 bytes of `[0-9a-z_-]` (`id_ok`, I1, I2; `400` otherwise). This is a clean break: execd used to accept any id. `list` reports each job's argv (`command`, `args`), which the 0600 ledger stores, within the job's scope; never its environment. Every decision above is in `execd-jobs`, proven in Verus with a mutant per row (`mise run verify:execd-jobs-mark-mutants`); `job_model` runs them over the table (`M1`, `M3`, `M7` red under `mut_mark_ignored`, `mut_remove_ignores_mark`, `mut_attach_ignores_mark`, `mut_running_unreported`, `mut_status_only_streams`, `mut_status_only_sends`) and `tests/jobmark.rs` drives them against the binary.
+**The mark on the wire.** A job's mark (`EXECD_JOB_MARK`, its spool directory's name) names one incarnation of an id, and the wire says it, so a client never mistakes a later job that reused the id for the one it knew. `start` answers `{"started": pgid, "mark": m}` and a held start's first frame is `{"started": pgid, "mark": m}`; `list` carries each job's `mark`, `command`, `args` (never the environment; the ledger keeps them too), `outputStart` and `outputEnd`. `attach` answers first with `{"attached": {"mark": m, "from": n}}` (`from` is the request's `offset`); it takes an optional `mark`, and a job whose mark differs is refused as `404 no such job` (`mark_ok`, M1, then `attach_plan`, M4; the refusal is not a state, so the retry with the right mark streams, M4-live). `attach` with `"output": false` is status-only: it starts at the output's current end whatever `offset` it names (`from`, M6) and sends no byte and no gap, only the shell's exit and the end (`stream_next`, M7, applied at every frame). `remove` takes an optional `marks` (id to mark) and answers `{"running": [ids], "mismatch": [ids]}`: a job whose mark is not the one named stays (M2) and is reported as a mismatch, a job whose group is not empty stays and is reported as running (M3), an id with no job is in neither, and the retry with the right mark takes it (M2-live). A start's id is 1 to 64 bytes of `[0-9a-z_-]` (`id_ok`, I1, I2; `400` otherwise). This is a clean break: execd used to accept any id. `list` reports each job's argv (`command`, `args`), which the 0600 ledger stores, within the job's scope; never its environment, and past `LIST_ENDED_MAX` ended rows it answers the count it left out as `"more"` ("The `list` bound", under retention). Every decision above is in `execd-jobs`, proven in Verus with a mutant per row (`mise run verify:execd-jobs-mark-mutants`); `job_model` runs them over the table (`M1`, `M3`, `M7` red under `mut_mark_ignored`, `mut_remove_ignores_mark`, `mut_attach_ignores_mark`, `mut_running_unreported`, `mut_status_only_streams`, `mut_status_only_sends`) and `tests/jobmark.rs` drives them against the binary.
 
 A client frees a job with `remove`, `kill` with `remove` or `wipe`; a job no client frees is bounded by the retention below.
 
@@ -309,15 +309,50 @@ A client frees a job with `remove`, `kill` with `remove` or `wipe`; a job no cli
 An ended job a client never removes used to stay until execd exited: up to its 8 MiB of output (plus stderr labels and the unfinished
 chunk in memory) and one table entry, forever. `Options::retention` bounds both, in two tiers, with **no protocol change**:
 
-| knob                     | default             | tier   | what it does                                                                       |
-| ------------------------ | ------------------- | ------ | ---------------------------------------------------------------------------------- |
-| `EXECD_JOB_OUTPUT_MS`    | 900000 (15 min)     | 1, on  | drop an ended job's output this long after its end; keep its entry                 |
-| `EXECD_JOBS_ENDED_BYTES` | 268435456 (256 MiB) | 1, on  | past this much output over ended jobs, drop the oldest's output first; never reaps |
-| `EXECD_JOBS_ENDED_MAX`   | 256                 | 2, on  | past this many ended entries, reap the oldest reapable one (no clock)              |
-| `EXECD_JOB_ENTRY_MS`     | 0 (off)             | 2, off | reap an ended job's entry this long after its end                                  |
+| knob                     | default             | tier  | what it does                                                                       |
+| ------------------------ | ------------------- | ----- | ---------------------------------------------------------------------------------- |
+| `EXECD_JOB_OUTPUT_MS`    | 900000 (15 min)     | 1, on | drop an ended job's output this long after its end; keep its entry                 |
+| `EXECD_JOBS_ENDED_BYTES` | 268435456 (256 MiB) | 1, on | past this much output over ended jobs, drop the oldest's output first; never reaps |
+| `EXECD_JOBS_ENDED_MAX`   | 4096                | 2, on | past this many ended entries, reap the oldest reapable one (a backstop)            |
+| `EXECD_JOB_ENTRY_MS`     | 86400000 (24 h)     | 2, on | reap an ended job's entry this long after its end (a predictable lifetime)         |
 
 `0` is off for each, and **all four at `0` is exactly the behaviour before**: the sweeper task is never started
 (`Retention::enabled`, `start_retention`), so nothing is dropped or reaped and nothing wakes (`every_knob_off_is_todays_behaviour`).
+
+**Why 4096 and 24 h, and what a full table costs.** The clock is the deadline and the ceiling is its backstop: 4096 entries is one
+job every 21 seconds for a day, so the ceiling does not undercut the promise until a sandbox runs faster than that, while 256 (one
+every 5.6 minutes) did undercut it constantly — a ceiling smaller than the clock's rate is a ceiling that fires first and reaps
+entries the clock promised to keep. The costs, measured with `benches/retention_scale.py` (release binary, this 2-CPU host, a
+synthetic ledger a restart adopts — the rows execd writes, realistic ids and argv, no spool):
+
+| ended entries | `list` before the bound (bytes, p50 / p95) | `list` now (bytes, p50 / p95) | `/livez` stall in a `list`, before → now | per-event ledger write | start with that ledger | RSS     |
+| ------------- | ------------------------------------------ | ----------------------------- | ---------------------------------------- | ---------------------- | ---------------------- | ------- |
+| 256           | 90.9 KB, 2.2 / 3.4 ms                      | the same                      | 4.0 → 1.0 ms                             | 1.2-1.6 ms             | 0.45 s                 | 7.0 MB  |
+| 1024          | 363.5 KB, 11.3 / 13.2 ms                   | 181.8 KB, 5.2 / 6.2 ms        | 11.5 → 6.4 ms                            | 3.0-6.6 ms             | 1.9 s                  | 7.3 MB  |
+| 4096          | 1.45 MB, 36.9 / 45.7 ms                    | 181.8 KB, 3.0 / 5.7 ms        | 46.6 → 3.0 ms                            | 11-24 ms (median 20)   | 7.0 s                  | 11.3 MB |
+
+Two of those are answered here: `list` is bounded (`LIST_ENDED_MAX`, below), and a first sweep after a restart reaps a full table
+in 64 passes (`SWEEP_ACTIONS_MAX`), which leaves the ledger and the table empty and every reaped id answering `gone`/`404`. Two
+are not, and are the reason this paragraph exists rather than a claim of "costs little":
+
+- **The per-event ledger write is on the runtime thread.** Only the sweep's write takes a `disk_turn` (`sweep`, `ctx.disk_turn`
+  then `off_runtime`); every other `Jobs::save` — a start, an end, a keep, a resize, a removal, a hangup, a recovery — writes and
+  renames the whole file inline. 1.5 MB is 20 ms (median of seven runs; 11-24) of every request at 4096 against 1.2-1.6 ms at 256,
+  and on a disk that bills a write at 300 ms it stalls all traffic for 0.60 s at 256, 1.2 s at 1024 and 3.9 s at 4096 (an
+  `LD_PRELOAD` delaying a write under the state directory, billed per 128 KiB; a flat per-syscall delay is 0.6 s at all three,
+  because a ledger replace is one write and one rename). The fix is an incremental ledger (append plus compaction), a change of its
+  own.
+- **Recovery scans `/proc` once per entry.** `jobs::recover` asks `proc::job_members` for every row before it knows the phase;
+  for a row saved as `ended` the answer is unused (`execd_jobs::recover`'s postcondition: an ended state is `Restore`, unchanged).
+  4096 rows are 63,000 `/proc` opens and 7.0 s of start on an 86-process host, and it scales with the host's process count.
+
+**The `list` bound.** `list` answers with every job of its scope that has not ended, and with the newest `LIST_ENDED_MAX` (512)
+ended ones; past that it adds `"more": n`, the number it did not list. The newest are the rows it keeps, because the count ceiling
+reaps the oldest first and a client that reattaches wants what just happened, and the response carries the count instead of silently
+dropping rows: a client that ignores an unknown field sees the defined answer for a table today's ceiling already bounds (256 ended
+rows, byte for byte what execd answered before), and one that reads `more` knows to ask for less or wait. Rows that have not ended
+are not bounded — the table cannot hold many, since each needs processes and a spool, and the byte budget governs a job's output,
+not its existence — and the cap covers ended entries only, which are what a ceiling raises.
 
 **Tier 1, the tombstone.** The entry keeps its mark, argv, `state: "ended"`, code, signal, end time and offset; the ring goes to
 `base == end` (`Ring::evict_all`) and its spool is deleted. A late client gets the existing gap semantics: `read` answers the

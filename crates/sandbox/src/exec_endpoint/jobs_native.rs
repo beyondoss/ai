@@ -977,7 +977,8 @@ pub(super) fn predates(what: &str) -> std::io::Error {
 }
 
 /// A `list` answer: `{"jobs": [{"id", "mark", "command", "args", "outputStart", "outputEnd", "state", "code", "signal"?, "kept", "num", "kind", "seen", "started",
-/// "ended", "label"}]}`. A job whose id is not one is skipped, never followed.
+/// "ended", "label"}], "more"?}`. A job whose id is not one is skipped, never followed. An endpoint bounds its ended rows and
+/// answers the count it left out as `more`; this parsing reads the rows it was given either way.
 pub fn parse_list(v: &Value) -> std::io::Result<Vec<JobInfo>> {
     let jobs = v
         .get("jobs")

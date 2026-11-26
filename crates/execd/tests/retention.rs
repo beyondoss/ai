@@ -1008,3 +1008,221 @@ async fn a_sweep_concurrent_with_remove_and_start_leaves_one_state() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// A full table: the `list` bound, and the clock across a restart
+// ---------------------------------------------------------------------------------------------
+
+/// Seconds since the epoch, as the kernel records a job's end (`Phase::Ended.at`).
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+fn row_id(i: usize) -> String {
+    format!("job_01J8Z9K3M4N5P6Q7R8S9T0V1W{i:05}")
+}
+
+/// One ledger row for an ended job, as `ledger.rs` writes it: a realistic id and argv, a mark, a dead
+/// group's number, no spool (the state the 15-minute output clock leaves behind).
+fn ended_row(i: usize, at: u64) -> Value {
+    json!({
+        "scope": "s",
+        "id": row_id(i),
+        "label": "migration",
+        "command": "bash",
+        "args": ["-lc", "cargo test --workspace --release -- --test-threads=4"],
+        "mark": format!("{:016x}", 0x9F3A_0000u64 + i as u64),
+        "phase": "ended",
+        "pgid": 400_000 + i as i64,
+        "code": 0,
+        "signal": null,
+        "at": at,
+        "told": true,
+        "kept": {"num": null, "kind": "background"},
+        "seen": 1,
+        "started": at - 1,
+        "spool": null,
+        "term": null,
+        "idem": null,
+    })
+}
+
+fn write_ledger(state: &Path, rows: Vec<Value>) {
+    std::fs::create_dir_all(state).unwrap();
+    let file = json!({ "version": 1, "jobs": rows });
+    std::fs::write(
+        state.join("execd-jobs.json"),
+        serde_json::to_vec(&file).unwrap(),
+    )
+    .unwrap();
+}
+
+fn ledger_rows(state: &Path) -> Vec<Value> {
+    let v: Value =
+        serde_json::from_slice(&std::fs::read(state.join("execd-jobs.json")).unwrap()).unwrap();
+    v["jobs"].as_array().unwrap().clone()
+}
+
+/// **The `list` bound.** A table past `LIST_ENDED_MAX` ended entries (600 here, all kept: every
+/// ceiling and clock off) answers the newest 512 rows and the count it left out, because the answer is
+/// rebuilt on every reattach and was 1.45 MB and 39 ms of the runtime thread at 4096 entries.
+/// Delete the bound and this answers 600 rows with no `more`.
+#[tokio::test]
+async fn list_answers_the_newest_ended_rows_and_counts_the_rest() {
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    let jobs = root.path().join("jobs");
+    std::fs::create_dir(&jobs).unwrap();
+    const N: usize = 600;
+    let at = now() - 10_000;
+    write_ledger(
+        &state,
+        (0..N).map(|i| ended_row(i, at + i as u64)).collect(),
+    );
+    let e = Execd::start(
+        &[
+            ("EXECD_STATE_DIR", state.to_str().unwrap()),
+            ("EXECD_JOBS_DIR", jobs.to_str().unwrap()),
+            ("EXECD_JOB_OUTPUT_MS", "0"),
+            ("EXECD_JOB_ENTRY_MS", "0"),
+            ("EXECD_JOBS_ENDED_BYTES", "0"),
+            ("EXECD_JOBS_ENDED_MAX", "0"),
+        ],
+        &[],
+    );
+    let a = addr(&e);
+    let answer = op(a, json!({ "op": "list", "scope": "s" })).await.json();
+    let rows = answer["jobs"].as_array().unwrap();
+    assert_eq!(rows.len(), 512, "past the bound: {}", rows.len());
+    assert_eq!(answer["more"], json!(N - 512));
+    let ids: Vec<&str> = rows.iter().map(|r| r["id"].as_str().unwrap()).collect();
+    // The newest are the rows kept: the count ceiling reaps the oldest first, so those are the ones
+    // about to go.
+    let newest = row_id(N - 1);
+    assert!(ids.contains(&newest.as_str()), "the newest is missing");
+    for i in 0..N - 512 {
+        let oldest = row_id(i);
+        assert!(
+            !ids.contains(&oldest.as_str()),
+            "row {i} should be only counted"
+        );
+    }
+    assert_eq!(read(a, &newest).await["state"], "ended");
+}
+
+/// **The 24 h clock across a restart.** A recovered entry's deadline is its own end, so the first
+/// sweep after a restart reaps what the clock passed while execd was down: `read` answers `gone`,
+/// `attach` is `404`, `list` no longer has it, and neither does the ledger. An entry a minute old
+/// stays. No `EXECD_JOB_ENTRY_MS` is set: the clock is the default this test pins.
+#[tokio::test]
+async fn a_restart_reaps_the_entries_the_clock_passed() {
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    let jobs = root.path().join("jobs");
+    std::fs::create_dir(&jobs).unwrap();
+    let settings = [
+        ("EXECD_STATE_DIR", state.to_str().unwrap()),
+        ("EXECD_JOBS_DIR", jobs.to_str().unwrap()),
+    ];
+    let mut first = Execd::start(&settings, &[]);
+    let a = addr(&first);
+    start(a, "old", "head -c 1000 /dev/zero | tr '\\0' 'x'").await;
+    until_state(a, "old", "ended").await;
+    start(a, "young", "printf y").await;
+    until_state(a, "young", "ended").await;
+    // A crash, not a stop: the ledger is what the last save wrote.
+    first.child.kill().unwrap();
+    first.child.wait().unwrap();
+    let file = state.join("execd-jobs.json");
+    let mut v: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    for row in v["jobs"].as_array_mut().unwrap() {
+        row["at"] = json!(if row["id"] == "old" {
+            now() - 3 * 86_400
+        } else {
+            now() - 60
+        });
+    }
+    std::fs::write(&file, serde_json::to_vec(&v).unwrap()).unwrap();
+
+    let second = Execd::start(&settings, &[]);
+    let a = addr(&second);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if read(a, "old").await["state"] == "gone" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the restart never reaped the entry past the clock"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(post(a, &[], &attach_body("old", 0)).await.status, 404);
+    let rows = list(a).await;
+    let ids: Vec<&str> = rows.iter().map(|j| j["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["young"], "a row the clock did not pass was taken");
+    // The ledger is written off the runtime thread after the take commits, so it lags the answer.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let named: Vec<String> = ledger_rows(&state)
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect();
+        if named == ["young"] {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the ledger still names the reaped entry: {named:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// **A restart reaps a backlog past one sweep's action cap.** 200 entries older than the clock: a pass
+/// acts on at most 64 (`SWEEP_ACTIONS_MAX`), and the sweeps go on — the self-wake, or the earliest
+/// deadline `next_wake` finds, 50 ms later — until the table holds the one entry the clock did not
+/// pass. The ledger follows it, and an answer that fits carries no `more`. What a single pass would
+/// leave (`a_restart_reaps_the_entries_the_clock_passed` reaps one row either way) is not a property
+/// this test can delete: the deadline re-arms the sweeper whether or not it wakes itself.
+#[tokio::test]
+async fn a_restart_reaps_past_one_sweeps_action_cap() {
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    let jobs = root.path().join("jobs");
+    std::fs::create_dir(&jobs).unwrap();
+    const OLD: usize = 200;
+    let mut rows: Vec<Value> = (0..OLD).map(|i| ended_row(i, now() - 3 * 86_400)).collect();
+    rows.push(ended_row(OLD, now() - 60));
+    write_ledger(&state, rows);
+    let e = Execd::start(
+        &[
+            ("EXECD_STATE_DIR", state.to_str().unwrap()),
+            ("EXECD_JOBS_DIR", jobs.to_str().unwrap()),
+            ("EXECD_JOBS_ENDED_MAX", "0"),
+        ],
+        &[],
+    );
+    let a = addr(&e);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let left = loop {
+        let answer = op(a, json!({ "op": "list", "scope": "s" })).await.json();
+        let rows = answer["jobs"].as_array().unwrap().clone();
+        if rows.len() == 1 && ledger_rows(&state).len() == 1 {
+            assert!(answer.get("more").is_none(), "{answer}");
+            break rows;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the sweeps stopped with {} rows, the ledger with {}",
+            rows.len(),
+            ledger_rows(&state).len()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(left[0]["id"], row_id(OLD));
+    assert_eq!(read(a, &row_id(0)).await["state"], "gone");
+}

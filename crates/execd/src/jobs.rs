@@ -513,6 +513,13 @@ const SWEEP_ACTIONS_MAX: usize = 64;
 /// refused) can never spin.
 const SWEEP_MIN_SLEEP_MS: u64 = 50;
 
+/// The most ended rows one `list` answer carries ([`serve_op`]). An ended entry is cheap to keep and
+/// the ceiling lets a table hold thousands, while the answer is rebuilt on every reattach: past this
+/// many the newest are listed and the rest are only counted (`"more"`). At 4096 ended entries the
+/// answer would otherwise be 1.45 MB of output and 39 ms of the runtime thread, measured
+/// (`benches/retention_scale.py`).
+pub(crate) const LIST_ENDED_MAX: usize = 512;
+
 /// One pass of the retention: drop the output of the ended jobs the policy names, reap the entries
 /// it names, then — in **one** pass, off the runtime thread — write the ledger and delete every
 /// file no entry names any more.
@@ -1500,10 +1507,32 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq, data: Vec<u8>) -> 
             http::json_response(200, &json!({ "running": running, "mismatch": mismatch }))
         }
         "list" => {
-            let list: Vec<Value> = jobs
-                .in_scope(&job.scope, Pick::All)
+            // Every job that has not ended answers in full; the ended ones past `[LIST_ENDED_MAX]`
+            // are counted, not listed. The newest rows are the ones kept: the count ceiling reaps the
+            // oldest first, and a client that reattaches wants what just happened. A table of 256
+            // ended entries — what the old ceiling held — is answered byte for byte as before, since
+            // `more` is absent unless rows were left out.
+            let cells = jobs.in_scope(&job.scope, Pick::All);
+            let mut ended: Vec<(u64, usize)> = Vec::new();
+            for (i, (_, cell)) in cells.iter().enumerate() {
+                let j = locked(cell);
+                if j.k.ended() {
+                    ended.push((j.k.ended_at(), i));
+                }
+            }
+            let mut dropped = vec![false; cells.len()];
+            if ended.len() > LIST_ENDED_MAX {
+                ended.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                for &(_, i) in &ended[LIST_ENDED_MAX..] {
+                    dropped[i] = true;
+                }
+            }
+            let more = ended.len().saturating_sub(LIST_ENDED_MAX);
+            let list: Vec<Value> = cells
                 .into_iter()
-                .map(|((_, id), c)| {
+                .enumerate()
+                .filter(|(i, _)| !dropped[*i])
+                .map(|(_, ((_, id), c))| {
                     let j = locked(&c);
                     let (state, code) = state_of(&j);
                     let mut entry = json!({
@@ -1528,7 +1557,11 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq, data: Vec<u8>) -> 
                     entry
                 })
                 .collect();
-            http::json_response(200, &json!({ "jobs": list }))
+            let mut body = json!({ "jobs": list });
+            if more > 0 {
+                body["more"] = json!(more);
+            }
+            http::json_response(200, &body)
         }
         other => {
             // An op this server does not implement: the embedder's, if it has a hook.

@@ -64,8 +64,8 @@ execd takes no arguments; it is configured by environment variables:
   EXECD_IDLE_TIMEOUT_MS           close a connection with no request in flight for this long; 0 (default) never
   EXECD_JOB_OUTPUT_MS             drop an ended job's output this long after its end, keeping its status (default 900000 = 15 min; 0 never)
   EXECD_JOBS_ENDED_BYTES          the most output retained over ended jobs; past it the oldest is dropped first (default 268435456 = 256 MiB; 0 unbounded)
-  EXECD_JOBS_ENDED_MAX            the most ended jobs the server holds; past it the oldest entry is reaped (default 256; 0 unbounded)
-  EXECD_JOB_ENTRY_MS              reap an ended job's entry, status included, this long after its end (default 0 = never)
+  EXECD_JOBS_ENDED_MAX            the most ended jobs the server holds; past it the oldest entry is reaped (default 4096; 0 unbounded)
+  EXECD_JOB_ENTRY_MS              reap an ended job's entry, status included, this long after its end (default 86400000 = 24 h; 0 never)
 ";
 
 fn number<T: std::str::FromStr>(name: &str, v: Option<String>) -> Result<Option<T>, String> {
@@ -107,7 +107,8 @@ pub fn parse<E: Fn(&str) -> Option<String>>(env: E) -> Result<Config, String> {
                 .unwrap_or(execd::ENDED_BYTES),
             max: number::<usize>("EXECD_JOBS_ENDED_MAX", get("EXECD_JOBS_ENDED_MAX"))?
                 .unwrap_or(execd::ENDED_MAX),
-            entry_ms: number::<u64>("EXECD_JOB_ENTRY_MS", get("EXECD_JOB_ENTRY_MS"))?.unwrap_or(0),
+            entry_ms: number::<u64>("EXECD_JOB_ENTRY_MS", get("EXECD_JOB_ENTRY_MS"))?
+                .unwrap_or(execd::ENDED_ENTRY_MS),
         },
         max_streams: number("EXECD_MAX_STREAMS", get("EXECD_MAX_STREAMS"))?,
         disk_writers: number("EXECD_DISK_WRITERS", get("EXECD_DISK_WRITERS"))?,
@@ -161,8 +162,8 @@ mod tests {
             execd::Retention {
                 output_ms: 900_000,
                 bytes: 256 << 20,
-                max: 256,
-                entry_ms: 0,
+                max: 4096,
+                entry_ms: 86_400_000,
             }
         );
         assert_eq!((c.max_streams, c.disk_writers), (None, None));
