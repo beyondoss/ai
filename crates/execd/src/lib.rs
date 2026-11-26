@@ -84,6 +84,16 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(execd_wire::HEART
 /// gap.
 pub const JOB_OUTPUT_RETENTION: usize = 8 * 1024 * 1024;
 
+/// How long an ended job keeps its output before it is dropped and only its status is kept
+/// ([`Retention::output_ms`]).
+pub const ENDED_OUTPUT_MS: u64 = 15 * 60 * 1000;
+
+/// The most output retained over ended jobs ([`Retention::bytes`]).
+pub const ENDED_BYTES: u64 = 256 * 1024 * 1024;
+
+/// The most ended entries a server holds ([`Retention::max`]).
+pub const ENDED_MAX: usize = 256;
+
 /// The largest answer the agent accepts (`DEFAULT_MAX_RESPONSE_BYTES`, 16 MiB). A one-shot answer is
 /// one JSON object; the agent refuses a bigger one, so output past this would be thrown away at the
 /// far end anyway.
@@ -133,6 +143,52 @@ pub enum Route {
 /// must not block; the work belongs in the returned future.
 pub type RouteHook = Arc<dyn Fn(HttpRequest) -> Route + Send + Sync>;
 
+/// How long an ended job keeps what it holds, and what the server does about it. Two tiers, one
+/// sweeper (`jobs::sweep`): the **output** is dropped first (a *tombstone*: the entry keeps its
+/// offsets, `state`, code and end, the ring goes to `base == end`, and a late reader gets the status
+/// plus a gap), and the **entry** is taken later, and only through the gate `remove` takes.
+///
+/// Every number is a knob, and every off value (`0`) is exactly what execd always did: nothing is
+/// dropped and nothing is reaped, so a deployment that wants no retention sets all four to `0` and
+/// keeps today's behaviour.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Retention {
+    /// `EXECD_JOB_OUTPUT_MS`: drop an ended job's output this long after its end, keeping its entry.
+    /// `0`: never. Default [`ENDED_OUTPUT_MS`] (15 min).
+    pub output_ms: u64,
+    /// `EXECD_JOBS_ENDED_BYTES`: the most output retained over ended jobs. Past it the oldest is
+    /// tombstoned first, so a late reader gets the same answer it would past the retention: a gap.
+    /// `0`: unbounded. Default [`ENDED_BYTES`] (256 MiB).
+    pub bytes: u64,
+    /// `EXECD_JOBS_ENDED_MAX`: the most ended entries the table holds. Past it the oldest ended
+    /// entry is reaped, with no clock involved: a flood of tiny jobs grows only entries. `0`:
+    /// unbounded. Default [`ENDED_MAX`] (256).
+    pub max: usize,
+    /// `EXECD_JOB_ENTRY_MS`: reap an ended job's entry, status included, this long after its end.
+    /// `0`: never, which is the default: reaping an entry is the only change here a client can
+    /// suffer (`404` on a reconnect), so it ships off.
+    pub entry_ms: u64,
+}
+
+impl Default for Retention {
+    fn default() -> Self {
+        Self {
+            output_ms: ENDED_OUTPUT_MS,
+            bytes: ENDED_BYTES,
+            max: ENDED_MAX,
+            entry_ms: 0,
+        }
+    }
+}
+
+impl Retention {
+    /// Whether any of the four is on. With all four at `0` the sweeper is never started and no
+    /// ended job is touched.
+    pub fn enabled(&self) -> bool {
+        self.output_ms > 0 || self.bytes > 0 || self.max > 0 || self.entry_ms > 0
+    }
+}
+
 /// What the deployment tells execd. [`Options::new`] is a conforming notify endpoint with the spec's
 /// numbers and notify off, as an operator's deployment setting starts out.
 #[derive(Clone)]
@@ -164,6 +220,9 @@ pub struct Options {
     pub run_as: Option<RunAs>,
     /// How much of each job's output is kept; see [`JOB_OUTPUT_RETENTION`].
     pub job_output_retention: usize,
+    /// How long an ended job keeps its output and its entry, and what the ceilings are; see
+    /// [`Retention`]. All four off is what execd always did.
+    pub retention: Retention,
     /// Where the retained output of kept jobs is spooled, as chunk files under a directory of
     /// execd's own (mode 0700); `None` is `$TMPDIR`, else `/tmp`. Use a disk-backed directory:
     /// on tmpfs the output is RAM.
@@ -232,6 +291,7 @@ impl Options {
             heartbeat: HEARTBEAT_INTERVAL,
             run_as: None,
             job_output_retention: JOB_OUTPUT_RETENTION,
+            retention: Retention::default(),
             jobs_dir: None,
             state_dir: None,
             max_response_bytes: MAX_RESPONSE_BYTES,
@@ -258,6 +318,7 @@ impl std::fmt::Debug for Options {
             .field("heartbeat", &self.heartbeat)
             .field("run_as", &self.run_as)
             .field("job_output_retention", &self.job_output_retention)
+            .field("retention", &self.retention)
             .field("jobs_dir", &self.jobs_dir)
             .field("state_dir", &self.state_dir)
             .field("max_response_bytes", &self.max_response_bytes)
@@ -524,6 +585,9 @@ pub fn serve(listener: tokio::net::TcpListener, opts: Options) -> std::io::Resul
     // The jobs a previous execd started, before the first request can name one.
     jobs::recover(&ctx);
     let stop = CancellationToken::new();
+    // The retention of ended jobs (`Retention`): one task, asleep until a job ends or a deadline
+    // arrives, started only when one of its four knobs is on, and stopped with the server.
+    jobs::start_retention(&ctx, stop.clone());
     let accept = tokio::spawn(http::accept_loop(listener, ctx.clone(), stop.clone()));
     Ok(Handle {
         addr,

@@ -149,6 +149,38 @@ impl Ring {
         ring
     }
 
+    /// [`Self::recover`] for a job whose output the previous execd dropped and whose entry it kept
+    /// (a tombstone, `kept` here): nothing is held, and the offsets continue from `end`, so a
+    /// client's reads never go backwards. It touches no file: the job's spool is gone.
+    pub fn evicted(retain: usize, dir: PathBuf, end: u64) -> Self {
+        let mut ring = Self::new(retain, dir);
+        ring.base = end;
+        ring
+    }
+
+    /// Drop every byte the ring holds, in memory and on disk, keeping only the offset: `base` moves
+    /// to `end`, so a read answers from there and a stream sends one gap. The files that held the
+    /// bytes are returned for the caller to delete **off the runtime thread**; so is the spool,
+    /// which held them (`Job::spool`), and the ring's own directory is not its to delete (`kept`).
+    /// Idempotent: a second call finds nothing held and returns nothing.
+    pub fn evict_all(&mut self) -> Vec<PathBuf> {
+        let mut files = Vec::with_capacity(self.files * 2);
+        for i in 0..self.files {
+            let at = self.base + (i * FRAME_MAX) as u64;
+            files.push(self.chunk_path(at));
+            files.push(self.chunk_bits_path(at));
+        }
+        self.base = self.end();
+        self.files = 0;
+        self.tail.clear();
+        self.tail_e = None;
+        self.made = false;
+        // An ended job holds no descriptor (ARCHITECTURE.md, Bounds): the ring's handle on the spool
+        // directory goes with the spool.
+        self._hold = None;
+        files
+    }
+
     /// The bytes of the unfinished chunk.
     pub fn tail_len(&self) -> usize {
         self.tail.len()
