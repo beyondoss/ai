@@ -732,31 +732,33 @@ async fn writer_threads_are_bounded_by_disk_writers_and_the_rest_wait() {
     wipe(&e).await;
 }
 
-/// 2 MB of output (more than one batch: 16 rounds of 64 KiB) piles up in the spool while the disk
-/// is stuck, then drains in order with every byte once and contiguous offsets. Red: a batch that
-/// ends with more to read (`Drained::More`) treated as done leaves the rest unread.
+/// About 4.9 MB of output (more than three batches of 16 rounds of 64 KiB, within the 8 MiB
+/// retention) piles up in the spool while the disk is stuck, then drains in order with every byte
+/// once and contiguous offsets. A regression guard for ordering through the batches: it goes red
+/// when a batch hands over bytes out of place (an offset advanced short of what was read), not
+/// when the batch loop alone is removed, because punching the spool also wakes the tail.
 #[tokio::test]
 async fn output_past_one_batch_keeps_its_order_and_every_byte() {
     let gate = Gate::closed();
     let e = Execd::start(&[], &[gate.env()]);
     let done = gate.dir.path().join("written");
     let script = format!(
-        "sleep 0.3; seq 1 300000; touch {}; sleep 30",
+        "sleep 0.3; seq 1 700000; touch {}; sleep 30",
         done.display()
     );
     assert_eq!(start_job(&e, "ord", &script).await.status, 200);
     until("the job to write everything", || async { done.exists() }).await;
     assert_eq!(gate.held(), 1);
     gate.open();
-    let want: String = (1..=300_000).map(|i| format!("{i}\n")).collect();
-    assert!(want.len() > 16 * 64 * 1024, "more than one batch");
+    let want: String = (1..=700_000).map(|i| format!("{i}\n")).collect();
+    assert!(want.len() > 3 * 16 * 64 * 1024, "more than three batches");
     let mut got = Vec::new();
     let mut next = 0u64;
     let deadline = Instant::now() + Duration::from_secs(30);
     while got.len() < want.len() {
         let r = read(&e, "ord", next).await;
         assert_eq!(r.from, next, "offsets are contiguous");
-        next = r.end;
+        next = r.from + r.data.len() as u64;
         got.extend_from_slice(&r.data);
         assert!(
             Instant::now() < deadline,
