@@ -58,14 +58,14 @@ execd takes no arguments; it is configured by environment variables:
   EXECD_LOG                       off, error, warn, info, debug or trace (default info)
   EXECD_WORKER_THREADS            1 (default) one thread, 0 a worker per CPU, N workers
   EXECD_MAX_STREAMS               the most requests in flight, each over its limit answered 503: unset sizes it from the descriptor limit, 0 no cap
-  EXECD_DISK_WRITERS              blocking disk jobs at once off the runtime: job output batches and a retention sweep (default 8); 0 does them on the runtime
+  EXECD_DISK_WRITERS              blocking disk jobs at once off the runtime: job output batches, the jobs ledger, a retention sweep (default 8); 0 does them on the runtime
   EXECD_RAISE_NOFILE              1|true|0|false: raise the soft open file limit to the hard limit at start (default 1)
   EXECD_SHED_WHEN_OUT_OF_FDS      1|true|0|false: out of descriptors, answer waiting connections 503 instead of leaving them queued (default 1)
   EXECD_IDLE_TIMEOUT_MS           close a connection with no request in flight for this long; 0 (default) never
   EXECD_JOB_OUTPUT_MS             drop an ended job's output this long after its end, keeping its status (default 900000 = 15 min; 0 never)
   EXECD_JOBS_ENDED_BYTES          the most output retained over ended jobs; past it the oldest is dropped first (default 268435456 = 256 MiB; 0 unbounded)
-  EXECD_JOBS_ENDED_MAX            the most ended jobs the server holds; past it the oldest entry is reaped (default 256; 0 unbounded)
-  EXECD_JOB_ENTRY_MS              reap an ended job's entry, status included, this long after its end (default 0 = never)
+  EXECD_JOBS_ENDED_MAX            the most ended jobs the server holds; past it the oldest entry is reaped (default 4096; 0 unbounded)
+  EXECD_JOB_ENTRY_MS              reap an ended job's entry, status included, this long after its end (default 86400000 = 24 h; 0 never)
 ";
 
 fn number<T: std::str::FromStr>(name: &str, v: Option<String>) -> Result<Option<T>, String> {
@@ -107,7 +107,8 @@ pub fn parse<E: Fn(&str) -> Option<String>>(env: E) -> Result<Config, String> {
                 .unwrap_or(execd::ENDED_BYTES),
             max: number::<usize>("EXECD_JOBS_ENDED_MAX", get("EXECD_JOBS_ENDED_MAX"))?
                 .unwrap_or(execd::ENDED_MAX),
-            entry_ms: number::<u64>("EXECD_JOB_ENTRY_MS", get("EXECD_JOB_ENTRY_MS"))?.unwrap_or(0),
+            entry_ms: number::<u64>("EXECD_JOB_ENTRY_MS", get("EXECD_JOB_ENTRY_MS"))?
+                .unwrap_or(execd::ENDED_ENTRY_MS),
         },
         max_streams: number("EXECD_MAX_STREAMS", get("EXECD_MAX_STREAMS"))?,
         disk_writers: number("EXECD_DISK_WRITERS", get("EXECD_DISK_WRITERS"))?,
@@ -161,8 +162,8 @@ mod tests {
             execd::Retention {
                 output_ms: 900_000,
                 bytes: 256 << 20,
-                max: 256,
-                entry_ms: 0,
+                max: 4096,
+                entry_ms: 86_400_000,
             }
         );
         assert_eq!((c.max_streams, c.disk_writers), (None, None));

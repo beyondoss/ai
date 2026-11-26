@@ -9,7 +9,7 @@
 //! only its intent on disk), `attach_after_decide=<file>` ([`park`]: an attach that has chosen its offset and
 //! registered its stream waits until the file goes), `attach_before_decide=<file>` (an attach that has looked its job
 //! up waits before it locks it), `sweep_after_save=exit` (the retention exits between its ledger write and its
-//! unlinks).
+//! unlinks), `ledger_slow=<ms>` (every write of the jobs ledger costs this long, the way a slow disk does).
 
 use std::path::PathBuf;
 use std::sync::OnceLock;

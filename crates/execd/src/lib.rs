@@ -92,11 +92,19 @@ pub const ENDED_OUTPUT_MS: u64 = 15 * 60 * 1000;
 /// The most output retained over ended jobs ([`Retention::bytes`]).
 pub const ENDED_BYTES: u64 = 256 * 1024 * 1024;
 
-/// The most ended entries a server holds ([`Retention::max`]).
-pub const ENDED_MAX: usize = 256;
+/// The most ended entries a server holds ([`Retention::max`]): 4096, one job every 21 seconds for a
+/// day, which is what makes [`ENDED_ENTRY_MS`] a clock a busy sandbox can rely on rather than one the
+/// ceiling undercuts. Measured cost of a full table (this host, release binary): 12-15 MiB of RSS
+/// against 7 MiB at 256, a 1.5 MB ledger, and 12-22 ms for the change that asked, the ledger being
+/// rewritten whole off the runtime (`benches/retention_scale.py`).
+pub const ENDED_MAX: usize = 4096;
 
-/// Default for [`Options::disk_writers`]: the blocking disk jobs (job output batches, a retention
-/// sweep) that run off the runtime at once.
+/// How long an ended job's entry is kept ([`Retention::entry_ms`]): 24 hours, so an unread result has
+/// a predictable lifetime ([`ENDED_MAX`] is then the backstop, not the deadline).
+pub const ENDED_ENTRY_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Default for [`Options::disk_writers`]: the blocking disk jobs (job output batches, the jobs
+/// ledger, a retention sweep's unlinks) that run off the runtime at once.
 pub const DISK_WRITERS: usize = 8;
 
 /// Descriptors one request in flight holds at most (measured on the binary: a stream or a one-shot
@@ -182,11 +190,11 @@ pub struct Retention {
     pub bytes: u64,
     /// `EXECD_JOBS_ENDED_MAX`: the most ended entries the table holds. Past it the oldest ended
     /// entry is reaped, with no clock involved: a flood of tiny jobs grows only entries. `0`:
-    /// unbounded. Default [`ENDED_MAX`] (256).
+    /// unbounded. Default [`ENDED_MAX`] (4096).
     pub max: usize,
     /// `EXECD_JOB_ENTRY_MS`: reap an ended job's entry, status included, this long after its end.
-    /// `0`: never, which is the default: reaping an entry is the only change here a client can
-    /// suffer (`404` on a reconnect), so it ships off.
+    /// `0`: never. Default [`ENDED_ENTRY_MS`] (24 h): an ended result's lifetime is then predictable,
+    /// and a client that reconnects later than that gets the defined `404`/`gone`, never a stream.
     pub entry_ms: u64,
 }
 
@@ -196,7 +204,7 @@ impl Default for Retention {
             output_ms: ENDED_OUTPUT_MS,
             bytes: ENDED_BYTES,
             max: ENDED_MAX,
-            entry_ms: 0,
+            entry_ms: ENDED_ENTRY_MS,
         }
     }
 }
@@ -290,10 +298,10 @@ pub struct Options {
     /// descriptors from running out under the requests execd already took. `None` (the default here,
     /// and `EXECD_MAX_STREAMS=0`) is no cap: the descriptor limit alone ends it.
     pub max_in_flight: Option<usize>,
-    /// At most this many jobs' output batches are written to disk at once, each on a thread off the
-    /// runtime; a job's batch beyond it waits its turn (its spool file holds what it wrote
-    /// meanwhile, and the job itself is never slowed). `0` writes on the runtime, as before this
-    /// existed (`EXECD_DISK_WRITERS=0`).
+    /// At most this many blocking disk jobs at once, each on a thread off the runtime: a job's
+    /// output batch, a write of the jobs ledger, a retention sweep's unlinks; one beyond it waits its
+    /// turn (a job's spool file holds what it wrote meanwhile, and a job that ended is not slowed).
+    /// `0` writes on the runtime, as before this existed (`EXECD_DISK_WRITERS=0`).
     pub disk_writers: usize,
     /// Out of descriptors, answer the connections waiting in the kernel's queue `503` with a spare
     /// descriptor ([`http::accept_loop`]). `false` (`EXECD_SHED_WHEN_OUT_OF_FDS=0`) leaves them
@@ -491,7 +499,7 @@ impl Ctx {
         self.activity.send_modify(|v| *v = v.wrapping_add(1));
     }
 
-    /// A turn for one blocking disk job — a job's output batch, a retention sweep's ledger write and
+    /// A turn for one blocking disk job — a job's output batch, a ledger write, a retention sweep's
     /// unlinks — of the [`Options::disk_writers`] allowed at once, or `None` when that is `0` (the
     /// caller then does its own thing, as before the bound existed). The one gate every off-loop
     /// disk job passes, so the threads are bounded however many jobs and sweeps want one; the
@@ -501,6 +509,53 @@ impl Ctx {
             return None;
         }
         self.disk_slots.acquire().await.ok()
+    }
+
+    /// Write the jobs ledger for a change of a job's life, off the runtime thread and holding one of
+    /// the `disk_writers` turns — the gate a job's output batch takes. The caller awaits it before it
+    /// answers, so the answer still promises what it promised when the write was inline: when a
+    /// `start` answers, the file names the job; when a `remove` answers, it does not. What changed is
+    /// where it runs: 1.5 MB of write and rename at a full table is minutes of nothing for the
+    /// requests this server exists to answer, and it no longer spends them on the runtime's thread.
+    ///
+    /// Ordering against another writer — a second life change, or a retention sweep's — is the
+    /// ledger's: `Ledger::save` takes the file's writer lock and only then snapshots the table, so
+    /// writes are serialized and the last file written is the last state snapshotted, whichever
+    /// thread wrote it. A write that was asked for earlier can never land over a newer one.
+    pub(crate) async fn save_jobs(self: &Arc<Self>) {
+        if !self.jobs.ledger().enabled() {
+            return;
+        }
+        if cfg!(feature = "mut_ledger_write_inline") {
+            self.jobs.save();
+            return;
+        }
+        let turn = self.disk_turn().await;
+        let me = self.clone();
+        proc::off_runtime(move || me.jobs.save()).await;
+        drop(turn);
+    }
+
+    /// [`Self::save_jobs`] for a keyed start's claim (K10): written, synced, renamed and its directory
+    /// synced on a disk-writer thread, and how that came out returned, so the start still refuses when
+    /// the claim is not on disk. A claim nobody wrote is a refusal, never a spawn.
+    pub(crate) async fn claim_jobs(self: &Arc<Self>) -> job_kernel::Persist {
+        let turn = self.disk_turn().await;
+        let me = self.clone();
+        let wrote = proc::off_runtime(move || Some(me.jobs.claim()))
+            .await
+            .unwrap_or(job_kernel::Persist::Failed);
+        drop(turn);
+        wrote
+    }
+
+    /// [`Self::save_jobs`] for a shutdown that ends every job: the ledger is emptied (`SIGTERM`), so
+    /// the next execd adopts nothing.
+    pub(crate) async fn forget_jobs(self: &Arc<Self>) {
+        let turn = self.disk_turn().await;
+        let me = self.clone();
+        proc::off_runtime(move || me.jobs.forget()).await;
+        drop(turn);
     }
 }
 
@@ -570,9 +625,9 @@ impl Handle {
             .at_shutdown(job_kernel::Kind::Job, stop)
             .record
         {
-            self.ctx.jobs.save();
+            self.ctx.save_jobs().await;
         } else {
-            self.ctx.jobs.forget();
+            self.ctx.forget_jobs().await;
         }
         self.ctx.spool.clean();
         self.reaper.cancel();

@@ -280,6 +280,9 @@ mut_retention_ignores_owed = [] # a job whose notify callback is owed is tombsto
 mut_retention_reaps_keyed = [] # a keyed job's entry, and its key's record (K8), is reaped
 mut_attach_registers_late = [] # an attach counts its stream after deciding to stream (the old order)
 mut_attach_ignores_removed = [] # an attach of a job taken after its lookup streams it anyway
+# Mutations of the ledger's write path and of recovery, used only by `tests/ledger.rs`'s red runs.
+mut_ledger_write_inline = [] # a change of a job's life writes the ledger on the runtime's thread
+mut_recover_scans_ended = [] # recovery asks `/proc` for every row, including one saved as ended
 # Mutations of `ring` (the crate `execd-ring`, which Verus proves), used only by `src/ring.rs`'s differential
 # test's red runs: each removes one guard.
 mut_window_before_base = [

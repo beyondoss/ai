@@ -365,6 +365,10 @@ impl Ledger {
 /// synced before the rename and the directory after, so a crash of the host leaves the old file or the new one, and
 /// a failure at any step is the caller's to see (the temporary is removed).
 fn write_atomic(dir: &Path, file: &File, durable: bool) -> std::io::Result<()> {
+    // A test's slow disk (`fault.rs`): every ledger write costs this long, on the thread that wrote it.
+    if let Some(ms) = crate::fault::at("ledger_slow").and_then(|v| v.parse::<u64>().ok()) {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
     let tmp = dir.join(format!("{FILE}.tmp"));
     let _ = fs::remove_file(&tmp);
     let put = || -> std::io::Result<()> {

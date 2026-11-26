@@ -2020,10 +2020,19 @@ fn production_calls_the_kernel() {
         assert!(prod.contains(needle), "jobs.rs no longer calls {needle}");
     }
     // K9, K10: a keyed start's claim is durable before anything is spawned, and the kernel says whether to spawn.
+    // The claim is written off the runtime and awaited (`Ctx::claim_jobs`, `Ledger::claim`), then given to the kernel's
+    // `launch`: the three steps stay in this order, and a claim nobody wrote still refuses the start.
+    let claim = prod
+        .find("Some(ctx.claim_jobs().await)")
+        .expect("a keyed start's claim is written");
     let intent = prod
-        .find("kernel::launch(idem.is_some().then(|| ctx.jobs.claim()))")
+        .find("kernel::launch(claim)")
         .expect("the keyed start's claim goes through the kernel's launch");
     let spawn = prod.find("proc::spawn(&mut cmd)").expect("the spawn");
+    assert!(
+        claim < intent,
+        "the claim is given to the kernel before it is written"
+    );
     assert!(intent < spawn, "the claim is saved after the spawn");
     // The table is the kernel's verified storage, not a map of the shell's.
     assert!(!prod.contains("HashMap<Key"), "jobs.rs keeps its own map");

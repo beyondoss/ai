@@ -227,7 +227,7 @@
 //! | `keep` | `id`, `num`, `kind`, `seen` | `{}` |
 //! | `seen` | `id`, `offset` | `{}` |
 //! | `kill` | `ids`, `remove`, `grace_ms` | `{"survivors": [{"id", "pids": [..]}]}` |
-//! | `list` | | `{"jobs": [{"id", "mark", "command", "args", "outputStart", "outputEnd", "state", "code", "signal"?, "kept", "num", "kind", "seen", "started", "ended", "label", "pty"?}]}` |
+//! | `list` | | `{"jobs": [{"id", "mark", "command", "args", "outputStart", "outputEnd", "state", "code", "signal"?, "kept", "num", "kind", "seen", "started", "ended", "label", "pty"?}], "more"?}`: `more` is the count of ended rows the answer left out (it lists the newest 512) |
 //! | `remove` | `ids`, `marks`? (`{id: mark}`) | `{"running": [ids], "mismatch": [ids]}`: a job whose group is not empty, or whose mark is not the one named, is left |
 //! | `wipe` | `grace_ms` | `{"survivors": [{"pids": [..]}]}` |
 //! | `write` | `id`, `at`, `data`, `eof` | `{"written": N, "closed"?: true}` |

@@ -141,9 +141,16 @@ impl Jobs {
         }
     }
 
+    /// The jobs ledger, for the paths that write it off the runtime ([`crate::Ctx::save_jobs`]).
+    pub(crate) fn ledger(&self) -> &Ledger {
+        &self.ledger
+    }
+
     /// Write the table's jobs to the ledger: every job that has a group and is not removed. Called
     /// with no job's lock held, at each change of a job's life (spawn, shell exit, end, keep,
-    /// removal); a no-op without [`crate::Options::state_dir`].
+    /// removal); a no-op without [`crate::Options::state_dir`]. Blocking, and the whole file: every
+    /// caller but recovery runs it off the runtime thread, holding a disk turn
+    /// ([`crate::Ctx::save_jobs`], the sweep).
     pub fn save(&self) {
         if !self.ledger.enabled() {
             return;
@@ -151,8 +158,9 @@ impl Jobs {
         self.ledger.save(|| self.entries());
     }
 
-    /// [`Self::save`] for a keyed start's claim: durable, and how it came out (K10).
-    fn claim(&self) -> Persist {
+    /// [`Self::save`] for a keyed start's claim: durable, and how it came out (K10). Blocking; a start
+    /// runs it off the runtime ([`crate::Ctx::claim_jobs`]).
+    pub(crate) fn claim(&self) -> Persist {
         self.ledger.claim(|| self.entries())
     }
 
@@ -272,13 +280,13 @@ impl Jobs {
 
     /// Take the `checked` jobs out of the table; their pumps and timers stop. A key that now holds
     /// another job than the one checked keeps it (J10).
-    fn remove(&self, checked: &[(Key, JobCell)]) {
+    async fn remove(&self, ctx: &Arc<Ctx>, checked: &[(Key, JobCell)]) {
         let cells = locked(&self.map).take(checked, Arc::ptr_eq);
         for sp in self.release(cells) {
             sp.remove();
         }
         self.bump();
-        self.save();
+        ctx.save_jobs().await;
     }
 
     /// The table's half of a removal, for cells already taken out of it: the kernel lets each go
@@ -512,6 +520,13 @@ const SWEEP_ACTIONS_MAX: usize = 64;
 /// The least the sweeper sleeps between two looks, so a job due but vetoed (or one the gate
 /// refused) can never spin.
 const SWEEP_MIN_SLEEP_MS: u64 = 50;
+
+/// The most ended rows one `list` answer carries ([`serve_op`]). An ended entry is cheap to keep and
+/// the ceiling lets a table hold thousands, while the answer is rebuilt on every reattach: past this
+/// many the newest are listed and the rest are only counted (`"more"`). At 4096 ended entries the
+/// answer would otherwise be 1.45 MB of output and 37 ms of the runtime thread, measured
+/// (`benches/retention_scale.py`).
+pub(crate) const LIST_ENDED_MAX: usize = 512;
 
 /// One pass of the retention: drop the output of the ended jobs the policy names, reap the entries
 /// it names, then — in **one** pass, off the runtime thread — write the ledger and delete every
@@ -1043,7 +1058,7 @@ async fn term_reader(
         stdin.dead.cancel();
         let _ = hung;
         ctx.jobs.bump();
-        ctx.jobs.save();
+        ctx.save_jobs().await;
     }
 }
 
@@ -1439,7 +1454,7 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq, data: Vec<u8>) -> 
             http::json_response(200, &json!({ "sent": sent }))
         }
         "resize" => resize_job(ctx, &job).await,
-        "keep" | "seen" => keep_or_seen(ctx, &job),
+        "keep" | "seen" => keep_or_seen(ctx, &job).await,
         "kill" | "wipe" => {
             let wipe = job.op == "wipe";
             let grace = Duration::from_millis(job.grace_ms.unwrap_or(300));
@@ -1476,7 +1491,7 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq, data: Vec<u8>) -> 
                         gone.push((k, c));
                     }
                 }
-                jobs.remove(&gone);
+                jobs.remove(ctx, &gone).await;
             }
             jobs.bump();
             http::json_response(200, &json!({ "survivors": survivors }))
@@ -1496,14 +1511,36 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq, data: Vec<u8>) -> 
                     Removal::Mismatch => mismatch.push(k.1),
                 }
             }
-            jobs.remove(&gone);
+            jobs.remove(ctx, &gone).await;
             http::json_response(200, &json!({ "running": running, "mismatch": mismatch }))
         }
         "list" => {
-            let list: Vec<Value> = jobs
-                .in_scope(&job.scope, Pick::All)
+            // Every job that has not ended answers in full; the ended ones past [`LIST_ENDED_MAX`]
+            // are counted, not listed. The newest rows are the ones kept: the count ceiling reaps the
+            // oldest first, and a client that reattaches wants what just happened. A table of 256
+            // ended entries — what the old ceiling held — is answered byte for byte as before, since
+            // `more` is absent unless rows were left out.
+            let cells = jobs.in_scope(&job.scope, Pick::All);
+            let mut ended: Vec<(u64, usize)> = Vec::new();
+            for (i, (_, cell)) in cells.iter().enumerate() {
+                let j = locked(cell);
+                if j.k.ended() {
+                    ended.push((j.k.ended_at(), i));
+                }
+            }
+            let mut dropped = vec![false; cells.len()];
+            if ended.len() > LIST_ENDED_MAX {
+                ended.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                for &(_, i) in &ended[LIST_ENDED_MAX..] {
+                    dropped[i] = true;
+                }
+            }
+            let more = ended.len().saturating_sub(LIST_ENDED_MAX);
+            let list: Vec<Value> = cells
                 .into_iter()
-                .map(|((_, id), c)| {
+                .enumerate()
+                .filter(|(i, _)| !dropped[*i])
+                .map(|(_, ((_, id), c))| {
                     let j = locked(&c);
                     let (state, code) = state_of(&j);
                     let mut entry = json!({
@@ -1528,7 +1565,11 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq, data: Vec<u8>) -> 
                     entry
                 })
                 .collect();
-            http::json_response(200, &json!({ "jobs": list }))
+            let mut body = json!({ "jobs": list });
+            if more > 0 {
+                body["more"] = json!(more);
+            }
+            http::json_response(200, &body)
         }
         other => {
             // An op this server does not implement: the embedder's, if it has a hook.
@@ -1606,13 +1647,13 @@ async fn resize_job(ctx: &Arc<Ctx>, job: &JobReq) -> Resp {
     {
         return http::error_response(409, "the terminal hung up");
     }
-    ctx.jobs.save();
+    ctx.save_jobs().await;
     http::json_response(200, &json!({ "cols": size.cols, "rows": size.rows }))
 }
 
 /// `keep` (the job is the endpoint's now, with its `notify`) and `seen` (how much output the model
 /// has been shown).
-fn keep_or_seen(ctx: &Arc<Ctx>, job: &JobReq) -> Resp {
+async fn keep_or_seen(ctx: &Arc<Ctx>, job: &JobReq) -> Resp {
     let keep = job.op == "keep";
     // notify: a `notify` that fails the grammar refuses the whole `keep`, before anything is
     // recorded (N4, N5). The reason never quotes the token.
@@ -1629,30 +1670,31 @@ fn keep_or_seen(ctx: &Arc<Ctx>, job: &JobReq) -> Resp {
     let Some(cell) = ctx.jobs.get(&key) else {
         return http::error_response(404, "no such job");
     };
-    let mut j = locked(&cell);
-    if keep {
-        kernel::step(
-            &mut j.k,
-            Ev::Keep {
-                num: job.num,
-                kind: job.kind.clone(),
-                seen: job.seen,
-            },
-        );
-        // The latest keep governs (N6): with notify it replaces the job's (and its proof abandons
-        // whatever was in flight), without it removes it.
-        let event = exec_notify::Event::Keep {
-            notify: notify.is_some(),
-        };
-        j.notify = notify;
-        notify::feed(ctx, &cell, &key, &mut j, event);
-    } else {
-        kernel::step(&mut j.k, Ev::Seen { offset: job.offset });
+    {
+        let mut j = locked(&cell);
+        if keep {
+            kernel::step(
+                &mut j.k,
+                Ev::Keep {
+                    num: job.num,
+                    kind: job.kind.clone(),
+                    seen: job.seen,
+                },
+            );
+            // The latest keep governs (N6): with notify it replaces the job's (and its proof abandons
+            // whatever was in flight), without it removes it.
+            let event = exec_notify::Event::Keep {
+                notify: notify.is_some(),
+            };
+            j.notify = notify;
+            notify::feed(ctx, &cell, &key, &mut j, event);
+        } else {
+            kernel::step(&mut j.k, Ev::Seen { offset: job.offset });
+        }
     }
-    drop(j);
     if keep {
         ctx.jobs.bump_activity();
-        ctx.jobs.save();
+        ctx.save_jobs().await;
     }
     http::json_response(200, &json!({}))
 }
@@ -1895,17 +1937,21 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
     // A keyed start's claim is durable before anything is spawned (K9, K10): a crash from here to the group's save
     // leaves an intent a restart answers as lost, never a start to run again. A claim that cannot be written is a
     // start that does not run: the kernel says which refusal, and the retry, once the disk takes it, starts.
-    match kernel::launch(idem.is_some().then(|| ctx.jobs.claim())) {
+    let claim = match idem.is_some() {
+        true => Some(ctx.claim_jobs().await),
+        false => None,
+    };
+    match kernel::launch(claim) {
         Launch::Spawn => {}
         Launch::DiskFull => {
-            ctx.jobs.remove(&[(key, cell)]);
+            ctx.jobs.remove(ctx, &[(key, cell)]).await;
             return http::error_response(
                 507,
                 "the sandbox's disk is full: no room to record the start",
             );
         }
         Launch::Failed => {
-            ctx.jobs.remove(&[(key, cell)]);
+            ctx.jobs.remove(ctx, &[(key, cell)]).await;
             return http::error_response(500, "cannot record the start");
         }
     }
@@ -1954,7 +2000,7 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
                 tail = Some((t, journal));
             }
             Err(e) => {
-                ctx.jobs.remove(&[(key, cell.clone())]);
+                ctx.jobs.remove(ctx, &[(key, cell.clone())]).await;
                 crate::log_warn!("cannot make a job's spool: {e}");
                 let (status, why) = spool_failure(&e);
                 return http::error_response(status, why);
@@ -1966,7 +2012,7 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
             match launch_term(ctx, req, &mut cmd, size, out, dir).await {
                 Ok(t) => Lead::Term(t),
                 Err((status, why)) => {
-                    ctx.jobs.remove(&[(key, cell.clone())]);
+                    ctx.jobs.remove(ctx, &[(key, cell.clone())]).await;
                     return http::error_response(status, why);
                 }
             }
@@ -1974,7 +2020,7 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
         _ => match proc::spawn(&mut cmd) {
             Ok(p) => Lead::Proc(p),
             Err(e) => {
-                ctx.jobs.remove(&[(key, cell.clone())]);
+                ctx.jobs.remove(ctx, &[(key, cell.clone())]).await;
                 let (_, why) = exec::spawn_failure(ctx, req, &e);
                 return http::error_response(500, why.trim_end());
             }
@@ -2010,7 +2056,7 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
         link.send(&term::resize_frame(*size)).await;
     }
     ctx.jobs.bump_activity();
-    ctx.jobs.save();
+    ctx.save_jobs().await;
 
     let tail = tail.map(|(t, journal)| Tailing::start(ctx, &cell, t, journal));
     match lead {
@@ -2508,7 +2554,7 @@ async fn supervise_after(
             }
         }
         ctx.jobs.bump();
-        ctx.jobs.save();
+        ctx.save_jobs().await;
         loop {
             let wake = exits.next().await;
             if proc::job_gone(pgid, &mark, wake == proc::Wake::Tick).await {
@@ -2549,7 +2595,7 @@ async fn supervise_after(
         ctx.groups.remove(*g);
     }
     ctx.jobs.bump();
-    ctx.jobs.save();
+    ctx.save_jobs().await;
     if ended {
         ctx.jobs.wake_retention();
     }
@@ -2568,7 +2614,7 @@ pub(crate) fn recover(ctx: &Arc<Ctx>) {
     let base = spool_base(ctx);
     let mut adopted: Vec<std::path::PathBuf> = Vec::new();
     for e in ctx.jobs.ledger.load() {
-        let alive = !proc::job_members(saved_pgid(&e), &e.mark).is_empty();
+        let alive = may_be_alive(e.phase) && !proc::job_members(saved_pgid(&e), &e.mark).is_empty();
         // A terminal's keeper, asked while its group lives: it answers (and is the keeper this
         // execd must trust: its pid and uid are checked) or it is gone, and it may have left the
         // shell's status.
@@ -2763,6 +2809,8 @@ pub(crate) fn recover(ctx: &Arc<Ctx>) {
         Spool::retain(base, &keep);
     }
     ctx.jobs.bump_activity();
+    // Inline, unlike every other life change: this is the start of the process, before the server
+    // accepts anything, and the machine has one write to do.
     ctx.jobs.save();
     // A recovered ended job is a candidate for the retention at once: its deadline may be long past.
     ctx.jobs.wake_retention();
@@ -2846,6 +2894,18 @@ fn saved_pgid(e: &Entry) -> i32 {
     e.state().pgid()
 }
 
+/// Whether recovery must look for a row's processes at all: only a row that can still have them.
+///
+/// A row saved as `ended` cannot: a job ends only when its group and every process carrying its mark
+/// are gone, and no process can take the mark afterwards, so its `alive` is false by construction. And
+/// `execd_jobs::recover` ignores it for that phase anyway (an ended state comes back `Restore`,
+/// unchanged) — so recovery would scan `/proc` once per row, 4096 times for a full table, to be told
+/// what the phase already says. Measured at 4096 rows: 63,000 `/proc` opens, 7.0 s of start on an
+/// 86-process host, and it scales with the host's process count.
+fn may_be_alive(phase: Saved) -> bool {
+    phase != Saved::Ended || cfg!(feature = "mut_recover_scans_ended")
+}
+
 /// [`supervise`] for a job a previous execd started: not our child, so no status arrives. Wait for
 /// its group to empty and end it with what the kernel was given: the shell's saved status, else
 /// the lost one.
@@ -2893,7 +2953,7 @@ async fn supervise_adopted(
     }
     ctx.groups.remove(pg);
     ctx.jobs.bump();
-    ctx.jobs.save();
+    ctx.save_jobs().await;
 }
 
 /// The job a stream attached to, while the table still holds that very job under `key`: a removed
@@ -3117,6 +3177,22 @@ mod spool_failure_tests {
         assert!(spool_failure(&full).1.contains("disk is full"));
         let other = std::io::Error::from_raw_os_error(13) /* EACCES */;
         assert_eq!(spool_failure(&other).0, 500);
+    }
+}
+
+#[cfg(test)]
+mod recovery_scan_tests {
+    use super::*;
+
+    /// Recovery asks `/proc` only for the rows that can still have processes. An `ended` row is what a
+    /// full table is made of, and its answer is not just useless but already known: delete the
+    /// exception and recovery spends one scan of every process per ended row.
+    #[test]
+    fn only_a_row_that_can_still_have_processes_is_asked_for_them() {
+        for phase in [Saved::Spawning, Saved::Running, Saved::Exited] {
+            assert!(may_be_alive(phase), "{phase:?} must be looked for");
+        }
+        assert!(!may_be_alive(Saved::Ended), "an ended row is never scanned");
     }
 }
 
