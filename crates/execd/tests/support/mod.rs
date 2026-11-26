@@ -78,21 +78,52 @@ impl Execd {
     /// [`Self::start`], launched the way `cmd &` or `nohup` launches it: the signals named in
     /// `ignoring` (`HUP INT QUIT ...`) are `SIG_IGN` in the process execd starts as.
     pub fn start_ignoring(ignoring: &str) -> Self {
-        Self::start_launched(Some(ignoring), ports::CHILD_LISTEN, &[], &[])
+        Self::start_launched(
+            Some(&format!("trap '' {ignoring}")),
+            ports::CHILD_LISTEN,
+            &[],
+            &[],
+        )
+    }
+
+    /// [`Self::start`], launched by a shell whose soft `RLIMIT_NOFILE` is `soft`, as a stock shell
+    /// hands it over.
+    pub fn start_with_soft_nofile(soft: u32) -> Self {
+        Self::start_launched(
+            Some(&format!("ulimit -Sn {soft}")),
+            ports::CHILD_LISTEN,
+            &[],
+            &[],
+        )
+    }
+
+    /// [`Self::start`] with `settings`, launched by a shell that runs `prelude` first.
+    pub fn start_launched_with(prelude: &str, settings: &[(&str, &str)]) -> Self {
+        Self::start_launched(Some(prelude), ports::CHILD_LISTEN, settings, &[])
+    }
+
+    /// [`Self::start`], launched by a shell with both `RLIMIT_NOFILE` limits set.
+    pub fn start_with_nofile(soft: u32, hard: u32) -> Self {
+        Self::start_launched(
+            Some(&format!("ulimit -Sn {soft}; ulimit -Hn {hard}")),
+            ports::CHILD_LISTEN,
+            &[],
+            &[],
+        )
     }
 
     fn start_launched(
-        ignoring: Option<&str>,
+        shell: Option<&str>,
         listen: &str,
         settings: &[(&str, &str)],
         env: &[(&str, &str)],
     ) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let mut cmd = match ignoring {
+        let mut cmd = match shell {
             None => Command::new(BIN),
-            Some(sigs) => {
+            Some(prelude) => {
                 let mut c = Command::new("sh");
-                c.args(["-c", &format!("trap '' {sigs}; exec \"$0\""), BIN]);
+                c.args(["-c", &format!("{prelude}; exec \"$0\""), BIN]);
                 c
             }
         };

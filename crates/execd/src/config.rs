@@ -27,6 +27,15 @@ pub struct Config {
     /// `EXECD_JOB_OUTPUT_MS`, `EXECD_JOBS_ENDED_BYTES`, `EXECD_JOBS_ENDED_MAX`, `EXECD_JOB_ENTRY_MS`:
     /// how long an ended job keeps its output and its entry (see `Options::retention`).
     pub retention: execd::Retention,
+    /// `EXECD_MAX_STREAMS`: unset sizes the cap from the descriptor limit, `0` is no cap, `N` is N.
+    pub max_streams: Option<usize>,
+    /// `EXECD_DISK_WRITERS`: unset is [`crate::DISK_WRITERS`], `0` does blocking disk work on the
+    /// runtime.
+    pub disk_writers: Option<usize>,
+    /// `EXECD_RAISE_NOFILE`: raise the soft `RLIMIT_NOFILE` to the hard limit at start (default 1).
+    pub raise_nofile: bool,
+    /// `EXECD_SHED_WHEN_OUT_OF_FDS`: see `Options::shed_when_out_of_fds` (default 1).
+    pub shed_when_out_of_fds: bool,
     pub log_level: Level,
     pub worker_threads: usize,
     pub idle_timeout: Option<Duration>,
@@ -48,6 +57,10 @@ execd takes no arguments; it is configured by environment variables:
   EXECD_STATE_DIR                 where the jobs ledger and each job's output files are kept, so a restart (SIGHUP) of execd leaves its jobs running and finds them; a stop (SIGTERM) always ends them (default none: a restart kills them too; use a tmpfs directory)
   EXECD_LOG                       off, error, warn, info, debug or trace (default info)
   EXECD_WORKER_THREADS            1 (default) one thread, 0 a worker per CPU, N workers
+  EXECD_MAX_STREAMS               the most requests in flight, each over its limit answered 503: unset sizes it from the descriptor limit, 0 no cap
+  EXECD_DISK_WRITERS              blocking disk jobs at once off the runtime: job output batches and a retention sweep (default 8); 0 does them on the runtime
+  EXECD_RAISE_NOFILE              1|true|0|false: raise the soft open file limit to the hard limit at start (default 1)
+  EXECD_SHED_WHEN_OUT_OF_FDS      1|true|0|false: out of descriptors, answer waiting connections 503 instead of leaving them queued (default 1)
   EXECD_IDLE_TIMEOUT_MS           close a connection with no request in flight for this long; 0 (default) never
   EXECD_JOB_OUTPUT_MS             drop an ended job's output this long after its end, keeping its status (default 900000 = 15 min; 0 never)
   EXECD_JOBS_ENDED_BYTES          the most output retained over ended jobs; past it the oldest is dropped first (default 268435456 = 256 MiB; 0 unbounded)
@@ -96,6 +109,15 @@ pub fn parse<E: Fn(&str) -> Option<String>>(env: E) -> Result<Config, String> {
                 .unwrap_or(execd::ENDED_MAX),
             entry_ms: number::<u64>("EXECD_JOB_ENTRY_MS", get("EXECD_JOB_ENTRY_MS"))?.unwrap_or(0),
         },
+        max_streams: number("EXECD_MAX_STREAMS", get("EXECD_MAX_STREAMS"))?,
+        disk_writers: number("EXECD_DISK_WRITERS", get("EXECD_DISK_WRITERS"))?,
+        raise_nofile: get("EXECD_RAISE_NOFILE").is_none()
+            || boolean("EXECD_RAISE_NOFILE", get("EXECD_RAISE_NOFILE"))?,
+        shed_when_out_of_fds: get("EXECD_SHED_WHEN_OUT_OF_FDS").is_none()
+            || boolean(
+                "EXECD_SHED_WHEN_OUT_OF_FDS",
+                get("EXECD_SHED_WHEN_OUT_OF_FDS"),
+            )?,
         log_level: match get("EXECD_LOG") {
             None => Level::Info,
             Some(s) => Level::parse(&s).ok_or_else(|| {
@@ -143,6 +165,8 @@ mod tests {
                 entry_ms: 0,
             }
         );
+        assert_eq!((c.max_streams, c.disk_writers), (None, None));
+        assert!(c.raise_nofile && c.shed_when_out_of_fds);
     }
 
     /// Each retention knob is read, and `0` for all four is off (`Retention::enabled` is false):
@@ -183,6 +207,21 @@ mod tests {
             let e = cfg(&[(k, "-1")]).unwrap_err();
             assert!(e.contains(k), "{e}");
         }
+    }
+
+    /// The request cap and the disk writer count are read, and `0` for each is that gate off.
+    #[test]
+    fn the_descriptor_and_writer_knobs_turn_off_with_zero() {
+        let c = cfg(&[
+            ("EXECD_MAX_STREAMS", "0"),
+            ("EXECD_DISK_WRITERS", "0"),
+            ("EXECD_RAISE_NOFILE", "0"),
+            ("EXECD_SHED_WHEN_OUT_OF_FDS", "false"),
+        ])
+        .unwrap();
+        assert_eq!((c.max_streams, c.disk_writers), (Some(0), Some(0)));
+        assert!(!c.raise_nofile && !c.shed_when_out_of_fds);
+        assert!(cfg(&[("EXECD_RAISE_NOFILE", "maybe")]).is_err());
     }
 
     #[test]

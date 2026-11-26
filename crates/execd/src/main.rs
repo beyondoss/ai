@@ -78,6 +78,45 @@ fn runtime(worker_threads: usize) -> std::io::Result<tokio::runtime::Runtime> {
     b.enable_all().build()
 }
 
+/// Raise the soft `RLIMIT_NOFILE` to the hard limit and say what it came to. A connection and a
+/// stream each hold several descriptors (the socket, the spool files, the watches), and the 1024 a
+/// shell usually hands over runs out at a few hundred streams. Idempotent: at the hard limit already
+/// (or unlimited) nothing is set. A refusal leaves the inherited limit, which is what the process
+/// had anyway; the new limit is inherited by the commands execd starts.
+fn raise_open_file_limit(enabled: bool) -> Option<u64> {
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+    let Rlimit { current, maximum } = getrlimit(Resource::Nofile);
+    let show = |l: Option<u64>| l.map_or_else(|| "unlimited".to_string(), |n| n.to_string());
+    let raise = match (current, maximum) {
+        (Some(soft), Some(hard)) => soft < hard,
+        (Some(_), None) => true,
+        (None, _) => false,
+    };
+    if !enabled || !raise {
+        execd::log_info!("open file limit soft={} (unchanged)", show(current));
+        return current;
+    }
+    match setrlimit(
+        Resource::Nofile,
+        Rlimit {
+            current: maximum,
+            maximum,
+        },
+    ) {
+        Ok(()) => execd::log_info!(
+            "open file limit raised soft={} -> {}",
+            show(current),
+            show(maximum)
+        ),
+        Err(e) => execd::log_warn!(
+            "cannot raise the open file limit soft={} hard={}: {e}",
+            show(current),
+            show(maximum)
+        ),
+    }
+    getrlimit(Resource::Nofile).current
+}
+
 /// The bearer a previous image of this process left in a descriptor, read and closed.
 fn take_inherited_bearer() -> Option<String> {
     let fd: i32 = std::env::var(BEARER_FD).ok()?.parse().ok()?;
@@ -136,6 +175,7 @@ fn main() -> ExitCode {
     }
     let inherited = take_inherited_bearer();
     execd::log::set_level(cli.log_level);
+    let soft_nofile = raise_open_file_limit(cli.raise_nofile);
     let runtime = match runtime(cli.worker_threads) {
         Ok(r) => r,
         Err(e) => {
@@ -143,7 +183,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match runtime.block_on(run(cli, inherited)) {
+    match runtime.block_on(run(cli, inherited, soft_nofile)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             execd::log_error!("execd failed: {e}");
@@ -164,7 +204,11 @@ async fn listens_on_loopback(listen: &str) -> std::io::Result<bool> {
     Ok(any)
 }
 
-async fn run(cli: Config, inherited: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(
+    cli: Config,
+    inherited: Option<String>,
+    soft_nofile: Option<u64>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let bearer = bearer(&cli, inherited)?;
     let root = match &cli.root {
         Some(r) => r.clone(),
@@ -206,6 +250,17 @@ async fn run(cli: Config, inherited: Option<String>) -> Result<(), Box<dyn std::
     opts.state_dir = cli.state_dir.clone();
     opts.terminals_max = cli.terminals_max;
     opts.retention = cli.retention;
+    opts.max_in_flight = match cli.max_streams {
+        None => execd::stream_limit(soft_nofile),
+        Some(0) => None,
+        Some(n) => Some(n),
+    };
+    opts.disk_writers = cli.disk_writers.unwrap_or(execd::DISK_WRITERS);
+    opts.shed_when_out_of_fds = cli.shed_when_out_of_fds;
+    match opts.max_in_flight {
+        Some(n) => execd::log_info!("at most {n} requests in flight, then 503"),
+        None => execd::log_info!("no cap on requests in flight"),
+    }
     let secured = bearer.is_some();
     opts.bearer = bearer;
     opts.insecure_no_auth = cli.insecure_no_auth;

@@ -49,7 +49,7 @@ use crate::ledger::{Entry, Idem, Ledger, Saved};
 use crate::notify::{self, Notifier, NotifyTarget};
 use crate::proc::{self, locked};
 use crate::ring::Ring;
-use crate::tail::{Journal, Spool, Start, Tail};
+use crate::tail::{self, Drained, Journal, Spool, Start, Tail};
 use crate::term;
 use crate::{Ctx, Retention, StreamEnd, StreamStart};
 
@@ -2250,7 +2250,7 @@ fn spool_base(ctx: &Ctx) -> &crate::spool::Base {
 struct Tailing {
     ctx: Arc<Ctx>,
     cell: JobCell,
-    tail: tokio::sync::Mutex<Tail>,
+    tail: Mutex<Tail>,
     /// The unfinished chunk, on disk beside the ring ([`Journal`]).
     journal: Mutex<Journal>,
     done: tokio_util::sync::CancellationToken,
@@ -2267,7 +2267,7 @@ impl Tailing {
         let t = Arc::new(Self {
             ctx: ctx.clone(),
             cell: cell.clone(),
-            tail: tokio::sync::Mutex::new(tail),
+            tail: Mutex::new(tail),
             journal: Mutex::new(journal),
             done: tokio_util::sync::CancellationToken::new(),
         });
@@ -2291,23 +2291,82 @@ impl Tailing {
     }
 
     /// Read what the files hold into the ring. `false`: the job was removed, so nothing is kept.
-    async fn flush(&self) -> bool {
-        let mut tail = self.tail.lock().await;
-        tail.drain(|data, stderr| {
-            {
+    ///
+    /// With `disk_writers` > 0 the reads and every disk write behind them (chunks, journal,
+    /// punching) run off the runtime, a batch of [`tail::ROUNDS`] rounds at a time, each batch
+    /// holding one of `disk_writers` permits, so a slow disk stalls this job's tail and nobody else
+    /// and the threads are bounded however many jobs write. A batch that finds no permit waits for
+    /// one (logged at debug). With `0` it is what ran before: one round at a time on the runtime,
+    /// yielding between rounds.
+    async fn flush(self: &Arc<Self>) -> bool {
+        let threaded = self.ctx.opts.disk_writers > 0;
+        loop {
+            let drained = if threaded {
+                let slot = match self.ctx.disk_slots.try_acquire() {
+                    Ok(slot) => slot,
+                    Err(_) => {
+                        crate::log_debug!("tail waits for a writer slot");
+                        match self.ctx.disk_slots.acquire().await {
+                            Ok(slot) => slot,
+                            // Closed only with the server, which never happens.
+                            Err(_) => return false,
+                        }
+                    }
+                };
+                let this = self.clone();
+                let drained = proc::off_runtime(move || this.drain_batch(tail::ROUNDS)).await;
+                drop(slot);
+                drained
+            } else {
+                self.drain_batch(1)
+            };
+            match drained {
+                Drained::More if threaded => {}
+                Drained::More => tokio::task::yield_now().await,
+                Drained::Idle => return true,
+                Drained::Stopped => return false,
+            }
+        }
+    }
+
+    fn drain_batch(&self, rounds: usize) -> Drained {
+        let mut tail = locked(&self.tail);
+        let mut gated = false;
+        tail.drain_batch(rounds, |data, stderr| {
+            if !gated {
+                gated = true;
+                tail_gate();
+            }
+            let tail_len = {
                 let mut j = locked(&self.cell);
                 if kernel::step(&mut j.k, Ev::Push) == Act::Discard {
                     return false;
                 }
                 j.out.push(data, stderr);
-                // Before the spool's bytes are returned (the drain punches after this returns).
-                locked(&self.journal).record(stderr, data, j.out.tail_len());
-            }
+                j.out.tail_len()
+            };
+            // Before the spool's bytes are returned (the batch punches after this returns).
+            locked(&self.journal).record(stderr, data, tail_len);
             self.ctx.jobs.bump();
             true
         })
-        .await
     }
+}
+
+/// The test seam for a slow disk (`EXECD_TEST_FAULT` `tail_gate=<dir>`, debug builds only): a batch
+/// with output to write holds here, with a file `<dir>/held-<n>` naming it, for as long as
+/// `<dir>/closed` exists. A disk that never answers, released when the test says.
+fn tail_gate() {
+    let Some(dir) = crate::fault::at("tail_gate").map(std::path::PathBuf::from) else {
+        return;
+    };
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let held = dir.join(format!("held-{}", NEXT.fetch_add(1, Ordering::Relaxed)));
+    let _ = std::fs::write(&held, b"");
+    while dir.join("closed").exists() {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let _ = std::fs::remove_file(held);
 }
 
 /// The job's life: wait for the shell, report `shell_exit` if its group lives on, wait for the

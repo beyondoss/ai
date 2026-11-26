@@ -271,12 +271,17 @@ impl Tail {
         [self.streams[0].off, self.streams[1].off]
     }
 
-    /// Read both files to their ends, a buffer from each in turn so neither starves the other, and
-    /// hand each piece to `sink` (`stderr` for the `err` file). `sink` returns `false` to stop (the
-    /// job is gone); then so does this. Yields to the runtime after every round, so a job
-    /// writing flat out cannot hold the one thread.
-    pub async fn drain(&mut self, mut sink: impl FnMut(&[u8], bool) -> bool) -> bool {
-        loop {
+    /// Read both files, a buffer from each in turn so neither starves the other, and hand each
+    /// piece to `sink` (`stderr` for the `err` file). `sink` returns `false` to stop (the job is
+    /// gone); then so does this. At most `rounds` rounds per call, so a job writing flat out gives
+    /// the caller a turn between batches. Blocking: the sink writes the ring's chunks and journal,
+    /// and this punches the files.
+    pub fn drain_batch(
+        &mut self,
+        rounds: usize,
+        mut sink: impl FnMut(&[u8], bool) -> bool,
+    ) -> Drained {
+        for _ in 0..rounds {
             let mut any = false;
             for (i, s) in self.streams.iter_mut().enumerate() {
                 let n = match s.file.read_at(&mut self.buf, s.off) {
@@ -290,17 +295,32 @@ impl Tail {
                 any = true;
                 s.off += n as u64;
                 if !sink(&self.buf[..n], i == 1) {
-                    return false;
+                    return Drained::Stopped;
                 }
                 s.punch(&mut self.warned);
             }
             if !any {
-                return true;
+                return Drained::Idle;
             }
-            tokio::task::yield_now().await;
         }
+        Drained::More
     }
 }
+
+/// How [`Tail::drain_batch`] ended. `Stopped` is also what a panicking batch counts as.
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+pub enum Drained {
+    /// The sink refused a piece: the job is gone.
+    #[default]
+    Stopped,
+    /// Both files are read to their ends.
+    Idle,
+    /// The batch used its rounds up; there may be more.
+    More,
+}
+
+/// Rounds of reading per [`Tail::drain_batch`] call off the runtime: at most 2 x 16 x 64 KiB.
+pub const ROUNDS: usize = 16;
 
 impl Drop for Tail {
     fn drop(&mut self) {

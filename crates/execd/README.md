@@ -104,6 +104,10 @@ error that names the variable and the value (exit 2), and so is any argument: ex
 | `EXECD_JOBS_ENDED_BYTES`   | 256 MiB                                            | the most output kept over ended jobs; past it the oldest's output is dropped first; 0 unbounded                                                                                                                                                                                  |
 | `EXECD_JOBS_ENDED_MAX`     | 256                                                | the most ended jobs kept; past it the oldest reapable entry is reaped (never a keyed job, one with a stream, or one owed a callback); 0 unbounded                                                                                                                                |
 | `EXECD_JOB_ENTRY_MS`       | 0 (off)                                            | reap an ended job's entry, status included, this long after its end                                                                                                                                                                                                              |
+| `EXECD_MAX_STREAMS`        | sized from `RLIMIT_NOFILE`                          | the most requests in flight; one more is answered `503` with `retry-after`. `0` is no cap |
+| `EXECD_DISK_WRITERS`       | `8`                                                | blocking disk jobs off the runtime at once (job output batches and a retention sweep). `0` does them on the runtime |
+| `EXECD_RAISE_NOFILE`       | `1`                                                | raise the soft `RLIMIT_NOFILE` to the hard limit at start; `0` leaves the inherited one |
+| `EXECD_SHED_WHEN_OUT_OF_FDS` | `1`                                              | out of descriptors, answer the connections waiting in the kernel's queue `503`; `0` leaves them waiting, as before |
 
 ## The heartbeat interval
 
