@@ -313,6 +313,11 @@ mut_ranges_unbounded = [
 mut_flush_fail_base = [
   "beyond-execd-ring/mut_flush_fail_base",
 ]
+# Mutations of the ring's chunk layout (one packed file per job), used only by `src/ring.rs` and
+# `tests/pack.rs`: each deletes one protection, and its test goes red.
+mut_pack_keeps_short_tail = [] # recovery counts a stride the crash cut short as a whole chunk
+mut_pack_ignores_punch_probe = [] # the pack is used where the filesystem cannot punch (eviction frees nothing)
+mut_pack_stride_overlap = [] # a chunk's stderr bits start where the next chunk's bytes do
 # Mutations of the wire kernel (the crate `execd-wire`, which Verus proves): the one-shot headers test, the
 # stream heartbeat test and the job escape test go red under them.
 mut_beat_late = [

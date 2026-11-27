@@ -496,6 +496,16 @@ pub(crate) struct Ctx {
 }
 
 impl Ctx {
+    /// How this server keeps a job's held chunks on disk: the pack when it was asked for and the
+    /// jobs directory's filesystem can punch a hole, one file per chunk otherwise.
+    pub fn ring_layout(&self) -> crate::ring::Layout {
+        if self.spool.pack() {
+            crate::ring::Layout::Pack
+        } else {
+            crate::ring::Layout::PerChunk
+        }
+    }
+
     pub fn activity_changed(&self) {
         self.activity.send_modify(|v| *v = v.wrapping_add(1));
     }
