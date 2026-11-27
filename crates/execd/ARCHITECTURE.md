@@ -16,7 +16,7 @@ variables alone ([Configuration](#configuration)).
 | `src/main.rs`       | the binary: bearer sources and the environment scrub, fail-closed start, subreaper, signals                                                                                                   |
 | `src/config.rs`     | the binary's settings: every `EXECD_*` variable, parsed once at startup, and the usage text                                                                                                   |
 | `src/log.rs`        | the logger: one text line per event to stderr, level via `EXECD_LOG` / `log::set_level`, no subscriber                                                                                        |
-| `src/fault.rs`      | the test knob `EXECD_TEST_FAULT` (debug builds only): where a keyed start's claim write fails or execd exits after the spawn                                                                  |
+| `src/fault.rs`      | the test knob `EXECD_TEST_FAULT` (debug builds only): where a keyed start's claim write fails, where execd exits after the spawn, where the ledger's append is cut short or its fold is split |
 | `src/runas.rs`      | `EXECD_RUN_AS`: resolving the user, proving execd can switch, the switch helper                                                                                                               |
 | `src/admit.rs`      | the count of requests in flight and its admission against `max_in_flight` (one compare-and-swap; loom models)                                                                                 |
 | `src/http.rs`       | hyper (HTTP/1.1 and h2c), routing, `/livez`, the bearer check, the request limit, the log line                                                                                                |
@@ -31,7 +31,7 @@ variables alone ([Configuration](#configuration)).
 | `src/proc.rs`       | spawning, the reaper that collects every child, process groups by syscall, the subreaper                                                                                                      |
 | `src/spool.rs`      | the jobs directory: where a kept job's retained output lives as chunk files, and stale-directory cleanup                                                                                      |
 | `src/tail.rs`       | a job's output spool: the two `O_APPEND` files its stdout and stderr go to, execd's tail of them (woken by one `inotify`), and the spool's directory                                          |
-| `src/ledger.rs`     | the jobs ledger: the one typed value kept across a restart of execd, written whole and read at start                                                                                          |
+| `src/ledger.rs`     | the jobs ledger: the one typed value kept across a restart of execd — the table as one file and a log of the changes since, appended per life change and folded when it outgrows the table    |
 | `src/frame.rs`      | streaming frame encoding                                                                                                                                                                      |
 
 ## Configuration
@@ -39,7 +39,7 @@ variables alone ([Configuration](#configuration)).
 execd has no command-line flags. It is configured by `EXECD_*` environment variables, each read once at startup in
 `src/config.rs` and nowhere else: `EXECD_LISTEN`, `EXECD_ROOT`, `EXECD_HOME`, `EXECD_BEARER_FILE`, `EXECD_BEARER`,
 `EXECD_INSECURE_NO_AUTH`, `EXECD_RUN_AS`, `EXECD_MAX_RESPONSE_BYTES`, `EXECD_JOBS_DIR`, `EXECD_STATE_DIR`,
-`EXECD_LOG`, `EXECD_WORKER_THREADS`, `EXECD_IDLE_TIMEOUT_MS`, and the four retention knobs `EXECD_JOB_OUTPUT_MS`,
+`EXECD_LOG`, `EXECD_WORKER_THREADS`, `EXECD_IDLE_TIMEOUT_MS`, `EXECD_DISK_WRITERS`, and the four retention knobs `EXECD_JOB_OUTPUT_MS`,
 `EXECD_JOBS_ENDED_BYTES`, `EXECD_JOBS_ENDED_MAX` and `EXECD_JOB_ENTRY_MS` (the table is in the README; see "Ended jobs: retention"). A value that does not parse is an error
 naming the variable and the value, with exit status 2; a boolean is `1`, `true`, `0` or `false`; an empty variable is unset.
 Any argument other than the internal `--execd-run-as-helper` re-exec marker (handled before anything else) prints the variable
@@ -161,7 +161,7 @@ sent one and got no echo fails closed with `not_offered`; a held start streams t
 digest is kept, never the env, which can hold secrets, and the label and the id are not in it.
 
 _Where the record lives, and how long._ The key's record (`Rec`: scope, key, id, digest) is the table's, written under its lock with the entry
-(K7), saved in the job's ledger entry (`Idem`, `execd-jobs.json`, a field the version-1 file already ignores) and put back by `recover` for
+(K7), saved in the job's ledger entry (`Idem`, `execd-jobs.json`, a field older files do not carry) and put back by `recover` for
 every job it brings back (K6, `keeps_record`), so a retry after a restart of execd replays. It leaves only with its job, in `Table::take`
 (K8: exactly that job's records, no other's, never one a successor of the id could be mistaken for). The retention (see "Ended jobs:
 retention") drops a keyed job's _output_ like anyone's, and never its _entry_: no ceiling, clock or budget reaps a keyed job, so a job
@@ -187,7 +187,9 @@ _The replay's wait (K14, K15)._ A replay that arrives while the original is stil
 and how many polls were made. A job that has a group or has ended is always answered; a refusal is only for a job that never started, and the wait is bounded.
 
 _Test knob._ `EXECD_TEST_FAULT` (a debug build only) names a file whose lines `claim_save=full|eio` and `after_spawn=exit` make the claim's write fail or
-execd exit between the spawn and the group's save; removing the file clears the fault. It is read in `fault.rs` alone.
+execd exit between the spawn and the group's save, `sweep_after_save=exit` and `ledger_slow=<ms>` a retention sweep's crash window and a ledger write
+that costs that long, and `ledger_append_crash=<n>`, `ledger_fold=1` and `ledger_fold_crash=exit` a ledger record cut short, a forced fold and the crash
+between a fold's two files; removing the file clears the fault. It is read in `fault.rs` alone.
 
 **Output streams.** (`src/ring.rs` does the I/O; which offsets are held, where a read starts, which chunks retention drops and which bytes are stderr are the Verus-proven kernel `crates/execd-ring`, R1 to R6 in its docs, and `ring.rs`'s tests hold the whole to a plain `Vec` under random pushes, reads and refused chunks.) The ring keeps which pipe each byte came from, one bit per byte: an in-memory bitmap for the unfinished tail,
 allocated at the job's first stderr byte, and a `<chunk>.e` sidecar (8 KiB, same `0600`, `O_EXCL|O_NOFOLLOW`) beside each full
@@ -352,9 +354,52 @@ Each of the three costs that scales with the table is answered here:
   7.0 s of start at 4096 rows on an 86-process host, 10.3 s at 4000 rows on this one once the scan is put back, and it scales with
   the host's process count. With the skip, a 4096-row start is 0.11 s: the ledger's parse and the table's insert.
 
-What a bigger table still costs is the write's bytes: the file is replaced whole, so a slow enough disk makes the request that asked
-wait for 1.5 MB (3.9 s there). An incremental ledger — append, with a compaction — would bound that too; it is a change of its own,
-and these numbers are what it waits on.
+- **A life change writes one record, not the table** (`ledger.rs`). The ledger is two files: `execd-jobs.json`, the table
+  alone, and `execd-jobs.log`, one framed record per change of a job's life since — the job's whole row, or the fact that it is
+  gone. A change appends its record; the log is folded back into a new file when it outgrows the table (`LOG_MIN` = 64 KiB, or
+  the size the table takes, whichever is more), so the pair never holds more than two tables. Measured on the release binary, one
+  start→end→remove cycle (three life changes) at 256 / 1024 / 4096 ended entries:
+
+  | ended entries | table   | bytes written per cycle, before → now | per cycle p50, before → now | cycles/s, before → now |
+  | ------------- | ------- | ------------------------------------- | --------------------------- | ---------------------- |
+  | 256           | 94 KB   | 284 443 → 1 850                       | 7.6 → 6.7 ms                | 132 → 149              |
+  | 1024          | 377 KB  | 1 132 236 → 1 778                     | 13.3 → 12.6 ms              | 76 → 80                |
+  | 4096          | 1.51 MB | 4 523 581 → 1 617                     | 60.8 → 35.9 ms              | 16 → 28                |
+
+  The before column is the release binary at `87347af`, built in its own worktree and run by the same harness
+  (`handoffs/CAPY-12/ledger_cycles.py --before-bin`); the byte counts move by a few hundred bytes with where the fold lands,
+  the timings by about 15% run to run.
+
+  On a disk that bills 300 ms a write _and_ a rename (the `handoffs/CAPY-8/slowdisk.c` shim), a cycle is 912 / 915 / 640 ms
+  against 1813 / 1825 / 1885 ms: the old path paid three renames a cycle, the new one none. Every guarantee the whole-file write
+  made is kept, and each is a test in `tests/ledger.rs` that goes red when it is taken out:
+  - **A record is framed** by a length and a CRC-32, and a replay stops at the first record that does not hold together — a
+    record cut short by a crash is dropped, not believed (`a_record_cut_short_is_dropped_and_the_log_folded`,
+    `a_record_that_does_not_checksum_is_not_applied`). The load marks such a log for a fold, so the next write rewrites it rather
+    than appending behind the fragment, where every later record would be unreadable.
+  - **The fold is the old state or the new one, never a mix.** `execd-jobs.json` is written aside, synced, renamed, its
+    directory synced; then `execd-jobs.log` is replaced by a new one whose header names that file by length and checksum. A crash
+    between the two leaves the new table with a log that names the old one, and the log is dropped
+    (`a_crash_between_the_fold_and_its_log_leaves_the_new_table`). The log in force therefore always names its table.
+  - **The answer still implies the change is written.** The change's own record is written (and, for a keyed start's claim, the
+    whole file is written, synced, renamed and its directory synced) before the answer goes out: a `keep` answers with the ledger
+    already holding it, and a kill the instant the answer arrives recovers it
+    (`a_life_change_is_on_disk_when_its_answer_arrives`; `tests/startkey.rs` for the claim, K10).
+  - **Ordering against a sweep is the writer lock, and the log no longer needs it for ordering.** `Ledger::save` reads the table
+    under the file's writer lock and appends what differs from what the log says, so each record is a row as of the moment of the
+    write and the last record for a row is the newest state; two writers cannot lose each other's fact
+    (`a_write_that_overlaps_a_sweep_loses_nothing`). The lock is still what a fold needs exclusively.
+  - **The write that must leave the table whole still does.** A retention sweep's one pass is `save_whole` (a fold): the file
+    is the table and the log is empty, so the ledger-then-unlink order of the retention and its crash test
+    (`a_crash_after_the_ledger_write_leaves_no_spool_behind`) are unchanged. A restart's write is an ordinary change — one
+    record for what recovery changed, or nothing — except into a log a crash left torn, which is folded instead of appended
+    to, so the torn tail is repaired (`a_record_cut_short_is_dropped_and_the_log_folded`).
+  - **No version to serve.** A sandbox gets the binary it was built for, so the ledger owes no older execd anything and
+    there is no compatibility flag to keep. `execd-jobs.json` keeps the version-1 shape and the log names it by length and
+    checksum because those are the cheap whole-table form and the fold's identity check, not because a rollback reads them; the
+    version markers stay as a diagnostic. What is mandatory is same-build recovery, and it is what the four guarantees above
+    are: a restarted execd reads exactly what it wrote, a torn tail is dropped rather than resurrecting or losing a job, and a
+    crash mid-fold leaves one consistent pair.
 
 **The `list` bound.** `list` answers with every job of its scope that has not ended, and with the newest `LIST_ENDED_MAX` (512)
 ended ones; past that it adds `"more": n`, the number it did not list. The newest are the rows it keeps, because the count ceiling
@@ -550,11 +595,13 @@ cargo test -p beyond-execd --features mut_signal_after_reap --test os_model the_
 ### A restart of execd: the jobs ledger (R1-R5)
 
 A job's processes outlive execd when it is killed or crashes; what died is the table that knew them. With
-`EXECD_STATE_DIR` (`Options::state_dir`) set, execd keeps one typed value across its own restart: `execd-jobs.json`
-(`src/ledger.rs`), the table's jobs that have a group and are not removed, each as the job kernel's `State` plus its
-address, label and mark. It is replaced whole (written aside, renamed) at each change of a job's life (spawn, the shell's
-exit, the end, `keep`, removal), never as marker files; a file that does not parse is read as empty. A new execd reads it
-before it serves (`jobs::recover`) and asks the pure `job_kernel::recover(state, alive, now)` what each job becomes, where
+`EXECD_STATE_DIR` (`Options::state_dir`) set, execd keeps one typed value across its own restart, in two files
+(`src/ledger.rs`): `execd-jobs.json`, the table's jobs that have a group and are not removed, each as the job kernel's
+`State` plus its address, label and mark, and `execd-jobs.log`, one framed record per change of a job's life since that
+file was written (spawn, the shell's exit, the end, `keep`, removal), never marker files. A change appends its record; the
+log is folded into a new `execd-jobs.json` when it outgrows the table ("the ledger", under retention, has the cost and the
+guarantees). A new execd reads both before it serves (`jobs::recover`) — the file, then the log's records over it, up to the
+first that does not hold together — and asks the pure `job_kernel::recover(state, alive, now)` what each job becomes, where
 `alive` is whether any process of the group or carrying the mark runs:
 
 | saved                    | group | becomes                                                                        |
@@ -564,6 +611,9 @@ before it serves (`jobs::recover`) and asks the pure `job_kernel::recover(state,
 | running                  | gone  | ended, code `-1` (`LOST_CODE`): the shell's status was seen by no one (R3)     |
 | exited                   | gone  | ended with the shell's saved code and signal (R3)                              |
 | no group yet, or removed |       | not in the table (R4)                                                          |
+
+A file that does not parse is read as empty; a log of a file that is not the one there (a fold renamed its file and died
+before its log) is dropped, which costs nothing because the file it names already holds those records.
 
 R5: recovering what recovery returned changes nothing, so a restart during a restart is safe. Proven in Verus
 (`execd-jobs`, `recover` and `lemma_recover_idempotent`), run by production, and driven through the real binary by

@@ -514,9 +514,10 @@ impl Ctx {
     /// Write the jobs ledger for a change of a job's life, off the runtime thread and holding one of
     /// the `disk_writers` turns — the gate a job's output batch takes. The caller awaits it before it
     /// answers, so the answer still promises what it promised when the write was inline: when a
-    /// `start` answers, the file names the job; when a `remove` answers, it does not. What changed is
-    /// where it runs: 1.5 MB of write and rename at a full table is minutes of nothing for the
-    /// requests this server exists to answer, and it no longer spends them on the runtime's thread.
+    /// `start` answers, the ledger has the job; when a `remove` answers, it does not. What it costs is
+    /// one record of the change (`ledger.rs`), not the table: 1.5 MB a change at a full table was
+    /// minutes of nothing for the requests this server exists to answer, on the runtime's thread
+    /// before and on a disk-writer thread since.
     ///
     /// Ordering against another writer — a second life change, or a retention sweep's — is the
     /// ledger's: `Ledger::save` takes the file's writer lock and only then snapshots the table, so

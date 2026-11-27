@@ -283,6 +283,11 @@ mut_attach_ignores_removed = [] # an attach of a job taken after its lookup stre
 # Mutations of the ledger's write path and of recovery, used only by `tests/ledger.rs`'s red runs.
 mut_ledger_write_inline = [] # a change of a job's life writes the ledger on the runtime's thread
 mut_recover_scans_ended = [] # recovery asks `/proc` for every row, including one saved as ended
+mut_ledger_never_folds = [] # the log is never folded back into the table: it grows without bound
+mut_ledger_trusts_checksum = [] # a record is applied whether or not its checksum matches
+mut_ledger_ignores_base = [] # a log is applied to whatever table is there, not the one it names
+mut_ledger_appends_past_tail = [] # a log whose last record was cut short is appended to, not folded
+mut_ledger_append_skipped = [] # a life change's record never reaches the log
 # Mutations of `ring` (the crate `execd-ring`, which Verus proves), used only by `src/ring.rs`'s differential
 # test's red runs: each removes one guard.
 mut_window_before_base = [
