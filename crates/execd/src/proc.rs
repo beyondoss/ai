@@ -32,7 +32,7 @@ use std::time::Duration;
 
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, killpg};
-use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid, waitpid};
 use nix::unistd::Pid;
 use tokio::sync::{oneshot, watch};
 
@@ -280,22 +280,109 @@ fn is_live(state: char) -> bool {
 
 /// [`live_members`] by reading every process in `/proc`.
 fn live_members_scan(pgid: i32) -> Vec<u32> {
+    scan(pgid, None, false)
+}
+
+/// The one `/proc` scan: every live process that belongs to the job — for `mark` its group's members
+/// and everything carrying it, for `None` the group's members alone. `strays_only` keeps just the
+/// marked processes the group signal does not reach.
+///
+/// One [`Scratch`] serves the whole scan, so the work here is one `openat` and one `read` per
+/// process and nothing per process on the heap: a box with two processes allocates what a box with
+/// two thousand does (`benches/proc_scan.py` counts both).
+fn scan(pgid: i32, mark: Option<&str>, strays_only: bool) -> Vec<u32> {
     let mut out = Vec::new();
     let Ok(dir) = std::fs::read_dir("/proc") else {
         return out;
     };
+    let me = std::process::id();
+    let mut scratch = Scratch::new(mark);
     for e in dir.flatten() {
         let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
             continue;
         };
-        if let Some((state, _, pg)) = stat(pid)
+        if pid == me {
+            continue;
+        }
+        // Membership is the kernel's (W3). The mark is read from `/proc` only for a process the
+        // group does not already reach: for one it reaches the answer does not depend on it.
+        if let Some((state, _, pg)) = scratch.stat(pid)
             && is_live(state)
-            && pg == pgid
+            && wire::is_member(
+                pgid,
+                pg,
+                mark.is_some() && !wire::group_reaches(pgid, pg) && scratch.has_mark(pid),
+                strays_only,
+            )
         {
             out.push(pid);
         }
     }
     out
+}
+
+/// The buffers one `/proc` scan reuses: the path it opened last, the mark it looks for, and the file
+/// it read last. None of them is per process, so a scan costs the same handful of allocations
+/// whatever the box's process table holds — where a `format!` and an `fs::read` per process made the
+/// cycle's allocations grow with it (`benches/proc_scan.py --assert-flat` measures that they do not).
+struct Scratch {
+    path: String,
+    /// `EXECD_JOB_MARK=<mark>`, built once per scan; empty for a scan that only reads `stat`.
+    want: Vec<u8>,
+    buf: Vec<u8>,
+}
+
+impl Scratch {
+    fn new(mark: Option<&str>) -> Self {
+        let mut want = Vec::with_capacity(mark.map_or(0, |m| JOB_MARK_ENV.len() + m.len() + 1));
+        if let Some(mark) = mark {
+            want.extend_from_slice(JOB_MARK_ENV.as_bytes());
+            want.push(b'=');
+            want.extend_from_slice(mark.as_bytes());
+        }
+        Self {
+            path: String::with_capacity(32),
+            want,
+            // A process's `environ` is a few KiB: the first read grows the buffer, and every later
+            // process's fits in it.
+            buf: Vec::with_capacity(4 << 10),
+        }
+    }
+
+    /// Read `/proc/<pid>/<file>` into [`Self::buf`], which is reused. `false` when it cannot be
+    /// read: the process exited between the directory read and this open, or its `environ` belongs
+    /// to another uid (execd reads it only as root).
+    fn read(&mut self, pid: u32, file: &str) -> bool {
+        use std::fmt::Write as _;
+        use std::io::Read as _;
+        self.path.clear();
+        // Writing to a `String` cannot fail.
+        let _ = write!(self.path, "/proc/{pid}/{file}");
+        let Ok(mut f) = std::fs::File::open(&self.path) else {
+            return false;
+        };
+        self.buf.clear();
+        f.read_to_end(&mut self.buf).is_ok()
+    }
+
+    /// `(state, ppid, pgrp)` of `pid`, from `/proc/<pid>/stat`.
+    fn stat(&mut self, pid: u32) -> Option<(char, i32, i32)> {
+        // Bytes, not a `String`: the command name inside the parentheses is a raw `comm` and need
+        // not be UTF-8. A name that failed to decode would otherwise vanish from the scan, and a
+        // precise check would call a still-live group empty.
+        self.read(pid, "stat")
+            .then(|| parse_stat(&self.buf))
+            .flatten()
+    }
+
+    /// Whether `pid`'s environment, as it was at exec, holds `EXECD_JOB_MARK=<mark>`.
+    fn has_mark(&mut self, pid: u32) -> bool {
+        self.read(pid, "environ")
+            && self
+                .buf
+                .split(|&b| b == 0)
+                .any(|kv| kv == self.want.as_slice())
+    }
 }
 
 /// Whether group `pgid` has no live member, as cheaply as is right.
@@ -358,15 +445,6 @@ pub(crate) fn new_job_mark(seq: u64) -> String {
     format!("{:016x}{seq:x}", h.finish())
 }
 
-/// Whether `pid`'s environment, as it was at exec, holds `EXECD_JOB_MARK=<mark>`.
-fn has_mark(pid: u32, mark: &str) -> bool {
-    let Ok(env) = std::fs::read(format!("/proc/{pid}/environ")) else {
-        return false;
-    };
-    let want = format!("{JOB_MARK_ENV}={mark}");
-    env.split(|&b| b == 0).any(|kv| kv == want.as_bytes())
-}
-
 /// The live (non-zombie) processes of a job: its process group's members and everything that
 /// carries its mark, wherever it has gone. By reading `/proc`.
 pub(crate) fn job_members(pgid: i32, mark: &str) -> Vec<u32> {
@@ -376,33 +454,7 @@ pub(crate) fn job_members(pgid: i32, mark: &str) -> Vec<u32> {
 /// The scan behind [`job_members`]; `strays_only` keeps just the marked processes that have left
 /// the job's group.
 fn members(pgid: i32, mark: &str, strays_only: bool) -> Vec<u32> {
-    let mut out = Vec::new();
-    let Ok(dir) = std::fs::read_dir("/proc") else {
-        return out;
-    };
-    let me = std::process::id();
-    for e in dir.flatten() {
-        let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
-            continue;
-        };
-        if pid == me {
-            continue;
-        }
-        if let Some((state, _, pg)) = stat(pid)
-            && is_live(state)
-            // Membership is the kernel's (W3). The mark is read from `/proc` only for a process the
-            // group does not already reach: for one it reaches the answer does not depend on it.
-            && wire::is_member(
-                pgid,
-                pg,
-                !wire::group_reaches(pgid, pg) && has_mark(pid, mark),
-                strays_only,
-            )
-        {
-            out.push(pid);
-        }
-    }
-    out
+    scan(pgid, Some(mark), strays_only)
 }
 
 /// [`job_members`] without holding up the runtime for the `/proc` scan.
@@ -420,11 +472,77 @@ pub(crate) fn job_empty(pgid: i32, mark: &str) -> bool {
     job_members(pgid, mark).is_empty()
 }
 
-/// Whether a job has no live process, as cheaply as is right: [`group_gone`], plus whatever left
+/// Whether execd has no child at all, as the kernel answers it: `waitid` with `WNOWAIT` reports a
+/// zombie without collecting it (a `waitpid` with `WNOWAIT` is `EINVAL`), so nothing is taken out of
+/// the reaper's hands, and `ECHILD` — no child to wait for — is the answer this asks for. A child
+/// that is merely running, or stopped, is not `ECHILD`.
+fn no_children() -> bool {
+    matches!(
+        waitid(
+            Id::All,
+            WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT
+        ),
+        Err(Errno::ECHILD)
+    )
+}
+
+/// Whether the job's group's own number already says it is alive. `kill(-pgid, 0)` finds a group
+/// that exists, zombies included, and where execd is the subreaper every zombie is collected at
+/// once: so a group that exists is alive until its last member is gone. `precise` asks for the slow
+/// tick, whose `/proc` read settles the one case left (a zombie whose live parent is outside the
+/// group).
+fn group_alive(pgid: i32, precise: bool) -> bool {
+    group_exists(pgid) && SUBREAPER.load(Ordering::Relaxed) && !precise
+}
+
+/// Whether a job has no live process, as cheaply as is right: [`group_alive`], plus whatever left
 /// the group with the job's mark (found by a scan, which a group that is already empty still needs).
+///
+/// This is the answer for a job this server did **not** spawn — a restart's adoption — whose
+/// processes are not its descendants. A job this server spawned asks [`job_gone_owned`] instead.
 pub(crate) async fn job_gone(pgid: i32, mark: &str, precise: bool) -> bool {
-    if group_exists(pgid) && SUBREAPER.load(Ordering::Relaxed) && !precise {
+    if group_alive(pgid, precise) {
         return false;
+    }
+    job_gone_by_scan(pgid, mark).await
+}
+
+/// [`job_gone`] for a job this server spawned: its processes are this process's descendants, so a
+/// child list the kernel reports empty answers the common end without reading `/proc` — one
+/// `waitid` instead of an `openat` and a `read` per process on the box, which was the whole cost of
+/// a job-life cycle on a busy sandbox (`benches/proc_scan.py`).
+///
+/// That is the whole argument, and it needs all three of its parts:
+///
+/// 1. every process carrying the job's mark inherited it from the child this server spawned, so it
+///    descends from execd;
+/// 2. a live process's ancestors are live, so the topmost of that chain is a live child of execd —
+///    or one of them died, and the survivors were adopted by the nearest subreaper ancestor, which
+///    is execd again (it is the subreaper for everything it spawned);
+/// 3. so `ECHILD` — no child of execd at all, a zombie included — means nothing of this job (or of
+///    any other) is running, and the group's own number has already said its group is gone.
+///
+/// The converse is what keeps this a fast path and not a replacement: another job's child, a
+/// terminal's keeper, or a process execd adopted keeps a child list non-empty, and then the answer
+/// is the scan's, as before. A job a restart adopted is not this process's descendant at all, so
+/// it never takes this path (`jobs::supervise_adopted` calls [`job_gone`]).
+///
+pub(crate) async fn job_gone_owned(pgid: i32, mark: &str, precise: bool) -> bool {
+    if group_alive(pgid, precise) {
+        return false;
+    }
+    if !cfg!(feature = "mut_end_scan_always") && SUBREAPER.load(Ordering::Relaxed) && no_children()
+    {
+        crate::log_debug!("a job has no process left: execd has no child at all pgid={pgid}");
+        return true;
+    }
+    job_gone_by_scan(pgid, mark).await
+}
+
+/// The scan's answer, off the runtime: no live process of the job is left.
+async fn job_gone_by_scan(pgid: i32, mark: &str) -> bool {
+    if cfg!(feature = "mut_end_group_only") {
+        return true;
     }
     let mark = mark.to_string();
     off_runtime(move || job_members(pgid, &mark).is_empty()).await
@@ -442,13 +560,10 @@ pub(crate) fn signal_job(pg: Pg, mark: &str, sig: Signal) {
     }
 }
 
-/// `(state, ppid, pgrp)` of `pid`, from `/proc/<pid>/stat`.
+/// `(state, ppid, pgrp)` of `pid`, from `/proc/<pid>/stat`, for the tests below.
+#[cfg(test)]
 fn stat(pid: u32) -> Option<(char, i32, i32)> {
-    // Bytes, not a `String`: the command name inside the parentheses is a raw `comm` and need not
-    // be UTF-8. A name that failed to decode would otherwise vanish from the scan, and a precise
-    // check would call a still-live group empty.
-    let text = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
-    parse_stat(&text)
+    Scratch::new(None).stat(pid)
 }
 
 /// The fields after the last `)` of a `/proc/<pid>/stat` line. The command name may itself hold

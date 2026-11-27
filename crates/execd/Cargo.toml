@@ -288,6 +288,11 @@ mut_ledger_trusts_checksum = [] # a record is applied whether or not its checksu
 mut_ledger_ignores_base = [] # a log is applied to whatever table is there, not the one it names
 mut_ledger_appends_past_tail = [] # a log whose last record was cut short is appended to, not folded
 mut_ledger_append_skipped = [] # a life change's record never reaches the log
+# A job whose group is gone reads as ended without the scan, whatever still carries its mark
+# (`tests/job_escape.rs`: the end of a job is its group *and* every process carrying its mark).
+mut_end_group_only = []
+# The end always reads `/proc`, never the child list (`tests/job_escape.rs`: the fast path's line).
+mut_end_scan_always = []
 # Mutations of `ring` (the crate `execd-ring`, which Verus proves), used only by `src/ring.rs`'s differential
 # test's red runs: each removes one guard.
 mut_window_before_base = [
