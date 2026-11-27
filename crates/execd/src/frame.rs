@@ -53,8 +53,3 @@ pub(crate) fn fuzz(data: &[u8]) {
         assert_eq!(back, chunk);
     }
 }
-
-/// Standard base64 with padding.
-pub(crate) fn b64(data: &[u8]) -> String {
-    base64::engine::general_purpose::STANDARD.encode(data)
-}

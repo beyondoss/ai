@@ -98,6 +98,10 @@ done
 description = "A terminal's keeper in a release build: 30 idle keepers, each under 1 MiB of Pss (crates/execd/tests/keeper_size.rs, compiled only without debug assertions)."
 run = "cargo test --release -p beyond-execd --locked --test keeper_size -- --nocapture"
 
+[tasks."test:execd-answer-mutants"]
+description = "Red runs for the list/read answer differential (crates/execd/src/jobs.rs, `answer_tests`): eight mutants of the wire — a field dropped, a key renamed, keys reordered, a value retyped, a number reformatted, a null lost, the `more` count dropped, empty `stderr_ranges` sent — must each turn it red. Green only when every one does."
+run = "python3 crates/execd/scripts/answer-mutants.py"
+
 [tasks."verify:execd-jobs-term-mutants"]
 description = "crates/execd-jobs under each terminal and keeper mut_* feature (T1 to T14, P1, Q1, K1, K2, Q6): every proof must go red (a Verus verification failure, not a build error). Pairs with `verify:kernels`, which must be green without a feature."
 run = '''
