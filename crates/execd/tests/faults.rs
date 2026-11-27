@@ -895,7 +895,10 @@ async fn a_retention_sweep_waits_for_a_disk_writer_turn() {
     // of the pool is held and the sweep can have none.
     gate.close();
     for i in 0..execd::DISK_WRITERS {
-        assert_eq!(start_job(&e, &format!("busy{i}"), CHATTER).await.status, 200);
+        assert_eq!(
+            start_job(&e, &format!("busy{i}"), CHATTER).await.status,
+            200
+        );
     }
     until("every turn held by a stuck batch", || async {
         gate.held() == execd::DISK_WRITERS
