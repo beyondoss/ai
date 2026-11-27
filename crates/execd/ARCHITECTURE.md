@@ -353,7 +353,7 @@ Each of the three costs that scales with the table is answered here:
 
 - **`list` is bounded** (`LIST_ENDED_MAX`, below), and a first sweep after a restart reaps a full table in 64 passes
   (`SWEEP_ACTIONS_MAX`), which leaves the ledger and the table empty and every reaped id answering `gone`/`404`.
-- **The ledger write is off the runtime** (`Ctx::save_jobs`): one of the `disk_writers` turns, the write and the rename on a thread
+- **The ledger write is off the runtime** (`Ctx::save_jobs`): one of the `DISK_WRITERS` turns, the write and the rename on a thread
   of its own (`proc::off_runtime`), one write per change of a job's life, and the change's own answer awaits it. What that keeps is
   the promise the inline write made — when a `start` answers, the file names the job; when a `remove` answers, it does not — and
   what it gives back is everybody else's latency: with every ledger write held 300 ms, an unrelated `GET /livez` waited 601 ms
@@ -1026,14 +1026,19 @@ under a load-then-add version of `enter_within`.
 **Job output is written off the runtime.** The reads, ring chunk writes, journal appends and hole
 punching (`tail.rs` `Tail::drain_batch`, driven from `jobs.rs` `Tailing::flush`) run on a thread
 (`proc::off_runtime`), in batches of up to `tail::ROUNDS` = 16 rounds per file, and each batch holds
-one of `disk_writers` turns (`Ctx::disk_turn`) — the same turn the retention sweep's ledger write and
-unlinks take (`jobs.rs` `sweep`), so there is one gate for all off-loop disk work and the threads are
-bounded however many jobs write and sweeps run. Nothing is queued in memory: the spool file is the
-queue, written by the job itself, so a slow disk makes the tail fall behind and the file grow, and
-never blocks another connection. A tail that finds no turn waits for one (logged at debug).
-`EXECD_DISK_WRITERS=0` is the behaviour before this change — the batches on the runtime, one round at
-a time, yielding between rounds — and
-`with_disk_writers_zero_a_stuck_output_write_stalls_every_caller_as_before` holds it.
+one of the eight turns of `DISK_WRITERS` (`Ctx::disk_turn`) — the same turn the retention sweep's
+ledger write and unlinks take (`jobs.rs` `sweep`), so there is one gate for all off-loop disk work
+and the threads are bounded however many jobs write and sweeps run. Nothing is queued in memory: the
+spool file is the queue, written by the job itself, so a slow disk makes the tail fall behind and the
+file grow, and never blocks another connection. A tail that finds no turn waits for one (logged at
+debug).
+
+The pool is a constant, not a knob. It bounds disk queue depth — how many writes are outstanding
+against the disk at once — not CPU, because each writer is a blocking thread that spends its time in
+`write`; eight is the depth the measurements above and every shipped default were taken at. There is
+no "write on the runtime" mode to select: that was the bug this change fixes (a stuck write held the
+runtime thread and every caller with it), and it lives on only as the test-only `mut_tail_write_inline`
+mutation, under which `a_stuck_output_write_does_not_stall_an_unrelated_caller` goes red.
 
 A job's **end** is recorded after its last flush (`supervise_after` → `flush`), so a disk that stops
 answering defers that job's `ended` state, and its retention, until the disk answers again. It defers
@@ -1057,10 +1062,10 @@ contiguous offsets), which goes red when a batch advances its offset short of wh
 across a crash is `tests/restart.rs` (`a_client_resumes_at_its_offset_across_a_crash_with_no_gap`),
 which goes red when the journal append is removed.
 
-**Tests** (`tests/faults.rs` unless named): the gate-seam pair
-`a_stuck_output_write_does_not_stall_an_unrelated_caller` /
-`with_disk_writers_zero_a_stuck_output_write_stalls_every_caller_as_before`;
-`writer_threads_are_bounded_by_disk_writers_and_the_rest_wait`;
+**Tests** (`tests/faults.rs` unless named):
+`a_stuck_output_write_does_not_stall_an_unrelated_caller` (red under `mut_tail_write_inline`);
+`writer_threads_are_bounded_to_eight_and_the_rest_wait` (red without the semaphore, and red if
+`EXECD_DISK_WRITERS` is ever read again);
 `output_past_one_batch_keeps_its_order_and_every_byte`;
 `a_connection_with_no_descriptor_left_is_refused_503_not_left_waiting`;
 `with_shedding_off_a_connection_past_the_descriptor_limit_waits_as_before`;

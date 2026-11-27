@@ -104,8 +104,14 @@ pub const ENDED_MAX: usize = 4096;
 /// a predictable lifetime ([`ENDED_MAX`] is then the backstop, not the deadline).
 pub const ENDED_ENTRY_MS: u64 = 24 * 60 * 60 * 1000;
 
-/// Default for [`Options::disk_writers`]: the blocking disk jobs (job output batches, the jobs
-/// ledger, a retention sweep's unlinks) that run off the runtime at once.
+/// The blocking disk jobs (job output batches, the jobs ledger, a retention sweep's unlinks) that
+/// run off the runtime at once ([`Ctx::disk_turn`]). A constant, not a knob: it bounds disk queue
+/// depth — how many writes are in the queue to the disk at once — not CPU. Eight is the depth every
+/// measurement and every shipped default in this crate was taken at, and the number is about the
+/// disk, not the cores: each writer is a blocking thread that spends its time in `write`, so a
+/// deeper pool only lengthens the queue on a slow disk, and a shallower one makes a job's own tail
+/// wait behind unrelated writes. Anything past the pool waits its turn (a job's spool file holds
+/// what it wrote meanwhile), so the bound can delay a write but never drop one.
 pub const DISK_WRITERS: usize = 8;
 
 /// Descriptors one request in flight holds at most (measured on the binary: a stream or a one-shot
@@ -299,11 +305,6 @@ pub struct Options {
     /// descriptors from running out under the requests execd already took. `None` (the default here,
     /// and `EXECD_MAX_STREAMS=0`) is no cap: the descriptor limit alone ends it.
     pub max_in_flight: Option<usize>,
-    /// At most this many blocking disk jobs at once, each on a thread off the runtime: a job's
-    /// output batch, a write of the jobs ledger, a retention sweep's unlinks; one beyond it waits its
-    /// turn (a job's spool file holds what it wrote meanwhile, and a job that ended is not slowed).
-    /// `0` writes on the runtime, as before this existed (`EXECD_DISK_WRITERS=0`).
-    pub disk_writers: usize,
     /// Out of descriptors, answer the connections waiting in the kernel's queue `503` with a spare
     /// descriptor ([`http::accept_loop`]). `false` (`EXECD_SHED_WHEN_OUT_OF_FDS=0`) leaves them
     /// waiting, as before this existed.
@@ -347,7 +348,6 @@ impl Options {
             helper_exe: None,
             terminals_max: None,
             max_in_flight: None,
-            disk_writers: DISK_WRITERS,
             shed_when_out_of_fds: true,
             route_hook: None,
         }
@@ -489,7 +489,7 @@ pub(crate) struct Ctx {
     pub next_seq: AtomicU64,
     /// Requests in flight, server-wide: the sum of every connection's own count.
     pub in_flight: admit::InFlightCount,
-    /// Permits for [`Options::disk_writers`] blocking disk jobs at once (see [`Ctx::disk_turn`]).
+    /// Permits for the [`DISK_WRITERS`] blocking disk jobs at once (see [`Ctx::disk_turn`]).
     pub disk_slots: tokio::sync::Semaphore,
     /// Bumped whenever [`Handle::activity`] may have changed (shared with `jobs`).
     pub activity: Arc<tokio::sync::watch::Sender<u64>>,
@@ -511,19 +511,16 @@ impl Ctx {
     }
 
     /// A turn for one blocking disk job — a job's output batch, a ledger write, a retention sweep's
-    /// unlinks — of the [`Options::disk_writers`] allowed at once, or `None` when that is `0` (the
-    /// caller then does its own thing, as before the bound existed). The one gate every off-loop
-    /// disk job passes, so the threads are bounded however many jobs and sweeps want one; the
-    /// semaphore is closed only with the server, which never happens while a job runs.
+    /// unlinks — of the [`DISK_WRITERS`] allowed at once. The one gate every off-loop disk job
+    /// passes, so the threads are bounded however many jobs and sweeps want one. `None` only when
+    /// the semaphore is closed, which happens only with the server and so never while a job runs;
+    /// the caller then does its write without a turn rather than not at all.
     pub(crate) async fn disk_turn(&self) -> Option<tokio::sync::SemaphorePermit<'_>> {
-        if self.opts.disk_writers == 0 {
-            return None;
-        }
         self.disk_slots.acquire().await.ok()
     }
 
     /// Write the jobs ledger for a change of a job's life, off the runtime thread and holding one of
-    /// the `disk_writers` turns — the gate a job's output batch takes. The caller awaits it before it
+    /// the [`DISK_WRITERS`] turns — the gate a job's output batch takes. The caller awaits it before it
     /// answers, so the answer still promises what it promised when the write was inline: when a
     /// `start` answers, the ledger has the job; when a `remove` answers, it does not. What it costs is
     /// one record of the change (`ledger.rs`), not the table: 1.5 MB a change at a full table was
@@ -684,7 +681,7 @@ pub fn serve(listener: tokio::net::TcpListener, opts: Options) -> std::io::Resul
         .as_deref()
         .map_or_else(ledger::Ledger::disabled, ledger::Ledger::at);
     let ledger_on = ledger.enabled();
-    let disk_slots = tokio::sync::Semaphore::new(opts.disk_writers);
+    let disk_slots = tokio::sync::Semaphore::new(DISK_WRITERS);
     let ctx = Arc::new(Ctx {
         opts,
         scrub,

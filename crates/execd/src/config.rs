@@ -29,9 +29,6 @@ pub struct Config {
     pub retention: execd::Retention,
     /// `EXECD_MAX_STREAMS`: unset sizes the cap from the descriptor limit, `0` is no cap, `N` is N.
     pub max_streams: Option<usize>,
-    /// `EXECD_DISK_WRITERS`: unset is [`crate::DISK_WRITERS`], `0` does blocking disk work on the
-    /// runtime.
-    pub disk_writers: Option<usize>,
     /// `EXECD_RAISE_NOFILE`: raise the soft `RLIMIT_NOFILE` to the hard limit at start (default 1).
     pub raise_nofile: bool,
     /// `EXECD_SHED_WHEN_OUT_OF_FDS`: see `Options::shed_when_out_of_fds` (default 1).
@@ -58,7 +55,6 @@ execd takes no arguments; it is configured by environment variables:
   EXECD_LOG                       off, error, warn, info, debug or trace (default info)
   EXECD_WORKER_THREADS            1 (default) one thread, 0 a worker per CPU, N workers
   EXECD_MAX_STREAMS               the most requests in flight, each over its limit answered 503: unset sizes it from the descriptor limit, 0 no cap
-  EXECD_DISK_WRITERS              blocking disk jobs at once off the runtime: job output batches, the jobs ledger, a retention sweep (default 8); 0 does them on the runtime
   EXECD_RAISE_NOFILE              1|true|0|false: raise the soft open file limit to the hard limit at start (default 1)
   EXECD_SHED_WHEN_OUT_OF_FDS      1|true|0|false: out of descriptors, answer waiting connections 503 instead of leaving them queued (default 1)
   EXECD_IDLE_TIMEOUT_MS           close a connection with no request in flight for this long; 0 (default) never
@@ -111,7 +107,6 @@ pub fn parse<E: Fn(&str) -> Option<String>>(env: E) -> Result<Config, String> {
                 .unwrap_or(execd::ENDED_ENTRY_MS),
         },
         max_streams: number("EXECD_MAX_STREAMS", get("EXECD_MAX_STREAMS"))?,
-        disk_writers: number("EXECD_DISK_WRITERS", get("EXECD_DISK_WRITERS"))?,
         raise_nofile: get("EXECD_RAISE_NOFILE").is_none()
             || boolean("EXECD_RAISE_NOFILE", get("EXECD_RAISE_NOFILE"))?,
         shed_when_out_of_fds: get("EXECD_SHED_WHEN_OUT_OF_FDS").is_none()
@@ -166,7 +161,7 @@ mod tests {
                 entry_ms: 86_400_000,
             }
         );
-        assert_eq!((c.max_streams, c.disk_writers), (None, None));
+        assert_eq!(c.max_streams, None);
         assert!(c.raise_nofile && c.shed_when_out_of_fds);
     }
 
@@ -210,17 +205,16 @@ mod tests {
         }
     }
 
-    /// The request cap and the disk writer count are read, and `0` for each is that gate off.
+    /// The request cap is read and `0` turns it off.
     #[test]
-    fn the_descriptor_and_writer_knobs_turn_off_with_zero() {
+    fn the_descriptor_knobs_turn_off_with_zero() {
         let c = cfg(&[
             ("EXECD_MAX_STREAMS", "0"),
-            ("EXECD_DISK_WRITERS", "0"),
             ("EXECD_RAISE_NOFILE", "0"),
             ("EXECD_SHED_WHEN_OUT_OF_FDS", "false"),
         ])
         .unwrap();
-        assert_eq!((c.max_streams, c.disk_writers), (Some(0), Some(0)));
+        assert_eq!(c.max_streams, Some(0));
         assert!(!c.raise_nofile && !c.shed_when_out_of_fds);
         assert!(cfg(&[("EXECD_RAISE_NOFILE", "maybe")]).is_err());
     }
