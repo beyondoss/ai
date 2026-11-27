@@ -1123,9 +1123,12 @@ async fn a_restart_reaps_the_entries_the_clock_passed() {
     let state = root.path().join("state");
     let jobs = root.path().join("jobs");
     std::fs::create_dir(&jobs).unwrap();
+    // This test edits `execd-jobs.json` to age a row, so it runs the ledger in its whole-file form
+    // (`EXECD_LEDGER_APPEND=0`): with a log, the file is only the table as of the last fold.
     let settings = [
         ("EXECD_STATE_DIR", state.to_str().unwrap()),
         ("EXECD_JOBS_DIR", jobs.to_str().unwrap()),
+        ("EXECD_LEDGER_APPEND", "0"),
     ];
     let mut first = Execd::start(&settings, &[]);
     let a = addr(&first);
@@ -1133,17 +1136,10 @@ async fn a_restart_reaps_the_entries_the_clock_passed() {
     until_state(a, "old", "ended").await;
     start(a, "young", "printf y").await;
     until_state(a, "young", "ended").await;
-    // A crash, not a stop: the ledger is what the last save wrote. One restart folds the log back into
-    // the file (`ledger.rs`: life changes append, a restart writes the table whole), so what this test
-    // edits next is the whole state; the second restart is the one that reads it.
+    // A crash, not a stop: the ledger is what the last save wrote, which with `EXECD_LEDGER_APPEND=0` is
+    // the whole table.
     first.child.kill().unwrap();
     first.child.wait().unwrap();
-    if std::path::Path::new(&state.join("execd-jobs.log")).exists() {
-        let mut folded = Execd::start(&settings, &[]);
-        list(addr(&folded)).await;
-        folded.child.kill().unwrap();
-        folded.child.wait().unwrap();
-    }
     let file = state.join("execd-jobs.json");
     let mut v: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
     for row in v["jobs"].as_array_mut().unwrap() {
