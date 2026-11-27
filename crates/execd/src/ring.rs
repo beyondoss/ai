@@ -292,7 +292,15 @@ impl Ring {
             Err(_) => end,
         }
         .min(end);
-        if end < floor && floor.is_multiple_of(frame) {
+        let outran = if cfg!(feature = "mut_pack_ignores_journal_floor") {
+            // The mutant: a pack that stops short of the journal's first byte is kept as it is, so
+            // the chunk the journal had advanced past reads back as the hole it is (zeros) at an
+            // offset the answer still names. `tests/pack.rs` goes red.
+            false
+        } else {
+            end < floor && floor.is_multiple_of(frame)
+        };
+        if outran {
             // The pack stops short of the journal's first byte: a chunk the journal had advanced
             // past and the disk did not keep. Everything in the pack is behind it, so all of it is
             // the gap it was before the crash — the same one a per-chunk file cut short leaves —
@@ -990,6 +998,8 @@ mod tests {
 
     /// A chunk's bytes are written before its bits, so a stride the crash cut short is not a chunk:
     /// the length stops inside the payload, and what it names is every chunk before it.
+    ///
+    /// Red under `mut_pack_keeps_short_tail`.
     #[test]
     fn a_stride_the_crash_cut_short_is_not_a_chunk() {
         let (mut ring, d) = packed_kept(10_000_000);
@@ -1021,6 +1031,8 @@ mod tests {
     /// The same, with the journal ahead of the pack: a chunk the journal had advanced past and the
     /// disk did not keep. Nothing the pack holds is before the journal's byte any more, so all of
     /// it is the gap it was before the crash, and no byte of it is served as data.
+    ///
+    /// Red under `mut_pack_ignores_journal_floor`.
     #[test]
     fn a_pack_short_of_the_journals_byte_is_a_gap() {
         let (mut ring, d) = packed_kept(10_000_000);

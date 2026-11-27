@@ -355,8 +355,11 @@ async fn a_torn_pack_tail_is_recovered_from_the_journal() {
 /// starts after it — a gap of exactly the bytes that window held, one chunk here — and every byte it
 /// does serve is the byte the job wrote.
 ///
-/// Red under `mut_pack_keeps_short_tail`: recovery names the missing chunk from the file's length,
-/// serves zeros where its bytes were, and the bytes after it move.
+/// Red under `mut_pack_ignores_journal_floor`: recovery keeps the pack as it is, so the chunk the
+/// journal had advanced past reads back as the hole it is — zeros at an offset the answer still
+/// names — and every byte after it moves. (`mut_pack_keeps_short_tail` does not reach this case:
+/// the torn pack ends below the journal's first byte, so the floor trip, not the whole-chunk count,
+/// is what declares this gap.)
 #[tokio::test]
 async fn a_pack_the_journal_outran_is_a_declared_gap() {
     const N: usize = 300 * 1024;
