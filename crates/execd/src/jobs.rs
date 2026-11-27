@@ -146,16 +146,27 @@ impl Jobs {
         &self.ledger
     }
 
-    /// Write the table's jobs to the ledger: every job that has a group and is not removed. Called
+    /// Record the table's jobs in the ledger: every job that has a group and is not removed. Called
     /// with no job's lock held, at each change of a job's life (spawn, shell exit, end, keep,
-    /// removal); a no-op without [`crate::Options::state_dir`]. Blocking, and the whole file: every
-    /// caller but recovery runs it off the runtime thread, holding a disk turn
-    /// ([`crate::Ctx::save_jobs`], the sweep).
+    /// removal); a no-op without [`crate::Options::state_dir`]. Blocking, and each change appends the
+    /// rows that differ (`ledger.rs`): every caller runs it off the runtime thread, holding a disk turn
+    /// ([`crate::Ctx::save_jobs`]).
     pub fn save(&self) {
         if !self.ledger.enabled() {
             return;
         }
         self.ledger.save(|| self.entries());
+    }
+
+    /// [`Self::save`] whole: the table as one file, its log folded. For the writes that must leave
+    /// [`crate::ledger`]'s file complete — a retention sweep's one pass and a restart's (`jobs::recover`)
+    /// — where the cost is one write per sweep, not per life change, and an execd that knows nothing of
+    /// the log still reads the file.
+    pub fn save_whole(&self) {
+        if !self.ledger.enabled() {
+            return;
+        }
+        self.ledger.save_whole(|| self.entries());
     }
 
     /// [`Self::save`] for a keyed start's claim: durable, and how it came out (K10). Blocking; a start
@@ -193,7 +204,7 @@ impl Jobs {
 
     /// The server is shutting down and kills every group: nothing is left to recover.
     pub fn forget(&self) {
-        self.ledger.save(Vec::new);
+        self.ledger.forget();
     }
 
     fn bump(&self) {
@@ -683,7 +694,7 @@ pub(crate) async fn sweep(ctx: &Arc<Ctx>) -> Swept {
         let turn = ctx.disk_turn().await;
         let ctx = ctx.clone();
         proc::off_runtime(move || {
-            ctx.jobs.save();
+            ctx.jobs.save_whole();
             if crate::fault::at("sweep_after_save").as_deref() == Some("exit") {
                 // A test's crash between the durable marker and the unlinks.
                 std::process::exit(86);
@@ -2609,7 +2620,8 @@ const SWEEP_PASSES: usize = 5;
 /// adopted (watched until the group empties, then ended with the shell's saved status, else
 /// [`kernel::LOST_CODE`]) and a held start no one kept, whose client left with the old process, is
 /// killed as any disconnect kills it; the rest come back as they ended or not at all. The output
-/// of a recovered job is empty. Idempotent: it writes the ledger back as the table now is.
+/// of a recovered job is empty. Idempotent: the ledger's record of what recovery changed is written back as the table
+/// now is ([`Jobs::save`]: an append of the rows that differ, or a fold when a crash left the log torn).
 pub(crate) fn recover(ctx: &Arc<Ctx>) {
     let base = spool_base(ctx);
     let mut adopted: Vec<std::path::PathBuf> = Vec::new();
@@ -2810,7 +2822,8 @@ pub(crate) fn recover(ctx: &Arc<Ctx>) {
     }
     ctx.jobs.bump_activity();
     // Inline, unlike every other life change: this is the start of the process, before the server
-    // accepts anything, and the machine has one write to do.
+    // accepts anything, and the machine has at most one record to append — what recovery changed. A log a
+    // crash left torn is not appended to at all: the load says so and this write folds it instead.
     ctx.jobs.save();
     // A recovered ended job is a candidate for the retention at once: its deadline may be long past.
     ctx.jobs.wake_retention();

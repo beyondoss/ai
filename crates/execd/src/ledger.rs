@@ -1,11 +1,23 @@
 //! The jobs ledger: the one typed value execd keeps across a restart of its own process.
 //!
 //! A job's processes run on when execd is killed, crashes or is restarted; what dies is the table
-//! that knew them. With [`crate::Options::state_dir`] set, the table's jobs are written here as one
-//! file, `execd-jobs.json`, replaced whole (written aside and renamed, so a reader sees the old
-//! file or the new, never half of one) on every change of a job's life: its spawn, its shell's exit,
-//! its end, its keep and its removal. A restarted execd reads it back and asks
-//! [`crate::job_kernel::recover`] what each job becomes (`jobs::recover`).
+//! that knew them. With [`crate::Options::state_dir`] set, the table's jobs are kept in two files, and
+//! a restarted execd reads them back and asks [`crate::job_kernel::recover`] what each job becomes
+//! (`jobs::recover`).
+//!
+//! **A file of the table, and a log of the changes since it.** `execd-jobs.json` is the table as one
+//! file: `{"version":1,"jobs":[...]}`, written aside and renamed, so a reader sees the old file or the
+//! new one, never half of one. `execd-jobs.log` is what has happened to it since: one framed record per
+//! change of a job's life, each the job's whole row (or the fact that its row is gone), a length and a
+//! checksum in front of it so a record cut short by a crash is dropped instead of believed. A life
+//! change appends its record; nothing rewrites the table. The log is folded back into a new
+//! `execd-jobs.json` when it outgrows [`LOG_MIN`] or the size of the table it sits on, and its own
+//! header names the file it was written against by length and checksum, so a log of a compaction that
+//! did not finish is dropped rather than applied over a file it does not describe.
+//!
+//! Why: the file used to be replaced whole on **every** change of a job's life, 1.16 MB written per
+//! start→end→remove cycle at 1024 ended entries and 4.6 MB at the 4096 ceiling — 26/46/134 ms a cycle,
+//! serialized, on a table that only grows. An append is one 350-byte record (`reports/CAPY-9.md`).
 //!
 //! Only what a restart cannot learn from the OS is kept: the job's address, its label, its mark (how
 //! its processes are found again, wherever they went), the kernel's [`State`] (phase, claim, what
@@ -13,9 +25,11 @@
 //! (`Entry::spool`, see `tail.rs`), where the job's files, the journal and the ring's chunks are,
 //! and a restarted execd rebuilds the ring from there.
 //!
-//! The file is `0600` in a `0700` directory. A file that does not parse, or names a version this
-//! execd does not know, is set aside (read as empty) and never trusted.
+//! The files are `0600` in a `0700` directory. A file that does not parse, or names a version this
+//! execd does not know, is read as empty and never trusted; so is a log whose records stop making
+//! sense, from there on.
 
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write as _;
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
@@ -25,8 +39,23 @@ use serde::{Deserialize, Serialize};
 
 use crate::job_kernel::{Claim, Persist, Phase, Size, State, Term};
 
+/// The table, whole: the file execd wrote on every life change before this crate appended, and the one
+/// a rollback to that execd still reads. Unchanged in shape, so an `execd-jobs.json` written by this
+/// execd and one written by the execd before it are the same file.
 const FILE: &str = "execd-jobs.json";
+/// The changes since [`FILE`], one framed record each.
+const LOG: &str = "execd-jobs.log";
 const VERSION: u32 = 1;
+/// [`LOG`]'s own format: its header and its framing.
+const LOG_VERSION: u32 = 1;
+/// The most a record may claim to be. A row of a full table is ~350 bytes and the longest argv is
+/// bounded; a longer length is a corrupt one, and the record is not read.
+const RECORD_MAX: u64 = 1 << 20;
+/// The log is folded into a new [`FILE`] once the bytes appended to it pass this much — or the size the
+/// table itself takes as a file, if that is more. So the two files together hold at most two tables, and
+/// a small table never rewrites itself on every change. At the 4096-entry ceiling (1.5 MB) a fold is one
+/// write every ~3800 life changes: 4 cases in 10 000 of what the whole-file write cost per change.
+const LOG_MIN: u64 = 64 * 1024;
 
 /// One saved job.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,10 +139,35 @@ pub(crate) enum Saved {
     Ended,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize)]
+struct FileRef<'a> {
+    version: u32,
+    jobs: &'a [Entry],
+}
+
+#[derive(Deserialize)]
 struct File {
     version: u32,
     jobs: Vec<Entry>,
+}
+
+/// One change of a job's life, as [`LOG`] records it: the job's row as it now is, or the fact that the
+/// table no longer has it.
+#[allow(clippy::large_enum_variant)] // one row, built to be written and dropped: a box would allocate for nothing
+#[derive(Serialize, Deserialize)]
+enum Record {
+    Put(Entry),
+    Del { scope: String, id: String },
+}
+
+/// [`LOG`]'s header: which [`FILE`] its records belong to. A file is named by what it is (its length and
+/// its checksum), so a log written against a table that is no longer there — a compaction that renamed
+/// its file and crashed before its log — is a log of nothing, and is dropped.
+#[derive(Serialize, Deserialize)]
+struct Head {
+    version: u32,
+    len: u64,
+    crc: u32,
 }
 
 impl Entry {
@@ -255,21 +309,62 @@ impl Entry {
 /// Where the ledger lives; `None` keeps nothing, as execd always did.
 pub(crate) struct Ledger {
     dir: Option<PathBuf>,
-    /// One writer at a time, so the last file written is the last state snapshotted.
-    write: std::sync::Mutex<()>,
+    /// Append each change of a job's life and fold the log when it outgrows the table
+    /// ([`crate::Options::ledger_append`]). `false` writes the whole file on every change, as execd did
+    /// before this existed — the same file, and no log.
+    append: bool,
+    /// One writer at a time: a record is built from the table *and* written under this, so records for
+    /// one job are appended in the order their states were read, and a fold replaces the file and the
+    /// log as one step no append can land inside.
+    state: std::sync::Mutex<Log>,
+}
+
+/// What the ledger knows of its two files.
+struct Log {
+    /// The log, opened for appending: `None` until the first append, and after a fold (the log is a new
+    /// file then, and the old handle one that is gone).
+    file: Option<fs::File>,
+    /// What the log says: the rows of [`FILE`] plus every record applied over them, so the next change
+    /// can append only what differs.
+    base: HashMap<(String, String), Entry>,
+    /// The bytes of records in the log.
+    bytes: u64,
+    /// The length and checksum of the [`FILE`] the log on disk names.
+    len: u64,
+    crc: u32,
+    /// The bytes [`FILE`] takes: the log may grow to as much before it is folded.
+    table: u64,
+    /// The log on disk is not to be appended to until a fold rewrites it: a record was cut short, a
+    /// write failed, or the log names a file that is not the one there.
+    repair: bool,
+}
+
+impl Log {
+    fn none() -> Self {
+        Self {
+            file: None,
+            base: HashMap::new(),
+            bytes: 0,
+            len: 0,
+            crc: 0,
+            table: 0,
+            repair: true,
+        }
+    }
 }
 
 impl Ledger {
     pub fn disabled() -> Self {
         Self {
             dir: None,
-            write: std::sync::Mutex::new(()),
+            append: true,
+            state: std::sync::Mutex::new(Log::none()),
         }
     }
 
     /// The ledger in `dir`, made (`0700`) if need be. A directory that cannot be made disables it,
     /// said once: jobs are then not remembered across a restart.
-    pub fn at(dir: &Path) -> Self {
+    pub fn at(dir: &Path, append: bool) -> Self {
         match fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
@@ -277,7 +372,8 @@ impl Ledger {
         {
             Ok(()) => Self {
                 dir: Some(dir.to_path_buf()),
-                write: std::sync::Mutex::new(()),
+                append,
+                state: std::sync::Mutex::new(Log::none()),
             },
             Err(e) => {
                 crate::log_warn!(
@@ -293,39 +389,103 @@ impl Ledger {
         self.dir.is_some()
     }
 
-    /// Replace the file with `snapshot()`, taken under the writer lock. Best effort: a write that
-    /// fails is logged, and the previous file stands.
+    /// A change of a job's life: append the rows that differ from what the log says, and fold the log
+    /// into a new file once it has outgrown the table. The table is read under the writer lock, so what
+    /// is appended is the table as of the moment of the write, whatever the caller changed — the
+    /// guarantee the whole-file write gave, which is why two writers (a life change, a retention sweep)
+    /// cannot lose each other's fact.
+    ///
+    /// Best effort, as the whole-file write was: a write that fails is logged and the previous state
+    /// stands, and the next write folds the log, so a record cut short is never appended past.
     pub fn save(&self, snapshot: impl FnOnce() -> Vec<Entry>) {
         let Some(dir) = &self.dir else { return };
-        let _one = crate::proc::locked(&self.write);
-        let file = File {
-            version: VERSION,
-            jobs: snapshot(),
-        };
-        if let Err(e) = write_atomic(dir, &file, false) {
+        let mut st = crate::proc::locked(&self.state);
+        if !self.append {
+            let rows = snapshot();
+            self.whole(dir, &mut st, false, &rows);
+            return;
+        }
+        let rows = snapshot();
+        // The rows the log does not have as they now are, and the ones it has that the table does not.
+        let live: HashSet<(&str, &str)> = rows
+            .iter()
+            .map(|e| (e.scope.as_str(), e.id.as_str()))
+            .collect();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut framed = true;
+        for e in &rows {
+            if st.base.get(&(e.scope.clone(), e.id.clone())) != Some(e) {
+                framed &= frame(&mut buf, &Record::Put(e.clone())).is_ok();
+            }
+        }
+        for (scope, id) in st.base.keys() {
+            if !live.contains(&(scope.as_str(), id.as_str())) {
+                let del = Record::Del {
+                    scope: scope.clone(),
+                    id: id.clone(),
+                };
+                framed &= frame(&mut buf, &del).is_ok();
+            }
+        }
+        drop(live);
+        // A test's fold (`fault.rs`): the same write, taken down the fold's path whatever the log's size.
+        let forced = crate::fault::at("ledger_fold").is_some();
+        let full = !cfg!(feature = "mut_ledger_never_folds")
+            && st.bytes + buf.len() as u64 > LOG_MIN.max(st.table);
+        if !framed || forced || st.repair || full {
+            self.whole(dir, &mut st, false, &rows);
+            return;
+        }
+        if buf.is_empty() || cfg!(feature = "mut_ledger_append_skipped") {
+            return;
+        }
+        if let Err(e) = append(dir, &mut st, &buf) {
             crate::log_warn!(
-                "cannot save the jobs ledger dir={} error={e}",
+                "cannot append to the jobs ledger dir={} error={e}",
                 dir.display()
             );
+            st.repair = true;
+            return;
         }
+        st.bytes += buf.len() as u64;
+        st.base = rows
+            .into_iter()
+            .map(|e| ((e.scope.clone(), e.id.clone()), e))
+            .collect();
+    }
+
+    /// [`Self::save`] for a write that must leave the table whole in [`FILE`]: a retention sweep's (one
+    /// pass, off the runtime, whenever it acted). The log is folded, so the file is the table and the log
+    /// is empty — a whole table after every sweep, which is what an execd that knows nothing of the log,
+    /// one this deployment rolled back to, reads. Best effort, as [`Self::save`].
+    pub fn save_whole(&self, snapshot: impl FnOnce() -> Vec<Entry>) {
+        let Some(dir) = &self.dir else { return };
+        let mut st = crate::proc::locked(&self.state);
+        let rows = snapshot();
+        self.whole(dir, &mut st, false, &rows);
+    }
+
+    /// The server is going away and kills every group: the table is empty, and both files say so.
+    pub fn forget(&self) {
+        let Some(dir) = &self.dir else { return };
+        let mut st = crate::proc::locked(&self.state);
+        self.whole(dir, &mut st, false, &[]);
     }
 
     /// [`Self::save`] for a keyed start's claim (K10): the file is written, synced, renamed and its directory synced,
-    /// and how that came out is returned, so the start can refuse when the claim is not on disk. A ledger that is not
-    /// enabled keeps nothing across a restart, so there is nothing to lose: `Durable`.
+    /// and how that came out is returned, so the start can refuse when the claim is not on disk. The claim is a whole
+    /// write, as it always was, so the file a rollback reads names the claim too. A ledger that is not enabled keeps
+    /// nothing across a restart, so there is nothing to lose: `Durable`.
     pub fn claim(&self, snapshot: impl FnOnce() -> Vec<Entry>) -> Persist {
         let Some(dir) = &self.dir else {
             return Persist::Durable;
         };
-        let _one = crate::proc::locked(&self.write);
-        let file = File {
-            version: VERSION,
-            jobs: snapshot(),
-        };
+        let mut st = crate::proc::locked(&self.state);
+        let rows = snapshot();
         let written = match crate::fault::at("claim_save").as_deref() {
             Some("full") => Err(std::io::ErrorKind::StorageFull.into()),
             Some(_) => Err(std::io::Error::other("injected claim fault")),
-            None => write_atomic(dir, &file, true),
+            None => self.fold(dir, &mut st, true, &rows),
         };
         match written {
             Ok(()) => Persist::Durable,
@@ -343,33 +503,303 @@ impl Ledger {
         }
     }
 
-    /// The saved jobs: none if there is no file, or it is not one of ours.
+    /// The saved jobs: none if there is no file, or it is not one of ours. The rows of [`FILE`] with the
+    /// records of [`LOG`] applied over them, in the order the table had them — which is the order `list`
+    /// answers in, so a restart never reorders a client's answer.
     pub fn load(&self) -> Vec<Entry> {
         let Some(dir) = &self.dir else {
             return Vec::new();
         };
-        let Ok(bytes) = fs::read(dir.join(FILE)) else {
-            return Vec::new();
-        };
-        match serde_json::from_slice::<File>(&bytes) {
+        let bytes = fs::read(dir.join(FILE)).unwrap_or_default();
+        // A file that is absent or unreadable is not a table a log can sit on: the next write folds
+        // instead. (A directory nothing has written yet takes its first change as a fold of a one-row
+        // table, so from then on a log always sits on a file — which is what a rollback reads.)
+        let mut unreadable = !dir.join(FILE).is_file();
+        let rows = match serde_json::from_slice::<File>(&bytes) {
             Ok(f) if f.version == VERSION => f.jobs,
+            _ if bytes.is_empty() => Vec::new(),
             _ => {
                 crate::log_warn!("the jobs ledger is not readable; starting with none");
+                unreadable = true;
                 Vec::new()
             }
+        };
+        let mut st = Log {
+            len: bytes.len() as u64,
+            crc: crc32(&bytes),
+            table: bytes.len() as u64,
+            ..Log::none()
+        };
+        let mut rows = Rows::of(rows);
+        // The records since it. Read even with `append` off: a log a previous run of this execd left
+        // names changes this file does not have, and the first whole write puts them in it.
+        if let Ok(raw) = fs::read(dir.join(LOG)) {
+            st.bytes = replay(&raw, (st.len, st.crc), &mut rows);
         }
+        // A log whose records stop holding together (a cut-off last one) is folded at the next write:
+        // appending after the fragment would leave every later record unreadable behind it.
+        st.repair = if cfg!(feature = "mut_ledger_appends_past_tail") {
+            unreadable
+        } else {
+            rows.repair || unreadable
+        };
+        let rows = rows.entries();
+        st.base = rows
+            .iter()
+            .map(|e| ((e.scope.clone(), e.id.clone()), e.clone()))
+            .collect();
+        *crate::proc::locked(&self.state) = st;
+        rows
+    }
+
+    /// [`Self::fold`], best effort: a failure is logged and the previous state stands.
+    fn whole(&self, dir: &Path, st: &mut Log, durable: bool, rows: &[Entry]) {
+        if let Err(e) = self.fold(dir, st, durable, rows) {
+            crate::log_warn!(
+                "cannot save the jobs ledger dir={} error={e}",
+                dir.display()
+            );
+            st.file = None;
+            st.repair = true;
+        }
+    }
+
+    /// Write the table whole, and fold the log into a new one that names it: [`FILE`] aside, synced,
+    /// renamed over the old one; then [`LOG`] aside, renamed over the old one. What a crash can leave:
+    ///
+    /// - before [`FILE`]'s rename: the old file, and the old log, which names it — the state before;
+    /// - between the two renames: the new file, and a log that names the old one, and is dropped — the
+    ///   state after;
+    /// - after both: the new file and an empty log naming it — the state after.
+    ///
+    /// So the pair is the old state or the new one, never a mix, and the log in force always names the
+    /// file it was written against. The table's bytes are synced before the log's rename, so no crash
+    /// leaves a log naming a file whose bytes are not on disk.
+    fn fold(&self, dir: &Path, st: &mut Log, durable: bool, rows: &[Entry]) -> std::io::Result<()> {
+        let bytes = serde_json::to_vec(&FileRef {
+            version: VERSION,
+            jobs: rows,
+        })
+        .map_err(std::io::Error::other)?;
+        let crc = crc32(&bytes);
+        // Nothing to write: the file holds exactly these bytes and the log holds nothing, so the pair on
+        // disk is the state that was just read — a restart that adopted nothing new, on a clean log. (Never
+        // for a durable write: "the same bytes as last time" is not "on disk".)
+        if !durable && !st.repair && st.bytes == 0 && st.len == bytes.len() as u64 && st.crc == crc
+        {
+            return Ok(());
+        }
+        // With a log to rewrite, the table's bytes are on disk before the log that names them; without
+        // one (the whole-file write, `append` off) the write costs what it always did — no sync.
+        replace(dir, FILE, &bytes, self.append || durable, durable)?;
+        // A test's crash between the two files (`fault.rs`): the table is renamed and the process is
+        // gone before its log is, which is the one window the pair is not written as one step.
+        if crate::fault::at("ledger_fold_crash").as_deref() == Some("exit") {
+            std::process::exit(88);
+        }
+        st.file = None;
+        st.bytes = 0;
+        st.len = bytes.len() as u64;
+        st.crc = crc;
+        st.table = st.len;
+        st.repair = false;
+        st.base = rows
+            .iter()
+            .map(|e| ((e.scope.clone(), e.id.clone()), e.clone()))
+            .collect();
+        if !self.append {
+            return Ok(());
+        }
+        replace(dir, LOG, &header(st.len, crc)?, durable, durable)
     }
 }
 
-/// Replace the ledger file with `file`: write a temporary beside it, rename it over. With `durable`, the temporary is
-/// synced before the rename and the directory after, so a crash of the host leaves the old file or the new one, and
-/// a failure at any step is the caller's to see (the temporary is removed).
-fn write_atomic(dir: &Path, file: &File, durable: bool) -> std::io::Result<()> {
-    // A test's slow disk (`fault.rs`): every ledger write costs this long, on the thread that wrote it.
-    if let Some(ms) = crate::fault::at("ledger_slow").and_then(|v| v.parse::<u64>().ok()) {
+/// The rows of a ledger, in the order the table had them: [`Ledger::load`]'s output and, through it,
+/// the order `list` answers in after a restart.
+struct Rows {
+    v: Vec<Entry>,
+    /// A row a record deleted: kept in `v` (its place in the order taken by nothing) and dropped at the
+    /// end, so deleting one row never shifts another.
+    gone: Vec<bool>,
+    at: HashMap<(String, String), usize>,
+    /// A record could not be read, so the log is not trusted from there on.
+    repair: bool,
+}
+
+impl Rows {
+    fn of(v: Vec<Entry>) -> Self {
+        let at = v
+            .iter()
+            .enumerate()
+            .map(|(i, e)| ((e.scope.clone(), e.id.clone()), i))
+            .collect();
+        let gone = vec![false; v.len()];
+        Self {
+            v,
+            gone,
+            at,
+            repair: false,
+        }
+    }
+
+    fn put(&mut self, e: Entry) {
+        let key = (e.scope.clone(), e.id.clone());
+        match self.at.get(&key) {
+            Some(&i) => self.v[i] = e,
+            None => {
+                self.at.insert(key, self.v.len());
+                self.v.push(e);
+                self.gone.push(false);
+            }
+        }
+    }
+
+    fn del(&mut self, scope: &str, id: &str) {
+        if let Some(i) = self.at.remove(&(scope.to_string(), id.to_string())) {
+            self.gone[i] = true;
+        }
+    }
+
+    fn entries(self) -> Vec<Entry> {
+        self.v
+            .into_iter()
+            .zip(self.gone)
+            .filter_map(|(e, gone)| (!gone).then_some(e))
+            .collect()
+    }
+}
+
+/// Apply the log's records to `rows`, and return the bytes of the log after its header (what the fold's
+/// limit counts). Everything from the first record that does not hold together — a length that runs
+/// past the end, a checksum that does not match, bytes that are not a record — is left alone, and
+/// `rows.repair` says so, so the next write folds instead of appending past it.
+fn replay(raw: &[u8], (len, crc): (u64, u32), rows: &mut Rows) -> u64 {
+    let Some(nl) = raw.iter().position(|&b| b == b'\n') else {
+        // No header: a log that cannot be read at all (an empty file is one that was made and never
+        // used, which is not a repair).
+        rows.repair = !raw.is_empty();
+        return raw.len() as u64;
+    };
+    match serde_json::from_slice::<Head>(&raw[..nl]) {
+        Ok(h)
+            if h.version == LOG_VERSION
+                && (cfg!(feature = "mut_ledger_ignores_base")
+                    || (h.len == len && h.crc == crc)) => {}
+        _ => {
+            // A log of another file: a fold renamed its file and died before its log, so its records
+            // are in that file already and dropping them costs nothing.
+            rows.repair = true;
+            return (raw.len() - nl - 1) as u64;
+        }
+    }
+    let mut i = nl + 1;
+    while i < raw.len() {
+        if raw.len() - i < 8 {
+            rows.repair = true;
+            break;
+        }
+        let n = u32_at(raw, i);
+        let want = u32_at(raw, i + 4) as u32;
+        let start = i + 8;
+        if n > RECORD_MAX || n > (raw.len() - start) as u64 {
+            rows.repair = true;
+            break;
+        }
+        let body = &raw[start..start + n as usize];
+        if crc32(body) != want && !cfg!(feature = "mut_ledger_trusts_checksum") {
+            rows.repair = true;
+            break;
+        }
+        match serde_json::from_slice::<Record>(body) {
+            Ok(Record::Put(e)) => rows.put(e),
+            Ok(Record::Del { scope, id }) => rows.del(&scope, &id),
+            Err(_) => {
+                rows.repair = true;
+                break;
+            }
+        }
+        i = start + n as usize;
+    }
+    (raw.len() - nl - 1) as u64
+}
+
+fn u32_at(b: &[u8], o: usize) -> u64 {
+    u64::from(u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]))
+}
+
+/// One framed record: a length, a checksum, the record.
+fn frame(buf: &mut Vec<u8>, r: &Record) -> Result<(), ()> {
+    let body = serde_json::to_vec(r).map_err(|_| ())?;
+    let len = u32::try_from(body.len()).map_err(|_| ())?;
+    buf.extend_from_slice(&len.to_le_bytes());
+    buf.extend_from_slice(&crc32(&body).to_le_bytes());
+    buf.extend_from_slice(&body);
+    Ok(())
+}
+
+/// [`LOG`]'s header: the file its records belong to, named by length and checksum, and a newline so the
+/// records read on from it.
+fn header(len: u64, crc: u32) -> std::io::Result<Vec<u8>> {
+    let mut head = serde_json::to_vec(&Head {
+        version: LOG_VERSION,
+        len,
+        crc,
+    })
+    .map_err(std::io::Error::other)?;
+    head.push(b'\n');
+    Ok(head)
+}
+
+/// Open the log for appending (once) and append `buf`. A log file that is not there is not recreated: a
+/// log with no header is one nothing can read, so the caller folds instead (`st.repair`).
+fn append(dir: &Path, st: &mut Log, buf: &[u8]) -> std::io::Result<()> {
+    if let Some(ms) = slow() {
         std::thread::sleep(std::time::Duration::from_millis(ms));
     }
-    let tmp = dir.join(format!("{FILE}.tmp"));
+    if st.file.is_none() {
+        // A log that is not there is made, header first: a state directory nothing has written yet
+        // (a first job, or one that ran with `append` off) gets its log at its first change.
+        if !dir.join(LOG).exists() {
+            replace(dir, LOG, &header(st.len, st.crc)?, false, false)?;
+        }
+        let opened = fs::OpenOptions::new()
+            .append(true)
+            .mode(0o600)
+            .open(dir.join(LOG))?;
+        st.file = Some(opened);
+    }
+    let Some(f) = st.file.as_mut() else {
+        return Err(std::io::Error::other("the jobs log is not open"));
+    };
+    // A test's torn tail (`fault.rs`): this record's first `n` bytes reach the file and the process is
+    // gone, as a crash in the middle of the write leaves it.
+    if let Some(n) = crate::fault::at("ledger_append_crash").and_then(|v| v.parse::<usize>().ok()) {
+        let _ = f.write_all(&buf[..n.min(buf.len())]);
+        let _ = f.sync_all();
+        std::process::exit(87);
+    }
+    f.write_all(buf)
+}
+
+/// A test's slow disk (`fault.rs`): every ledger write costs this long, on the thread that wrote it.
+fn slow() -> Option<u64> {
+    crate::fault::at("ledger_slow").and_then(|v| v.parse::<u64>().ok())
+}
+
+/// Replace `dir/name` with `bytes`: written aside, renamed over. `sync_file` syncs the bytes before the
+/// rename and `sync_dir` the rename itself, so a crash of the host leaves the old file or a whole new
+/// one; a failure at any step is the caller's to see (the temporary is removed).
+fn replace(
+    dir: &Path,
+    name: &str,
+    bytes: &[u8],
+    sync_file: bool,
+    sync_dir: bool,
+) -> std::io::Result<()> {
+    if let Some(ms) = slow() {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+    let tmp = dir.join(format!("{name}.tmp"));
     let _ = fs::remove_file(&tmp);
     let put = || -> std::io::Result<()> {
         let mut f = fs::OpenOptions::new()
@@ -377,13 +807,15 @@ fn write_atomic(dir: &Path, file: &File, durable: bool) -> std::io::Result<()> {
             .create_new(true)
             .mode(0o600)
             .open(&tmp)?;
-        f.write_all(&serde_json::to_vec(file).map_err(std::io::Error::other)?)?;
-        if durable {
+        f.write_all(bytes)?;
+        // The bytes before the name: a crash leaves the old file or a whole new one, never a new name
+        // over half a file.
+        if sync_file {
             f.sync_all()?;
         }
         drop(f);
-        fs::rename(&tmp, dir.join(FILE))?;
-        if durable {
+        fs::rename(&tmp, dir.join(name))?;
+        if sync_dir {
             fs::File::open(dir)?.sync_all()?;
         }
         Ok(())
@@ -393,4 +825,47 @@ fn write_atomic(dir: &Path, file: &File, durable: bool) -> std::io::Result<()> {
         let _ = fs::remove_file(&tmp);
     }
     r
+}
+
+/// CRC-32 (the checksum gzip uses): each record and each table file is named by it, so a record cut
+/// short, or a log whose table is not the one there, is not mistaken for a whole one.
+fn crc32(bytes: &[u8]) -> u32 {
+    const TABLE: [u32; 256] = {
+        let mut t = [0u32; 256];
+        let mut i = 0;
+        while i < 256 {
+            let mut c = i as u32;
+            let mut k = 0;
+            while k < 8 {
+                c = if c & 1 != 0 {
+                    0xEDB8_8320 ^ (c >> 1)
+                } else {
+                    c >> 1
+                };
+                k += 1;
+            }
+            t[i] = c;
+            i += 1;
+        }
+        t
+    };
+    let mut c = u32::MAX;
+    for &b in bytes {
+        c = TABLE[((c ^ u32::from(b)) & 0xff) as usize] ^ (c >> 8);
+    }
+    !c
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The checksum is CRC-32: the vectors every implementation agrees on, so a change that keeps "some"
+    /// checksum but not this one is caught.
+    #[test]
+    fn the_checksum_is_crc_32() {
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+        assert_eq!(crc32(b""), 0);
+        assert_eq!(crc32(b"a"), 0xE8B7_BE43);
+    }
 }

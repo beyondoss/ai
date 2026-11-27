@@ -9,7 +9,12 @@
 //! only its intent on disk), `attach_after_decide=<file>` ([`park`]: an attach that has chosen its offset and
 //! registered its stream waits until the file goes), `attach_before_decide=<file>` (an attach that has looked its job
 //! up waits before it locks it), `sweep_after_save=exit` (the retention exits between its ledger write and its
-//! unlinks), `ledger_slow=<ms>` (every write of the jobs ledger costs this long, the way a slow disk does).
+//! unlinks), `ledger_slow=<ms>` (every write of the jobs ledger costs this long, the way a slow disk does),
+//! `ledger_append_crash=<n>` (the next ledger record reaches the log's file only down to its `n`th byte, and the
+//! process exits: the torn tail a crash in the middle of an append leaves), `ledger_fold=1` (the next write of the
+//! ledger is a fold, however small the log: what a test that must reach the fold's steps needs) and
+//! `ledger_fold_crash=exit` (the fold's table is renamed and the process exits before its log is: the crash between
+//! the two files).
 
 use std::path::PathBuf;
 use std::sync::OnceLock;

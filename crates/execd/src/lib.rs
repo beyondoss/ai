@@ -266,6 +266,11 @@ pub struct Options {
     /// `None`: nothing is kept, as before. Use a directory that dies with the machine the jobs run
     /// on (tmpfs): a ledger that outlives its processes only names groups that are gone.
     pub state_dir: Option<PathBuf>,
+    /// Keep the ledger as the table plus a log of the changes since it (`ledger.rs`): each change of a
+    /// job's life appends its row instead of rewriting the file, and the log is folded back into the
+    /// file when it outgrows it. `false` (`EXECD_LEDGER_APPEND=0`) writes the whole file on every
+    /// change, as execd did before this existed — the same file, byte for byte, and no log.
+    pub ledger_append: bool,
     /// The most output a one-shot answer carries; see [`MAX_RESPONSE_BYTES`].
     pub max_response_bytes: usize,
     /// The most a request may carry; see [`MAX_REQUEST_BYTES`].
@@ -338,6 +343,7 @@ impl Options {
             retention: Retention::default(),
             jobs_dir: None,
             state_dir: None,
+            ledger_append: true,
             max_response_bytes: MAX_RESPONSE_BYTES,
             max_request_bytes: MAX_REQUEST_BYTES,
             observer: None,
@@ -368,6 +374,7 @@ impl std::fmt::Debug for Options {
             .field("retention", &self.retention)
             .field("jobs_dir", &self.jobs_dir)
             .field("state_dir", &self.state_dir)
+            .field("ledger_append", &self.ledger_append)
             .field("max_response_bytes", &self.max_response_bytes)
             .field("max_request_bytes", &self.max_request_bytes)
             .field("observer", &self.observer.is_some())
@@ -514,9 +521,10 @@ impl Ctx {
     /// Write the jobs ledger for a change of a job's life, off the runtime thread and holding one of
     /// the `disk_writers` turns — the gate a job's output batch takes. The caller awaits it before it
     /// answers, so the answer still promises what it promised when the write was inline: when a
-    /// `start` answers, the file names the job; when a `remove` answers, it does not. What changed is
-    /// where it runs: 1.5 MB of write and rename at a full table is minutes of nothing for the
-    /// requests this server exists to answer, and it no longer spends them on the runtime's thread.
+    /// `start` answers, the ledger has the job; when a `remove` answers, it does not. What it costs is
+    /// one record of the change (`ledger.rs`), not the table: 1.5 MB a change at a full table was
+    /// minutes of nothing for the requests this server exists to answer, on the runtime's thread
+    /// before and on a disk-writer thread since.
     ///
     /// Ordering against another writer — a second life change, or a retention sweep's — is the
     /// ledger's: `Ledger::save` takes the file's writer lock and only then snapshots the table, so
@@ -670,7 +678,9 @@ pub fn serve(listener: tokio::net::TcpListener, opts: Options) -> std::io::Resul
     let ledger = opts
         .state_dir
         .as_deref()
-        .map_or_else(ledger::Ledger::disabled, ledger::Ledger::at);
+        .map_or_else(ledger::Ledger::disabled, |d| {
+            ledger::Ledger::at(d, opts.ledger_append)
+        });
     let ledger_on = ledger.enabled();
     let disk_slots = tokio::sync::Semaphore::new(opts.disk_writers);
     let ctx = Arc::new(Ctx {

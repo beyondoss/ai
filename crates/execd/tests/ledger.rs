@@ -1,14 +1,20 @@
-//! The jobs ledger: where its write runs, and what a restart reads of it.
+//! The jobs ledger: where its write runs, what a life change costs, and what a restart reads of it.
 //!
-//! `execd-jobs.json` is one file, replaced whole on every change of a job's life. Two costs scaled with
-//! a table of thousands of ended entries (`EXECD_JOBS_ENDED_MAX = 4096`): the write's 1.5 MB sat on the
-//! runtime's thread, and recovery scanned `/proc` once per row before it learned the row had ended.
-//! Each has a test here that goes red when it is taken away.
+//! The ledger is two files: `execd-jobs.json`, the table whole, and `execd-jobs.log`, one framed record
+//! per change of a job's life since (`ledger.rs`). A change used to replace the file whole — 1.5 MB at
+//! the 4096-entry ceiling, on the runtime's thread — and recovery scanned `/proc` once per row before it
+//! learned the row had ended. Each property here has a test that goes red when it is taken away, and each
+//! mutation has a `# red` line:
 //!
 //! ```sh
 //! cargo test -p beyond-execd --test ledger
-//! cargo test -p beyond-execd --test ledger --features mut_ledger_write_inline   # red
-//! cargo test -p beyond-execd --test ledger --features mut_recover_scans_ended   # red
+//! cargo test -p beyond-execd --test ledger --features mut_ledger_write_inline        # red
+//! cargo test -p beyond-execd --test ledger --features mut_recover_scans_ended        # red
+//! cargo test -p beyond-execd --test ledger --features mut_ledger_append_skipped      # red
+//! cargo test -p beyond-execd --test ledger --features mut_ledger_appends_past_tail   # red
+//! cargo test -p beyond-execd --test ledger --features mut_ledger_trusts_checksum     # red
+//! cargo test -p beyond-execd --test ledger --features mut_ledger_ignores_base        # red
+//! cargo test -p beyond-execd --test ledger --features mut_ledger_never_folds         # red
 //! ```
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -20,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use support::Execd;
-use support::http::{post, send};
+use support::http::{post, send, try_post};
 
 fn addr(e: &Execd) -> SocketAddr {
     SocketAddr::V4(e.addr)
@@ -102,6 +108,39 @@ async fn until_state(a: SocketAddr, id: &str, state: &str) {
     }
 }
 
+/// Wait for the execd under test to exit on its own, with the request that kills it polled alongside: a
+/// blocking `wait` would hold the very runtime that request needs.
+async fn died(e: &mut Execd, req: impl std::future::Future) -> Option<i32> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut req = Box::pin(req);
+    let mut done = false;
+    loop {
+        if let Some(s) = e.child.try_wait().unwrap() {
+            return s.code();
+        }
+        assert!(Instant::now() < deadline, "execd never exited");
+        if done {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        } else {
+            // The answer is never read: the request's only job is to be in flight when execd dies.
+            done = tokio::time::timeout(Duration::from_millis(20), &mut req)
+                .await
+                .is_ok();
+        }
+    }
+}
+
+/// The `list` answer's row for `id` — what the server, or the execd that recovered from it, says the job is
+/// — or `null` for a job it does not have. Never the file: what a restart reads is the contract, so the tests
+/// here ask the server, not the bytes.
+async fn listed(a: SocketAddr, id: &str) -> Value {
+    let rows = op(a, json!({ "op": "list", "scope": "s" })).await;
+    rows["jobs"]
+        .as_array()
+        .and_then(|js| js.iter().find(|j| j["id"] == id).cloned())
+        .unwrap_or(Value::Null)
+}
+
 /// The ledger's row for `id`, as it is on disk right now: no polling, no sleep.
 fn row(state: &Path, id: &str) -> Value {
     let v: Value =
@@ -162,9 +201,10 @@ async fn a_life_changes_ledger_write_holds_nobody_else() {
     );
 }
 
-/// **The ledger is current when the answer that promised it arrives.** With every write held 250 ms, a
-/// `keep` answers only after its write landed: the row on disk already carries the keep the moment the
-/// answer is read, no polling. A write that is fired and forgotten would answer first and land later.
+/// **The ledger has the change when the answer that promised it arrives.** With every write held 250 ms,
+/// a `keep` answers only after its record reached the log — and the server is killed the instant the answer
+/// is in hand, as a crash at the worst moment is. The next execd recovers the job with the keep, so the
+/// record was on disk before the answer, not fired and forgotten.
 #[tokio::test]
 async fn a_life_change_is_on_disk_when_its_answer_arrives() {
     let root = tempfile::tempdir().unwrap();
@@ -172,23 +212,27 @@ async fn a_life_change_is_on_disk_when_its_answer_arrives() {
     let jobs = root.path().join("jobs");
     std::fs::create_dir(&jobs).unwrap();
     let fault = fault(root.path(), "ledger_slow=250\n");
-    let e = Execd::start(&settings(&state, &jobs, Some(&fault)), &[]);
+    let settings = settings(&state, &jobs, Some(&fault));
+    let mut e = Execd::start(&settings, &[]);
     let a = addr(&e);
     start(a, "j", "true").await;
     until_state(a, "j", "ended").await;
     assert!(
-        row(&state, "j")["kept"]["num"].is_null(),
-        "the job carries no number before the keep: {}",
-        row(&state, "j")
+        listed(a, "j").await["num"].is_null(),
+        "the job carries no number before the keep"
     );
     let t = Instant::now();
     keep(a, "j").await;
     let took = t.elapsed();
     assert!(took >= Duration::from_millis(230), "{took:?}");
+    e.child.kill().unwrap();
+    e.child.wait().unwrap();
+    let e = Execd::start(&settings, &[]);
+    let row = listed(addr(&e), "j").await;
     assert_eq!(
-        row(&state, "j")["kept"]["num"],
+        row["num"],
         json!(1),
-        "the answer came before the ledger had the keep"
+        "the answer came before the ledger had the keep: {row}"
     );
 }
 
@@ -237,6 +281,270 @@ async fn a_write_that_overlaps_a_sweep_loses_nothing() {
         json!({"num": 1, "kind": "background"}),
         "the keep was lost"
     );
+}
+
+/// **A record cut short is dropped, not believed — and the log is folded, not appended past.** The next
+/// record reaches the file down to its 24th byte and the process dies there (`ledger_append_crash`), the way
+/// a crash in the middle of an append leaves it: four bytes of length, four of checksum, and part of a row.
+/// The complete record before it survives, the cut one leaves no job behind, and a change made after the
+/// restart is in the ledger a restart later — which holds only because recovery folded the torn log instead
+/// of writing after the fragment, where every later record would be unreadable behind it.
+#[tokio::test]
+async fn a_record_cut_short_is_dropped_and_the_log_folded() {
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    let jobs = root.path().join("jobs");
+    std::fs::create_dir(&jobs).unwrap();
+    let fault = fault(root.path(), "");
+    let settings = settings(&state, &jobs, Some(&fault));
+    let mut e = Execd::start(&settings, &[]);
+    let a = addr(&e);
+    start(a, "a", "sleep 20").await;
+    until_state(a, "a", "running").await;
+    std::fs::write(&fault, "ledger_append_crash=24\n").unwrap();
+    let body = json!({ "command": "sh", "args": ["-c", "sleep 20"],
+                       "job": { "op": "start", "scope": "s", "id": "b", "hold": false } });
+    let code = died(&mut e, try_post(a, &[], &body)).await;
+    assert_eq!(code, Some(87), "the append never reached its fault");
+    std::fs::remove_file(&fault).unwrap();
+
+    let mut e = Execd::start(&settings, &[]);
+    let a = addr(&e);
+    assert_eq!(
+        listed(a, "a").await["state"],
+        json!("running"),
+        "the whole record before the cut was dropped too"
+    );
+    assert!(
+        listed(a, "b").await.is_null(),
+        "the half-written record became a job"
+    );
+    start(a, "c", "true").await;
+    until_state(a, "c", "ended").await;
+    e.child.kill().unwrap();
+    e.child.wait().unwrap();
+    let e = Execd::start(&settings, &[]);
+    assert_eq!(
+        listed(addr(&e), "c").await["state"],
+        json!("ended"),
+        "a change made after the torn tail was lost: the log was appended to, not folded"
+    );
+}
+
+/// **A record whose checksum does not match is not applied.** One byte of the newest record's row is changed
+/// for another — the record still parses, and now says the job exited 1 where it exited 0 — and the answer
+/// after the restart is what the record before it left: the exit code, and no keep. Believed, the changed row
+/// would show both.
+#[tokio::test]
+async fn a_record_that_does_not_checksum_is_not_applied() {
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    let jobs = root.path().join("jobs");
+    std::fs::create_dir(&jobs).unwrap();
+    let settings = settings(&state, &jobs, None);
+    let mut e = Execd::start(&settings, &[]);
+    let a = addr(&e);
+    start(a, "c", "exit 0").await;
+    until_state(a, "c", "ended").await;
+    keep(a, "c").await;
+    e.child.kill().unwrap();
+    e.child.wait().unwrap();
+
+    let log = std::fs::read(state.join("execd-jobs.log")).unwrap();
+    let at = log
+        .windows(8)
+        .rposition(|w| w == b"\"code\":0")
+        .expect("the newest record's exit code");
+    let mut bad = log;
+    bad[at + 7] = b'1';
+    std::fs::write(state.join("execd-jobs.log"), &bad).unwrap();
+
+    let e = Execd::start(&settings, &[]);
+    let row = listed(addr(&e), "c").await;
+    assert_eq!(
+        row["code"],
+        json!(0),
+        "a record the checksum rejects was applied: {row}"
+    );
+    assert!(
+        row["num"].is_null(),
+        "the rejected record's keep was applied: {row}"
+    );
+}
+
+/// **A crash between the fold's two files is the old state or the new one, never a mix.** The fold renames
+/// the table and the process dies before its log is renamed (`ledger_fold_crash`), so the log on disk still
+/// names the *old* table — and is dropped. The change that triggered the fold (a `keep`) is there, because the
+/// new table has it; applied anyway, the stale log would put the row back to the state before the keep.
+#[tokio::test]
+async fn a_crash_between_the_fold_and_its_log_leaves_the_new_table() {
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    let jobs = root.path().join("jobs");
+    std::fs::create_dir(&jobs).unwrap();
+    let fault = fault(root.path(), "");
+    let settings = settings(&state, &jobs, Some(&fault));
+    let mut e = Execd::start(&settings, &[]);
+    let a = addr(&e);
+    start(a, "f", "sleep 20").await;
+    until_state(a, "f", "running").await;
+    // The keep folds — the log's one record goes into the table — and the crash comes between the two files.
+    std::fs::write(&fault, "ledger_fold=1\nledger_fold_crash=exit\n").unwrap();
+    let body = json!({ "command": "true",
+                       "job": { "op": "keep", "scope": "s", "id": "f", "num": 1,
+                                "kind": "background", "seen": 1 } });
+    let code = died(&mut e, try_post(a, &[], &body)).await;
+    assert_eq!(code, Some(88), "the fold never reached its fault");
+    std::fs::remove_file(&fault).unwrap();
+
+    let e = Execd::start(&settings, &[]);
+    let row = listed(addr(&e), "f").await;
+    assert_eq!(row["state"], json!("running"), "{row}");
+    assert_eq!(
+        row["num"],
+        json!(1),
+        "the log of the fold that did not finish was applied over its table: {row}"
+    );
+}
+
+/// Seeded rows for the two size tests: `n` ended jobs of a realistic size, the shape `ledger.rs` writes.
+fn seed(state: &Path, n: usize, at: u64) {
+    std::fs::create_dir_all(state).unwrap();
+    let rows: Vec<Value> = (0..n).map(|i| ended_row(i, at)).collect();
+    std::fs::write(
+        state.join("execd-jobs.json"),
+        serde_json::to_vec(&json!({ "version": 1, "jobs": rows })).unwrap(),
+    )
+    .unwrap();
+}
+
+fn size(p: &Path) -> u64 {
+    std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+}
+
+/// **A life change writes one record, not the table.** With 1024 ended rows adopted, one `keep` leaves
+/// `execd-jobs.json` byte for byte as it was and adds under a kilobyte to the log — where replacing the table
+/// wrote 386 KB for the same change. At the ceiling that is 1.16 MB a cycle against about a kilobyte.
+#[tokio::test]
+async fn a_life_change_appends_a_record_and_leaves_the_table_alone() {
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    let jobs = root.path().join("jobs");
+    std::fs::create_dir(&jobs).unwrap();
+    seed(&state, 1024, now() - 60);
+    let e = Execd::start(&settings(&state, &jobs, None), &[]);
+    let a = addr(&e);
+    // A restart adopts the table and folds it, so both files are where the last write left them.
+    listed(a, "none").await;
+    let (table, _) = (size(&state.join("execd-jobs.json")), ());
+    let log = size(&state.join("execd-jobs.log"));
+    keep(a, "job_01J8Z9K3M4N5P6Q7R8S9T0V1W00000").await;
+    assert_eq!(
+        size(&state.join("execd-jobs.json")),
+        table,
+        "the change rewrote the table"
+    );
+    let grew = size(&state.join("execd-jobs.log")) - log;
+    assert!(
+        (1..1024).contains(&grew),
+        "the change wrote {grew} bytes, not one record"
+    );
+}
+
+/// **A restart answers `list` in the order the table had.** The file names the rows in order, and the log's records are
+/// applied in place — a row it changes keeps its place, a row it adds goes last, a row it deletes leaves its place empty
+/// rather than shifting the rest — so a client that reattaches after a restart reads the same order it read before.
+#[tokio::test]
+async fn a_restart_keeps_the_tables_order() {
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    let jobs = root.path().join("jobs");
+    std::fs::create_dir(&jobs).unwrap();
+    let ids: Vec<String> = (0..5).map(|i| format!("job_z{i}")).collect();
+    let rows: Vec<Value> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| {
+            let mut r = ended_row(i, now() - 60);
+            r["id"] = json!(id);
+            r
+        })
+        .collect();
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(
+        state.join("execd-jobs.json"),
+        serde_json::to_vec(&json!({ "version": 1, "jobs": rows })).unwrap(),
+    )
+    .unwrap();
+    let mut e = Execd::start(&settings(&state, &jobs, None), &[]);
+    let a = addr(&e);
+    // A change of a middle row (a log record) and a new one (appended after it), then a crash.
+    keep(a, &ids[2]).await;
+    start(a, "job_last", "true").await;
+    until_state(a, "job_last", "ended").await;
+    e.child.kill().unwrap();
+    e.child.wait().unwrap();
+
+    let e = Execd::start(&settings(&state, &jobs, None), &[]);
+    let answer = op(addr(&e), json!({ "op": "list", "scope": "s" })).await;
+    let order: Vec<String> = answer["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|j| j["id"].as_str().unwrap().to_string())
+        .collect();
+    let mut want = ids.clone();
+    want.push("job_last".into());
+    assert_eq!(order, want, "the restart reordered the table: {answer}");
+}
+
+/// **The log is folded before it outgrows the table.** With 256 ended rows (a ~90 KB file) and 400 life
+/// changes, the log never passes the documented bound — the size of the table, with a 64 KiB floor — because
+/// the write that would pass it folds instead; and the fold happens. Without it the log reaches 150 KB and
+/// keeps going: the files are unbounded again, which is the whole cost this change exists to remove.
+#[tokio::test]
+async fn the_log_is_folded_before_it_outgrows_the_table() {
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    let jobs = root.path().join("jobs");
+    std::fs::create_dir(&jobs).unwrap();
+    const N: usize = 256;
+    seed(&state, N, now() - 60);
+    let e = Execd::start(&settings(&state, &jobs, None), &[]);
+    let a = addr(&e);
+    listed(a, "none").await;
+    let table = size(&state.join("execd-jobs.json"));
+    let bound = table.max(64 * 1024) + 4096;
+    let mut folds = 0;
+    let mut before = size(&state.join("execd-jobs.log"));
+    for i in 0..400 {
+        let id = format!("job_01J8Z9K3M4N5P6Q7R8S9T0V1W{:05}", i % N);
+        let r = post(
+            a,
+            &[],
+            &json!({ "command": "true",
+                     "job": { "op": "keep", "scope": "s", "id": id, "num": i + 1,
+                              "kind": "background", "seen": 1 } }),
+        )
+        .await;
+        assert_eq!(r.status, 200, "keep {id}: {}", r.json());
+        let log = size(&state.join("execd-jobs.log"));
+        assert!(
+            log <= bound,
+            "after {} changes the log is {log} bytes, past the {bound} of the table it sits on",
+            i + 1
+        );
+        assert!(
+            log + size(&state.join("execd-jobs.json")) <= 2 * bound,
+            "the two files passed twice the table's bound after {} changes",
+            i + 1
+        );
+        if log < before {
+            folds += 1;
+        }
+        before = log;
+    }
+    assert!(folds >= 1, "the log was never folded: {folds}");
 }
 
 /// One ledger row for an ended job, as `ledger.rs` writes one: a realistic id and argv, a mark, a dead

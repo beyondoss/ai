@@ -71,6 +71,26 @@ pub async fn post(addr: SocketAddr, headers: &[(&str, &str)], body: &Value) -> A
     send(addr, "POST", "/exec", headers, body.to_string().as_bytes()).await
 }
 
+/// [`post`], but a connection that fails is `None` instead of a panic: for a request sent to a server a test
+/// expects to die in the middle of answering it.
+pub async fn try_post(addr: SocketAddr, headers: &[(&str, &str)], body: &Value) -> Option<Answer> {
+    let mut sock = tokio::net::TcpStream::connect(addr).await.ok()?;
+    sock.write_all(&request(
+        "POST",
+        "/exec",
+        headers,
+        body.to_string().as_bytes(),
+    ))
+    .await
+    .ok()?;
+    let mut raw = Vec::new();
+    let _ = sock.read_to_end(&mut raw).await;
+    // Cut off before the answer began: the server died mid-request.
+    raw.windows(4)
+        .any(|w| w == b"\r\n\r\n")
+        .then(|| parse(&raw))
+}
+
 pub fn parse(raw: &[u8]) -> Answer {
     let split = raw
         .windows(4)

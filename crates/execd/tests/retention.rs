@@ -1133,9 +1133,17 @@ async fn a_restart_reaps_the_entries_the_clock_passed() {
     until_state(a, "old", "ended").await;
     start(a, "young", "printf y").await;
     until_state(a, "young", "ended").await;
-    // A crash, not a stop: the ledger is what the last save wrote.
+    // A crash, not a stop: the ledger is what the last save wrote. One restart folds the log back into
+    // the file (`ledger.rs`: life changes append, a restart writes the table whole), so what this test
+    // edits next is the whole state; the second restart is the one that reads it.
     first.child.kill().unwrap();
     first.child.wait().unwrap();
+    if std::path::Path::new(&state.join("execd-jobs.log")).exists() {
+        let mut folded = Execd::start(&settings, &[]);
+        list(addr(&folded)).await;
+        folded.child.kill().unwrap();
+        folded.child.wait().unwrap();
+    }
     let file = state.join("execd-jobs.json");
     let mut v: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
     for row in v["jobs"].as_array_mut().unwrap() {
