@@ -1123,21 +1123,22 @@ async fn a_restart_reaps_the_entries_the_clock_passed() {
     let state = root.path().join("state");
     let jobs = root.path().join("jobs");
     std::fs::create_dir(&jobs).unwrap();
-    // This test edits `execd-jobs.json` to age a row, so it runs the ledger in its whole-file form
-    // (`EXECD_LEDGER_APPEND=0`): with a log, the file is only the table as of the last fold.
+    // This test ages a row by editing `execd-jobs.json`, and the file is the whole table only where a
+    // crash meets a fold: a log's records are in the log until it outgrows the table. So every write here
+    // is folded (`ledger_fold`, a debug-build seam like the crash windows), which leaves the file the
+    // table after each change. It is the seam, not a setting, that ships.
     let settings = [
         ("EXECD_STATE_DIR", state.to_str().unwrap()),
         ("EXECD_JOBS_DIR", jobs.to_str().unwrap()),
-        ("EXECD_LEDGER_APPEND", "0"),
     ];
-    let mut first = Execd::start(&settings, &[]);
+    let fault = fault_env(root.path(), "ledger_fold=1\n");
+    let mut first = Execd::start(&settings, &[("EXECD_TEST_FAULT", &fault)]);
     let a = addr(&first);
     start(a, "old", "head -c 1000 /dev/zero | tr '\\0' 'x'").await;
     until_state(a, "old", "ended").await;
     start(a, "young", "printf y").await;
     until_state(a, "young", "ended").await;
-    // A crash, not a stop: the ledger is what the last save wrote, which with `EXECD_LEDGER_APPEND=0` is
-    // the whole table.
+    // A crash, not a stop: the ledger is what the last save wrote, which here is the whole table.
     first.child.kill().unwrap();
     first.child.wait().unwrap();
     let file = state.join("execd-jobs.json");

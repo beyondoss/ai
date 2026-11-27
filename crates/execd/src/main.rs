@@ -256,7 +256,6 @@ async fn run(
         Some(n) => Some(n),
     };
     opts.disk_writers = cli.disk_writers.unwrap_or(execd::DISK_WRITERS);
-    opts.ledger_append = cli.ledger_append;
     opts.shed_when_out_of_fds = cli.shed_when_out_of_fds;
     match opts.max_in_flight {
         Some(n) => execd::log_info!("at most {n} requests in flight, then 503"),

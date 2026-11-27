@@ -39,7 +39,7 @@ variables alone ([Configuration](#configuration)).
 execd has no command-line flags. It is configured by `EXECD_*` environment variables, each read once at startup in
 `src/config.rs` and nowhere else: `EXECD_LISTEN`, `EXECD_ROOT`, `EXECD_HOME`, `EXECD_BEARER_FILE`, `EXECD_BEARER`,
 `EXECD_INSECURE_NO_AUTH`, `EXECD_RUN_AS`, `EXECD_MAX_RESPONSE_BYTES`, `EXECD_JOBS_DIR`, `EXECD_STATE_DIR`,
-`EXECD_LOG`, `EXECD_WORKER_THREADS`, `EXECD_IDLE_TIMEOUT_MS`, `EXECD_DISK_WRITERS`, `EXECD_LEDGER_APPEND`, and the four retention knobs `EXECD_JOB_OUTPUT_MS`,
+`EXECD_LOG`, `EXECD_WORKER_THREADS`, `EXECD_IDLE_TIMEOUT_MS`, `EXECD_DISK_WRITERS`, and the four retention knobs `EXECD_JOB_OUTPUT_MS`,
 `EXECD_JOBS_ENDED_BYTES`, `EXECD_JOBS_ENDED_MAX` and `EXECD_JOB_ENTRY_MS` (the table is in the README; see "Ended jobs: retention"). A value that does not parse is an error
 naming the variable and the value, with exit status 2; a boolean is `1`, `true`, `0` or `false`; an empty variable is unset.
 Any argument other than the internal `--execd-run-as-helper` re-exec marker (handled before anything else) prints the variable
@@ -362,9 +362,13 @@ Each of the three costs that scales with the table is answered here:
 
   | ended entries | table   | bytes written per cycle, before → now | per cycle p50, before → now | cycles/s, before → now |
   | ------------- | ------- | ------------------------------------- | --------------------------- | ---------------------- |
-  | 256           | 94 KB   | 284 502 → 753                         | 9.1 → 6.6 ms                | 109 → 151              |
-  | 1024          | 377 KB  | 1 132 286 → 690                       | 23.0 → 12.5 ms              | 43 → 80                |
-  | 4096          | 1.51 MB | 4 523 764 → 395                       | 85.6 → 37.6 ms              | 12 → 27                |
+  | 256           | 94 KB   | 284 443 → 1 850                       | 7.6 → 6.7 ms                | 132 → 149              |
+  | 1024          | 377 KB  | 1 132 236 → 1 778                     | 13.3 → 12.6 ms              | 76 → 80                |
+  | 4096          | 1.51 MB | 4 523 581 → 1 617                     | 60.8 → 35.9 ms              | 16 → 28                |
+
+  The before column is the release binary at `87347af`, built in its own worktree and run by the same harness
+  (`handoffs/CAPY-12/ledger_cycles.py --before-bin`); the byte counts move by a few hundred bytes with where the fold lands,
+  the timings by about 15% run to run.
 
   On a disk that bills 300 ms a write _and_ a rename (the `handoffs/CAPY-8/slowdisk.c` shim), a cycle is 912 / 915 / 640 ms
   against 1813 / 1825 / 1885 ms: the old path paid three renames a cycle, the new one none. Every guarantee the whole-file write
@@ -390,10 +394,12 @@ Each of the three costs that scales with the table is answered here:
     (`a_crash_after_the_ledger_write_leaves_no_spool_behind`) are unchanged. A restart's write is an ordinary change — one
     record for what recovery changed, or nothing — except into a log a crash left torn, which is folded instead of appended
     to, so the torn tail is repaired (`a_record_cut_short_is_dropped_and_the_log_folded`).
-  - **Rollback.** `execd-jobs.json` keeps its version-1 shape, byte for byte the file this execd wrote before the log existed, so
-    an execd that predates the log reads it and adopts what it names. It cannot read the log, so it misses the changes since the
-    last fold — at most one log's worth, bounded by the table's size — and adopts a table that is that stale. Nothing is
-    corrupted: what such an execd writes back is a whole table again, and this one ignores a log that does not name it.
+  - **No version to serve.** A sandbox gets the binary it was built for, so the ledger owes no older execd anything and
+    there is no compatibility flag to keep. `execd-jobs.json` keeps the version-1 shape and the log names it by length and
+    checksum because those are the cheap whole-table form and the fold's identity check, not because a rollback reads them; the
+    version markers stay as a diagnostic. What is mandatory is same-build recovery, and it is what the four guarantees above
+    are: a restarted execd reads exactly what it wrote, a torn tail is dropped rather than resurrecting or losing a job, and a
+    crash mid-fold leaves one consistent pair.
 
 **The `list` bound.** `list` answers with every job of its scope that has not ended, and with the newest `LIST_ENDED_MAX` (512)
 ended ones; past that it adds `"more": n`, the number it did not list. The newest are the rows it keeps, because the count ceiling

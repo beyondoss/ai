@@ -32,9 +32,6 @@ pub struct Config {
     /// `EXECD_DISK_WRITERS`: unset is [`crate::DISK_WRITERS`], `0` does blocking disk work on the
     /// runtime.
     pub disk_writers: Option<usize>,
-    /// `EXECD_LEDGER_APPEND`: append each change of a job's life to the ledger's log and fold it back
-    /// when it outgrows the table (default 1); `0` rewrites the whole file on every change, as before.
-    pub ledger_append: bool,
     /// `EXECD_RAISE_NOFILE`: raise the soft `RLIMIT_NOFILE` to the hard limit at start (default 1).
     pub raise_nofile: bool,
     /// `EXECD_SHED_WHEN_OUT_OF_FDS`: see `Options::shed_when_out_of_fds` (default 1).
@@ -62,7 +59,6 @@ execd takes no arguments; it is configured by environment variables:
   EXECD_WORKER_THREADS            1 (default) one thread, 0 a worker per CPU, N workers
   EXECD_MAX_STREAMS               the most requests in flight, each over its limit answered 503: unset sizes it from the descriptor limit, 0 no cap
   EXECD_DISK_WRITERS              blocking disk jobs at once off the runtime: job output batches, the jobs ledger, a retention sweep (default 8); 0 does them on the runtime
-  EXECD_LEDGER_APPEND             1|true|0|false: keep the ledger as the table plus a log of the changes since it, folded when it outgrows the table (default 1); 0 rewrites the whole file on every change
   EXECD_RAISE_NOFILE              1|true|0|false: raise the soft open file limit to the hard limit at start (default 1)
   EXECD_SHED_WHEN_OUT_OF_FDS      1|true|0|false: out of descriptors, answer waiting connections 503 instead of leaving them queued (default 1)
   EXECD_IDLE_TIMEOUT_MS           close a connection with no request in flight for this long; 0 (default) never
@@ -116,8 +112,6 @@ pub fn parse<E: Fn(&str) -> Option<String>>(env: E) -> Result<Config, String> {
         },
         max_streams: number("EXECD_MAX_STREAMS", get("EXECD_MAX_STREAMS"))?,
         disk_writers: number("EXECD_DISK_WRITERS", get("EXECD_DISK_WRITERS"))?,
-        ledger_append: get("EXECD_LEDGER_APPEND").is_none()
-            || boolean("EXECD_LEDGER_APPEND", get("EXECD_LEDGER_APPEND"))?,
         raise_nofile: get("EXECD_RAISE_NOFILE").is_none()
             || boolean("EXECD_RAISE_NOFILE", get("EXECD_RAISE_NOFILE"))?,
         shed_when_out_of_fds: get("EXECD_SHED_WHEN_OUT_OF_FDS").is_none()

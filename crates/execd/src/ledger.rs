@@ -309,10 +309,6 @@ impl Entry {
 /// Where the ledger lives; `None` keeps nothing, as execd always did.
 pub(crate) struct Ledger {
     dir: Option<PathBuf>,
-    /// Append each change of a job's life and fold the log when it outgrows the table
-    /// ([`crate::Options::ledger_append`]). `false` writes the whole file on every change, as execd did
-    /// before this existed — the same file, and no log.
-    append: bool,
     /// One writer at a time: a record is built from the table *and* written under this, so records for
     /// one job are appended in the order their states were read, and a fold replaces the file and the
     /// log as one step no append can land inside.
@@ -357,14 +353,13 @@ impl Ledger {
     pub fn disabled() -> Self {
         Self {
             dir: None,
-            append: true,
             state: std::sync::Mutex::new(Log::none()),
         }
     }
 
     /// The ledger in `dir`, made (`0700`) if need be. A directory that cannot be made disables it,
     /// said once: jobs are then not remembered across a restart.
-    pub fn at(dir: &Path, append: bool) -> Self {
+    pub fn at(dir: &Path) -> Self {
         match fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
@@ -372,7 +367,6 @@ impl Ledger {
         {
             Ok(()) => Self {
                 dir: Some(dir.to_path_buf()),
-                append,
                 state: std::sync::Mutex::new(Log::none()),
             },
             Err(e) => {
@@ -400,11 +394,6 @@ impl Ledger {
     pub fn save(&self, snapshot: impl FnOnce() -> Vec<Entry>) {
         let Some(dir) = &self.dir else { return };
         let mut st = crate::proc::locked(&self.state);
-        if !self.append {
-            let rows = snapshot();
-            self.whole(dir, &mut st, false, &rows);
-            return;
-        }
         let rows = snapshot();
         // The rows the log does not have as they now are, and the ones it has that the table does not.
         let live: HashSet<(&str, &str)> = rows
@@ -589,9 +578,8 @@ impl Ledger {
         {
             return Ok(());
         }
-        // With a log to rewrite, the table's bytes are on disk before the log that names them; without
-        // one (the whole-file write, `append` off) the write costs what it always did — no sync.
-        replace(dir, FILE, &bytes, self.append || durable, durable)?;
+        // The table's bytes are on disk before the log that names them.
+        replace(dir, FILE, &bytes, true, durable)?;
         // A test's crash between the two files (`fault.rs`): the table is renamed and the process is
         // gone before its log is, which is the one window the pair is not written as one step.
         if crate::fault::at("ledger_fold_crash").as_deref() == Some("exit") {
@@ -607,9 +595,6 @@ impl Ledger {
             .iter()
             .map(|e| ((e.scope.clone(), e.id.clone()), e.clone()))
             .collect();
-        if !self.append {
-            return Ok(());
-        }
         replace(dir, LOG, &header(st.len, crc)?, durable, durable)
     }
 }
