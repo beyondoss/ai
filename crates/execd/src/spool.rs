@@ -20,10 +20,17 @@
 //! **Stale directories.** At startup, a directory in the base that is named like this, is a real
 //! directory (not a link), belongs to the same uid, and names a pid that no longer exists is
 //! removed. Nothing else is touched.
+//!
+//! **Punching.** Two things return what execd has read to the filesystem: the tail punches a spool
+//! file's read prefix, and the ring punches an evicted chunk's stride in the pack
+//! ([`punch`]). A filesystem without `FALLOC_FL_PUNCH_HOLE` (NFS, SMB, some FUSE) must not be given
+//! the pack at all — its eviction would free nothing and the file would grow with the job's whole
+//! output — so the capability is probed once per directory ([`punch_hole_supported`]) and a server
+//! whose jobs directory cannot punch keeps one file per chunk.
 
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io;
-use std::os::fd::{AsRawFd as _, OwnedFd};
+use std::os::fd::{AsFd as _, AsRawFd as _, OwnedFd};
 use std::sync::Arc;
 
 use nix::fcntl::{OFlag, open, openat};
@@ -154,6 +161,9 @@ pub(crate) struct JobsDir {
     server: Base,
     /// The ledger's spools' directory, held open (with a ledger only).
     stable: Option<Base>,
+    /// Whether a job's chunks go in one file (`ring::Layout::Pack`): asked for, and the filesystem
+    /// here can punch a hole.
+    pack: bool,
     next: AtomicU64,
 }
 
@@ -193,14 +203,31 @@ impl JobsDir {
                 }
             }
         };
+        // The pack's eviction is a punch. A filesystem that cannot punch would let a job's pack
+        // grow with its whole output, so it keeps one file per chunk: asked once, here, of the
+        // directory every spool of this server hangs under.
+        let pack = punch_hole_supported(&path);
+        if !pack {
+            crate::log_warn!(
+                "the jobs directory {} cannot punch a hole (FALLOC_FL_PUNCH_HOLE): a job's chunks \
+                 stay one file each, and an evicted chunk is freed by unlinking it",
+                path.display()
+            );
+        }
         let dir = Self {
             path,
             server,
             stable,
+            pack,
             next: AtomicU64::new(0),
         };
         dir.log_filesystem();
         Ok(dir)
+    }
+
+    /// Whether a job's chunks go in one file here (see [`JobsDir::open`]).
+    pub fn pack(&self) -> bool {
+        self.pack
     }
 
     /// The path a new job will use (nothing is created until it writes a full chunk).
@@ -366,6 +393,109 @@ pub(crate) fn read_chunk(path: &Path, pos: u64, buf: &mut [u8]) -> io::Result<us
         .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
         .open(path)?;
     f.read_at(buf, pos)
+}
+
+/// Open (or make) the one file a job's chunks live in: `0600`, never through a link, read and
+/// write (`read` is what serves a byte and `write` is what eviction punches).
+pub(crate) fn open_pack(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
+        .open(path)
+}
+
+/// Open a pack file a previous execd wrote, to read it: never through a link. Nothing is created:
+/// a pack that is not there is not this job's.
+pub(crate) fn open_pack_ro(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
+        .open(path)
+}
+
+/// Write `data` at `at`, all of it. A short write is an error: the caller treats a chunk it could
+/// not write whole as one the disk refused, which reads back as a gap.
+pub(crate) fn write_at(f: &File, at: u64, data: &[u8]) -> io::Result<()> {
+    f.write_all_at(data, at)
+}
+
+/// Read up to `buf.len()` bytes of `f` from `at`.
+pub(crate) fn read_at(f: &File, at: u64, buf: &mut [u8]) -> io::Result<usize> {
+    f.read_at(buf, at)
+}
+
+/// Return `[at, at+len)` of `f` to the filesystem as a hole, its length unchanged: the bytes read
+/// back as zeros, and the blocks are free.
+pub(crate) fn punch(f: &File, at: u64, len: u64) -> io::Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    nix::fcntl::fallocate(
+        f.as_fd(),
+        nix::fcntl::FallocateFlags::FALLOC_FL_PUNCH_HOLE
+            | nix::fcntl::FallocateFlags::FALLOC_FL_KEEP_SIZE,
+        i64::try_from(at).map_err(io::Error::other)?,
+        i64::try_from(len).map_err(io::Error::other)?,
+    )
+    .map_err(io::Error::from)
+}
+
+/// Whether the filesystem under `dir` can punch a hole, asked once per directory and remembered.
+///
+/// A ring's pack lives in a directory of its own, one level under a jobs directory
+/// ([`JobsDir`]), so the answer a server asks for its own directory speaks for every job it
+/// writes: the filesystem is a property of where the directory is, and the probe writes nothing
+/// that outlives it.
+pub(crate) fn punch_hole_supported(dir: &Path) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(&ok) = crate::proc::locked(seen).get(dir) {
+        return ok;
+    }
+    let ok = punch_probe(dir);
+    crate::proc::locked(seen).insert(dir.to_path_buf(), ok);
+    ok
+}
+
+/// [`punch_hole_supported`] asked of the filesystem itself: a scratch file two pages long, one
+/// page of it punched, then removed. No fault file, no cache.
+fn punch_probe(dir: &Path) -> bool {
+    if cfg!(feature = "mut_pack_ignores_punch_probe") {
+        // The mutant: the answer is not asked, and the pack is used on a filesystem that cannot
+        // punch, whose eviction frees nothing. `tests/pack.rs` goes red.
+        return true;
+    }
+    // A test's way to stand on a filesystem that cannot punch, where mounting one is not:
+    // `EXECD_TEST_FAULT` `punch_probe=unsupported`.
+    if crate::fault::at("punch_probe").as_deref() == Some("unsupported") {
+        return false;
+    }
+    static N: AtomicU64 = AtomicU64::new(0);
+    let path = dir.join(format!(
+        ".punch-probe-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    let probe = || -> io::Result<()> {
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
+            .open(&path)?;
+        let page = 4096;
+        f.set_len(2 * page)?;
+        punch(&f, page, page)
+    };
+    let ok = probe().is_ok();
+    let _ = fs::remove_file(&path);
+    ok
 }
 
 #[cfg(test)]

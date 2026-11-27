@@ -585,7 +585,7 @@ impl Drop for Hub {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod hold_tests {
     use super::*;
-    use crate::ring::Ring;
+    use crate::ring::{Layout, Ring};
     use crate::spool::JobsDir;
 
     fn stable() -> (tempfile::TempDir, JobsDir) {
@@ -612,7 +612,9 @@ mod hold_tests {
         let (_base1, jobs1) = stable();
         let (a, _w) = Spool::create(jobs1.stable(), "a").unwrap();
         let mut journal = Journal::create(&a.access(), a.guard(), [0, 0], Vec::new(), 0).unwrap();
-        let mut ring = Ring::new(1 << 20, a.ring_dir()).holding(a.guard()).kept();
+        let mut ring = Ring::new(1 << 20, a.ring_dir(), Layout::Pack)
+            .holding(a.guard())
+            .kept();
         a.remove();
         drop(a);
         drop(jobs1);
@@ -662,7 +664,9 @@ mod hold_tests {
         let (_base, jobs) = stable();
         let (a, _w) = Spool::create(jobs.stable(), "a").unwrap();
         let mut journal = Journal::create(&a.access(), a.guard(), [0, 0], Vec::new(), 0).unwrap();
-        let mut ring = Ring::new(1 << 20, a.ring_dir()).holding(a.guard()).kept();
+        let mut ring = Ring::new(1 << 20, a.ring_dir(), Layout::Pack)
+            .holding(a.guard())
+            .kept();
         a.remove();
         drop(a);
         let (b, _wb) = Spool::create(jobs.stable(), "b").unwrap();

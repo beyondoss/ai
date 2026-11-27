@@ -1912,7 +1912,11 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
                         command: req.command.clone(),
                         args: req.args.clone(),
                     },
-                    out: Ring::new(ctx.opts.job_output_retention, ctx.spool.new_job()),
+                    out: Ring::new(
+                        ctx.opts.job_output_retention,
+                        ctx.spool.new_job(),
+                        ctx.ring_layout(),
+                    ),
                     spool: None,
                     k: kernel::State::new(epoch(), job.hold, pty),
                     notify: None,
@@ -2002,9 +2006,13 @@ async fn start_job(ctx: &Arc<Ctx>, req: &Request, job: &JobReq) -> Resp {
                 {
                     let mut j = locked(&cell);
                     // The ring's chunks live in the spool, which a restart reads again.
-                    j.out = Ring::new(ctx.opts.job_output_retention, sp.ring_dir())
-                        .holding(sp.guard())
-                        .kept();
+                    j.out = Ring::new(
+                        ctx.opts.job_output_retention,
+                        sp.ring_dir(),
+                        ctx.ring_layout(),
+                    )
+                    .holding(sp.guard())
+                    .kept();
                     j.spool = Some(sp);
                 }
                 tail = Some((t, journal));
@@ -2399,16 +2407,26 @@ impl Tailing {
                 gated = true;
                 tail_gate();
             }
-            let tail_len = {
+            let (tail_len, flushed) = {
                 let mut j = locked(&self.cell);
                 if kernel::step(&mut j.k, Ev::Push) == Act::Discard {
                     return false;
                 }
+                let before = j.out.chunks_flushed();
                 j.out.push(data, stderr);
-                j.out.tail_len()
+                (j.out.tail_len(), j.out.chunks_flushed() > before)
             };
             // Before the spool's bytes are returned (the batch punches after this returns).
             locked(&self.journal).record(stderr, data, tail_len);
+            // A test's crash with the journal's advance on disk and the chunk it names not
+            // (`EXECD_TEST_FAULT`, debug builds only; nothing in a shipped build). Only after a
+            // flush: a record that followed no flush has advanced nothing.
+            if flushed
+                && cfg!(debug_assertions)
+                && crate::fault::at("pack_torn_after_journal").is_some()
+            {
+                locked(&self.cell).out.lose_pack_tail();
+            }
             self.ctx.jobs.bump();
             true
         })
@@ -2578,6 +2596,9 @@ async fn supervise_after(
     if let Some((t, task)) = tail {
         t.done.cancel();
         let _ = task.await;
+        // Nothing writes the ring again, so its handle on the chunks goes: an ended job holds no
+        // descriptor (ARCHITECTURE.md, Bounds), and a read opens the file once a read.
+        locked(cell).out.close_pack();
     }
     // The end is observable from here on: notify calls back.
     let mut ended = false;
@@ -2722,7 +2743,11 @@ pub(crate) fn recover(ctx: &Arc<Ctx>) {
                 None,
             ),
             (None, None) => (
-                Ring::new(ctx.opts.job_output_retention, ctx.spool.new_job()),
+                Ring::new(
+                    ctx.opts.job_output_retention,
+                    ctx.spool.new_job(),
+                    ctx.ring_layout(),
+                ),
                 None,
             ),
         };
@@ -2853,7 +2878,8 @@ fn rebuild(ctx: &Arc<Ctx>, sp: &Spool) -> Option<(Ring, Tail, Journal)> {
     if from.checked_add(total)? > kernel::OFFSET_MAX || from % FRAME_MAX as u64 != 0 {
         return None;
     }
-    let mut ring = Ring::recover(retain, sp.ring_dir(), from).holding(sp.guard());
+    let mut ring =
+        Ring::recover(retain, sp.ring_dir(), from, ctx.ring_layout()).holding(sp.guard());
     let chunk_end = ring.end();
     if chunk_end > from + total {
         // Chunks the journal never covered: not one this journal can continue.
@@ -2898,9 +2924,13 @@ fn restart_cold(ctx: &Arc<Ctx>, sp: &Spool) -> Option<(Ring, Tail, Journal)> {
     let _ = std::fs::remove_dir_all(sp.ring_dir());
     let tail = Tail::open(&ctx.tails, sp, Start::Data).ok()?;
     let journal = Journal::create(&sp.access(), sp.guard(), tail.offsets(), Vec::new(), 0).ok()?;
-    let ring = Ring::new(ctx.opts.job_output_retention, sp.ring_dir())
-        .holding(sp.guard())
-        .kept();
+    let ring = Ring::new(
+        ctx.opts.job_output_retention,
+        sp.ring_dir(),
+        ctx.ring_layout(),
+    )
+    .holding(sp.guard())
+    .kept();
     Some((ring, tail, journal))
 }
 
@@ -2943,6 +2973,8 @@ async fn supervise_adopted(
     if let Some((t, task)) = tail {
         t.done.cancel();
         let _ = task.await;
+        // An ended job holds no descriptor: the chunks' handle goes with the last write.
+        locked(&cell).out.close_pack();
     }
     {
         let mut j = locked(&cell);
@@ -3226,7 +3258,11 @@ mod retention_policy_tests {
             label: String::new(),
             argv: Argv::default(),
             // A ring that touches no file until something is pushed into it.
-            out: Ring::new(1024, std::path::PathBuf::from("/nonexistent/job")),
+            out: Ring::new(
+                1024,
+                std::path::PathBuf::from("/nonexistent/job"),
+                crate::ring::Layout::PerChunk,
+            ),
             spool: None,
             k,
             notify: None,
@@ -3559,7 +3595,11 @@ mod answer_tests {
                 args: vec!["-lc".into(), "cargo test --workspace".into()],
             },
             // A ring that touches no file until a chunk is full.
-            out: Ring::new(1024, std::path::PathBuf::from("/nonexistent/job")),
+            out: Ring::new(
+                1024,
+                std::path::PathBuf::from("/nonexistent/job"),
+                crate::ring::Layout::PerChunk,
+            ),
             spool: None,
             k,
             notify: None,
