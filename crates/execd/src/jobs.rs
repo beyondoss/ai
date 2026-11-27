@@ -2549,8 +2549,10 @@ async fn supervise_after(
     let (code, signal) = status.unwrap_or((kernel::LOST_CODE, None));
     let pgid = pg.id;
     let mark = locked(cell).mark.clone();
+    // This server spawned the job, so its processes are this process's descendants and an empty
+    // child list answers the end without a `/proc` scan (`proc::job_gone_owned`).
     let mut exits = proc::ChildEvents::new();
-    if !proc::job_gone(pgid, &mark, false).await {
+    if !proc::job_gone_owned(pgid, &mark, false).await {
         // What the shell printed goes before `shell_exit`: it is in the files already, so read to
         // their ends. The tail goes on, the group lives.
         if let Some((t, _)) = &tail {
@@ -2567,7 +2569,7 @@ async fn supervise_after(
         ctx.save_jobs().await;
         loop {
             let wake = exits.next().await;
-            if proc::job_gone(pgid, &mark, wake == proc::Wake::Tick).await {
+            if proc::job_gone_owned(pgid, &mark, wake == proc::Wake::Tick).await {
                 break;
             }
         }
@@ -2930,6 +2932,8 @@ async fn supervise_adopted(
 ) {
     let mark = locked(&cell).mark.clone();
     let mut exits = proc::ChildEvents::new();
+    // The scan is the only answer here: a previous execd spawned this group, so its processes are
+    // not this process's descendants and an empty child list says nothing about them.
     while !proc::job_gone(pg.id, &mark, false).await {
         let wake = exits.next().await;
         if proc::job_gone(pg.id, &mark, wake == proc::Wake::Tick).await {
