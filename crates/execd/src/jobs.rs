@@ -3595,7 +3595,11 @@ mod answer_tests {
                 args: vec!["-lc".into(), "cargo test --workspace".into()],
             },
             // A ring that touches no file until a chunk is full.
-            out: Ring::new(1024, std::path::PathBuf::from("/nonexistent/job")),
+            out: Ring::new(
+                1024,
+                std::path::PathBuf::from("/nonexistent/job"),
+                crate::ring::Layout::PerChunk,
+            ),
             spool: None,
             k,
             notify: None,
