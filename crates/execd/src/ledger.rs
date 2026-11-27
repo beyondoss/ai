@@ -39,9 +39,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::job_kernel::{Claim, Persist, Phase, Size, State, Term};
 
-/// The table, whole: the file execd wrote on every life change before this crate appended, and the one
-/// a rollback to that execd still reads. Unchanged in shape, so an `execd-jobs.json` written by this
-/// execd and one written by the execd before it are the same file.
+/// The table, whole: the write every life change made before this crate appended, and still the form a
+/// fold, a retention sweep and a keyed start's claim leave behind. Its shape is the whole table because
+/// that is what a full write wants to be and what [`LOG`]'s header names by length and checksum — no
+/// other execd reads it, since a sandbox gets the binary it was built for.
 const FILE: &str = "execd-jobs.json";
 /// The changes since [`FILE`], one framed record each.
 const LOG: &str = "execd-jobs.log";
@@ -90,8 +91,8 @@ pub(crate) struct Entry {
     /// The offset every byte of the job's output ends at, when the retention dropped the output and
     /// kept the entry (a tombstone, `jobs::sweep`): nothing is held, and a restart rebuilds the ring
     /// at this offset so a client's reads never go backwards. `None`: the output is the spool's, if
-    /// any. Serde-default, so a file written before it still parses, and absent when `None`, so a
-    /// ledger with no tombstone is byte for byte the file execd wrote before.
+    /// any. Serde-default, so a file whose writer did not know it still parses, and absent when `None`,
+    /// so a row without one costs no bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub out: Option<u64>,
     /// A terminal's: its size, its keeper's pid and whether it was open. The keeper's socket is in the spool.
@@ -444,9 +445,10 @@ impl Ledger {
     }
 
     /// [`Self::save`] for a write that must leave the table whole in [`FILE`]: a retention sweep's (one
-    /// pass, off the runtime, whenever it acted). The log is folded, so the file is the table and the log
-    /// is empty — a whole table after every sweep, which is what an execd that knows nothing of the log,
-    /// one this deployment rolled back to, reads. Best effort, as [`Self::save`].
+    /// pass, off the runtime, whenever it acted), and the server's going away. The log is folded, so the
+    /// file is the table and the log is empty after it. A sweep writes whole because its unlinks follow
+    /// this write and the order is only safe when the ledger it leaves is the table itself. Best effort,
+    /// as [`Self::save`].
     pub fn save_whole(&self, snapshot: impl FnOnce() -> Vec<Entry>) {
         let Some(dir) = &self.dir else { return };
         let mut st = crate::proc::locked(&self.state);
@@ -463,7 +465,8 @@ impl Ledger {
 
     /// [`Self::save`] for a keyed start's claim (K10): the file is written, synced, renamed and its directory synced,
     /// and how that came out is returned, so the start can refuse when the claim is not on disk. The claim is a whole
-    /// write, as it always was, so the file a rollback reads names the claim too. A ledger that is not enabled keeps
+    /// write because it must be *synced* before anything is spawned, and the fold is the path that syncs; an appended
+    /// record plus an `fsync` would do the same for less, and is the next change. A ledger that is not enabled keeps
     /// nothing across a restart, so there is nothing to lose: `Durable`.
     pub fn claim(&self, snapshot: impl FnOnce() -> Vec<Entry>) -> Persist {
         let Some(dir) = &self.dir else {
@@ -502,7 +505,7 @@ impl Ledger {
         let bytes = fs::read(dir.join(FILE)).unwrap_or_default();
         // A file that is absent or unreadable is not a table a log can sit on: the next write folds
         // instead. (A directory nothing has written yet takes its first change as a fold of a one-row
-        // table, so from then on a log always sits on a file — which is what a rollback reads.)
+        // table, so from then on a log always sits on a file.)
         let mut unreadable = !dir.join(FILE).is_file();
         let rows = match serde_json::from_slice::<File>(&bytes) {
             Ok(f) if f.version == VERSION => f.jobs,

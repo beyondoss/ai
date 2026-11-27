@@ -161,7 +161,7 @@ sent one and got no echo fails closed with `not_offered`; a held start streams t
 digest is kept, never the env, which can hold secrets, and the label and the id are not in it.
 
 _Where the record lives, and how long._ The key's record (`Rec`: scope, key, id, digest) is the table's, written under its lock with the entry
-(K7), saved in the job's ledger entry (`Idem`, `execd-jobs.json`, a field the version-1 file already ignores) and put back by `recover` for
+(K7), saved in the job's ledger entry (`Idem`, `execd-jobs.json`, a field older files do not carry) and put back by `recover` for
 every job it brings back (K6, `keeps_record`), so a retry after a restart of execd replays. It leaves only with its job, in `Table::take`
 (K8: exactly that job's records, no other's, never one a successor of the id could be mistaken for). The retention (see "Ended jobs:
 retention") drops a keyed job's _output_ like anyone's, and never its _entry_: no ceiling, clock or budget reaps a keyed job, so a job
