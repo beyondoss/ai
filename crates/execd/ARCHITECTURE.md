@@ -33,6 +33,7 @@ variables alone ([Configuration](#configuration)).
 | `src/tail.rs`       | a job's output spool: the two `O_APPEND` files its stdout and stderr go to, execd's tail of them (woken by one `inotify`), and the spool's directory                                          |
 | `src/ledger.rs`     | the jobs ledger: the one typed value kept across a restart of execd — the table as one file and a log of the changes since, appended per life change and folded when it outgrows the table    |
 | `src/frame.rs`      | streaming frame encoding                                                                                                                                                                      |
+| `src/answer.rs`     | the `list` and `read` answers, serialized straight into one buffer: their shapes, and how their bytes are pinned                                                                              |
 
 ## Configuration
 
@@ -150,6 +151,18 @@ beside `code` 128 + S, set in the same step as `shell_exit` or the end, so no re
 `list` answer `signal` only for such a job (absent for an exit, even of 137), and the job stream's final frame is `{"signal": S}`
 in place of `{"exit_code": 128 + S}`, as a one-shot stream's is. A job stopped by `kill` therefore reports the signal that
 killed its shell (15, or 9 after the grace). Nothing is persisted: a job lives in the table and is gone with execd.
+
+**How the two answers are written** (`src/answer.rs`). `list` and `read` serialize their answer straight into one `Vec<u8>`, one
+allocation per answer, and hand it to the same response path (`http::json_bytes`); there is no `serde_json::Value` and so no map
+per row and no key `String` per field. The row, the `pty` and the `read` body are `Serialize` structs whose fields are declared in
+the order the wire carries them, which is the sorted order the `Value` maps used to produce (a `serde_json` map is a `BTreeMap`),
+and every value goes through the same serializer, so escaping, numbers and the `null`s a `None` becomes are unchanged; `more` is
+the last field and absent when nothing was left out, and `stderr_ranges` is absent when the window holds no stderr byte. A
+base64 payload is encoded into the answer's own buffer as it is written (`answer::B64`, through `Display`), so the window is
+copied once, not three times. `jobs::answer_tests` holds these bytes to the exact builders this replaced, over a fixture of every
+shape the two ops answer, and `mise run test:execd-answer-mutants` runs eight mutants of the wire against it (a field dropped, a
+key renamed, keys reordered, a value retyped, a number reformatted, a `null` lost, `more` dropped, empty `stderr_ranges` sent),
+each of which must go red. Measured in "The `list` and `read` answers" under Performance.
 
 **The start key.** `start` may carry `idempotency_key` (1 to 128 characters of `[0-9A-Za-z._:-]`, else `400`; `execd_jobs::key_valid`, K12 and K13): a start retried
 after its answer was lost never runs a second job. What `start` does is `Table::begin`'s decision (`start_decision`, K1 to K5, proven in
@@ -1062,6 +1075,46 @@ EXEC_BENCH_A=/path/to/beyond-ai-demo mise run bench:execd           # on the hos
 sandbox execd is built for. The baseline answers every request with `Connection: close`, so it cannot hold a kept-alive
 connection; its sequential round trips include a connect on each request, and the "new connection each" row gives execd the
 same.
+
+### The `list` and `read` answers, without a `Value` tree
+
+Both ops used to build a `serde_json::Value` per row and per frame and then serialize the tree again. This is the count that
+mattered: the runtime thread paid it per request, and `/livez` queued behind it.
+
+Measured on this repository's release build of the binary (symbol-ful, `strip=false`, the same code as the shipped profile) on a
+4-CPU box, a table seeded through the ledger so both builds answer the same rows, 200 `list`s and 100 `read`s per row
+(`~/.capy/work/perf/answer_perf.py`, `allocs.sh`; DHAT counts are the difference between a run of 2 ops and one of 22, so they
+are that op's own cost). Counts travel; the milliseconds are this box's, which is faster than the one CAPY-9's `/proc` numbers
+came from.
+
+| op                                                   | allocations    | bytes allocated     | `p50`          | `p95`          | `/livez` behind it (`p50` / `max`) |
+| ---------------------------------------------------- | -------------- | ------------------- | -------------- | -------------- | ---------------------------------- |
+| `list`, 1 024 ended entries (512 rows)               | 29 461 → 2 084 | 3 226 713 → 382 472 | 1.62 → 0.32 ms | 1.70 → 0.36 ms | 1.61 / 3.23 → 0.32 / 0.40 ms       |
+| `list`, 4 096 ended entries (512 rows, `more` 3 584) | 29 461 → 2 083 | 3 226 711 → 382 440 | 1.82 → 0.53 ms | 1.84 → 0.56 ms | 1.84 / 2.29 → 0.55 / 0.62 ms       |
+| `read`, 64 KiB window                                | 60 → 49        | 571 509 → 221 959   | 0.19 → 0.19 ms | 0.20 → 0.20 ms | —                                  |
+| `list`, empty table (the whole request)              | 20 → 17        | 2 444 → 1 816       | —              | —              | —                                  |
+
+Peak RSS after 200 `list`s of the 1 024-entry table: 10 352 → 7 200 KiB, the 3.1 MB difference being one
+list's garbage that used to be materialized.
+
+The wire did not move: the same table answers 163 733 B at 1 024 entries and 163 711 B at 4 096, from both builds, byte for
+byte (`~/.capy/work/perf/diff_answers.py`: 34 answers per table — the list, `read` of one row of each shape at five windows, and
+a `read` of a job that is not there — compared as bytes between the two binaries). The shapes a seeded table cannot carry (a
+running row, a live terminal, the `ended` of a job the restart sees) are pinned in the crate instead, by
+`jobs::answer_tests`'s fixture matrix and its eight mutants; a live table's answers are compared by
+`~/.capy/work/perf/live_diff.py` (real 300 KB of output read back as base64 with its stderr ranges, `code`, `signal`, `pty`,
+offsets and state — every field a `read` answer has), with only a `list` row's `mark`, `started` and `ended` masked, because
+those three are a random draw and the wall clock.
+
+What is left of the `list` count is not the answer: 2 050 of the 2 084 blocks are the table snapshot, two `String` clones per
+cell (`Table::in_scope`, which also serves `kill` and `remove`, and is proven in Verus), so the answer itself costs the one
+`Vec` its bytes are written into. `read`'s 221 959 B for a 64 KiB window is that window, the 87 896 B answer buffer it is
+encoded into, and the ring's own chunk and bitmap reads — one copy of the payload, where there used to be three. Neither op
+allocates per field or per row model; a `read` does not allocate per base64 chunk (it encodes through a 4 KiB stack buffer).
+
+The trade to name: `read`'s latency is unchanged (0.19 ms both ways), so this is purely a CPU and garbage cost taken off the
+runtime, and it shows where the runtime was actually busy — `list`'s 5× and the `/livez` stall behind it, which is what a
+sandbox's probe and its next `attach` used to wait on.
 
 ### Job stdin, streams, signal and env (`benches/jobs_stdin.py`)
 

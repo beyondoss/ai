@@ -67,15 +67,20 @@ impl HttpBody for Body {
 
 pub(crate) type Resp = Response<Body>;
 
-/// A JSON answer with this status.
-pub(crate) fn json_response(status: u16, body: &Value) -> Resp {
-    let mut r = Response::new(Body::Full(Some(Bytes::from(body.to_string()))));
+/// A JSON answer with this status, from a body already serialized into one buffer.
+pub(crate) fn json_bytes(status: u16, body: Bytes) -> Resp {
+    let mut r = Response::new(Body::Full(Some(body)));
     *r.status_mut() = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     r.headers_mut().insert(
         CONTENT_TYPE,
         hyper::header::HeaderValue::from_static("application/json"),
     );
     r
+}
+
+/// A JSON answer with this status.
+pub(crate) fn json_response(status: u16, body: &Value) -> Resp {
+    json_bytes(status, Bytes::from(body.to_string()))
 }
 
 pub(crate) fn error_response(status: u16, msg: &str) -> Resp {

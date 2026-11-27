@@ -37,6 +37,7 @@ use serde_json::{Value, json};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
+use crate::answer;
 use crate::exec::{self, Cut, Sink};
 use crate::frame::{self, FRAME_MAX};
 use crate::http::{self, Line, Request, Resp};
@@ -794,31 +795,69 @@ pub(crate) fn start_retention(ctx: &Arc<Ctx>, stop: CancellationToken) {
     });
 }
 
-fn state_of(j: &Job) -> (&'static str, Value) {
+/// `(state, code)` as `read` and `list` answer it: the code once there is one.
+fn state_of(j: &Job) -> (&'static str, Option<i32>) {
     let (state, code) = j.k.named();
-    (state.as_str(), code.map_or(Value::Null, |c| json!(c)))
-}
-
-/// `signal`, when a signal killed the shell: a member of `read` and `list` answers only once the
-/// job has a code.
-fn put_signal(j: &Job, obj: &mut Value) {
-    if let Some(sig) = j.k.signal() {
-        obj["signal"] = json!(sig);
-    }
+    (state.as_str(), code)
 }
 
 /// `pty`, on a terminal job's `read` and `list` entries: its size, and whether its keeper still holds
 /// it. Absent for a job with no terminal.
-fn put_pty(j: &Job, obj: &mut Value) {
+fn pty_of(j: &Job) -> Option<answer::Pty> {
     match j.k.term {
-        Term::No => {}
-        Term::Open { size, .. } => {
-            obj["pty"] = json!({ "cols": size.cols, "rows": size.rows, "open": true });
-        }
-        Term::Gone { size } => {
-            obj["pty"] = json!({ "cols": size.cols, "rows": size.rows, "open": false });
-        }
+        Term::No => None,
+        Term::Open { size, .. } => Some(answer::Pty {
+            cols: size.cols,
+            open: true,
+            rows: size.rows,
+        }),
+        Term::Gone { size } => Some(answer::Pty {
+            cols: size.cols,
+            open: false,
+            rows: size.rows,
+        }),
     }
+}
+
+/// One `list` row of `j`, as the answer writes it.
+pub(crate) fn row_of<'a>(id: &'a str, j: &'a Job) -> answer::Row<'a> {
+    let (state, code) = state_of(j);
+    answer::Row {
+        args: &j.argv.args,
+        code,
+        command: &j.argv.command,
+        ended: j.k.ended_at(),
+        id,
+        kept: j.k.kept(),
+        kind: j.k.kind(),
+        label: &j.label,
+        mark: &j.mark,
+        num: j.k.num(),
+        output_end: j.out.end(),
+        output_start: j.out.base,
+        pty: pty_of(j),
+        seen: j.k.seen,
+        signal: j.k.signal(),
+        started: j.k.started,
+        state,
+    }
+}
+
+/// One `read` answer of `j`: the window, and the job's status beside it.
+fn read_answer(j: &Job, offset: u64, max: usize) -> Result<Bytes, serde_json::Error> {
+    let (from, data, ranges) = j.out.read(offset, max);
+    let (state, code) = state_of(j);
+    let body = answer::ReadBody {
+        code,
+        data: answer::B64(&data),
+        end: j.out.end(),
+        offset: from,
+        pty: pty_of(j),
+        signal: j.k.signal(),
+        state,
+        stderr_ranges: &ranges,
+    };
+    answer::body(&body, data.len().div_ceil(3) * 4 + 512)
 }
 
 /// `SIGTERM` the jobs (each `(pgid, mark)`), wait up to `grace` for them to empty, `SIGKILL` what is
@@ -1409,30 +1448,20 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq, data: Vec<u8>) -> 
         }
         "read" => {
             let body = match jobs.get(&key(&job.id)) {
-                None => json!({ "state": "gone", "offset": 0, "end": 0, "data": "" }),
+                None => Ok(Bytes::from_static(answer::GONE)),
                 Some(cell) => {
                     let j = locked(&cell);
-                    let (state, code) = state_of(&j);
-                    let (from, data, ranges) = j
-                        .out
-                        .read(job.offset, usize::try_from(job.max).unwrap_or(usize::MAX));
-                    let mut body = json!({
-                        "state": state,
-                        "code": code,
-                        "offset": from,
-                        "end": j.out.end(),
-                        "data": frame::b64(&data),
-                    });
-                    if !ranges.is_empty() {
-                        body["stderr_ranges"] =
-                            ranges.iter().map(|&(a, n)| json!([a, n])).collect();
-                    }
-                    put_signal(&j, &mut body);
-                    put_pty(&j, &mut body);
-                    body
+                    read_answer(
+                        &j,
+                        job.offset,
+                        usize::try_from(job.max).unwrap_or(usize::MAX),
+                    )
                 }
             };
-            http::json_response(200, &body)
+            match body {
+                Ok(b) => http::json_bytes(200, b),
+                Err(_) => answer::failed(),
+            }
         }
         "write" => write_stdin(ctx, req, &job, data).await,
         "signal" => {
@@ -1547,40 +1576,10 @@ async fn serve_op(ctx: &Arc<Ctx>, req: &Request, job: JobReq, data: Vec<u8>) -> 
                 }
             }
             let more = ended.len().saturating_sub(LIST_ENDED_MAX);
-            let list: Vec<Value> = cells
-                .into_iter()
-                .enumerate()
-                .filter(|(i, _)| !dropped[*i])
-                .map(|(_, ((_, id), c))| {
-                    let j = locked(&c);
-                    let (state, code) = state_of(&j);
-                    let mut entry = json!({
-                        "id": id,
-                        "mark": j.mark,
-                        "command": j.argv.command,
-                        "args": j.argv.args,
-                        "outputStart": j.out.base,
-                        "outputEnd": j.out.end(),
-                        "state": state,
-                        "code": code,
-                        "kept": j.k.kept(),
-                        "num": j.k.num(),
-                        "kind": j.k.kind(),
-                        "seen": j.k.seen,
-                        "started": j.k.started,
-                        "ended": j.k.ended_at(),
-                        "label": j.label,
-                    });
-                    put_signal(&j, &mut entry);
-                    put_pty(&j, &mut entry);
-                    entry
-                })
-                .collect();
-            let mut body = json!({ "jobs": list });
-            if more > 0 {
-                body["more"] = json!(more);
+            match answer::list(&cells, &dropped, more) {
+                Ok(b) => http::json_bytes(200, b),
+                Err(_) => answer::failed(),
             }
-            http::json_response(200, &body)
         }
         other => {
             // An op this server does not implement: the embedder's, if it has a hook.
@@ -3455,5 +3454,313 @@ mod tail_step_tests {
         assert_eq!(step_after(Drained::Idle, false), TailStep::Stop(true));
         assert_eq!(step_after(Drained::Stopped, true), TailStep::Stop(false));
         assert_eq!(step_after(Drained::Stopped, false), TailStep::Stop(false));
+    }
+}
+
+/// The `list` and `read` answers against the builders this change replaced, byte for byte.
+///
+/// The oracle below is `jobs.rs` at 87347af copied verbatim — the `Value` trees those two ops built,
+/// serialized by the same serde_json that writes the answer now — so a comparison of the two is a
+/// comparison of the wire. Any field dropped, renamed, reordered, retyped or reformatted, a lost
+/// `null`, a missing `more`, or a `stderr_ranges` that appears when it should not changes the bytes
+/// and turns this module red; `scripts/answer-mutants.py` applies each of those and records which
+/// test caught it.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod answer_tests {
+    use base64::Engine as _;
+
+    use super::*;
+
+    fn old_state_of(j: &Job) -> (&'static str, Value) {
+        let (state, code) = j.k.named();
+        (state.as_str(), code.map_or(Value::Null, |c| json!(c)))
+    }
+
+    fn old_put_signal(j: &Job, obj: &mut Value) {
+        if let Some(sig) = j.k.signal() {
+            obj["signal"] = json!(sig);
+        }
+    }
+
+    fn old_put_pty(j: &Job, obj: &mut Value) {
+        match j.k.term {
+            Term::No => {}
+            Term::Open { size, .. } => {
+                obj["pty"] = json!({ "cols": size.cols, "rows": size.rows, "open": true });
+            }
+            Term::Gone { size } => {
+                obj["pty"] = json!({ "cols": size.cols, "rows": size.rows, "open": false });
+            }
+        }
+    }
+
+    fn old_row(id: &str, j: &Job) -> Value {
+        let (state, code) = old_state_of(j);
+        let mut entry = json!({
+            "id": id,
+            "mark": j.mark,
+            "command": j.argv.command,
+            "args": j.argv.args,
+            "outputStart": j.out.base,
+            "outputEnd": j.out.end(),
+            "state": state,
+            "code": code,
+            "kept": j.k.kept(),
+            "num": j.k.num(),
+            "kind": j.k.kind(),
+            "seen": j.k.seen,
+            "started": j.k.started,
+            "ended": j.k.ended_at(),
+            "label": j.label,
+        });
+        old_put_signal(j, &mut entry);
+        old_put_pty(j, &mut entry);
+        entry
+    }
+
+    fn old_read(j: &Job, offset: u64, max: usize) -> Value {
+        let (state, code) = old_state_of(j);
+        let (from, data, ranges) = j.out.read(offset, max);
+        let mut body = json!({
+            "state": state,
+            "code": code,
+            "offset": from,
+            "end": j.out.end(),
+            "data": base64::engine::general_purpose::STANDARD.encode(&data),
+        });
+        if !ranges.is_empty() {
+            body["stderr_ranges"] = ranges.iter().map(|&(a, n)| json!([a, n])).collect();
+        }
+        old_put_signal(j, &mut body);
+        old_put_pty(j, &mut body);
+        body
+    }
+
+    /// The old builder for a `read` of a job the table does not hold.
+    fn old_gone() -> Value {
+        json!({ "state": "gone", "offset": 0, "end": 0, "data": "" })
+    }
+
+    /// A job with the fields every case shares; each case below changes what its shape is about.
+    fn job() -> Job {
+        let mut k = kernel::State::new(1_700_000_000, false, None);
+        k.phase = kernel::Phase::Running { pgid: 4242 };
+        Job {
+            mark: "0123456789abcdef".into(),
+            sp: 1,
+            label: "migration".into(),
+            argv: Argv {
+                command: "bash".into(),
+                args: vec!["-lc".into(), "cargo test --workspace".into()],
+            },
+            // A ring that touches no file until a chunk is full.
+            out: Ring::new(1024, std::path::PathBuf::from("/nonexistent/job")),
+            spool: None,
+            k,
+            notify: None,
+            notifier: Notifier::default(),
+            stdin: None,
+            streams: 0,
+            idem: None,
+            tombstoned: false,
+        }
+    }
+
+    /// Every shape either op answers: each phase, a terminal open and hung up, signalled and plain
+    /// exits, output the retention dropped, a held start, a keyed job, empty argv, and strings
+    /// carrying every byte that needs escaping.
+    fn fixtures() -> Vec<(&'static str, Job)> {
+        let ended = |code: i32, signal: Option<i32>, at: u64| kernel::Phase::Ended {
+            pgid: 4242,
+            code,
+            signal,
+            at,
+            shell_told: true,
+        };
+        let mut out: Vec<(&'static str, Job)> = Vec::new();
+
+        let mut j = job();
+        j.out.push(b"hello\n", false);
+        j.k.seen = 6;
+        out.push(("running with output read", j));
+
+        let mut j = job();
+        j.k.term = Term::Open {
+            size: kernel::Size { cols: 80, rows: 24 },
+            applied: true,
+        };
+        out.push(("running, terminal open", j));
+
+        let mut j = job();
+        j.k.phase = kernel::Phase::Spawning;
+        out.push(("spawning", j));
+
+        let mut j = job();
+        j.k.phase = kernel::Phase::Exited {
+            pgid: 4242,
+            code: 0,
+            signal: None,
+        };
+        out.push(("exited, code only", j));
+
+        let mut j = job();
+        j.k.phase = kernel::Phase::Exited {
+            pgid: 4242,
+            code: 137,
+            signal: Some(9),
+        };
+        out.push(("exited by a signal", j));
+
+        let mut j = job();
+        j.k.phase = ended(0, None, 1_700_000_100);
+        j.out.push(b"out:", false);
+        j.out.push(b"err", true);
+        j.out.push(b"\n", false);
+        out.push(("ended, both streams", j));
+
+        let mut j = job();
+        j.k.phase = ended(3, None, 1_700_000_200);
+        j.out.push(b"dropped\n", false);
+        j.out.evict_all();
+        j.tombstoned = true;
+        out.push(("tombstoned output", j));
+
+        let mut j = job();
+        j.k.phase = ended(139, Some(11), 1_700_000_300);
+        j.k.term = Term::Gone {
+            size: kernel::Size {
+                cols: 132,
+                rows: 43,
+            },
+        };
+        out.push(("ended by SIGSEGV, terminal hung up", j));
+
+        let mut j = job();
+        j.k.claim = kernel::Claim::Held;
+        out.push(("held start", j));
+
+        let mut j = job();
+        j.k.claim = kernel::Claim::Kept {
+            num: Some(7),
+            kind: None,
+        };
+        out.push(("kept with a number, no kind", j));
+
+        let mut j = job();
+        j.label = String::new();
+        j.argv = Argv::default();
+        j.k.term = Term::Open {
+            size: kernel::Size {
+                cols: 1,
+                rows: 1024,
+            },
+            applied: false,
+        };
+        out.push(("empty argv and label, a 1x1024 terminal", j));
+
+        let mut j = job();
+        j.label = "quote \" backslash \\ nl \n tab \t nul \u{0} del \u{7f} emoji 🐹 end".into();
+        j.argv = Argv {
+            command: "sh".into(),
+            args: vec![
+                "-c".into(),
+                "echo \"hi\" && printf '\\n'".into(),
+                String::new(),
+            ],
+        };
+        j.mark = "\u{1f}-\"x\"".into();
+        out.push(("strings that must escape", j));
+        out
+    }
+
+    /// Every row shape, byte for byte — the id included, which is escaped like every other string.
+    #[test]
+    fn a_rows_bytes_are_the_ones_the_value_wrote() {
+        for (what, j) in fixtures() {
+            for id in ["job_01J8Z9K3", "job\"0/\u{7f}\u{1}"] {
+                let mut buf = Vec::new();
+                serde_json::to_writer(&mut buf, &row_of(id, &j)).unwrap();
+                assert_eq!(
+                    String::from_utf8(buf).unwrap(),
+                    old_row(id, &j).to_string(),
+                    "{what}, id {id:?}"
+                );
+            }
+        }
+    }
+
+    /// The whole `list` answer: every row in the table's order, the rows the bound dropped left out,
+    /// and the count last and only when rows were left out.
+    #[test]
+    fn a_list_answer_is_the_bytes_the_value_wrote() {
+        for more in [0usize, 3, 4096] {
+            for every in [0usize, 1, 3] {
+                let cells: Vec<(Key, JobCell)> = fixtures()
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (_, j))| {
+                        (
+                            (String::new(), format!("job_{i:02}")),
+                            Arc::new(Mutex::new(j)),
+                        )
+                    })
+                    .collect();
+                let dropped: Vec<bool> = (0..cells.len())
+                    .map(|i| every > 0 && i % every == 0)
+                    .collect();
+                let old = {
+                    let rows: Vec<Value> = cells
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| !dropped[*i])
+                        .map(|(_, ((_, id), c))| old_row(id, &locked(c)))
+                        .collect();
+                    let mut body = json!({ "jobs": rows });
+                    if more > 0 {
+                        body["more"] = json!(more);
+                    }
+                    body.to_string()
+                };
+                let new = answer::list(&cells, &dropped, more).unwrap();
+                assert_eq!(
+                    String::from_utf8(new.to_vec()).unwrap(),
+                    old,
+                    "more = {more}, every {every}th row dropped"
+                );
+            }
+        }
+        let empty = answer::list(&[], &[], 0).unwrap();
+        assert_eq!(String::from_utf8(empty.to_vec()).unwrap(), r#"{"jobs":[]}"#);
+    }
+
+    /// Every `read` window shape: from the start, from the middle, at the end, past it, and with a
+    /// window that names stderr bytes and one that must not.
+    #[test]
+    fn a_read_answer_is_the_bytes_the_value_wrote() {
+        for (what, j) in fixtures() {
+            let windows = [
+                (0u64, 1 << 20),
+                (0, 1),
+                (2, 5),
+                (3, 7),
+                (u64::MAX, 64),
+                (j.out.end(), 16),
+            ];
+            for (offset, max) in windows {
+                let new = read_answer(&j, offset, max).unwrap();
+                assert_eq!(
+                    String::from_utf8(new.to_vec()).unwrap(),
+                    old_read(&j, offset, max).to_string(),
+                    "{what} at {offset}+{max}"
+                );
+            }
+        }
+    }
+
+    /// A `read` of a job the table does not hold.
+    #[test]
+    fn the_gone_answer_is_the_bytes_the_value_wrote() {
+        assert_eq!(answer::GONE, old_gone().to_string().as_bytes());
     }
 }
