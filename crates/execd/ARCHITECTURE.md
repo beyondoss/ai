@@ -40,8 +40,10 @@ variables alone ([Configuration](#configuration)).
 execd has no command-line flags. It is configured by `EXECD_*` environment variables, each read once at startup in
 `src/config.rs` and nowhere else: `EXECD_LISTEN`, `EXECD_ROOT`, `EXECD_HOME`, `EXECD_BEARER_FILE`, `EXECD_BEARER`,
 `EXECD_INSECURE_NO_AUTH`, `EXECD_RUN_AS`, `EXECD_MAX_RESPONSE_BYTES`, `EXECD_JOBS_DIR`, `EXECD_STATE_DIR`,
-`EXECD_LOG`, `EXECD_WORKER_THREADS`, `EXECD_IDLE_TIMEOUT_MS`, `EXECD_DISK_WRITERS`, and the four retention knobs `EXECD_JOB_OUTPUT_MS`,
-`EXECD_JOBS_ENDED_BYTES`, `EXECD_JOBS_ENDED_MAX` and `EXECD_JOB_ENTRY_MS` (the table is in the README; see "Ended jobs: retention"). A value that does not parse is an error
+`EXECD_LOG`, `EXECD_WORKER_THREADS`, `EXECD_IDLE_TIMEOUT_MS`, and the four retention knobs `EXECD_JOB_OUTPUT_MS`,
+`EXECD_JOBS_ENDED_BYTES`, `EXECD_JOBS_ENDED_MAX` and `EXECD_JOB_ENTRY_MS` (the table is in the README; see "Ended jobs: retention").
+The pool that bounds off-loop disk work is not a variable: it is the constant `DISK_WRITERS` (eight), and the reasons for the number
+are under "Job output is written off the runtime". A value that does not parse is an error
 naming the variable and the value, with exit status 2; a boolean is `1`, `true`, `0` or `false`; an empty variable is unset.
 Any argument other than the internal `--execd-run-as-helper` re-exec marker (handled before anything else) prints the variable
 list to stderr and exits 2. There is no `--help` or `--version`: the startup line carries the version.
