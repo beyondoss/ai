@@ -282,6 +282,7 @@ mut_attach_registers_late = [] # an attach counts its stream after deciding to s
 mut_attach_ignores_removed = [] # an attach of a job taken after its lookup streams it anyway
 # Mutations of the ledger's write path and of recovery, used only by `tests/ledger.rs`'s red runs.
 mut_ledger_write_inline = [] # a change of a job's life writes the ledger on the runtime's thread
+mut_tail_write_inline = [] # a job's output batch is written on the runtime, one round at a time (the path #744 removed)
 mut_recover_scans_ended = [] # recovery asks `/proc` for every row, including one saved as ended
 mut_ledger_never_folds = [] # the log is never folded back into the table: it grows without bound
 mut_ledger_trusts_checksum = [] # a record is applied whether or not its checksum matches

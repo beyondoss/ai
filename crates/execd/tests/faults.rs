@@ -683,8 +683,8 @@ async fn livez_within(e: &Execd, within: Duration) -> Option<u16> {
 
 /// While a job's output write is stuck on the disk (held at the gate, indefinitely, not for a
 /// time), an unrelated caller is served: `/livez`, and a command run to completion. Red: with the
-/// batch on the runtime (`EXECD_DISK_WRITERS=0`, or `off_runtime` removed) the same stuck write
-/// leaves `/livez` unanswered (next test).
+/// batch on the runtime (the `mut_tail_write_inline` mutation, which is the path this replaced)
+/// the same stuck write leaves `/livez` unanswered.
 #[tokio::test]
 async fn a_stuck_output_write_does_not_stall_an_unrelated_caller() {
     let gate = Gate::closed();
@@ -707,26 +707,16 @@ async fn a_stuck_output_write_does_not_stall_an_unrelated_caller() {
     wipe(&e).await;
 }
 
-/// The off value: `EXECD_DISK_WRITERS=0` writes on the runtime, as before, so the same stuck write
-/// stalls every caller until it clears. This is the behaviour the fix removes, shown on the seam.
-#[tokio::test]
-async fn with_disk_writers_zero_a_stuck_output_write_stalls_every_caller_as_before() {
-    let gate = Gate::closed();
-    let e = Execd::start(&[("EXECD_DISK_WRITERS", "0")], &[gate.env()]);
-    assert_eq!(start_job(&e, "slow", CHATTER).await.status, 200);
-    until("a batch stuck on the disk", || async { gate.held() == 1 }).await;
-    assert_eq!(livez_within(&e, Duration::from_secs(2)).await, None);
-    gate.open();
-    assert_eq!(livez_within(&e, Duration::from_secs(5)).await, Some(200));
-    wipe(&e).await;
-}
-
-/// Ten jobs write through two writer slots with the disk stuck: two batches reach the disk and
-/// eight other jobs log that they wait for a slot; opening the disk serves every one, and the most
-/// batches ever on the disk at once (counted by the seam, exactly) is two. Red: without the
+/// Ten jobs write through the eight-writer pool with the disk stuck: eight batches reach the disk
+/// and two other jobs log that they wait for a slot; opening the disk serves every one, and the most
+/// batches ever on the disk at once (counted by the seam, exactly) is eight. Red: without the
 /// semaphore all ten reach the disk together and none waits.
+///
+/// `EXECD_DISK_WRITERS` is set to 2 and must change nothing: the pool is the constant
+/// `execd::DISK_WRITERS`, not a deployment's choice. Red if the variable is ever read again, because
+/// two batches would then reach the disk instead of eight.
 #[tokio::test]
-async fn writer_threads_are_bounded_by_disk_writers_and_the_rest_wait() {
+async fn writer_threads_are_bounded_to_eight_and_the_rest_wait() {
     let gate = Gate::closed();
     let e = Execd::start(
         &[("EXECD_DISK_WRITERS", "2"), ("EXECD_LOG", "debug")],
@@ -745,8 +735,8 @@ async fn writer_threads_are_bounded_by_disk_writers_and_the_rest_wait() {
             .len()
     };
     until(
-        "two batches on the disk and eight other jobs waiting",
-        || async { gate.held() == 2 && waiting() >= 8 },
+        "eight batches on the disk and two other jobs waiting",
+        || async { gate.held() == 8 && waiting() >= 2 },
     )
     .await;
     gate.open();
@@ -756,8 +746,8 @@ async fn writer_threads_are_bounded_by_disk_writers_and_the_rest_wait() {
         })
         .await;
     }
-    // Over the whole run, with all ten held back by the disk at once, never more than two were on it.
-    assert_eq!(gate.most(), 2, "the most batches on the disk at once");
+    // Over the whole run, with all ten held back by the disk at once, never more than eight were on it.
+    assert_eq!(gate.most(), 8, "the most batches on the disk at once");
     wipe(&e).await;
 }
 
@@ -871,19 +861,18 @@ fn written_under(dir: &Path) -> Vec<(String, Vec<u8>)> {
     out
 }
 
-/// The retention sweep's ledger write and unlinks take one of the same `disk_writers` turns a job's
-/// output batch takes (`jobs.rs` `sweep`, `Ctx::disk_turn`): with the only turn held by a batch
-/// stuck on a disk that never answers, the sweep's decision is made but its durable side waits —
-/// the spool files still hold the dropped output — and the files go once the turn frees. Red when
-/// the sweep runs off-loop without a turn: the spool file vanishes while the disk is stuck.
+/// The retention sweep's ledger write and unlinks take one of the same `DISK_WRITERS` turns a job's
+/// output batch takes (`jobs.rs` `sweep`, `Ctx::disk_turn`): with every turn held by a batch stuck
+/// on a disk that never answers, the sweep's decision is made but its durable side waits — the
+/// spool files still hold the dropped output — and the files go once a turn frees. Red when the
+/// sweep runs off-loop without a turn: the spool file vanishes while the disk is stuck.
 #[tokio::test]
 async fn a_retention_sweep_waits_for_a_disk_writer_turn() {
     let gate = Gate::answering();
     let spools = tempfile::tempdir().unwrap();
     let e = Execd::start(
         &[
-            ("EXECD_DISK_WRITERS", "1"),
-            // A deadline long enough that closing the gate and sticking a batch both happen well
+            // A deadline long enough that closing the gate and sticking every batch happen well
             // inside it: the sweep then acts on its own timer, not on a race this test wins.
             ("EXECD_JOB_OUTPUT_MS", "3000"),
             ("EXECD_JOBS_DIR", spools.path().to_str().unwrap()),
@@ -902,11 +891,17 @@ async fn a_retention_sweep_waits_for_a_disk_writer_turn() {
         "the ended job's spool holds its output: {:?}",
         written_under(spools.path())
     );
-    // The disk stops answering, and one job's batch takes the only turn and holds it.
+    // The disk stops answering, and one batch per job takes a turn and holds it, until every turn
+    // of the pool is held and the sweep can have none.
     gate.close();
-    assert_eq!(start_job(&e, "busy", CHATTER).await.status, 200);
-    until("the only turn held by a stuck batch", || async {
-        gate.held() == 1
+    for i in 0..execd::DISK_WRITERS {
+        assert_eq!(
+            start_job(&e, &format!("busy{i}"), CHATTER).await.status,
+            200
+        );
+    }
+    until("every turn held by a stuck batch", || async {
+        gate.held() == execd::DISK_WRITERS
     })
     .await;
     // Past its deadline the sweep decides (the output is a gap from here) and then waits for a turn:
@@ -920,7 +915,7 @@ async fn a_retention_sweep_waits_for_a_disk_writer_turn() {
         written_under(spools.path())
             .iter()
             .any(|(_, b)| b.as_slice() == b"hi"),
-        "the sweep unlinked the dropped output while the only disk turn was stuck: {:?}",
+        "the sweep unlinked the dropped output while every disk turn was stuck: {:?}",
         written_under(spools.path())
     );
     gate.open();
